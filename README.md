@@ -1,5 +1,19 @@
 # Fallout: New Vegas co-op: story sync (developer preview)
 
+> **Status (October 2026): developer preview, about 35% of the way to full-story co-op.**
+>
+> | Area | Where it stands |
+> |---|---|
+> | Sync core (protocol, merge rules, rejoin, rules engine) | built, covered by game-free tests and a 4-player soak |
+> | Co-op rules for every story quest | written for 481 quests |
+> | Engine hooks that record world changes | cover about two thirds of the script commands the game uses |
+> | Two game copies on one PC for automated tests | working |
+> | Quest stage sync between two real game copies | working: stages arrive exactly once, with no scripts re-run on the client |
+> | Goodsprings stage sweep | 65 of 104 stages pass |
+> | NV:MP alongside the plugin | both clients connect and see each other |
+>
+> There is no player release yet. Progress updates land here.
+
 Play the whole **Fallout: New Vegas** story together: 2 to 4 players, one shared world, one shared quest
 state. This repo is the **story layer**: an xNVSE plugin plus a game-free sync core that keeps quests,
 objectives, dialogue results, reputation and karma identical on every machine.
