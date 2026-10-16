@@ -1,0 +1,17 @@
+{
+  "protect": {
+    "vars": [],
+    "fields": [],
+    "globals": []
+  },
+  "add": {
+    "vars": [
+      {
+        "owner": "FalloutNV.esm:102037",
+        "name": "fTimer"
+      }
+    ],
+    "fields": [],
+    "globals": []
+  }
+}

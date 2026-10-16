@@ -1,0 +1,60 @@
+// L11 hooks_ui: x86 glue (xNVSE headers, FalloutNV.exe 1.4.0.525). Installs prologue-checked detours through
+// nvhooks::HookRegistry (L5's patcher; own instance, own memory ops) and feeds nvui::UiRouter.
+// Inert until Init() is called. Everything runs on the game main thread.
+#pragma once
+#include <functional>
+#include <string>
+#include <vector>
+
+#include "hook_patch.h"
+#include "ui_core.h"
+
+namespace nvui {
+
+struct HookReport {
+    std::string name;
+    nvhooks::PatchStatus status;
+};
+struct InitReport {
+    std::vector<HookReport> hooks;
+    int ok = 0, failed = 0;
+};
+
+// host=true: route boxes/menus/forced dialogue of REMOTE origins away from this machine. host=false (guest): only the condition
+// view hook is installed (conditions on the guest are evaluated for the guest's own slot).
+// The router with the game IUiEngine behind it (owned here; one per process).
+UiRouter* MakeRouter(Bridge b);
+InitReport Init(UiRouter& router, bool host);
+void Shutdown();
+UiRouter* router();
+
+// Reads the response chain of an INFO (L8's fndlg::readLines behind a lambda; wired by L10). Without it ForcedSay carries no text.
+using InfoReader = std::function<std::vector<fnvcoop_dlg::Line>(uint32_t infoAddr)>;
+void setInfoReader(InfoReader f);
+
+struct Counters {
+    uint64_t seenShowMessage = 0, seenBoxes = 0, seenService = 0, seenCond = 0, seenForced = 0, seenSwap = 0, seenActivate = 0;
+};
+const Counters& counters();
+
+// ---- origin-player side: what L8's EngineGlue stubs (openMenu / closeMenu / forceCloseDialog / resumeTalk) call -----------------
+namespace ops {
+using Answer = std::function<void(uint32_t menu, int32_t choice)>;
+void setAnswerSink(Answer a);  // -> EngineGlue::onMenuAnswered
+// MenuRequest on THIS machine: MessageBox opens a real message box (queued one at a time); service menus run the vanilla command
+// on the subject; anything else is reported through log and answered with -1.
+bool openMenu(const fnvcoop_dlg::MenuRequest& rq);
+void closeMenu(uint32_t menu);          // timeout: forces the box shut without answering
+void pump();                            // per frame: starts the next queued box
+bool openDialogMenu(uint32_t speakerRefID, const FormRef& topic);   // forced conversation: `<npc>.StartConversation player <topic>`
+bool forceCloseDialog();                // CloseAllMenusCore while the DialogMenu is open; never runs the END script locally
+bool dialogOpen();
+// Ending slideshow playback on a client: the SwapTexture the host script ran (`SwapTexture <ref> "old" "new"` through the console executor).
+bool swapTexture(const FormRef& ref, const std::string& oldTex, const std::string& newTex);
+size_t queuedBoxes();
+}  // namespace ops
+
+// Test hooks (RPC ui.* in ui_module.cpp)
+bool installedByName(const std::string& n);
+
+}  // namespace nvui

@@ -1,0 +1,26 @@
+# build output, run output, logs
+build/
+out/
+runs/
+*.log
+*.obj
+*.pdb
+*.ilk
+*.lib
+__pycache__/
+*.pyc
+.venv/
+
+# never commit game files, copies of the game, dumps, saves or binaries we do not own
+*.esm
+*.esp
+*.bsa
+*.sav
+*.fos
+*.dll
+*.exe
+local/
+fnv-instances*/
+third_party/NVSE/
+third_party/nvmp/
+!third_party/enet/

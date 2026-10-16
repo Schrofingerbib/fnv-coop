@@ -1,0 +1,213 @@
+#include "effect_json.h"
+
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+
+namespace nvhooks {
+using nvcoop::json::Value;
+using namespace fnvcoop;
+
+FormRef makeRef(std::string plugin, uint32_t id) {
+    for (char& c : plugin) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return FormRef(std::move(plugin), id);
+}
+
+std::string refToStr(const FormRef& r) {
+    char b[16];
+    // 6 digits for normal plugin-local ids; created refs (0xFF prefix, SpawnRef) keep all 8
+    if (r.localId > 0xFFFFFFu) std::snprintf(b, sizeof b, ":%08X", r.localId);
+    else std::snprintf(b, sizeof b, ":%06X", r.localId);
+    return r.plugin + b;
+}
+bool strToRef(const std::string& s, FormRef* out) {
+    size_t c = s.rfind(':');
+    if (c == std::string::npos || c == 0 || c + 1 >= s.size()) return false;
+    char* end = nullptr;
+    unsigned long id = std::strtoul(s.c_str() + c + 1, &end, 16);
+    if (*end) return false;
+    *out = makeRef(s.substr(0, c), static_cast<uint32_t>(id));
+    return true;
+}
+
+static std::string toStr(const Recipient& r) {
+    switch (r.mode) {
+        case Recipient::Default: return "default";
+        case Recipient::Origin: return "origin";
+        case Recipient::All: return "all";
+        case Recipient::Mask: return "mask:" + std::to_string(r.mask);
+    }
+    return "default";
+}
+static bool toRecipient(const std::string& s, Recipient* r) {
+    if (s.empty() || s == "default") { *r = Recipient::dflt(); return true; }
+    if (s == "origin") { *r = Recipient::origin(); return true; }
+    if (s == "all") { *r = Recipient::all(); return true; }
+    if (s.rfind("mask:", 0) == 0) { *r = Recipient::slots(static_cast<uint8_t>(std::atoi(s.c_str() + 5))); return true; }
+    return false;
+}
+
+static const char* effectNameLocal(const Effect& e) {
+    static const char* n[] = {"SetStage", "SetObjective", "SetGlobal", "EnableRef", "DisableRef", "AddItem", "RemoveItem",
+                              "ModActorValue", "ModReputation", "ModKarma", "StartQuest", "StopQuest", "MoveRef", "KillActor",
+                              "ResurrectActor", "SetScriptVar", "SetPlayerControls", "PartyTether", "SlideshowEnd", "SaveSuppress",
+                              "CompanionOwner", "ForcedDialogue", "BarrierArrive", "BarrierRelease", "SayOnceFlag", "CompleteQuest",
+                              "CompleteAllObjectives", "SetLock", "SetFactionRank", "SetPerk", "SwapTexture", "SetFastTravelLock",
+                              "FailQuest", "SpawnRef", "DespawnRef", "ObjectState", "RefScriptVar", "RefAddItem", "RefRemoveItem",
+                              "RemoveAllItems", "AddTopic", "AddNote", "RemoveNote", "SetMapMarker", "ForceActiveQuest", "RequestSave",
+                              "SetWeather", "SetTimeScale", "AdvanceTime"};
+    static_assert(std::variant_size_v<Effect> == sizeof n / sizeof *n, "effect.h gained/lost an Effect: update effectNameLocal + the JSON codec");
+    return e.index() < sizeof n / sizeof *n ? n[e.index()] : "?";
+}
+
+Value effectToJson(const Effect& e) {
+    Value o = Value::object();
+    auto T = [&](const char* t) { o.set("type", t); };
+    if (auto* x = std::get_if<SetStage>(&e)) { T("SetStage"); o.set("quest", refToStr(x->quest)).set("stage", (int64_t)x->stage); }
+    else if (auto* x = std::get_if<SetObjective>(&e)) { T("SetObjective"); o.set("quest", refToStr(x->quest)).set("objective", (int64_t)x->objective).set("flags", (int64_t)x->flags); }
+    else if (auto* x = std::get_if<SetGlobal>(&e)) { T("SetGlobal"); o.set("global", refToStr(x->global)).set("value", (double)x->value); }
+    else if (auto* x = std::get_if<EnableRef>(&e)) { T("EnableRef"); o.set("ref", refToStr(x->ref)); }
+    else if (auto* x = std::get_if<DisableRef>(&e)) { T("DisableRef"); o.set("ref", refToStr(x->ref)); }
+    else if (auto* x = std::get_if<AddItem>(&e)) { T("AddItem"); o.set("item", refToStr(x->item)).set("count", (int64_t)x->count).set("to", toStr(x->to)); }
+    else if (auto* x = std::get_if<RemoveItem>(&e)) { T("RemoveItem"); o.set("item", refToStr(x->item)).set("count", (int64_t)x->count).set("to", toStr(x->to)); }
+    else if (auto* x = std::get_if<ModActorValue>(&e)) { T("ModActorValue"); o.set("av", (int64_t)x->av).set("delta", (int64_t)x->delta).set("to", toStr(x->to)); }
+    else if (auto* x = std::get_if<ModReputation>(&e)) { T("ModReputation"); o.set("faction", refToStr(x->faction)).set("fame", (int64_t)x->fame).set("infamy", (int64_t)x->infamy).set("to", toStr(x->to)); }
+    else if (auto* x = std::get_if<ModKarma>(&e)) { T("ModKarma"); o.set("delta", (int64_t)x->delta).set("to", toStr(x->to)); }
+    else if (auto* x = std::get_if<StartQuest>(&e)) { T("StartQuest"); o.set("quest", refToStr(x->quest)); }
+    else if (auto* x = std::get_if<StopQuest>(&e)) { T("StopQuest"); o.set("quest", refToStr(x->quest)); }
+    else if (auto* x = std::get_if<MoveRef>(&e)) { T("MoveRef"); o.set("ref", refToStr(x->ref)).set("cell", x->cell.plugin.empty() ? std::string() : refToStr(x->cell)).set("x", (double)x->x).set("y", (double)x->y).set("z", (double)x->z); }
+    else if (auto* x = std::get_if<KillActor>(&e)) { T("KillActor"); o.set("actor", refToStr(x->actor)); }
+    else if (auto* x = std::get_if<ResurrectActor>(&e)) { T("ResurrectActor"); o.set("actor", refToStr(x->actor)); }
+    else if (auto* x = std::get_if<SetScriptVar>(&e)) { T("SetScriptVar"); o.set("owner", refToStr(x->owner)).set("var", (int64_t)x->index).set("value", x->value); }
+    else if (auto* x = std::get_if<CompleteQuest>(&e)) { T("CompleteQuest"); o.set("quest", refToStr(x->quest)); }
+    else if (auto* x = std::get_if<SetPlayerControls>(&e)) { T("SetPlayerControls"); o.set("controls", (int64_t)x->controls).set("enable", x->enable).set("to", toStr(x->to)); }
+    else if (auto* x = std::get_if<FailQuest>(&e)) { T("FailQuest"); o.set("quest", refToStr(x->quest)); }
+    else if (auto* x = std::get_if<CompleteAllObjectives>(&e)) { T("CompleteAllObjectives"); o.set("quest", refToStr(x->quest)); }
+    else if (auto* x = std::get_if<SetLock>(&e)) { T("SetLock"); o.set("ref", refToStr(x->ref)).set("locked", x->locked).set("level", (int64_t)x->level); }
+    else if (auto* x = std::get_if<SetFactionRank>(&e)) { T("SetFactionRank"); o.set("actor", refToStr(x->actor)).set("faction", refToStr(x->faction)).set("rank", (int64_t)x->rank); }
+    else if (auto* x = std::get_if<SetPerk>(&e)) { T("SetPerk"); o.set("perk", refToStr(x->perk)).set("rank", (int64_t)x->rank).set("to", toStr(x->to)); }
+    else if (auto* x = std::get_if<SetMapMarker>(&e)) { T("SetMapMarker"); o.set("marker", refToStr(x->marker)).set("flags", (int64_t)x->flags); }
+    else if (auto* x = std::get_if<CompanionOwner>(&e)) { T("CompanionOwner"); o.set("npc", refToStr(x->npc)).set("owner", (int64_t)x->owner); }
+    else if (auto* x = std::get_if<ObjectState>(&e)) { T("ObjectState"); o.set("ref", refToStr(x->ref)).set("mask", (int64_t)x->mask).set("open", x->open).set("locked", x->locked).set("level", (int64_t)x->level).set("destroyed", x->destroyed).set("activatedOnce", x->activatedOnce); }
+    else if (auto* x = std::get_if<RefAddItem>(&e)) { T("RefAddItem"); o.set("ref", refToStr(x->ref)).set("item", refToStr(x->item)).set("count", (int64_t)x->count); }
+    else if (auto* x = std::get_if<RefRemoveItem>(&e)) { T("RefRemoveItem"); o.set("ref", refToStr(x->ref)).set("item", refToStr(x->item)).set("count", (int64_t)x->count); }
+    else if (auto* x = std::get_if<RemoveAllItems>(&e)) { T("RemoveAllItems"); o.set("ref", refToStr(x->ref)); }
+    else if (auto* x = std::get_if<RefScriptVar>(&e)) { T("RefScriptVar"); o.set("ref", refToStr(x->ref)).set("var", (int64_t)x->index).set("value", x->value); }
+    else if (auto* x = std::get_if<AddTopic>(&e)) { T("AddTopic"); o.set("topic", refToStr(x->topic)); }
+    else if (auto* x = std::get_if<AddNote>(&e)) { T("AddNote"); o.set("note", refToStr(x->note)); }
+    else if (auto* x = std::get_if<RemoveNote>(&e)) { T("RemoveNote"); o.set("note", refToStr(x->note)); }
+    else if (auto* x = std::get_if<RequestSave>(&e)) { T("RequestSave"); o.set("kind", (int64_t)x->kind); }
+    else if (auto* x = std::get_if<SetWeather>(&e)) { T("SetWeather"); o.set("weather", refToStr(x->weather)).set("force", x->force); }
+    else if (auto* x = std::get_if<SetTimeScale>(&e)) { T("SetTimeScale"); o.set("scale", (double)x->scale); }
+    else if (auto* x = std::get_if<SpawnRef>(&e)) { T("SpawnRef"); o.set("ref", refToStr(x->ref())).set("base", refToStr(x->base)).set("cell", x->cell.plugin.empty() ? std::string() : refToStr(x->cell)).set("x", (double)x->x).set("y", (double)x->y).set("z", (double)x->z).set("leveled", x->leveled); }
+    else if (auto* x = std::get_if<DespawnRef>(&e)) { T("DespawnRef"); o.set("ref", refToStr(x->ref())); }
+    else { T("Unsupported"); o.set("name", effectNameLocal(e)); }  // round-2 session-level effects: not carried by this codec
+    return o;
+}
+
+static bool needRef(const Value& v, const char* k, FormRef* r, std::string* err) {
+    if (!strToRef(v.get(k).asString(""), r)) { if (err) *err = std::string("bad or missing ref field: ") + k; return false; }
+    return true;
+}
+
+bool effectFromJson(const Value& v, Effect* out, std::string* err) {
+    std::string t = v.get("type").asString("");
+    Recipient to = Recipient::dflt();
+    if (!toRecipient(v.get("to").asString(""), &to)) { if (err) *err = "bad recipient"; return false; }
+    FormRef r;
+    if (t == "SetStage") { if (!needRef(v, "quest", &r, err)) return false; *out = SetStage{r, (uint32_t)v.get("stage").asInt()}; }
+    else if (t == "SetObjective") { if (!needRef(v, "quest", &r, err)) return false; *out = SetObjective{r, (uint32_t)v.get("objective").asInt(), (uint8_t)v.get("flags").asInt()}; }
+    else if (t == "SetGlobal") { if (!needRef(v, "global", &r, err)) return false; *out = SetGlobal{r, (float)v.get("value").asNumber()}; }
+    else if (t == "EnableRef") { if (!needRef(v, "ref", &r, err)) return false; *out = EnableRef{r}; }
+    else if (t == "DisableRef") { if (!needRef(v, "ref", &r, err)) return false; *out = DisableRef{r}; }
+    else if (t == "AddItem") { if (!needRef(v, "item", &r, err)) return false; *out = AddItem{r, (int32_t)v.get("count").asInt(), to}; }
+    else if (t == "RemoveItem") { if (!needRef(v, "item", &r, err)) return false; *out = RemoveItem{r, (int32_t)v.get("count").asInt(), to}; }
+    else if (t == "ModActorValue") { *out = ModActorValue{(uint32_t)v.get("av").asInt(), (int32_t)v.get("delta").asInt(), to}; }
+    else if (t == "ModReputation") { if (!needRef(v, "faction", &r, err)) return false; *out = ModReputation{r, (int32_t)v.get("fame").asInt(), (int32_t)v.get("infamy").asInt(), to}; }
+    else if (t == "ModKarma") { *out = ModKarma{(int32_t)v.get("delta").asInt(), to}; }
+    else if (t == "StartQuest") { if (!needRef(v, "quest", &r, err)) return false; *out = StartQuest{r}; }
+    else if (t == "StopQuest") { if (!needRef(v, "quest", &r, err)) return false; *out = StopQuest{r}; }
+    else if (t == "MoveRef") {
+        if (!needRef(v, "ref", &r, err)) return false;
+        FormRef c;
+        strToRef(v.get("cell").asString(""), &c);
+        *out = MoveRef{r, c, (float)v.get("x").asNumber(), (float)v.get("y").asNumber(), (float)v.get("z").asNumber()};
+    }
+    else if (t == "KillActor") { if (!needRef(v, "actor", &r, err)) return false; *out = KillActor{r}; }
+    else if (t == "ResurrectActor") { if (!needRef(v, "actor", &r, err)) return false; *out = ResurrectActor{r}; }
+    else if (t == "SetScriptVar") { if (!needRef(v, "owner", &r, err)) return false; *out = SetScriptVar{r, (uint16_t)v.get("var").asInt(), v.get("value").asNumber()}; }
+    else if (t == "CompleteQuest") { if (!needRef(v, "quest", &r, err)) return false; *out = CompleteQuest{r}; }
+    else if (t == "SetPlayerControls") { *out = SetPlayerControls{(uint32_t)v.get("controls").asInt(), v.get("enable").asBool(true), to}; }
+    else if (t == "SetMapMarker") { if (!needRef(v, "marker", &r, err)) return false; *out = SetMapMarker{r, (uint8_t)v.get("flags").asInt()}; }
+    else if (t == "CompanionOwner") { if (!needRef(v, "npc", &r, err)) return false; *out = CompanionOwner{r, (uint8_t)v.get("owner").asInt()}; }
+    else if (t == "ObjectState") {
+        if (!needRef(v, "ref", &r, err)) return false;
+        ObjectState o2;
+        o2.ref = r; o2.mask = (uint8_t)v.get("mask").asInt(); o2.open = v.get("open").asBool(); o2.locked = v.get("locked").asBool();
+        o2.level = (int32_t)v.get("level").asInt(); o2.destroyed = v.get("destroyed").asBool(); o2.activatedOnce = v.get("activatedOnce").asBool();
+        *out = o2;
+    }
+    else if (t == "RefAddItem" || t == "RefRemoveItem") {
+        FormRef it;
+        if (!needRef(v, "ref", &r, err) || !needRef(v, "item", &it, err)) return false;
+        if (t == "RefAddItem") *out = RefAddItem{r, it, (int32_t)v.get("count").asInt()};
+        else *out = RefRemoveItem{r, it, (int32_t)v.get("count").asInt()};
+    }
+    else if (t == "RemoveAllItems") { if (!needRef(v, "ref", &r, err)) return false; *out = RemoveAllItems{r}; }
+    else if (t == "RefScriptVar") { if (!needRef(v, "ref", &r, err)) return false; *out = RefScriptVar{r, (uint16_t)v.get("var").asInt(), v.get("value").asNumber()}; }
+    else if (t == "AddTopic") { if (!needRef(v, "topic", &r, err)) return false; *out = AddTopic{r}; }
+    else if (t == "AddNote") { if (!needRef(v, "note", &r, err)) return false; *out = AddNote{r}; }
+    else if (t == "RemoveNote") { if (!needRef(v, "note", &r, err)) return false; *out = RemoveNote{r}; }
+    else if (t == "RequestSave") { *out = RequestSave{(uint8_t)v.get("kind").asInt()}; }
+    else if (t == "SetWeather") { if (!needRef(v, "weather", &r, err)) return false; *out = SetWeather{r, v.get("force").asBool()}; }
+    else if (t == "SetTimeScale") { *out = SetTimeScale{(float)v.get("scale").asNumber()}; }
+    else if (t == "SpawnRef") {
+        FormRef base, cell;
+        if (!needRef(v, "ref", &r, err) || !needRef(v, "base", &base, err)) return false;
+        strToRef(v.get("cell").asString(""), &cell);
+        SpawnRef sp;
+        sp.id = r.localId; sp.base = base; sp.cell = cell; sp.x = (float)v.get("x").asNumber(); sp.y = (float)v.get("y").asNumber(); sp.z = (float)v.get("z").asNumber();
+        sp.leveled = v.get("leveled").asBool();
+        *out = sp;
+    }
+    else if (t == "DespawnRef") { if (!needRef(v, "ref", &r, err)) return false; *out = DespawnRef{r.localId}; }
+    else if (t == "FailQuest") { if (!needRef(v, "quest", &r, err)) return false; *out = FailQuest{r}; }
+    else if (t == "CompleteAllObjectives") { if (!needRef(v, "quest", &r, err)) return false; *out = CompleteAllObjectives{r}; }
+    else if (t == "SetLock") { if (!needRef(v, "ref", &r, err)) return false; *out = SetLock{r, v.get("locked").asBool(), (int32_t)v.get("level").asInt()}; }
+    else if (t == "SetFactionRank") {
+        FormRef f;
+        if (!needRef(v, "actor", &r, err) || !needRef(v, "faction", &f, err)) return false;
+        *out = SetFactionRank{r, f, (int32_t)v.get("rank").asInt()};
+    }
+    else if (t == "SetPerk") { if (!needRef(v, "perk", &r, err)) return false; *out = SetPerk{r, (int32_t)v.get("rank").asInt(), to}; }
+    else { if (err) *err = "unknown effect type: " + t; return false; }
+    return true;
+}
+
+Value txnToJson(const EffectTxn& t) {
+    Value c = Value::object();
+    c.set("kind", (int64_t)t.cause.kind).set("source", t.cause.source.plugin.empty() ? std::string() : refToStr(t.cause.source)).set("aux", (int64_t)t.cause.aux);
+    Value fx = Value::array();
+    for (const Effect& e : t.effects) fx.push(effectToJson(e));
+    Value o = Value::object();
+    o.set("cause", c).set("origin", (int64_t)t.origin).set("effects", fx);
+    return o;
+}
+
+bool txnFromJson(const Value& v, EffectTxn* out, std::string* err) {
+    EffectTxn t;
+    const Value& c = v.get("cause");
+    t.cause.kind = static_cast<CauseKind>(c.get("kind").asInt());
+    strToRef(c.get("source").asString(""), &t.cause.source);
+    t.cause.aux = (int32_t)c.get("aux").asInt();
+    t.origin = (PlayerId)v.get("origin").asInt(0);
+    for (const Value& e : v.get("effects").items()) {
+        Effect fx;
+        if (!effectFromJson(e, &fx, err)) return false;
+        t.effects.push_back(fx);
+    }
+    *out = t;
+    return true;
+}
+
+}  // namespace nvhooks

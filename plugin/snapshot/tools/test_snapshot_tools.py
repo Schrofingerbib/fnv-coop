@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Tests for snapdiff/converge/guard against synthetic goldens in tests/goldens/snapshot/.
+Run: python -I plugin/snapshot/tools/test_snapshot_tools.py   (or via run_tests.py)
+
+Mutation twins: deliberately broken differs (blind to stage changes / skipping the empty guard) are run
+through the SAME oracle checks and those checks must FAIL on them.
+"""
+import copy
+import hashlib
+import os
+import subprocess
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import converge  # noqa: E402
+import snapdiff  # noqa: E402
+import snaplib  # noqa: E402
+
+GOLD = os.path.abspath(os.path.join(HERE, "..", "..", "..", "tests", "goldens", "snapshot"))
+
+
+def g(name):
+    return snaplib.load(os.path.join(GOLD, name + ".json"))
+
+
+# ---------------------------------------------------------------- the real differ + mutants
+def real_compare(a, b, **kw):
+    return snapdiff.compare(a, b, **kw)[0]
+
+
+def mutant_blind_to_stage(a, b, **kw):
+    """Broken differ: forgets to look at currentStage / completedStages."""
+    problems = snaplib.guard(a) + snaplib.guard(b)
+    if problems:
+        return 2
+    d = snaplib.diff(a, b, ignore=["*/currentStage", "*/completedStages"])
+    return 1 if d else 0
+
+
+def mutant_no_guard(a, b, **kw):
+    """Broken differ: no empty-snapshot guard, so two empty dumps compare equal."""
+    return 1 if snaplib.diff(a, b) else 0
+
+
+# ---------------------------------------------------------------- oracle checks (return True when the differ behaves)
+def check_catches_stage_change(cmp):
+    return cmp(g("base"), g("stage_changed")) == 1
+
+
+def check_catches_objective_change(cmp):
+    return cmp(g("base"), g("objective_changed")) == 1
+
+
+def check_rejects_empty(cmp):
+    return all(cmp(g(n), g(n)) == 2 for n in ("empty", "empty_shell", "near_empty", "errored"))
+
+
+def check_identical(cmp):
+    return cmp(g("base"), g("base")) == 0
+
+
+class RealDiffer(unittest.TestCase):
+    def test_identical_passes(self):
+        self.assertTrue(check_identical(real_compare))
+
+    def test_reordered_keys_still_equal(self):
+        a, b = g("base"), g("reordered")
+        self.assertNotEqual(list(a["shared"]["quests"]), list(b["shared"]["quests"]))  # fixture really is reordered
+        self.assertEqual(real_compare(a, b), 0)
+
+    def test_stage_change_caught_and_reported(self):
+        code, _, d = snapdiff.compare(g("base"), g("stage_changed"))
+        self.assertEqual(code, 1)
+        self.assertEqual(len(d), 1)
+        self.assertIn("VMS01", d[0]["label"])
+        self.assertTrue(d[0]["path"].endswith("/currentStage"))
+        self.assertEqual((d[0]["a"], d[0]["b"]), (10, 20))
+
+    def test_other_semantic_changes_caught(self):
+        for n in ("completed_stage_added", "objective_changed", "doc_dead", "float_changed"):
+            self.assertEqual(real_compare(g("base"), g(n)), 1, n)
+
+    def test_noise_within_tolerance_and_volatile_clock_and_meta_ignored(self):
+        self.assertEqual(real_compare(g("base"), g("noise_ok")), 0)
+
+    def test_noise_not_ignored_when_tolerance_tightened(self):
+        code = snapdiff.compare(g("base"), g("noise_ok"), tolerances=[("shared/globals/*/value", 1e-6)])[0]
+        self.assertEqual(code, 1)
+
+    def test_clock_global_diff_reported_when_default_ignores_off(self):
+        d = snaplib.diff(g("base"), g("noise_ok"), default_ignores=False)
+        self.assertTrue(any("GameHour" in e["label"] for e in d))
+
+    def test_perplayer_ignored_by_default_but_caught_when_requested(self):
+        self.assertEqual(real_compare(g("base"), g("perplayer_changed")), 0)
+        self.assertEqual(real_compare(g("base"), g("perplayer_changed"), sections=("shared", "perPlayer")), 1)
+
+    def test_position_tolerance_in_perplayer(self):
+        a = g("base")
+        b = copy.deepcopy(a)
+        b["perPlayer"]["host"]["position"]["x"] += 0.5  # < 1 unit tolerance
+        self.assertEqual(real_compare(a, b, sections=("shared", "perPlayer")), 0)
+        b["perPlayer"]["host"]["position"]["x"] += 5
+        self.assertEqual(real_compare(a, b, sections=("shared", "perPlayer")), 1)
+
+    def test_meta_only_diffed_on_request(self):
+        a = g("base")
+        b = copy.deepcopy(a)
+        b["meta"]["pluginsHash"] = "ffffffffffffffff"
+        self.assertEqual(real_compare(a, b), 0)
+        self.assertEqual(real_compare(a, b, include_meta=True), 1)
+
+    def test_empty_and_degenerate_snapshots_fail_not_pass(self):
+        self.assertTrue(check_rejects_empty(real_compare))
+        # even two empties that are byte-identical must be rejected
+        self.assertEqual(real_compare(g("empty"), g("empty")), 2)
+
+    def test_truncated_dump_detected_via_counts(self):
+        problems = snaplib.guard(g("truncated"))
+        self.assertTrue(any("truncated" in p for p in problems), problems)
+        self.assertEqual(real_compare(g("base"), g("truncated")), 2)
+
+    def test_schema_violation_rejected(self):
+        self.assertEqual(real_compare(g("base"), g("bad_schema")), 2)
+
+    def test_added_and_removed_quest_reported(self):
+        a = g("base")
+        b = copy.deepcopy(a)
+        q = b["shared"]["quests"].pop("FalloutNV.esm:104C2A")
+        b["meta"]["counts"]["quests"] -= 1
+        d = snaplib.diff(a, b)
+        self.assertTrue(d and all(e["kind"] == "removed" for e in d))
+        d2 = snaplib.diff(b, a)
+        self.assertTrue(all(e["kind"] == "added" for e in d2))
+
+    def test_guard_accepts_base_and_all_valid_variants(self):
+        for n in ("base", "reordered", "stage_changed", "noise_ok", "float_changed", "perplayer_changed"):
+            self.assertEqual(snaplib.guard(g(n), ("shared", "perPlayer")), [], n)
+
+    def test_cli_exit_codes(self):
+        py = [sys.executable, "-I", os.path.join(HERE, "snapdiff.py")]
+        f = lambda n: os.path.join(GOLD, n + ".json")
+        self.assertEqual(subprocess.call(py + [f("base"), f("reordered")], stdout=subprocess.DEVNULL), 0)
+        self.assertEqual(subprocess.call(py + [f("base"), f("stage_changed")], stdout=subprocess.DEVNULL), 1)
+        self.assertEqual(subprocess.call(py + [f("empty"), f("empty")], stdout=subprocess.DEVNULL), 2)
+        self.assertEqual(subprocess.call(py + [f("base"), f("missing")], stdout=subprocess.DEVNULL), 2)
+
+
+class Converge(unittest.TestCase):
+    def test_converged(self):
+        code, lines = converge.check([("host", g("base")), ("c1", g("reordered")), ("c2", g("noise_ok"))])
+        self.assertEqual(code, 0, lines)
+
+    def test_divergence_names_the_client(self):
+        code, lines = converge.check([("host", g("base")), ("c1", g("reordered")), ("c2", g("stage_changed"))])
+        self.assertEqual(code, 1)
+        text = "\n".join(lines)
+        self.assertIn("DIVERGED c2", text)
+        self.assertIn("converged c1", text)
+        self.assertIn("VMS01", text)
+
+    def test_empty_client_fails_not_vacuous(self):
+        code, _ = converge.check([("host", g("base")), ("c1", g("empty"))])
+        self.assertEqual(code, 2)
+        code, _ = converge.check([("host", g("empty")), ("c1", g("empty"))])
+        self.assertEqual(code, 2)
+
+    def test_needs_two(self):
+        self.assertEqual(converge.check([("host", g("base"))])[0], 2)
+
+    def test_karma_must_be_shared(self):
+        code, lines = converge.check([("host", g("base")), ("c1", g("karma_unshared"))], sections=("shared", "perPlayer"))
+        self.assertEqual(code, 1, lines)
+        self.assertTrue(any("KARMA NOT SHARED" in l for l in lines))
+
+    def test_quest_items_to_everyone(self):
+        code, lines = converge.check([("host", g("base")), ("c1", g("base"))],
+                                     require_items=["FalloutNV.esm:0DE1AA"], sections=("shared", "perPlayer"))
+        self.assertEqual(code, 0, lines)
+        code, lines = converge.check([("host", g("base")), ("c1", g("base"))],
+                                     require_items=["FalloutNV.esm:0DEFFF"], sections=("shared", "perPlayer"))
+        self.assertEqual(code, 1)
+
+
+class MutationTwins(unittest.TestCase):
+    """The oracle checks must pass on the real differ and FAIL on each mutant."""
+
+    def test_real_passes_all_checks(self):
+        for chk in (check_catches_stage_change, check_catches_objective_change, check_rejects_empty, check_identical):
+            self.assertTrue(chk(real_compare), chk.__name__)
+
+    def test_stage_blind_mutant_is_caught(self):
+        self.assertFalse(check_catches_stage_change(mutant_blind_to_stage))
+        self.assertTrue(check_catches_objective_change(mutant_blind_to_stage))  # control: it still sees other things
+
+    def test_no_guard_mutant_is_caught(self):
+        self.assertFalse(check_rejects_empty(mutant_no_guard))
+        self.assertTrue(check_catches_stage_change(mutant_no_guard))  # control
+
+
+class GoldensProtected(unittest.TestCase):
+    def test_manifest_matches(self):
+        with open(os.path.join(GOLD, "MANIFEST.sha256")) as f:
+            entries = [l.split() for l in f if l.strip()]
+        self.assertGreaterEqual(len(entries), 10)
+        for digest, name in entries:
+            with open(os.path.join(GOLD, name), "rb") as fh:
+                self.assertEqual(hashlib.sha256(fh.read()).hexdigest(), digest, "golden modified: " + name)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

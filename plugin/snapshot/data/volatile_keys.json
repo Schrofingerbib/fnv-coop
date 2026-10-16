@@ -1,0 +1,130 @@
+{
+ "counts": {
+  "fields": 0,
+  "globals": 0,
+  "groups": 2,
+  "protected": 0,
+  "snapshots": 6,
+  "vars": 6,
+  "warnings": 0
+ },
+ "dumpsPerLaunch": 3,
+ "entries": {
+  "fields": [],
+  "globals": [],
+  "vars": [
+   {
+    "edid": "NVDLC01MQ00",
+    "name": "starttimer",
+    "owner": "DeadMoney.esm:005229",
+    "reasons": [
+     "launch"
+    ]
+   },
+   {
+    "edid": "REPCONHQFreeform",
+    "name": "curtime",
+    "owner": "FalloutNV.esm:0E7533",
+    "reasons": [
+     "launch"
+    ]
+   },
+   {
+    "edid": "NVDLC02MQ00",
+    "name": "fstarttimer",
+    "owner": "HonestHearts.esm:008891",
+    "reasons": [
+     "launch"
+    ]
+   },
+   {
+    "edid": "NVDLC02RainQuest",
+    "name": "pdepth",
+    "owner": "HonestHearts.esm:00EDE7",
+    "reasons": [
+     "launch"
+    ]
+   },
+   {
+    "edid": "NVDLC04MQ00",
+    "name": "fstarttimer",
+    "owner": "LonesomeRoad.esm:003603",
+    "reasons": [
+     "launch"
+    ]
+   },
+   {
+    "edid": "NVDLC03MQ00",
+    "name": "fstarttimer",
+    "owner": "OldWorldBlues.esm:002FCA",
+    "reasons": [
+     "launch"
+    ]
+   },
+   {
+    "edid": "VCG00",
+    "name": "ftimer",
+    "owner": "FalloutNV.esm:102037",
+    "reasons": [
+     "manual:sweep"
+    ]
+   }
+  ]
+ },
+ "gameVersion": "1.4.0.525",
+ "generated": "2026-10-16",
+ "input": "none (idle autosave, 600 frames after load, watch refs on)",
+ "intervalSeconds": 20,
+ "launches": 2,
+ "note": "keys are FormRef + variable NAME; valid for any load order that contains the same plugins",
+ "plugins": [
+  "FalloutNV.esm",
+  "DeadMoney.esm",
+  "HonestHearts.esm",
+  "OldWorldBlues.esm",
+  "LonesomeRoad.esm",
+  "TribalPack.esm",
+  "MercenaryPack.esm",
+  "ClassicPack.esm",
+  "CaravanPack.esm",
+  "GunRunnersArsenal.esm"
+ ],
+ "pluginsHash": "c4b139c7082ba3a9",
+ "runs": [
+  {
+   "dumpsPerLaunch": 3,
+   "fields": 0,
+   "firstDumpAfterAutoloadFrames": 600,
+   "generated": "2026-10-16",
+   "globals": 0,
+   "id": 1,
+   "intervalSeconds": 20,
+   "launches": 2,
+   "settleIntervals": 0,
+   "vars": 6
+  },
+  {
+   "dumpsPerLaunch": 16,
+   "fields": 0,
+   "firstDumpAfterAutoloadFrames": 60,
+   "generated": "2026-10-16",
+   "globals": 0,
+   "id": 2,
+   "intervalSeconds": 4,
+   "launches": 2,
+   "note": "steady state = 4 timer vars, a subset of run 1; curtime/pdepth did not move this time, so volatility is intermittent: the shipped file is the UNION of runs (re-probing only adds). No settling observed within 64 s of the autoload; radio-quest running flag and the oldworldblues faction rank did not change in this window.",
+   "settleIntervals": 8,
+   "settlingKeys": 0,
+   "vars": 4
+  }
+ ],
+ "schema": 1,
+ "todo": [
+  "longer soak (about 5 min) and one dump after a cell change",
+  "re-probe after load-order changes",
+  "NVDLC03RadioBroadcast running flag / oldworldblues:016154 faction rank drift seen by L10 (baseline at host start vs 12-30 s later) was not reproduced via idle state dumps: investigate with a longer soak"
+ ],
+ "tool": "plugin/snapshot/tools/probe_run.py (volatile_probe.py probe)",
+ "unionOfRuns": true,
+ "warnings": []
+}

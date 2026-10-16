@@ -1,0 +1,9 @@
+; Data\NVSE\Plugins\nvcoop.ini  (all keys optional; env vars NVCOOP_INSTANCE / NVCOOP_AUTOLOAD /
+; NVCOOP_AUTOLOAD_FRAMES override the ini)
+[bridge]
+; pipe will be \.\pipe\nvcoop-<instance>
+instance=0
+; save name WITHOUT extension, loaded automatically once the main menu is up; empty = off
+autoload=
+; frames to wait after the main menu is ready before loading
+autoloadDelayFrames=600
