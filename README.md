@@ -1,5 +1,7 @@
 # Fallout: New Vegas co-op: story sync (developer preview)
 
+[![Discord](https://img.shields.io/badge/Discord-chat%20and%20help-5865F2?logo=discord&logoColor=white)](https://discord.gg/EXGB49R82t)
+
 > **Status (October 2026): developer preview, about 35% of the way to full-story co-op.**
 >
 > | Area | Where it stands |
