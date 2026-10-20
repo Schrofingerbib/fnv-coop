@@ -386,8 +386,11 @@ class ProvisionCli(unittest.TestCase):
         game_dll.write_bytes(b"in the game install")
         inst = self.inst / "0"
         inst.mkdir(parents=True)
-        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(inst / "Data"), str(self.game / "Data")],
-                           capture_output=True, text=True)
+        try:  # a Windows junction; off Windows there is no cmd and the test does not apply
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", str(inst / "Data"), str(self.game / "Data")],
+                               capture_output=True, text=True)
+        except OSError as e:
+            self.skipTest(f"cannot run cmd to create a junction: {e}")
         if r.returncode != 0:
             self.skipTest("cannot create a junction here: " + (r.stdout + r.stderr).strip())
         with mutant(mut):
@@ -405,6 +408,16 @@ class ProvisionCli(unittest.TestCase):
     def test_twin_plugins_link_unchecked(self):
         with self.assertRaises(AssertionError):
             self.check_linked_data_refused("plugins_link_unchecked")
+
+    def test_junction_tests_skip_without_cmd(self):
+        """Off Windows there is no cmd: the two junction tests must be skipped, not end in an error."""
+        def no_cmd(*a, **k):
+            raise FileNotFoundError("cmd")
+        names = [f"{__name__}.ProvisionCli.test_linked_data_refused", f"{__name__}.ProvisionCli.test_twin_plugins_link_unchecked"]
+        with mock.patch.object(subprocess, "run", no_cmd):
+            res = unittest.TestResult()
+            unittest.defaultTestLoader.loadTestsFromNames(names).run(res)
+        self.assertEqual((len(res.skipped), len(res.errors), len(res.failures)), (2, 0, 0), res.errors)
 
     def check_installed_core_given_again(self, mut):
         """--core-dll naming the core already installed in this instance must not delete it."""
