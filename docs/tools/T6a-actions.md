@@ -44,6 +44,7 @@ Walking is a stepped SetPos: it does not path around walls, so use it inside ope
 
 ## In-process input driver and bridge methods (plugin/bots, ini `[dev] bots=1`) - BUILT, NOT RUN IN GAME
 Nothing below has run in the real game; every engine address was read statically and each live call is gated.
+To turn it on in test instances, provision with `python -I tools/runner/run.py provision --n 2 --ini dev.bots=1`. Provisioning rewrites nvcoop.ini, so a hand edit is lost.
 **Input driver.** `plugin/bots/bots_module.cpp` detours `OSInputGlobals::GetControlState(ctrl, state)` (thiscall 0xA24660, `ret 8`, prologue pinned in
 `plugin/bots/bots_addrs.h`, stolen 6 bytes, restored by the hot-reload shutdown). It is the single function the game asks "is control X down" (state 0 held,
 1 pressed this frame, 2 released this frame; seen at ~170 call sites, a count from the `--table` output of the pin verifier, which is not in the public repo: see "Pin verifier" below). `ForcedInput` (input_core.h) holds or taps
