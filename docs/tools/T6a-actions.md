@@ -1,7 +1,7 @@
 # T6a-actions: bot action layer (tools/bots/)
 
 Status: Python API, fake bridge, in-process input driver (C++), engine-glue bridge methods, tests and mutation twins done and green (`python -I tools/bots/run_tests.py` prints ALL OK; wired into tools/test_all.py).
-Nothing in the real game has been run: every console line and engine call is UNVERIFIED until the lead's first in-game run. C++ tests: `plugin\\bots\\run_tests.cmd` (32 mutants).
+Nothing in the real game has been run: every console line and engine call is UNVERIFIED until the lead's first in-game run. C++ tests: `plugin\bots\run_tests.cmd` (32 mutants).
 
 No OS keyboard or mouse input anywhere. Everything goes through nvbridge (`exec`, `ref.info`, `activate.ref`, `world.query`, `ui.dialogopen`, `ui.closedialog`, `state`, `plugins`).
 
@@ -71,11 +71,18 @@ Python: `Bot.goto` walks with the driver (turn-rate limited steering, sidestep t
 sneak_toggle, activate_crosshair, menu_info, dialog_choices, inventory, press_box, consent, fast_travel, count_refs, vats_target(expect_hit)`.
 In-game proofs (lead runs, one game at a time): `tools/bots/proof_input.py` (movement, strafe axes, turn, jump edge, sneak toggle, fire, activate) and
 `tools/bots/proof_glue.py` (menu, dialogue pick, inventory vs console, VATS, consent, fast travel, countRefs). Both also self-test over the fake bridge.
-Both exit 0 when every check passed, 1 when a check failed, and 2 when the proof could not run (a bad command line, refused before the bridge is opened, or no game on the instance).
-`proof_glue.py` needs `--npc` and `--info` without `--fake`. `--other-info` names an INFO that the NPC does not offer now: the dialog check then also fails if `bot.dialog` lists it.
+Both exit 0 when every check passed, 1 when a check failed, and 2 when the proof could not run. "Could not run" is one of these: a bad command line (refused before the bridge is opened), no game on the instance, the game lost during the run (a crash or a pipe loss: `ConnectionLost` or `GameCrashed`), or a `proof_glue.py` form that the load order cannot resolve.
+`main()` returns the exit code and never raises `SystemExit` (`--help` returns 0). Any other Python exception is a bug in the proof: it ends in a traceback and exit 1.
+`proof_glue.py` needs `--npc` and `--info` without `--fake`. Every form argument is `Plugin.esm:HEX` or a bare hex runtime id, with an optional `0x` prefix and leading zeros. An empty form value is a bad command line.
+`--other-info` names an INFO that the NPC does not offer now: the dialog check then also fails if `bot.dialog` lists it.
+**How `--info` and `--other-info` are compared** (`proof_args.form_key`): as numbers, as (plugin, local id), never as text. So `FalloutNV.esm:801`, `FalloutNV.esm:0x801`, `FalloutNV.esm:0801`, `0x801` and `00000801` name the same INFO, and `FalloutNV.esm:1800` is not `FalloutNV.esm:800`.
+A bare id is a runtime id: its top byte is the load index, and the game's plugin list (bridge method `plugins`) gives its plugin. Its low 24 bits are the local id.
+`Plugin.esm:HEX` with more than 6 significant digits is a runtime id with its plugin given: it is accepted only when its top byte is the load index of that plugin.
+So the low 24 bits are compared only when the plugin is known to match. A top byte outside the load order, a plugin that is not loaded, or a top byte that is not the load index of the given plugin gives exit 2 before the proof drives anything.
+`--other-info` and `--info` that name the same INFO also give exit 2: before the bridge is opened when the spellings show it (the same plugin, or both bare), else after the load order is read and before the first check.
 **Pin verifier: not in the public repo.** The pin verifier `tools/bots/re/verify_pins.py` is not in this repository, so its commands cannot run from a clone.
 From this doc, it checked the pinned prologue bytes of every engine function called (the pins in `plugin/bots/bots_addrs.h`, the fast-travel pins included) against the exe.
-Its `--table` output is the source of the ~170 call sites of `GetControlState` given above. The C++ test with `BOTS_EXE` also checks the pins (C++ tests: `plugin\\bots\\run_tests.cmd`).
+Its `--table` output is the source of the ~170 call sites of `GetControlState` given above. The C++ test with `BOTS_EXE` also checks the pins (C++ tests: `plugin\bots\run_tests.cmd`).
 ### Round 3 additions (static RE, nothing run in game)
 - **Inventory totals** (confirmed): `bot.inventory` answers with 0x4C8F30 (base container + delta, equipped included) for explicit `items`, and for every ExtraContainerChanges entry otherwise.
 - **Speech checks:** `bot.say` allows INFOs for which 0x7627E0/0x762820 is true (reply `speechCheck:true`; `Bot.choose_topic` returns `data.speech_check`). HandleClick only plays a UI sound for them (0x4D5C60 with 0x1F or 0xC), then runs the same select/click/after/speak tail we replicate, so the engine rolls the check in its own speak path 0x762FF0 and the host result syncs through the normal dialogue layer. Flag-0x80 INFOs (0x7627C0) stay refused: they take another branch (item select 0x83E850, speak flag 1).
@@ -87,7 +94,10 @@ Known limits: terminal state only knows the bot's own picks; VATS limb choice; R
 
 ## Tests
 `tools/bots/tests/test_bots.py`: 24 tests over the fake bridge (virtual clock, milliseconds). Mutation twins in fake.py (`setpos_ignored, angle_ignored, activate_noop, transfer_noop, transfer_dup, equip_noop, drop_noop, fire_miss, health_stuck, dialog_never, ref_info_error, crash`): each must make the matching action fail. The fake uses the same grammar as primitives.py, so it proves the Bot logic, not the real console.
-`tools/bots/tests/test_proof.py` and `test_proof_cli.py`: the two proof scripts over the fake, and their command lines. A bad command line must exit 2 and name the argument before the bridge is opened, a missing game must exit 2, and `--other-info` must make the dialog check catch the fake mutant `dialog_lists_all`. Twins: in-process copies of the scripts with each check removed.
+`tools/bots/tests/test_proof.py` and `test_proof_cli.py`: the two proof scripts over the fake, and their command lines. A bad command line (an empty form value included) must make `main()` return 2 and name the argument before the bridge is opened, without `SystemExit`.
+A missing game, and a game lost in the middle of the run (`ConnectionLost` and `GameCrashed` from the fake), must give 2 without a traceback. `--other-info` in every accepted spelling must make the dialog check catch the fake mutant `dialog_lists_all`.
+`--info FalloutNV.esm:1800 --other-info FalloutNV.esm:800` must pass on a fake whose NPC offers 1800. A `form_key` table and the load-order refusals (exit 2 before the first check) check the runtime id rule.
+Twins: in-process copies of the scripts with each check removed or with the old code put back (text and suffix matching, the number-only same-INFO check, empty values let through, `ap.error` exits, an unguarded run, low 24 bits compared without the plugin).
 
 ## For T6b
 FakeBridge.pair() gives two bridges on one World (host and client views are not synchronised by the fake; a playbook that needs sync behaviour must simulate it on top). Agreed API was sent by message; any requested change goes to T6a-actions.

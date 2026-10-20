@@ -6,9 +6,15 @@ test.fasttravel / dev.countRefs / dev.terminal). THE LEAD RUNS THIS, one game at
     python tools/bots/proof_glue.py --fake
 
 Needs nvcoop.ini [dev] bots=1 and the player next to the NPC (a living NPC with a plain greeting, e.g. Sunny Smiles).
---npc and --info are required without --fake. Every form argument is Plugin.esm:HEX or a bare hex runtime id.
-Exit codes: 0 every check passed, 1 a check failed, 2 the proof could not run (a bad command line is refused before the
-bridge is opened; no game on the instance).
+--npc and --info are required without --fake. Every form argument is Plugin.esm:HEX or a bare hex runtime id (a 0x prefix
+and leading zeros are allowed, an empty value is refused).
+--info and --other-info are compared as numbers, as (plugin, local id), never as text (proof_args.form_key). A bare id is a
+runtime id whose top byte is the load index, and the game's plugin list gives its plugin. Plugin.esm:HEX with 8 digits is
+accepted only when its top byte is the load index of that plugin. The low 24 bits are compared only when the plugin is known
+to match.
+Exit codes: 0 every check passed, 1 a check failed, 2 the proof could not run: a bad command line (refused before the
+bridge is opened), no game on the instance, the game lost during the run (crash or pipe loss), or --info / --other-info
+that the load order cannot resolve or that name the same INFO (refused before the proof drives anything).
 Each check prints measured numbers. Every engine call behind these methods is unverified at runtime, so the first failure is
 expected information, not a surprise: the printed 'reply' says which gate refused.
   menu       none -> dialogue after talking (kind and id), dialogReady flips true when the line has finished
@@ -37,10 +43,43 @@ REQUIRED = {"npc": "the ref of the NPC to talk to (Plugin.esm:HEX)",
 FORMS = ("npc", "info", "other_info", "item", "target", "terminal", "marker", "base")
 
 
-def offers(choices, form):
-    """True if the bot.dialog choices contain INFO `form`. Suffix match on the hex part, as the dialog check always did."""
-    want = form.split(":")[-1].lower()
-    return any(c["info"].lower().endswith(want) for c in choices)
+def choice_key(c, plugins):
+    """The form key (proof_args.form_key) of one bot.dialog choice: its 'info' name, else its numeric 'formId'.
+    None when neither resolves in the load order `plugins`."""
+    for v in (c.get("info"), c.get("formId")):
+        if v is None or v == "":
+            continue
+        try:
+            return proof_args.form_key(v, plugins)
+        except ValueError:
+            continue
+    return None
+
+
+def offers(choices, want, plugins):
+    """True if the bot.dialog choices contain the INFO with form key `want`. Both sides are compared as
+    (plugin, local id) numbers, so '0x801', '0801', '00000801' and 'FalloutNV.esm:801' all name the same INFO
+    and FalloutNV.esm:1800 never matches FalloutNV.esm:800."""
+    return any(choice_key(c, plugins) == want for c in choices)
+
+
+def dialog_keys(a, plugins):
+    """(--info key, --other-info key or None) with the load order `plugins`, resolved once before the proof drives
+    anything. Raises proof_args.CannotRun when one of them does not resolve or when both name the same INFO."""
+    keys = {}
+    for dest in ("info", "other_info"):
+        v = getattr(a, dest)
+        if v is None:
+            keys[dest] = None
+            continue
+        try:
+            keys[dest] = proof_args.form_key(v, plugins)
+        except ValueError as e:
+            raise proof_args.CannotRun(f"argument {proof_args.flag(dest)}: {e}") from None
+    if keys["other_info"] is not None and keys["other_info"] == keys["info"]:
+        raise proof_args.CannotRun(f"argument --other-info {a.other_info!r} names the same INFO as --info {a.info!r} in this "
+                                   f"load order ({keys['info'][0]}:{keys['info'][1]:X}): give an INFO that this NPC does not offer now")
+    return keys["info"], keys["other_info"]
 
 
 def run(nv, a):
@@ -54,6 +93,8 @@ def run(nv, a):
         rows.append({"check": name, "result": "SKIP", "why": why})
         print(f"SKIP  {name}  {why}")
 
+    plugins = list(nv.plugins())
+    want, other_key = dialog_keys(a, plugins)   # CannotRun here: nothing has been driven yet
     b = Bot(nv, "glue")
     m0 = b.menu_info()
     check("menu_before", m0.get("kind") in ("none", "hud"), reply=m0)
@@ -65,11 +106,11 @@ def run(nv, a):
         b.wait(0.25)
     check("menu_dialogue", t.ok and m1.get("kind") == "dialogue" and m1.get("dialogReady"), reply=m1, talk=str(t))
     ch = b.dialog_choices()
-    if a.other_info:
-        other = offers(ch, a.other_info)
-        check("dialog", offers(ch, a.info) and not other, choices=ch, other_info=a.other_info, other_offered=other)
+    if other_key is not None:
+        other = offers(ch, other_key, plugins)
+        check("dialog", offers(ch, want, plugins) and not other, choices=ch, other_info=a.other_info, other_offered=other)
     else:
-        check("dialog", offers(ch, a.info), choices=ch)
+        check("dialog", offers(ch, want, plugins), choices=ch)
     s = b.choose_topic(a.info)
     b.wait(1.0)
     m2 = b.menu_info()
@@ -131,10 +172,11 @@ def parser():
 
 
 def check_args(a):
-    """Up-front checks for a game run (not --fake). An empty list means the proof can run."""
+    """Up-front checks for a game run (not --fake). An empty list means the proof can run.
+    The same-INFO refusal here is the part that needs no load order (proof_args.provably_same); dialog_keys does the rest."""
     bad = proof_args.problems(a, REQUIRED, FORMS)
-    if not bad and a.other_info and proof_args.form_number(a.other_info) == proof_args.form_number(a.info):
-        bad.append("argument --other-info names the same INFO number as --info: give an INFO that this NPC does not offer now")
+    if not bad and a.other_info is not None and proof_args.provably_same(a.other_info, a.info):
+        bad.append("argument --other-info names the same INFO as --info: give an INFO that this NPC does not offer now")
     return bad
 
 
@@ -158,24 +200,33 @@ def fake_bridge(mutant=None):
     return nv
 
 
+def _run_on(bridge, a):
+    with bridge as nv:
+        return run(nv, a)
+
+
 def main(argv=None, connect=None):
-    """`connect(instance)` opens the bridge (default: the real pipe); tests pass a fake one. Returns the exit code."""
+    """`connect(instance)` opens the bridge (default: the real pipe); tests pass a fake one.
+    Returns the exit code (0, 1 or 2, see the module doc). It never raises SystemExit: a bad command line returns 2."""
     ap = parser()
-    a = ap.parse_args(argv)
+    a, code = proof_args.parse(ap, argv)
+    if a is None:
+        return code
     if a.fake:
         nv = fake_bridge()
         for k, v in FAKE_ARGS.items():
             setattr(a, k, v)
-        rows = run(nv, a)
+        rows = proof_args.guarded("the fake bridge", lambda: run(nv, a))
     else:
         bad = check_args(a)
         if bad:
-            ap.error("; ".join(bad))   # exits 2, before the bridge is opened
+            return proof_args.refuse(ap, bad)   # before the bridge is opened
         bridge = proof_args.open_bridge(connect or proof_args.connect_real, a.instance)
         if bridge is None:
             return 2
-        with bridge as nv:
-            rows = run(nv, a)
+        rows = proof_args.guarded(f"instance {a.instance}", lambda: _run_on(bridge, a))
+    if rows is None:
+        return 2
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(json.dumps(rows, indent=2), encoding="utf-8")
     bad = [r["check"] for r in rows if r["result"] == "FAIL"]

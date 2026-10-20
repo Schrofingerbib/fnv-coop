@@ -4,10 +4,10 @@ against a real game. It proves, with numbers, that forced controls reach the eng
     python tools/bots/proof_input.py --instance 0 [--save <name>] [--target <Plugin.esm:HEX>] [--door <Plugin.esm:HEX>]
     python tools/bots/proof_input.py --fake            # same script over the fake bridge (game-free self-test)
 
-Needs nvcoop.ini [dev] bots=1 on the instance. Writes out/T6a/proof_input.json. No argument is required; --target and
---door are Plugin.esm:HEX or a bare hex runtime id.
-Exit codes: 0 every check passed, 1 a check failed, 2 the proof could not run (a bad command line is refused before the
-bridge is opened; no game on the instance).
+Needs nvcoop.ini [dev] bots=1 on the instance. Writes out/T6a/proof_input.json. No argument is required. --target and
+--door are Plugin.esm:HEX or a bare hex runtime id (an empty value is refused).
+Exit codes: 0 every check passed, 1 a check failed, 2 the proof could not run: a bad command line (refused before the
+bridge is opened), no game on the instance, or the game lost during the run (crash or pipe loss).
 Checks (each prints measured values so a failure says what the game did):
   hook      bot.status reports hooked=true and the control-state query counter rises each frame
   forward   hold Forward+Run for 2 s: the player moves 300..700 units along the facing direction (real locomotion speed)
@@ -158,25 +158,34 @@ def fake_bridge(mutant=None) -> FakeBridge:
     return FakeBridge(w, mutant=mutant)
 
 
+def _run_on(bridge, args) -> Report:
+    with bridge as nv:
+        if args.save:
+            nv.load_save(args.save)
+        return run(nv, args)
+
+
 def main(argv=None, connect=None) -> int:
-    """`connect(instance)` opens the bridge (default: the real pipe); tests pass a fake one. Returns the exit code."""
+    """`connect(instance)` opens the bridge (default: the real pipe); tests pass a fake one.
+    Returns the exit code (0, 1 or 2, see the module doc). It never raises SystemExit: a bad command line returns 2."""
     ap = parser()
-    args = ap.parse_args(argv)
+    args, code = proof_args.parse(ap, argv)
+    if args is None:
+        return code
     if args.fake:
         nv = fake_bridge()
         args.target, args.door = "FalloutNV.esm:603", "FalloutNV.esm:601"
-        rep = run(nv, args)
+        rep = proof_args.guarded("the fake bridge", lambda: run(nv, args))
     else:
         bad = check_args(args)
         if bad:
-            ap.error("; ".join(bad))   # exits 2, before the bridge is opened
+            return proof_args.refuse(ap, bad)   # before the bridge is opened
         bridge = proof_args.open_bridge(connect or proof_args.connect_real, args.instance)
         if bridge is None:
             return 2
-        with bridge as nv:
-            if args.save:
-                nv.load_save(args.save)
-            rep = run(nv, args)
+        rep = proof_args.guarded(f"instance {args.instance}", lambda: _run_on(bridge, args))
+    if rep is None:
+        return 2
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(rep.rows, indent=2), encoding="utf-8")
     failed = [x for x in rep.rows if x["result"] == "FAIL"]

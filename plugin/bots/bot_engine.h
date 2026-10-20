@@ -38,7 +38,8 @@ constexpr uint32_t kVatsMode = 8, kVatsSelValid = 0x118, kVatsSelRef = 0x128;
 constexpr int kDlgReady = 2;
 constexpr Addr32 kTerminalMenuPtr = 0x11D9334;   // *(TerminalMenu**), set while the terminal menu (id 0x421) is open
 constexpr uint32_t kTermList = 0x68, kTermTerminal = 0xA8, kTermRef = 0xAC;
-// Prologue pins for the engine functions the live engine calls (verified by tools/bots/re/verify_pins.py; thiscall unless noted)
+// Prologue pins for the engine functions the live engine calls (thiscall unless noted). The pin verifier that checked them,
+// tools/bots/re/verify_pins.py, is not in the public repo.
 }  // namespace eng
 
 struct IEngine {
