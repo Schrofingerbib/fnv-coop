@@ -24,7 +24,9 @@ here has been run in the game (code-only sprint).
 - Canonical monolith build (unchanged): `cmd /c tools\runner\build_l1.cmd`.
 - Split build: `plugin\loader\build_split.cmd` (own dirs `build\L1split`, `out\L1split`, so it never touches
   out\L1). Or pass `-DNVCOOP_SPLIT_LOADER=ON` to the normal configure.
-- Install: put both `nvcoop.dll` (loader) and `nvcoop_mod.dll` (core) in `Data\NVSE\Plugins\`.
+- Install: put both `nvcoop.dll` (loader) and `nvcoop_mod.dll` (core) in `Data\NVSE\Plugins\`. For test instances,
+  `python -I tools/runner/run.py provision --n 2 --plugin-dll out/L1split/nvcoop.dll --core-dll out/L1split/nvcoop_mod.dll`
+  does this and writes `[loader] core=<core file name>` into nvcoop.ini. A path that does not exist is an error.
 - Reload: bridge method `dev.reload` (params `{"reason":"..."}`, optional) returns `{generation, msUnload, msLoad}`
   or an error; `dev.status` returns the loader state. Events `dev.reloading`, `dev.reloaded`, `dev.reloadFailed`
   go into the normal event ring (which lives in the loader, so they survive reloads).

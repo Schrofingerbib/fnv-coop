@@ -30,6 +30,8 @@ python -I tools/pool/pool.py down
 ```
 
 Instances must be provisioned first (`python -I tools/runner/run.py provision --n 2`). `up` does not provision.
+Provisioning rewrites each instance's nvcoop.ini. Give extra entries with the repeatable `--ini SECTION.KEY=VALUE`
+(for example `--ini coop.enable=1 --ini dev.bots=1`), not with a hand edit.
 `--fake` runs an in-memory fake game (no launch, no pipes).
 The daemon listens on 127.0.0.1 only; port and a random token are in `runs/pool/pool.json` (`POOL_DIR` overrides
 the folder). Log: `runs/pool/daemon.log`.

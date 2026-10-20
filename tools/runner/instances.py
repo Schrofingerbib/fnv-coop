@@ -6,8 +6,15 @@ Each instance lives in <root>/<i>/ and mirrors the read-only Steam install with 
 marker files are per-instance, writable, real files. The game dir is only ever READ.
 
     python instances.py provision --n 2 [--nvse-dir DIR] [--plugin-dll out/L1/nvcoop.dll]
+                                  [--core-dll out/L1split/nvcoop_mod.dll] [--ini SECTION.KEY=VALUE ...]
     python instances.py show --n 2
     python instances.py destroy --n 2
+
+provision rewrites Data/NVSE/Plugins/nvcoop.ini every time, so hand edits are lost. Put extra entries on the
+command line instead: --ini is repeatable, e.g. --ini coop.enable=1 --ini dev.bots=1 --ini dev.animprobe=1.
+--plugin-dll defaults to out/L1/nvcoop.dll when that file exists. A --plugin-dll or --core-dll path that does
+not exist is an error (exit 2). --core-dll installs the split build's reloadable core next to the loader and
+writes [loader] core=<its file name> (docs/tools/T3a-loader.md).
 
 Environment overrides: FNV_GAME_DIR, FNV_INSTANCES_ROOT.
 """
@@ -193,11 +200,41 @@ def _replace(src: Path, dst: Path) -> None:
     shutil.copy2(src, dst)
 
 
+def plugin_plan(plugin_dll: Optional[Path] = None, core_dll: Optional[Path] = None,
+                plugin_files: Optional[List[Path]] = None) -> "tuple[List[Path], Dict[str, Dict[str, str]]]":
+    """The files to copy into Data/NVSE/Plugins, and the nvcoop.ini entries that they need.
+
+    provision calls this before it writes anything. A named file that does not exist is an error (before, a
+    missing --plugin-dll installed nothing and gave no message). Two files with the same name are an error,
+    because one would overwrite the other. core_dll is the reloadable core of the split build (nvcoop_mod.dll,
+    docs/tools/T3a-loader.md). It keeps its file name, and [loader] core= names it, so the loader finds it."""
+    named = [("plugin dll (--plugin-dll)", plugin_dll), ("core dll (--core-dll)", core_dll)]
+    named += [("plugin file", f) for f in plugin_files or []]
+    files: List[Path] = []
+    seen: Dict[str, Path] = {}
+    for what, f in named:
+        if not f:
+            continue
+        f = Path(f)
+        if not f.is_file():
+            raise FileNotFoundError(f"{what} not found: {f}")
+        if f.name.lower() in seen:
+            raise ValueError(f"{what} {f} has the same file name as {seen[f.name.lower()]}; "
+                             "one would overwrite the other in Data/NVSE/Plugins")
+        seen[f.name.lower()] = f
+        files.append(f)
+    ini = {"loader": {"core": Path(core_dll).name}} if core_dll else {}
+    return files, ini
+
+
 def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
               plugin_dll: Optional[Path] = None, plugin_files: Optional[List[Path]] = None,
               autoload: str = "", autoload_delay_frames: int = 600, modes=LINK_MODES,
               root: Optional[Path] = None, appid: Optional[str] = STEAM_APPID,
-              extra_ini: Optional[Dict[str, Dict[str, str]]] = None) -> Dict:
+              extra_ini: Optional[Dict[str, Dict[str, str]]] = None, core_dll: Optional[Path] = None) -> Dict:
+    # Check every input before the first write: a missing dll or a bad ini entry must not leave a half instance.
+    sources, plan_ini = plugin_plan(plugin_dll, core_dll, plugin_files)
+    ini_extra = merge_ini(plan_ini, extra_ini)  # an explicit extra_ini entry wins over [loader] core
     g = game_dir()
     if not (g / "FalloutNV.exe").exists():
         raise FileNotFoundError(f"game not found at {g}")
@@ -220,10 +257,10 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
             if f.is_file() and f.suffix.lower() in (".exe", ".dll") and f.name.lower().startswith(("nvse", "xnvse")):
                 _replace(f, d / f.name)
                 installed.append(f.name)
-    for p in ([plugin_dll] if plugin_dll else []) + list(plugin_files or []):
-        _replace(Path(p), plugins / Path(p).name)
-        installed.append("Data/NVSE/Plugins/" + Path(p).name)
-    cfg = write_plugin_ini(d, i, role, autoload, autoload_delay_frames, extra_ini)
+    for p in sources:
+        _replace(p, plugins / p.name)
+        installed.append("Data/NVSE/Plugins/" + p.name)
+    cfg = write_plugin_ini(d, i, role, autoload, autoload_delay_frames, ini_extra)
     meta = {
         "instance": i, "role": role, "dir": str(d), "pipe": rf"\\.\pipe\nvcoop-{i}",
         "exe": str(d / "FalloutNV.exe"), "link_counts": counts, "installed": installed,
@@ -241,8 +278,7 @@ def write_plugin_ini(d: Path, i: int, role: str, autoload: str = "", delay: int 
         "bridge": {"instance": str(i), "autoload": autoload, "autoloadDelayFrames": str(delay), "minimized": "1", "multiInstance": "1"},
         "coop": {"instanceId": str(i), "role": role, "pipe": rf"\\.\pipe\nvcoop-{i}"},
     }
-    for s, kv in (extra or {}).items():
-        cfg.setdefault(s, {}).update(kv)
+    merge_ini(cfg, extra)
     text = ""
     for s, kv in cfg.items():
         text += f"[{s}]\n" + "".join(f"{k}={v}\n" for k, v in kv.items()) + "\n"
@@ -252,6 +288,72 @@ def write_plugin_ini(d: Path, i: int, role: str, autoload: str = "", delay: int 
     if ini.exists() or ini.is_symlink():
         ini.unlink()  # never write through a hardlink into the game dir
     ini.write_text(text)
+    return cfg
+
+
+INI_FORM = "SECTION.KEY=VALUE"
+
+
+def check_ini_entry(section: str, key: Optional[str] = None, value: str = "") -> None:
+    """Raise ValueError if the entry cannot be written as one line under one [section] of nvcoop.ini.
+    With key None, check only the section name."""
+    where = f"{section}.{key}" if key is not None else f"[{section}]"
+    if not str(section).strip() or any(c in str(section) for c in "[]\r\n\0"):
+        raise ValueError(f"{where}: bad section name {section!r} (it is empty or contains [ ] or a line break)")
+    if key is None:
+        return
+    if not str(key).strip() or any(c in str(key) for c in "=[]\r\n\0") or str(key).lstrip()[:1] in (";", "#"):
+        raise ValueError(f"{where}: bad key {key!r} (it is empty, contains = [ ] or a line break, or starts a comment)")
+    if any(c in str(value) for c in "\r\n\0"):
+        raise ValueError(f"{where}: the value {value!r} contains a line break")
+
+
+def parse_ini_override(spec: str) -> "tuple[str, str, str]":
+    """Parse one --ini SECTION.KEY=VALUE into (section, key, value). VALUE can be empty and can contain '='.
+    Raise ValueError with the reason if the text is malformed."""
+    if "=" not in spec:
+        raise ValueError(f"{spec!r}: expected {INI_FORM}, the '=' is missing")
+    name, value = spec.split("=", 1)
+    if "." not in name:
+        raise ValueError(f"{spec!r}: expected {INI_FORM}, the '.' between section and key is missing")
+    section, key = name.split(".", 1)
+    section, key, value = section.strip(), key.strip(), value.strip()
+    check_ini_entry(section, key, value)
+    return section, key, value
+
+
+def ini_arg(spec: str) -> str:
+    """argparse type for --ini (instances.py and run.py): reject a malformed entry with a clear message."""
+    try:
+        parse_ini_override(spec)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return spec
+
+
+def ini_overrides(specs: Optional[List[str]]) -> Dict[str, Dict[str, str]]:
+    """--ini SECTION.KEY=VALUE strings -> the extra_ini dict of provision(). A later entry wins."""
+    out: Dict[str, Dict[str, str]] = {}
+    for spec in specs or []:
+        s, k, v = parse_ini_override(spec)
+        merge_ini(out, {s: {k: v}})
+    return out
+
+
+def merge_ini(cfg: Dict[str, Dict[str, str]], extra: Optional[Dict[str, Dict[str, str]]]) -> Dict[str, Dict[str, str]]:
+    """Merge extra into cfg in place and return cfg. Each entry is checked with check_ini_entry.
+
+    Section and key names match case-insensitively, as in GetPrivateProfileString, so an override replaces the
+    entry and keeps its first spelling. A case-sensitive merge wrote 'Role=client' after 'role=host'. The plugin
+    modules then disagree: GetPrivateProfileString reads the first entry, and the coop parser reads the last."""
+    for s, kv in (extra or {}).items():
+        check_ini_entry(s)
+        sec = next((x for x in cfg if x.lower() == str(s).lower()), str(s))
+        dst = cfg.setdefault(sec, {})
+        for k, v in kv.items():
+            check_ini_entry(sec, k, v)
+            key = next((x for x in dst if x.lower() == str(k).lower()), str(k))
+            dst[key] = str(v)
     return cfg
 
 
@@ -288,13 +390,23 @@ def verify_pins(i: int, root: Optional[Path] = None, extra: Optional[List[str]] 
     return bad
 
 
+DEFAULT_PLUGIN_DLL = Path(__file__).resolve().parents[2] / "out" / "L1" / "nvcoop.dll"
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("provision")
     p.add_argument("--n", type=int, default=2)
     p.add_argument("--nvse-dir")
-    p.add_argument("--plugin-dll", default=str(Path(__file__).resolve().parents[2] / "out" / "L1" / "nvcoop.dll"))
+    p.add_argument("--plugin-dll", default=None,
+                   help="plugin dll to install; a path that does not exist is an error "
+                        "(default: out/L1/nvcoop.dll if it exists, else no plugin)")
+    p.add_argument("--core-dll", default=None,
+                   help="split build only: the reloadable core (nvcoop_mod.dll) to install next to the loader; "
+                        "writes [loader] core=<file name>")
+    p.add_argument("--ini", action="append", default=[], type=ini_arg, metavar=INI_FORM,
+                   help="extra nvcoop.ini entry, repeatable, e.g. --ini coop.enable=1 --ini dev.bots=1")
     p.add_argument("--autoload", default="")
     p.add_argument("--no-appid", action="store_true")
     p.add_argument("--modes", default=",".join(LINK_MODES))
@@ -303,6 +415,17 @@ def main(argv=None) -> int:
         q.add_argument("--n", type=int, default=2)
     a = ap.parse_args(argv)
     if a.cmd == "provision":
+        if a.plugin_dll is None:  # not given: the default build output, only if it was built
+            dll = DEFAULT_PLUGIN_DLL if DEFAULT_PLUGIN_DLL.is_file() else None
+        else:  # given: it must exist ("" means no plugin)
+            dll = Path(a.plugin_dll) if a.plugin_dll else None
+        core = Path(a.core_dll) if a.core_dll else None
+        try:  # fail before the first write
+            plugin_plan(dll, core)
+            extra_ini = ini_overrides(a.ini)
+        except (OSError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
         root = instances_root()
         root.mkdir(parents=True, exist_ok=True)
         free = shutil.disk_usage(root).free
@@ -313,7 +436,7 @@ def main(argv=None) -> int:
         for i in range(a.n):
             m = provision(i, role="host" if i == 0 else "client",
                           nvse_dir=Path(a.nvse_dir) if a.nvse_dir else None,
-                          plugin_dll=Path(a.plugin_dll) if a.plugin_dll and Path(a.plugin_dll).exists() else None,
+                          plugin_dll=dll, core_dll=core, extra_ini=extra_ini,
                           autoload=a.autoload, modes=tuple(a.modes.split(",")),
                           appid=None if a.no_appid else STEAM_APPID)
             print(f"instance {i}: {m['dir']} links={m['link_counts']}")

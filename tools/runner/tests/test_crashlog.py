@@ -1,11 +1,17 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import crashlog  # noqa: E402
+import instances  # noqa: E402
+
+OLD_STEAM_DEFAULT = Path(r"C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas")
 
 
 class CrashLog(unittest.TestCase):
@@ -27,6 +33,31 @@ class CrashLog(unittest.TestCase):
         with tempfile.TemporaryDirectory() as g, tempfile.TemporaryDirectory() as d:
             s = crashlog.collect_crash_report(d, g, event_minutes=1, event_query=lambda m: ["stub"])
             self.assertEqual(s["files"], [])
+
+
+class CrashLogGameDir(unittest.TestCase):
+    """Without a game_dir argument, crashlog uses the runner's game dir (instances.game_dir: FNV_GAME_DIR, else
+    the Steam default). Before, it had its own copy of the Steam path and ignored FNV_GAME_DIR."""
+
+    def check_default_game_dir_is_the_runners(self, mut):
+        patch = mock.patch.object(crashlog, "default_game_dir", lambda: OLD_STEAM_DEFAULT) if mut else nullcontext()
+        with patch, tempfile.TemporaryDirectory() as g, tempfile.TemporaryDirectory() as d:
+            (Path(g) / "nvse.log").write_text("from the FNV_GAME_DIR install\n")
+            with mock.patch.dict(os.environ, {"FNV_GAME_DIR": g}):
+                s = crashlog.collect_crash_report(Path(d) / "out", event_minutes=1, event_query=lambda m: ["stub"])
+            self.assertEqual(Path(s["game_dir"]), Path(g))
+            self.assertIn("nvse.log", s["files"])
+            with mock.patch.dict(os.environ):
+                os.environ.pop("FNV_GAME_DIR", None)
+                self.assertEqual(crashlog.default_game_dir(), instances.game_dir())  # one Steam default, not two
+
+    def test_default_game_dir_is_the_runners(self):
+        self.check_default_game_dir_is_the_runners(None)
+
+    def test_twin_own_steam_default_ignores_env(self):
+        """Twin: the old module-level Steam path ignores FNV_GAME_DIR, so the check must fail."""
+        with self.assertRaises(AssertionError):
+            self.check_default_game_dir_is_the_runners("own_steam_default")
 
 
 if __name__ == "__main__":
