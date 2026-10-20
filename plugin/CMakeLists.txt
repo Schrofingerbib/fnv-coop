@@ -80,7 +80,7 @@ endif()
 # NOTE: xNVSE headers use max()/min(): do NOT define NOMINMAX for targets that include them.
 option(NVCOOP_LINK_SNAPSHOT "Link L7 fnvcoop_snapshot into nvcoop.dll (needs the xNVSE game-API sources; links in L7 snapshot)" ON)
 set(NVCOOP_SKIP_SUBDIRS "" CACHE STRING "semicolon list of plugin/<dir> to leave out (e.g. a lane whose code does not build yet)")
-foreach(sub hooks hooks_ui hooks_world snapshot nvmp coop flight animprobe reload bots)
+foreach(sub hooks hooks_ui hooks_world snapshot nvmp coop flight animprobe reload bots splitscreen)
   if(sub IN_LIST NVCOOP_SKIP_SUBDIRS)
     continue()
   endif()
@@ -92,6 +92,12 @@ foreach(sub hooks hooks_ui hooks_world snapshot nvmp coop flight animprobe reloa
     endif()
   endif()
 endforeach()
+# Track B focus guard: it subclasses the game window, so it goes only into the DLL that is never unloaded
+# (this monolithic nvcoop.dll, or the split-mode loader in plugin/loader/CMakeLists.txt).
+if(TARGET nvsplit_focus AND NOT NVCOOP_SPLIT_LOADER)
+  target_link_libraries(nvcoop PRIVATE nvsplit_focus)
+  target_compile_definitions(nvcoop PRIVATE NVCOOP_WITH_FOCUS_GUARD=1)
+endif()
 if(NVCOOP_LINK_SNAPSHOT AND TARGET fnvcoop_snapshot)
   target_compile_definitions(nvcoop PRIVATE NVCOOP_WITH_SNAPSHOT=1)
 endif()
