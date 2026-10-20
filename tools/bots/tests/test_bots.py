@@ -10,8 +10,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from bots import ActionFailed, Bot, FakeBridge, World  # noqa: E402
 from bots import primitives as P  # noqa: E402
-from bots.bot import ActionResult, BridgeError, ConnectionLost, RpcError, heading_deg  # noqa: E402
+from bots.bot import MSGBOX_CLOSING, ActionResult, BridgeError, ConnectionLost, RpcError, heading_deg  # noqa: E402
 from nvbridge import join_ref_line  # noqa: E402  (bots.bot put tools/runner on sys.path)
+
+REPO = Path(__file__).resolve().parents[3]
 
 ITEM, AMMO, CHEST, DOOR, NPC, RAIDER, GROUND, TERM, QUEST = 0x500, 0x501, 0x600, 0x601, 0x602, 0x603, 0x604, 0x605, 0x700
 INFO = 0x800
@@ -327,6 +329,148 @@ class GlueActions(unittest.TestCase):
         self.assertFalse(b2.fast_travel(ref(CHEST)).ok)
 
 
+WAVES = ([1] * 6, [(3.0, [1, 1]), (19.0, [1, 2])])   # the first in-game run (all DLC): 6 boxes, then 2, then 2 more about 16 s later
+
+
+def _boxes_left_after(dismiss):
+    """Engine boxes in waves with gaps shorter than quiet_s. Run dismiss(bot), then wait past the last wave.
+    -> (what dismiss returned, bridge, boxes still shown or still to come)."""
+    nv, b = make()
+    nv.native_boxes, nv.box_waves = list(WAVES[0]), [(t, list(n)) for t, n in WAVES[1]]
+    r = dismiss(b)
+    b.wait(25)
+    return r, nv, len(nv.native_boxes) + sum(len(n) for _, n in nv.box_waves)
+
+
+def _press_only_now(b, max_n=8, settle_s=0.3):
+    """Twin: dismiss_messages before the quiet window. It pressed while bot.menu said 'message' and stopped at the first poll without one."""
+    pressed = 0
+    while b.menu_info().get("kind") == "message" and pressed < max_n:
+        b.press_box(0)
+        pressed += 1
+        b.clock.sleep(settle_s)
+    return pressed
+
+
+def _closing_boxes(n=3, closing_s=1.0):
+    """n engine boxes; after each native press the box stays the top menu for closing_s with no current message (it is closing)."""
+    nv, b = make()
+    nv.native_boxes, nv.box_closing_s = [1] * n, closing_s
+    return nv, b
+
+
+def _any_refusal_fatal(b, settle_s=0.3):
+    """Twin: dismiss_messages before the closing retry. Any refusal of bot.menu.press ended it as a failure. -> (reason, presses)."""
+    pressed = 0
+    while b.menu_info().get("kind") == "message":
+        r = b.press_box(0)
+        if not r.ok:
+            return r.reason, pressed
+        pressed += 1
+        b.clock.sleep(settle_s)
+    return "", pressed
+
+
+class MessageBoxes(unittest.TestCase):
+    def test_dismiss_retries_a_closing_box_without_counting_a_press(self):
+        nv, b = _closing_boxes()
+        r = b.dismiss_messages(max_closing=4)
+        self.assertTrue(r.ok, r)
+        self.assertEqual((r.data["pressed"], nv.native_presses, nv.native_boxes), (3, [0, 0, 0], []))
+        self.assertGreater(r.data["closing"], 4)        # about 3 refusals per box: passes only because the bound starts again per press
+        self.assertEqual(b.menu_info()["kind"], "none")
+        nv, b = _closing_boxes(n=1)                       # the last box closes and no next box comes
+        r = b.dismiss_messages()
+        self.assertTrue(r.ok, r)
+        self.assertEqual((r.data["pressed"], nv.native_boxes), (1, []))
+        self.assertGreater(r.data["closing"], 0)
+
+    def test_twin_any_refusal_fatal_fails_on_a_closing_box(self):
+        nv, b = _closing_boxes()
+        reason, pressed = _any_refusal_fatal(b)
+        self.assertEqual(pressed, 1)
+        self.assertIn(MSGBOX_CLOSING, reason)
+
+    def test_dismiss_gives_up_on_a_box_that_stays_closing(self):
+        nv, b = _closing_boxes(n=2, closing_s=1000.0)
+        r = b.dismiss_messages(max_closing=10)
+        self.assertEqual(r.reason, "postcondition")
+        self.assertEqual((r.data["pressed"], r.data["closing"]), (1, 11))
+        self.assertIn("stayed closing", r.data["why"])
+
+    def test_dismiss_keeps_other_refusals_fatal(self):
+        nv, b = make()
+        nv.native_boxes = [1]
+        r = b.dismiss_messages(button=1)
+        self.assertTrue(r.reason.startswith("rpc_error:native message box: button 1 is not shown"), r)
+        self.assertEqual(nv.native_boxes, [1])
+
+    def test_closing_text_is_the_plugins(self):
+        src = (REPO / "plugin" / "bots" / "bot_engine.h").read_text(encoding="utf-8")
+        self.assertIn('"' + MSGBOX_CLOSING + '"', src)
+
+    def test_dismiss_clears_queued_engine_boxes_with_button_0(self):
+        nv, b = make()
+        r = b.dismiss_messages()
+        self.assertTrue(r.ok, r)
+        self.assertEqual(r.data, {"pressed": 0, "paths": [], "waited_s": 20.0, "quiet_s": 20.0, "closing": 0})   # nothing shown: a quiet window, no press
+        nv.native_boxes = [1, 2, 1]                                    # three queued engine boxes (the DLC notices after a load)
+        self.assertEqual(b.menu_info()["kind"], "message")
+        r = b.dismiss_messages()
+        self.assertTrue(r.ok, r)
+        self.assertEqual(r.data, {"pressed": 3, "paths": ["native"] * 3, "waited_s": 20.9, "quiet_s": 20.0, "closing": 0})   # 3 x 0.3 s, then 20 s quiet
+        self.assertEqual(nv.native_presses, [0, 0, 0])
+        self.assertEqual(b.menu_info()["kind"], "none")
+
+    def test_dismiss_presses_every_wave_until_a_quiet_window(self):
+        r, nv, left = _boxes_left_after(lambda b: b.dismiss_messages())
+        self.assertTrue(r.ok, r)
+        self.assertEqual((left, r.data["pressed"], r.data["quiet_s"]), (0, 10, 20.0))
+        self.assertEqual(nv.native_presses, [0] * 10)
+        self.assertGreaterEqual(r.data["waited_s"], 19.0 + 20.0)     # it waited out the last wave, then the quiet window
+        self.assertLess(r.data["waited_s"], 19.0 + 20.0 + 2.0)
+
+    def test_twin_press_only_now_leaves_a_later_wave(self):
+        n, nv, left = _boxes_left_after(_press_only_now)
+        self.assertEqual((n, left), (6, 4))                             # the first wave only: 2 + 2 boxes come later and stay
+        self.assertEqual(_boxes_left_after(lambda b: b.dismiss_messages(quiet_s=0))[2], 4)   # quiet_s=0 is that old behaviour
+
+    def test_dismiss_gives_up_when_boxes_keep_coming(self):
+        nv, b = make()
+        nv.box_waves = [(5.0 + 10.0 * i, [1]) for i in range(40)]      # a box every 10 s: never 20 s without one
+        r = b.dismiss_messages(max_s=60)
+        self.assertEqual(r.reason, "timeout")
+        self.assertEqual((r.data["pressed"], r.data["waited_s"]), (6, 60.0))   # boxes at 5, 15, .. 55 s pressed, then it stops at max_s
+
+    def test_dismiss_answers_the_ui_layers_box_first(self):
+        nv, b = make()
+        nv.box = 900
+        nv.native_boxes = [1]
+        r = b.dismiss_messages()
+        self.assertTrue(r.ok, r)
+        self.assertEqual(r.data["paths"], ["ui", "native"])
+        self.assertEqual(nv.box_answers, [0])
+
+    def test_dismiss_gives_up_after_max_n(self):
+        nv, b = make()
+        nv.native_boxes = [1] * 12
+        r = b.dismiss_messages(max_n=8)
+        self.assertEqual(r.reason, "postcondition")
+        self.assertEqual(r.data["pressed"], 8)
+        self.assertEqual(len(nv.native_boxes), 4)
+
+    def test_press_reply_names_the_path(self):
+        nv, b = make()
+        nv.native_boxes = [2]
+        r = b.press_box(1)
+        self.assertTrue(r.ok, r)
+        self.assertEqual((r.data["path"], r.data["value"]), ("native", 1))
+        nv.native_boxes = [2]
+        self.assertTrue(b.press_box(2).reason.startswith("rpc_error:native message box: button 2 is not shown"))
+        nv.box = 900
+        self.assertEqual(b.press_box(0).data["path"], "ui")
+
+
 class GenuineActions(unittest.TestCase):
     def test_drop_returns_the_dropped_world_ref_from_the_event(self):
         nv, b = make()
@@ -512,7 +656,15 @@ def _scenario(name):
         "travel_ignored": lambda b: b.fast_travel(ref(CHEST), timeout_s=6.0),
         "ref_info_error": lambda b: b.pos(ref(NPC)) and None,
         "exec_ref_ignored": lambda b: b.take(ref(CHEST), ITEM, 1),
+        "msgbox_stuck": lambda b: _dismiss_two_boxes(b),
+        "msgbox_ui_only": lambda b: _dismiss_two_boxes(b),
     }[name]
+
+
+def _dismiss_two_boxes(b):
+    """Two engine message boxes are up: dismiss_messages must clear both, or fail."""
+    b.nv.native_boxes = [1, 2]
+    return b.dismiss_messages()
 
 
 def _drop_ref_check(b):
@@ -525,7 +677,7 @@ def _drop_ref_check(b):
 
 
 MUTANTS = ["move_ignored", "look_ignored", "stop_ignored", "jump_noop", "fire_noop", "setpos_ignored", "angle_ignored", "activate_noop", "transfer_noop", "transfer_dup", "equip_noop",
-           "drop_noop", "fire_miss", "health_stuck", "dialog_never", "drop_wrong_ref", "travel_ignored", "exec_ref_ignored"]
+           "drop_noop", "fire_miss", "health_stuck", "dialog_never", "drop_wrong_ref", "travel_ignored", "exec_ref_ignored", "msgbox_stuck", "msgbox_ui_only"]
 
 
 class MutationTwins(unittest.TestCase):
@@ -537,6 +689,13 @@ class MutationTwins(unittest.TestCase):
                 self.assertFalse(r.ok, f"mutant {m} slipped through: {r}")
                 nv0, b0 = make(None)
                 self.assertTrue(_scenario(m)(b0).ok, f"healthy scenario for {m} should pass")
+
+    def test_message_box_twins_fail_for_the_right_reason(self):
+        nv, b = make("msgbox_stuck")
+        r = _dismiss_two_boxes(b)
+        self.assertEqual((r.reason, r.data["pressed"]), ("postcondition", 8))   # pressed, re-checked, gave up: never looped forever
+        nv, b = make("msgbox_ui_only")
+        self.assertEqual(_dismiss_two_boxes(b).reason, "rpc_error:no message box is being shown")   # the bug seen in game
 
     def test_ref_info_error_reports_rpc_failure(self):
         nv, b = make("ref_info_error")

@@ -21,6 +21,28 @@ def run_with(mutant=None):
     return proof.run(FakeBridge(w, mutant=mutant), args)
 
 
+def run_with_boxes(dismiss, mutant=None):
+    """The proof over a fake that shows two engine message boxes; -> (report, bridge)."""
+    w = World()
+    w.add_actor(0x603, (0, 400, 0))
+    w.add_door(0x601, (50, 50, 0))
+    nv = FakeBridge(w, mutant=mutant)
+    nv.native_boxes = [1, 2]
+    args = argparse.Namespace(target="FalloutNV.esm:603", door="FalloutNV.esm:601", fake=True, dismiss_messages=dismiss)
+    return proof.run(nv, args), nv
+
+
+def run_with_waves(**dismiss_kw):
+    """The proof with --dismiss-messages over a fake whose engine boxes come in waves (6, then 2 at 3 s, then 2 at 19 s)."""
+    w = World()
+    w.add_actor(0x603, (0, 400, 0))
+    w.add_door(0x601, (50, 50, 0))
+    nv = FakeBridge(w)
+    nv.native_boxes, nv.box_waves = [1] * 6, [(3.0, [1, 1]), (19.0, [1, 2])]
+    args = argparse.Namespace(target="FalloutNV.esm:603", door="FalloutNV.esm:601", fake=True, dismiss_messages=True, **dismiss_kw)
+    return proof.run(nv, args), nv
+
+
 class Proof(unittest.TestCase):
     def test_passes_on_a_healthy_fake(self):
         rep = run_with()
@@ -35,6 +57,39 @@ class Proof(unittest.TestCase):
                 rep = run_with(mutant)
                 failed = {r["check"] for r in rep.rows if r["result"] == "FAIL"}
                 self.assertIn(check, failed, f"{mutant} should fail {check}; failed={failed}")
+
+    def test_dismiss_messages_is_opt_in(self):
+        rep, nv = run_with_boxes(dismiss=False)
+        self.assertEqual(nv.native_presses, [])                     # never called on its own
+        self.assertNotIn("dismiss_messages", {r["check"] for r in rep.rows})
+        rep, nv = run_with_boxes(dismiss=True)
+        self.assertEqual((rep.rows[0]["check"], rep.rows[0]["result"]), ("dismiss_messages", "PASS"))
+        self.assertEqual((nv.native_presses, nv.native_boxes), ([0, 0], []))
+        rep, nv = run_with_boxes(dismiss=True, mutant="msgbox_stuck")   # a box that never closes fails the row
+        self.assertEqual((rep.rows[0]["check"], rep.rows[0]["result"]), ("dismiss_messages", "FAIL"))
+
+    def test_dismiss_messages_row_passes_while_boxes_close(self):
+        # PR #9 review: a box that is closing (top menu 1001, no current message) refused the next press and the row failed
+        w = World()
+        w.add_actor(0x603, (0, 400, 0))
+        w.add_door(0x601, (50, 50, 0))
+        nv = FakeBridge(w)
+        nv.native_boxes, nv.box_closing_s = [1, 2, 1], 0.8
+        args = argparse.Namespace(target="FalloutNV.esm:603", door="FalloutNV.esm:601", fake=True, dismiss_messages=True)
+        rep = proof.run(nv, args)
+        self.assertEqual((rep.rows[0]["check"], rep.rows[0]["result"], rep.rows[0]["pressed"]), ("dismiss_messages", "PASS", 3))
+        self.assertEqual([r for r in rep.rows if r["result"] != "PASS"], [])
+
+    def test_dismiss_messages_waits_out_the_waves_before_the_checks(self):
+        rep, nv = run_with_waves()
+        self.assertEqual([r for r in rep.rows if r["result"] != "PASS"], [])
+        self.assertEqual((rep.rows[0]["check"], rep.rows[0]["pressed"]), ("dismiss_messages", 10))
+        self.assertGreaterEqual(rep.rows[0]["waited_s"], 39.0)
+        self.assertEqual((nv.native_presses, nv.native_boxes, nv.box_waves), ([0] * 10, [], []))
+        # twin: press only the boxes shown now (quiet 0 = the old behaviour). The wave at 3 s lands mid-proof and the player cannot move.
+        rep, nv = run_with_waves(dismiss_quiet_s=0.0)
+        self.assertEqual((rep.rows[0]["check"], rep.rows[0]["result"], rep.rows[0]["pressed"]), ("dismiss_messages", "PASS", 6))
+        self.assertIn("forward", {r["check"] for r in rep.rows if r["result"] == "FAIL"})
 
 
 

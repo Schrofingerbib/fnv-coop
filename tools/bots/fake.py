@@ -19,9 +19,20 @@ It implements the console grammar and bridge methods in primitives.py over a tin
   drop_wrong_ref    the OnDrop event names a different ref than the one the engine created
   travel_ignored    bot.fasttravel is accepted but the player never moves
   exec_ref_ignored  exec {cmd, ref} checks the ref, then runs the line with no calling reference
+  msgbox_stuck      bot.menu.press presses the engine's message box natively, but the box never closes
+  msgbox_ui_only    bot.menu.press only answers the UI layer's box (the plugin before the native path existed)
 
 Console lines follow the game (in game, 2026-10-21): "player.X" works, "<hex>.X" fails with
 Script command "<hex>.X" not found, and a line for another reference names it in exec's `ref` (calling reference).
+
+Message boxes: `box` is the UI layer's own box (ui.open / ui.answer); `native_boxes` lists the engine's own queued boxes (MessageMenu,
+menu id 1001), one entry per box = its number of buttons. bot.menu reports kind "message" while either is shown.
+`box_waves` = [(virtual time, [button counts]), ...] sorted by time: engine boxes that join `native_boxes` later, the way the DLC
+notices come after a load (6, then 2, then 2 about 16 s later). While an engine box is shown the game is in menu mode: held
+movement controls do not move the player.
+`box_closing_s` > 0: after a native press the box stays the top menu for that many virtual seconds with no current message (it is
+closing). A press in that time gets the plugin's refusal "... has no current message (it is closing) ...". Then the box goes and the
+next queued box (if any) is shown.
 """
 from __future__ import annotations
 
@@ -156,6 +167,11 @@ class FakeBridge:
         self.terminal_used: Dict[str, List[Dict[str, Any]]] = {}
         self.box = None                 # menu id of a message box being shown (tests set it)
         self.box_answers: List[int] = []
+        self.native_boxes: List[int] = []     # engine message boxes (MessageMenu 1001) queued, each = its button count (tests set it)
+        self.native_presses: List[int] = []   # buttons pressed natively, in order
+        self.box_waves: List[Tuple[float, List[int]]] = []   # (virtual time, [button counts]): engine boxes that appear later (tests set it)
+        self.box_closing_s = 0.0                # seconds a pressed engine box stays closing (tests set it); 0 = it goes at once
+        self._closing_until: Optional[float] = None
         self.shots_left = 0
         self.vats_state = {"phase": "idle", "reason": ""}
         self.sneaking = False
@@ -290,6 +306,8 @@ class FakeBridge:
             d = self.me.in_dialogue
             if d is not None:
                 return {"kind": "dialogue", "id": 0x3F1, "dialogReady": True}
+            if self.box is not None or self.native_boxes:
+                return {"kind": "message", "id": 0x3E9}
             return {"kind": getattr(self, "_menu", "none")}
         if method == P.M_BOT_DIALOG:
             d = self.me.in_dialogue
@@ -311,11 +329,27 @@ class FakeBridge:
                     "partial": not want}
         if method in (P.M_BOT_PRESS, P.M_BOT_CONSENT):
             if self.box is None:
+                # same order as bot_rpc.h: the UI layer's box first, then (bot.menu.press only) the engine's own message box
+                if method == P.M_BOT_PRESS and self.native_boxes and self.mutant != "msgbox_ui_only":
+                    button, n = params["button"], self.native_boxes[0]
+                    if self._closing_until is not None:   # the gate order of pressNativeMessageButton: closing before the button range
+                        raise RpcError(-32000, "native message box: the message box has no current message (it is closing)"
+                                               " (ui layer: no message box is being shown)", method)
+                    if not 0 <= button < n:
+                        raise RpcError(-32000, f"native message box: button {button} is not shown (the box has {n} buttons)"
+                                               " (ui layer: no message box is being shown)", method)
+                    self.native_presses.append(button)
+                    if self.mutant != "msgbox_stuck":
+                        if self.box_closing_s > 0:
+                            self._closing_until = self.clock.t + self.box_closing_s
+                        else:
+                            self.native_boxes.pop(0)
+                    return {"menu": 0x3E9, "button": button, "value": button, "buttons": n, "path": "native"}
                 raise RpcError(-32000, "no message box is being shown", method)
             button = params["button"] if method == P.M_BOT_PRESS else {"ready": 0, "notyet": 1}[params["answer"]]
             self.box_answers.append(button)
             menu, self.box = self.box, None
-            return {"menu": menu, "button": button}
+            return {"menu": menu, "button": button, "path": "ui"} if method == P.M_BOT_PRESS else {"menu": menu, "button": button}
         if method == P.M_TERMINAL:
             t = self._by_ref(params["ref"])
             if not isinstance(t, Thing) or t.kind != "terminal" or getattr(self, "_menu", "none") != "terminal":
@@ -465,13 +499,20 @@ class FakeBridge:
             marker = self.travel_due[1]
             self.travel_due = None
             me.pos, me.cell = [marker.pos[0] + 40, marker.pos[1], marker.pos[2]], marker.cell
+        t_end = self.clock.t
         left = dt
         while left > 1e-9:
             h = min(left, 0.02)
             left -= h
+            if self._closing_until is not None and t_end - left >= self._closing_until:   # the closing box goes, the next one shows
+                self._closing_until = None
+                if self.native_boxes:
+                    self.native_boxes.pop(0)
+            while self.box_waves and t_end - left >= self.box_waves[0][0]:
+                self.native_boxes.extend(self.box_waves.pop(0)[1])
             fwd = ("Forward" in self.held) - ("Backward" in self.held)
             side = ("Right" in self.held) - ("Left" in self.held)
-            if fwd or side:
+            if (fwd or side) and not self.native_boxes:   # an engine message box is up: menu mode, the player does not move
                 speed = 220.0 if "Run" in self.held else 120.0
                 yaw = math.radians(me.angle["Z"])
                 dx = (math.sin(yaw) * fwd + math.cos(yaw) * side) * speed * h

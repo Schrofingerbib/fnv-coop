@@ -58,5 +58,19 @@ inline constexpr CallPin TravelObjCtor = {"TravelObjCtor", 0x456540U, {0x55, 0x8
 // cdecl(size) -> game heap block
 inline constexpr CallPin HeapAlloc = {"HeapAlloc", 0x401000U, {0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x50, 0xe8, 0x14, 0x00, 0x00, 0x00, 0x8b, 0xc8, 0xe8, 0x2d}, 0};
 inline constexpr unsigned kPlayerPending = 0x1ECU, kTravelObjSize = 0x34U, kTravelObjMarker = 0x30U;   // player+0x1EC pending object; obj+0x30 = marker ref
-inline constexpr const CallPin* kAllCalls[] = {&PlayerCanTravel, &PendingTravelSet, &TravelObjCtor, &HeapAlloc, &TermClick, &GetContainerData, &ItemTotal, &TopMenuId, &LbSelect, &LbSelected, &ItemInfo, &InfoFlag80, &InfoSpecialB, &InfoSpecialC, &DlgItemClick, &LbAfter, &DlgSpeak, &Tick};
+// ---- native message box press (bot.menu.press when the UI layer has no box). Static RE on the 1.4.0.525 exe.
+// MessageMenu (menu id 1001 = 0x3E9) vtable, from MSVC RTTI (COL 0x1119C24, base Menu 0x1095484). Slot 3 (+0x0C) is HandleClick 0x7AA070,
+// slot 12 (+0x30) is HandleKeyboardInput 0x7AA110, slot 13 (+0x34) returns 0x3E9. The press refuses every object whose vtable is not this one:
+// the button-list offsets and the slot-3 behaviour below are only known for MessageMenu.
+inline constexpr unsigned MessageMenuVtbl = 0x107566CU;
+inline constexpr unsigned kMenuSlotHandleClick = 0x0CU;   // Menu vtable slot 3 (xNVSE GameUI.h: HandleClick(buttonID, Tile*))
+// MessageMenu::HandleClick(id, tile), thiscall, ret 8. With id 7 and a tile: value = ListBox<int>(this+0x40) value of that tile (0x7E1110,
+// 0 when the tile is not in the list); InterfaceManager+0xE4 (msgBoxButton) = value; run the message callback; 0x7AA530 closes the box
+// (or shows the next queued message). The engine's own Enter / hotkey paths (0x7AA110) do the same: list index -> tile -> HandleClick(7, tile).
+inline constexpr CallPin MsgMenuHandleClick = {"MsgMenuHandleClick", 0x7AA070U, {0x55, 0x8b, 0xec, 0x51, 0x53, 0x89, 0x4d, 0xfc, 0x83, 0x7d, 0x0c, 0x00, 0x75, 0x19, 0x83, 0x7d}, 8};
+inline constexpr const CallPin* kAllCalls[] = {&PlayerCanTravel, &PendingTravelSet, &TravelObjCtor, &HeapAlloc, &TermClick, &GetContainerData, &ItemTotal, &TopMenuId, &LbSelect, &LbSelected, &ItemInfo, &InfoFlag80, &InfoSpecialB, &InfoSpecialC, &DlgItemClick, &LbAfter, &DlgSpeak, &Tick, &MsgMenuHandleClick};
+// ---- data pins: a dword in the exe image that must hold `value` (vtable slots in .rdata). Checked at init with the call pins.
+struct DataPin { const char* name; unsigned addr; unsigned value; };
+inline constexpr DataPin MsgMenuSlotHandleClick = {"MessageMenu.vtbl[3]", MessageMenuVtbl + kMenuSlotHandleClick, 0x7AA070U};
+inline constexpr const DataPin* kAllData[] = {&MsgMenuSlotHandleClick};
 }  // namespace nvbots::addr
