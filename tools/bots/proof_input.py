@@ -44,6 +44,7 @@ FORMS = ("target", "door")
 
 # The sneak state as a console expression. The game's console has IsSneaking. "player.GetSneaking" gave "Unknown variable" (2026-10-21).
 SNEAK_EXPR = "player.IsSneaking"
+SETTLE_AFTER_JUMP_S = 2.5  # > the ~2 s after a jump in which only one crouch toggle takes effect
 
 
 class Report:
@@ -119,6 +120,9 @@ def run(nv, args) -> Report:
 
     j = b.jump()
     r.check("jump", j.ok, reply=str(j))
+    # Land and settle first: within about 2 s of a jump the engine applies only one crouch toggle (first in-game run,
+    # 2026-10-21: the second tap 1.1 s later left the player crouched; two seconds after the jump both taps worked).
+    b.wait(SETTLE_AFTER_JUMP_S)
 
     try:
         s0 = b._eval(SNEAK_EXPR)

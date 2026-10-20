@@ -67,6 +67,19 @@ class Proof(unittest.TestCase):
         self.assertEqual(row["result"], "FAIL", row)
         self.assertIn("Unknown variable 'GetSneaking'", row["error"])
 
+    def test_sneak_waits_for_the_landing_after_the_jump(self):
+        row = next(r for r in run_with().rows if r["check"] == "sneak")
+        self.assertEqual(row["result"], "PASS", row)
+        # twin: the first in-game order (sneak right after the jump) must fail like it did in the game
+        old = proof.SETTLE_AFTER_JUMP_S
+        proof.SETTLE_AFTER_JUMP_S = 0.0
+        try:
+            row = next(r for r in run_with().rows if r["check"] == "sneak")
+        finally:
+            proof.SETTLE_AFTER_JUMP_S = old
+        self.assertEqual(row["result"], "FAIL", row)
+        self.assertEqual((row["after_one_tap"], row["after_two_taps"]), (1, 1))
+
     def test_forward_runs_whatever_the_always_run_toggle(self):
         # first in-game run (2026-10-21): always-run on, and Run held for run:true made the player walk (152-165 units in 2 s)
         for on in (True, False):

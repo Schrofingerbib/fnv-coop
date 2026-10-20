@@ -55,6 +55,9 @@ _DRIVER_METHODS = {P.M_BOT_STATUS, P.M_BOT_MOVE, P.M_BOT_STOP, P.M_BOT_LOOK, P.M
 _EXPR_FUNCS = {"issneaking", "getangle", "getequipped", "getitemcount", "getopenstate", "getlocked", "getstage"}
 
 
+JUMP_SETTLE_S = 2.0  # see M_BOT_SNEAK in FakeBridge: crouch toggles right after a jump
+
+
 class VirtualClock:
     def __init__(self) -> None:
         self.t = 0.0
@@ -455,8 +458,15 @@ class FakeBridge:
         if method == P.M_BOT_JUMP:
             if self.mutant != "jump_noop" and self.jump_t <= 0:
                 self.jump_t, self.jump_base = 0.6, me.pos[2]
+                self.jump_settle_until, self.jump_toggles = self.clock.t + JUMP_SETTLE_S, 0
             return {}
         if method == P.M_BOT_SNEAK:
+            # In game (2026-10-21): within about 2 s of a jump only one crouch toggle takes effect; a second tap 1.1 s
+            # later left the player crouched. Two seconds after the jump both taps toggle again.
+            if self.clock.t < getattr(self, "jump_settle_until", 0.0):
+                self.jump_toggles += 1
+                if self.jump_toggles > 1:
+                    return {}
             self.sneaking = not self.sneaking
             return {}
         if method == P.M_BOT_ACTIVATE:
