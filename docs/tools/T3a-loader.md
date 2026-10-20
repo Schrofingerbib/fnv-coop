@@ -27,6 +27,7 @@ here has been run in the game (code-only sprint).
 - Install: put both `nvcoop.dll` (loader) and `nvcoop_mod.dll` (core) in `Data\NVSE\Plugins\`. For test instances,
   `python -I tools/runner/run.py provision --n 2 --plugin-dll out/L1split/nvcoop.dll --core-dll out/L1split/nvcoop_mod.dll`
   does this and writes `[loader] core=<core file name>` into nvcoop.ini. A path that does not exist is an error.
+  `--core-dll` without an explicit `--plugin-dll` is an error: the default out\L1\nvcoop.dll can be the monolith.
 - Reload: bridge method `dev.reload` (params `{"reason":"..."}`, optional) returns `{generation, msUnload, msLoad}`
   or an error; `dev.status` returns the loader state. Events `dev.reloading`, `dev.reloaded`, `dev.reloadFailed`
   go into the normal event ring (which lives in the loader, so they survive reloads).

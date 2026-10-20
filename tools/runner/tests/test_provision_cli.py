@@ -8,8 +8,10 @@ exception, is a failed test.
 """
 from __future__ import annotations
 
+import codecs
 import contextlib
 import io
+import locale
 import os
 import sys
 import tempfile
@@ -26,6 +28,7 @@ import instances  # noqa: E402
 import run  # noqa: E402
 
 REAL_PLAN = instances.plugin_plan
+REAL_RUN_ARGV = run.provision_argv
 PLUGINS = Path("Data") / "NVSE" / "Plugins"
 
 
@@ -68,6 +71,54 @@ def _run_argv_old(a):
             + (["--nvse-dir", a.nvse_dir] if a.nvse_dir else []) + (["--autoload", a.autoload] if a.autoload else []))
 
 
+def _run_argv_space_separated(a):
+    """The old forwarding form '--x', 'value'. instances.py then reads a value that starts with '-' as an option."""
+    out: List[str] = []
+    for x in REAL_RUN_ARGV(a):
+        out += x.split("=", 1) if x.startswith("--") and "=" in x else [x]
+    return out
+
+
+def _run_argv_drops_empty_plugin_dll(a):
+    """The run.py before the fix: a falsy --plugin-dll is not passed on, so "" means the default build."""
+    return [x for x in REAL_RUN_ARGV(a) if x != "--plugin-dll="]
+
+
+def _run_argv_default_filled(a):
+    """The old run.py: --plugin-dll defaults to out/L1/nvcoop.dll (if built) and goes on as an explicit value."""
+    a = types.SimpleNamespace(**vars(a))
+    if a.plugin_dll is None and run.DEFAULT_DLL.exists():
+        a.plugin_dll = str(run.DEFAULT_DLL)
+    return REAL_RUN_ARGV(a)
+
+
+def _plugin_args_default_pairing(plugin_dll, core_dll):
+    """The old CLI: --core-dll without --plugin-dll pairs the core with the default out/L1/nvcoop.dll."""
+    if plugin_dll is None:
+        dll = instances.DEFAULT_PLUGIN_DLL if instances.DEFAULT_PLUGIN_DLL.is_file() else None
+    else:
+        dll = Path(plugin_dll) if plugin_dll else None
+    return dll, (Path(core_dll) if core_dll else None)
+
+
+def _provision_ini_swapped(plan_ini, extra_ini):
+    """The merge order swapped: the [loader] core of --core-dll wins over an explicit --ini loader.core."""
+    return instances.merge_ini(instances.merge_ini({}, extra_ini), plan_ini)
+
+
+def _write_plugin_ini_locale(d, i, role, autoload="", delay=600, extra=None):
+    """The writer before the fix: it writes nvcoop.ini in Python's locale encoding, not in ini_encoding()."""
+    cfg = {"bridge": {"instance": str(i), "autoload": autoload, "autoloadDelayFrames": str(delay)},
+           "coop": {"instanceId": str(i), "role": role}}
+    instances.merge_ini(cfg, extra)
+    ini = Path(d) / PLUGINS / "nvcoop.ini"
+    ini.parent.mkdir(parents=True, exist_ok=True)
+    if ini.exists():
+        ini.unlink()
+    ini.write_text("".join(f"[{s}]\n" + "".join(f"{k}={v}\n" for k, v in kv.items()) for s, kv in cfg.items()))
+    return cfg
+
+
 MUTANTS = {
     "ini_ignored": [(instances, "ini_overrides", lambda specs: {})],
     "merge_case_sensitive": [(instances, "merge_ini", _merge_case_sensitive)],
@@ -77,6 +128,14 @@ MUTANTS = {
     "core_ignored": [(instances, "plugin_plan", _plan_core_ignored)],
     "core_without_loader_key": [(instances, "plugin_plan", _plan_core_without_loader_key)],
     "run_drops_options": [(run, "provision_argv", _run_argv_old)],
+    "no_encoding_check": [(instances, "check_ini_encodable", lambda *a, **k: None)],
+    "writer_locale_encoding": [(instances, "write_plugin_ini", _write_plugin_ini_locale)],
+    "core_pairs_with_default": [(instances, "plugin_args", _plugin_args_default_pairing)],
+    "run_fills_default_dll": [(run, "provision_argv", _run_argv_default_filled)],
+    "run_drops_empty_plugin_dll": [(run, "provision_argv", _run_argv_drops_empty_plugin_dll)],
+    "merge_order_swapped": [(instances, "provision_ini", _provision_ini_swapped)],
+    "run_space_separated": [(run, "provision_argv", _run_argv_space_separated)],
+    "per_instance_keys_allowed": [(instances, "check_per_instance_ini", lambda *a, **k: None)],
 }
 
 
@@ -300,11 +359,44 @@ class ProvisionCli(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.check_core_dll_installed_where_the_loader_looks("core_without_loader_key")
 
-    def test_explicit_loader_core_entry_wins(self):
-        code, _, err = self.cli(instances.main, ["provision", "--n", "1", "--core-dll", str(self.core),
-                                                 "--ini", "loader.core=other.dll"])
+    def check_explicit_loader_core_entry_wins(self, mut):
+        with mutant(mut):
+            code, _, err = self.cli(instances.main, ["provision", "--n", "1", "--plugin-dll", str(self.dll),
+                                                     "--core-dll", str(self.core), "--ini", "loader.core=other.dll"])
         self.assertEqual(code, 0, err)
         self.assertEqual(ini_values(self.nvcoop_ini(), "loader", "core"), ["other.dll"])
+
+    def test_explicit_loader_core_entry_wins(self):
+        self.check_explicit_loader_core_entry_wins(None)
+
+    def test_twin_merge_order_swapped(self):
+        with self.assertRaises(AssertionError):
+            self.check_explicit_loader_core_entry_wins("merge_order_swapped")
+
+    def check_core_dll_needs_explicit_plugin_dll(self, mut):
+        """A built out/L1/nvcoop.dll can be the monolith, which never reads [loader] core. So --core-dll must not
+        pair with the default silently, in instances.py and in run.py."""
+        built = self.file("out/L1/nvcoop.dll", b"monolith")
+        with mock.patch.object(instances, "DEFAULT_PLUGIN_DLL", built), \
+                mock.patch.object(run, "DEFAULT_DLL", built), mutant(mut):
+            for main in (instances.main, run.main):
+                for argv in (["--core-dll", str(self.core)], ["--plugin-dll", "", "--core-dll", str(self.core)]):
+                    code, _, err = self.cli(main, ["provision", "--n", "1", *argv])
+                    self.assertEqual(code, 2, f"{main.__module__} {argv}: exit {code}")
+                    self.assertIn("--core-dll", err)
+                    self.assertIn("--plugin-dll", err)
+                    self.assertFalse(self.inst.exists(), "nothing may be written before the input is checked")
+
+    def test_core_dll_needs_explicit_plugin_dll(self):
+        self.check_core_dll_needs_explicit_plugin_dll(None)
+
+    def test_twin_core_pairs_with_default(self):
+        with self.assertRaises(AssertionError):
+            self.check_core_dll_needs_explicit_plugin_dll("core_pairs_with_default")
+
+    def test_twin_run_py_fills_default_dll(self):
+        with self.assertRaises(AssertionError):
+            self.check_core_dll_needs_explicit_plugin_dll("run_fills_default_dll")
 
     def check_same_file_name_is_an_error(self, mut):
         """A monolith nvcoop.dll passed as --core-dll would overwrite the loader nvcoop.dll."""
@@ -344,11 +436,123 @@ class ProvisionCli(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.check_run_py_passes_options("run_drops_options")
 
+    def check_run_py_forwards_values_that_start_with_a_dash(self, mut):
+        with mutant(mut):
+            code, _, err = self.cli(run.main, ["provision", "--n", "1", "--plugin-dll", str(self.dll),
+                                               "--ini=-dash.key=v", "--autoload=-save"])
+            self.assertEqual(code, 0, err)
+            ini = self.nvcoop_ini()
+            self.assertEqual(ini_values(ini, "-dash", "key"), ["v"])
+            self.assertEqual(ini_values(ini, "bridge", "autoload"), ["-save"])
+            a = types.SimpleNamespace(n=1, plugin_dll="-x.dll", nvse_dir=None, autoload="", core_dll="-c.dll",
+                                      ini=["-s.k=v"])
+            self.assertEqual(run.provision_argv(a), ["provision", "--n", "1", "--plugin-dll=-x.dll",
+                                                     "--core-dll=-c.dll", "--ini=-s.k=v"])
+
     def test_run_py_forwards_values_that_start_with_a_dash(self):
-        a = types.SimpleNamespace(n=1, plugin_dll="-x.dll", nvse_dir=None, autoload="", core_dll="-c.dll",
-                                  ini=["-s.k=v"])
-        self.assertEqual(run.provision_argv(a), ["provision", "--n", "1", "--plugin-dll=-x.dll",
-                                                 "--core-dll=-c.dll", "--ini=-s.k=v"])
+        self.check_run_py_forwards_values_that_start_with_a_dash(None)
+
+    def test_twin_run_py_space_separated(self):
+        with self.assertRaises(AssertionError):
+            self.check_run_py_forwards_values_that_start_with_a_dash("run_space_separated")
+
+    def check_empty_plugin_dll_means_no_plugin(self, mut):
+        """--plugin-dll "" means no plugin in instances.py and in run.py, also when out/L1/nvcoop.dll is built."""
+        built = self.file("out/L1/nvcoop.dll", b"default-build")
+        with mock.patch.object(instances, "DEFAULT_PLUGIN_DLL", built), \
+                mock.patch.object(run, "DEFAULT_DLL", built), mutant(mut):
+            for main in (instances.main, run.main):
+                code, _, err = self.cli(main, ["provision", "--n", "1", "--plugin-dll", ""])
+                self.assertEqual(code, 0, err)
+                self.assertFalse((instances.instance_dir(0) / PLUGINS / "nvcoop.dll").exists(),
+                                 f'{main.__module__} --plugin-dll "" installed the default build')
+                self.assertEqual(instances.load_meta(0)["installed"], [])
+
+    def test_empty_plugin_dll_means_no_plugin(self):
+        self.check_empty_plugin_dll_means_no_plugin(None)
+
+    def test_twin_run_py_drops_empty_plugin_dll(self):
+        with self.assertRaises(AssertionError):
+            self.check_empty_plugin_dll_means_no_plugin("run_drops_empty_plugin_dll")
+
+    # ---------------------------------------------------------------- one --ini value for n instances
+    PER_INSTANCE_SPECS = ("bridge.instance=5", "coop.instanceId=5", "Coop.PIPE=x", "coop.role=client")
+
+    def check_per_instance_keys_need_n_1(self, mut):
+        """One --ini value applies to every instance. With --n 2, a per-instance key would give both instances
+        the same instance number, pipe or role."""
+        with mutant(mut):
+            for spec in self.PER_INSTANCE_SPECS:
+                for main in (instances.main, run.main):
+                    code, _, err = self.cli(main, ["provision", "--n", "2", "--ini", spec])
+                    self.assertEqual(code, 2, f"{main.__module__} --n 2 accepted --ini {spec!r}")
+                    self.assertIn(f"--ini {spec.split('=')[0]}", err)
+                    self.assertIn("per-instance", err)
+                    self.assertFalse(self.inst.exists(), "nothing may be written before the input is checked")
+            code, _, err = self.cli(instances.main, ["provision", "--n", "1", "--ini", "coop.role=client",
+                                                     "--ini", "bridge.instance=5"])
+        self.assertEqual(code, 0, f"--n 1 may set a per-instance key: {err}")
+        ini = self.nvcoop_ini()
+        self.assertEqual(ini_values(ini, "coop", "role"), ["client"])
+        self.assertEqual(ini_values(ini, "bridge", "instance"), ["5"])
+
+    def test_per_instance_keys_need_n_1(self):
+        self.check_per_instance_keys_need_n_1(None)
+
+    def test_twin_per_instance_keys_allowed(self):
+        with self.assertRaises(AssertionError):
+            self.check_per_instance_keys_need_n_1("per_instance_keys_allowed")
+
+    # ---------------------------------------------------------------- nvcoop.ini is in the ANSI code page
+    @staticmethod
+    def other_code_page() -> Tuple[str, str]:
+        """A code page that is not Python's locale encoding, and a word that it can encode and the locale
+        cannot (or encodes to other bytes). So the test does not depend on the code page of the host."""
+        loc = codecs.lookup(locale.getpreferredencoding(False)).name
+        return ("cp1253", "αρχείο") if loc == "cp1251" else ("cp1251", "файл")
+
+    def check_ini_in_ansi_code_page(self, mut):
+        """GetPrivateProfileStringA reads nvcoop.ini in the ANSI code page. An entry that the code page cannot
+        encode must fail before the first write, and the writer must use the code page of the check."""
+        enc, word = self.other_code_page()
+
+        def cli(main, argv):
+            try:
+                return self.cli(main, argv)
+            except UnicodeEncodeError as e:  # the bug: the write fails after the dll copy, 0-byte nvcoop.ini
+                self.fail(f"{main.__module__} {argv}: {e!r}, not exit 2 before the first write")
+
+        with mock.patch.object(instances, "ini_encoding", lambda: enc), mutant(mut):
+            for main in (instances.main, run.main):
+                for spec in ("coop.rules=名前.json", "名前.key=1", "coop.名前=1"):
+                    code, _, err = cli(main, ["provision", "--n", "1", "--plugin-dll", str(self.dll), "--ini", spec])
+                    self.assertEqual(code, 2, f"{main.__module__} accepted --ini {spec!r}")
+                    self.assertIn("--ini", err)
+                    self.assertIn(f"ANSI code page ({enc})", err)
+                    self.assertFalse(self.inst.exists(), "nothing may be written before the input is checked")
+                code, _, err = cli(main, ["provision", "--n", "1", "--plugin-dll", str(self.dll), "--autoload", "名前"])
+                self.assertEqual(code, 2, f"{main.__module__} accepted --autoload 名前")
+                self.assertIn("bridge.autoload", err)
+                self.assertFalse(self.inst.exists(), "nothing may be written before the input is checked")
+            with self.assertRaises(ValueError):  # the Python API checks extra_ini too
+                instances.provision(0, plugin_dll=self.dll, extra_ini={"coop": {"rules": "名前.json"}})
+            self.assertFalse(instances.instance_dir(0).exists())
+            code, _, err = cli(instances.main, ["provision", "--n", "1", "--plugin-dll", str(self.dll),
+                                                "--ini", f"coop.rules={word}.json"])
+        self.assertEqual(code, 0, err)
+        raw = (instances.instance_dir(0) / PLUGINS / "nvcoop.ini").read_bytes()
+        self.assertIn(f"rules={word}.json".encode(enc), raw, "the writer must use the encoding of the check")
+
+    def test_ini_in_ansi_code_page(self):
+        self.check_ini_in_ansi_code_page(None)
+
+    def test_twin_no_encoding_check(self):
+        with self.assertRaises(AssertionError):
+            self.check_ini_in_ansi_code_page("no_encoding_check")
+
+    def test_twin_writer_locale_encoding(self):
+        with self.assertRaises(AssertionError):
+            self.check_ini_in_ansi_code_page("writer_locale_encoding")
 
 
 if __name__ == "__main__":

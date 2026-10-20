@@ -5,7 +5,11 @@
                      [--core-dll out/L1split/nvcoop_mod.dll] [--ini SECTION.KEY=VALUE ...]
         passes these options to `instances.py provision` (see its help). --ini is repeatable, e.g.
         --ini coop.enable=1 --ini dev.bots=1 --ini dev.animprobe=1. provision rewrites nvcoop.ini, so hand
-        edits are lost. A --plugin-dll or --core-dll path that does not exist is an error (exit 2).
+        edits are lost. One --ini value applies to every instance: with --n 2 or more, the per-instance keys
+        bridge.instance, coop.instanceId, coop.pipe and coop.role are an error (exit 2).
+        --plugin-dll not given: out/L1/nvcoop.dll if it exists, else no plugin. --plugin-dll "": no plugin
+        (the same as in instances.py). A --plugin-dll or --core-dll path that does not exist is an error
+        (exit 2). --core-dll needs an explicit --plugin-dll (the split loader), else it is an error (exit 2).
     run.py up --n 2 [--wait-pipe 180]       launch instances (host=0, client=1..)
     run.py status
     run.py down
@@ -300,8 +304,9 @@ def cmd_status(a) -> int:
 
 def provision_argv(a) -> List[str]:
     """The `instances.py provision` argv for the options of `run.py provision`. The --x=value form keeps a value
-    that starts with '-' from being read as an option."""
-    argv = ["provision", "--n", str(a.n)] + ([f"--plugin-dll={a.plugin_dll}"] if a.plugin_dll else [])
+    that starts with '-' from being read as an option. --plugin-dll goes on whenever it was given, also as "",
+    so that instances.py applies its default and "" means no plugin in both tools."""
+    argv = ["provision", "--n", str(a.n)] + ([f"--plugin-dll={a.plugin_dll}"] if a.plugin_dll is not None else [])
     argv += ([f"--nvse-dir={a.nvse_dir}"] if a.nvse_dir else []) + ([f"--autoload={a.autoload}"] if a.autoload else [])
     argv += [f"--core-dll={a.core_dll}"] if a.core_dll else []
     argv += [f"--ini={spec}" for spec in a.ini]
@@ -313,12 +318,16 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("provision")
     p.add_argument("--n", type=int, default=2)
-    p.add_argument("--plugin-dll", default=str(DEFAULT_DLL) if DEFAULT_DLL.exists() else None)
+    # No default here: instances.py applies the default, so it can tell "not given" from "given".
+    p.add_argument("--plugin-dll", default=None,
+                   help="plugin dll; \"\" means no plugin (default: out/L1/nvcoop.dll if it exists, else no plugin)")
     p.add_argument("--nvse-dir")
     p.add_argument("--autoload", default="")
-    p.add_argument("--core-dll", default=None, help="split build: the reloadable core dll (nvcoop_mod.dll)")
+    p.add_argument("--core-dll", default=None,
+                   help="split build: the reloadable core dll (nvcoop_mod.dll); needs an explicit --plugin-dll")
     p.add_argument("--ini", action="append", default=[], type=instances.ini_arg, metavar=instances.INI_FORM,
-                   help="extra nvcoop.ini entry, repeatable, e.g. --ini coop.enable=1")
+                   help="extra nvcoop.ini entry, repeatable, e.g. --ini coop.enable=1; with --n 2 or more, "
+                        "the per-instance keys bridge.instance, coop.instanceId, coop.pipe and coop.role are an error")
     p = sub.add_parser("up")
     p.add_argument("--n", type=int, default=2)
     p.add_argument("--wait-pipe", type=float, default=0)

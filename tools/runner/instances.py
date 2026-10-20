@@ -12,9 +12,15 @@ marker files are per-instance, writable, real files. The game dir is only ever R
 
 provision rewrites Data/NVSE/Plugins/nvcoop.ini every time, so hand edits are lost. Put extra entries on the
 command line instead: --ini is repeatable, e.g. --ini coop.enable=1 --ini dev.bots=1 --ini dev.animprobe=1.
---plugin-dll defaults to out/L1/nvcoop.dll when that file exists. A --plugin-dll or --core-dll path that does
-not exist is an error (exit 2). --core-dll installs the split build's reloadable core next to the loader and
-writes [loader] core=<its file name> (docs/tools/T3a-loader.md).
+One --ini value applies to every instance. So with --n 2 or more, the per-instance keys bridge.instance,
+coop.instanceId, coop.pipe and coop.role are an error (exit 2). provision sets them for each instance.
+nvcoop.ini is in the ANSI code page (the plugin reads it with GetPrivateProfileStringA). An --ini entry that
+the ANSI code page cannot encode is an error (exit 2).
+--plugin-dll not given: out/L1/nvcoop.dll if that file exists, else no plugin. --plugin-dll "": no plugin.
+A --plugin-dll or --core-dll path that does not exist is an error (exit 2). --core-dll installs the split
+build's reloadable core next to the loader and writes [loader] core=<its file name> (docs/tools/T3a-loader.md).
+--core-dll needs an explicit --plugin-dll (the split loader), else it is an error (exit 2). The default
+out/L1/nvcoop.dll can be the monolith, which never reads [loader] core.
 
 Environment overrides: FNV_GAME_DIR, FNV_INSTANCES_ROOT.
 """
@@ -23,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import locale
 import os
 import re
 import shutil
@@ -234,7 +241,8 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
               extra_ini: Optional[Dict[str, Dict[str, str]]] = None, core_dll: Optional[Path] = None) -> Dict:
     # Check every input before the first write: a missing dll or a bad ini entry must not leave a half instance.
     sources, plan_ini = plugin_plan(plugin_dll, core_dll, plugin_files)
-    ini_extra = merge_ini(plan_ini, extra_ini)  # an explicit extra_ini entry wins over [loader] core
+    ini_extra = provision_ini(plan_ini, extra_ini)
+    check_ini_entry("bridge", "autoload", autoload)  # autoload goes into nvcoop.ini too
     g = game_dir()
     if not (g / "FalloutNV.exe").exists():
         raise FileNotFoundError(f"game not found at {g}")
@@ -287,25 +295,46 @@ def write_plugin_ini(d: Path, i: int, role: str, autoload: str = "", delay: int 
     ini = pdir / "nvcoop.ini"
     if ini.exists() or ini.is_symlink():
         ini.unlink()  # never write through a hardlink into the game dir
-    ini.write_text(text)
+    ini.write_text(text, encoding=ini_encoding())  # check_ini_entry checks with the same encoding
     return cfg
 
 
 INI_FORM = "SECTION.KEY=VALUE"
 
 
+def ini_encoding() -> str:
+    """The encoding of nvcoop.ini: the ANSI code page, because the plugin reads the file with
+    GetPrivateProfileStringA. write_plugin_ini writes with this encoding and check_ini_entry checks with it."""
+    getencoding = getattr(locale, "getencoding", None)  # Python 3.11+: the ANSI code page, also in UTF-8 mode
+    return getencoding() if getencoding else locale.getpreferredencoding(False)
+
+
+def check_ini_encodable(where: str, what: str, text: str) -> None:
+    """Raise ValueError if ini_encoding() cannot encode text. Without this check, write_plugin_ini fails with
+    UnicodeEncodeError after provision has copied the dlls, and it leaves a 0-byte nvcoop.ini."""
+    enc = ini_encoding()
+    try:
+        str(text).encode(enc)
+    except UnicodeEncodeError:
+        raise ValueError(f"{where}: the {what} {text!r} has characters that the ANSI code page ({enc}) cannot "
+                         "encode, and the plugin reads nvcoop.ini in that code page") from None
+
+
 def check_ini_entry(section: str, key: Optional[str] = None, value: str = "") -> None:
-    """Raise ValueError if the entry cannot be written as one line under one [section] of nvcoop.ini.
-    With key None, check only the section name."""
+    """Raise ValueError if the entry cannot be written as one line under one [section] of nvcoop.ini, in the
+    encoding of write_plugin_ini. With key None, check only the section name."""
     where = f"{section}.{key}" if key is not None else f"[{section}]"
     if not str(section).strip() or any(c in str(section) for c in "[]\r\n\0"):
         raise ValueError(f"{where}: bad section name {section!r} (it is empty or contains [ ] or a line break)")
+    check_ini_encodable(where, "section name", section)
     if key is None:
         return
     if not str(key).strip() or any(c in str(key) for c in "=[]\r\n\0") or str(key).lstrip()[:1] in (";", "#"):
         raise ValueError(f"{where}: bad key {key!r} (it is empty, contains = [ ] or a line break, or starts a comment)")
+    check_ini_encodable(where, "key", key)
     if any(c in str(value) for c in "\r\n\0"):
         raise ValueError(f"{where}: the value {value!r} contains a line break")
+    check_ini_encodable(where, "value", value)
 
 
 def parse_ini_override(spec: str) -> "tuple[str, str, str]":
@@ -357,6 +386,29 @@ def merge_ini(cfg: Dict[str, Dict[str, str]], extra: Optional[Dict[str, Dict[str
     return cfg
 
 
+def provision_ini(plan_ini: Optional[Dict[str, Dict[str, str]]],
+                  extra_ini: Optional[Dict[str, Dict[str, str]]]) -> Dict[str, Dict[str, str]]:
+    """The extra nvcoop.ini entries of provision(): the entries of plugin_plan, then extra_ini over them.
+    So an explicit entry (--ini loader.core=...) wins over the [loader] core that --core-dll writes."""
+    return merge_ini(merge_ini({}, plan_ini), extra_ini)
+
+
+# Keys that provision sets to a different value in each instance (write_plugin_ini). Lower case.
+PER_INSTANCE_INI_KEYS = (("bridge", "instance"), ("coop", "instanceid"), ("coop", "pipe"), ("coop", "role"))
+
+
+def check_per_instance_ini(extra_ini: Optional[Dict[str, Dict[str, str]]], n: int) -> None:
+    """Raise ValueError if extra_ini sets a per-instance key and n > 1. One --ini value applies to every
+    instance, so all n instances would get the same instance number, pipe or role."""
+    if n <= 1:
+        return
+    for s, kv in (extra_ini or {}).items():
+        for k in kv:
+            if (str(s).lower(), str(k).lower()) in PER_INSTANCE_INI_KEYS:
+                raise ValueError(f"--ini {s}.{k}: this is a per-instance key, and one --ini value applies to all "
+                                 f"{n} instances. Remove it (provision sets it for each instance), or use --n 1")
+
+
 def load_meta(i: int, root: Optional[Path] = None) -> Dict:
     return json.loads((instance_dir(i, root) / "instance.json").read_text())
 
@@ -393,6 +445,23 @@ def verify_pins(i: int, root: Optional[Path] = None, extra: Optional[List[str]] 
 DEFAULT_PLUGIN_DLL = Path(__file__).resolve().parents[2] / "out" / "L1" / "nvcoop.dll"
 
 
+def plugin_args(plugin_dll: Optional[str], core_dll: Optional[str]) -> "tuple[Optional[Path], Optional[Path]]":
+    """--plugin-dll and --core-dll of provision -> (plugin dll, core dll). None means: do not install that file.
+
+    --plugin-dll not given (None): DEFAULT_PLUGIN_DLL if it exists, else no plugin. --plugin-dll "": no plugin.
+    --core-dll needs an explicit, non-empty --plugin-dll, else ValueError. The default out/L1/nvcoop.dll can be
+    the monolith, which never reads [loader] core, so the core would never load."""
+    if core_dll and not plugin_dll:
+        raise ValueError("--core-dll needs an explicit --plugin-dll (the split loader), for example "
+                         "--plugin-dll out/L1split/nvcoop.dll --core-dll out/L1split/nvcoop_mod.dll. "
+                         "The default out/L1/nvcoop.dll can be the monolith, which never reads [loader] core")
+    if plugin_dll is None:
+        dll = DEFAULT_PLUGIN_DLL if DEFAULT_PLUGIN_DLL.is_file() else None
+    else:
+        dll = Path(plugin_dll) if plugin_dll else None
+    return dll, (Path(core_dll) if core_dll else None)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -400,13 +469,15 @@ def main(argv=None) -> int:
     p.add_argument("--n", type=int, default=2)
     p.add_argument("--nvse-dir")
     p.add_argument("--plugin-dll", default=None,
-                   help="plugin dll to install; a path that does not exist is an error "
+                   help="plugin dll to install; a path that does not exist is an error; \"\" means no plugin "
                         "(default: out/L1/nvcoop.dll if it exists, else no plugin)")
     p.add_argument("--core-dll", default=None,
                    help="split build only: the reloadable core (nvcoop_mod.dll) to install next to the loader; "
-                        "writes [loader] core=<file name>")
+                        "writes [loader] core=<file name>; needs an explicit --plugin-dll (the split loader)")
     p.add_argument("--ini", action="append", default=[], type=ini_arg, metavar=INI_FORM,
-                   help="extra nvcoop.ini entry, repeatable, e.g. --ini coop.enable=1 --ini dev.bots=1")
+                   help="extra nvcoop.ini entry, repeatable, e.g. --ini coop.enable=1 --ini dev.bots=1; "
+                        "with --n 2 or more, the per-instance keys bridge.instance, coop.instanceId, coop.pipe "
+                        "and coop.role are an error")
     p.add_argument("--autoload", default="")
     p.add_argument("--no-appid", action="store_true")
     p.add_argument("--modes", default=",".join(LINK_MODES))
@@ -415,14 +486,13 @@ def main(argv=None) -> int:
         q.add_argument("--n", type=int, default=2)
     a = ap.parse_args(argv)
     if a.cmd == "provision":
-        if a.plugin_dll is None:  # not given: the default build output, only if it was built
-            dll = DEFAULT_PLUGIN_DLL if DEFAULT_PLUGIN_DLL.is_file() else None
-        else:  # given: it must exist ("" means no plugin)
-            dll = Path(a.plugin_dll) if a.plugin_dll else None
-        core = Path(a.core_dll) if a.core_dll else None
         try:  # fail before the first write
-            plugin_plan(dll, core)
+            dll, core = plugin_args(a.plugin_dll, a.core_dll)
+            _, plan_ini = plugin_plan(dll, core)
             extra_ini = ini_overrides(a.ini)
+            check_per_instance_ini(extra_ini, a.n)
+            provision_ini(plan_ini, extra_ini)  # checks the [loader] core entry too
+            check_ini_entry("bridge", "autoload", a.autoload)
         except (OSError, ValueError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 2
