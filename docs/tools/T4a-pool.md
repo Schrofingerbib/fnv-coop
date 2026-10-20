@@ -65,7 +65,7 @@ a wrong guess costs nothing but the saving is unknown. `opt-in` rows are off unl
 | File | Section | Key | Value | Why | Status |
 |---|---|---|---|---|---|
 | Fallout.ini | General | `bUseMyGamesDirectory` | `0` | read INIs and saves from the instance dir, never from Documents\My Games | not in owner INI (added) |
-| Fallout.ini | General | `bAlwaysActive` | `1` | keep ticking while minimized (the pool keeps windows minimized) | present in owner INI |
+| Fallout.ini | General | `bAlwaysActive` | `1` | keep ticking while minimized (the pool keeps windows minimized). Not enough on its own: a deactivation in gameplay opens the pause menu, so nvcoop.dll also needs its focus guard (`[bridge] focusGuard`, on by default with `minimized=1`) | present in owner INI |
 | FalloutPrefs.ini | Display | `bFull Screen` | `0` | windowed so it can stay minimized without a mode switch | present in owner INI |
 | FalloutPrefs.ini | Display | `iSize W` | `640` | smallest practical resolution; fewer pixels to shade and a smaller back buffer | present in owner INI |
 | FalloutPrefs.ini | Display | `iSize H` | `480` | see iSize W | present in owner INI |
