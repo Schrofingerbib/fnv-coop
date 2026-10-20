@@ -284,7 +284,8 @@ def check_lowcost_guard_mygames(m):
 
 
 def check_owner_inis_untouched(m):
-    mg = Path.home() / "Documents" / "My Games" / "FalloutNV"
+    import mygames
+    mg = mygames.my_games_dir()
     files = [mg / "Fallout.ini", mg / "FalloutPrefs.ini"]
     h = lambda: [hashlib.sha256(f.read_bytes()).hexdigest() if f.exists() else "" for f in files]  # noqa: E731
     before = h()

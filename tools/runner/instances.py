@@ -23,6 +23,9 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import mygames  # noqa: E402
+
 DEFAULT_GAME = r"C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas"
 DEFAULT_ROOT = str(Path(__file__).resolve().parents[3] / "fnv-instances")
 STEAM_APPID = "22380"
@@ -126,7 +129,7 @@ PREFS_EDITS = [
 
 def _base_ini(name: str) -> str:
     """Start from the user's My Games ini (has the DLC archive list etc.), else the game default."""
-    mg = Path.home() / "Documents" / "My Games" / "FalloutNV" / name
+    mg = mygames.my_games_dir() / name
     if mg.exists():
         return mg.read_text(encoding="latin-1")
     if name.lower() == "fallout.ini":
