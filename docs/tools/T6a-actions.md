@@ -35,6 +35,7 @@ Failure reasons: `timeout`, `not_found`, `dead`, `postcondition`, `unsupported`,
 | talk(npc) | activate | `ui.dialogopen` true |
 | choose_topic(info) | `bot.say` | bridge reply `said` |
 | end_dialogue | `ui.closedialog` | `ui.dialogopen` false |
+
 Queries: pos, cell, alive, health, inventory_count(item, holder), quest_stage, dialogue_open, door_state, locked.
 
 ## Unverified grammar (fix in tools/bots/primitives.py only)
@@ -67,6 +68,7 @@ Controls 0..9, 12, 14, 16 are proven from call sites; 10, 11 and 13..27 follow t
 | dev.refsOf {base,cell?} | enabled refs of a base form in the cell; `Bot.drop` uses a before/after difference as the fallback when `bot.drops` is unavailable |
 | dev.terminal {ref,entry} / dev.terminalState {ref} | click entry N of the open terminal menu (0x757F70 on the ListBox tile); state = what this bot picked, the engine has no used flag; needs the terminal menu open (Bot.use_terminal activates it first) |
 | dev.countRefs {base,cell?} | walks TESObjectCELL::objectList (cell+0xAC), skips disabled/deleted |
+
 Python: `Bot.goto` walks with the driver (turn-rate limited steering, sidestep then jump when stuck, `walk_path`), falls back to stepped SetPos; `look, stop, jump,
 sneak_toggle, activate_crosshair, menu_info, dialog_choices, inventory, press_box, consent, fast_travel, count_refs, vats_target(expect_hit)`.
 In-game proofs (lead runs, one game at a time): `tools/bots/proof_input.py` (movement, strafe axes, turn, jump edge, sneak toggle, fire, activate) and
@@ -83,6 +85,7 @@ So the low 24 bits are compared only when the plugin is known to match. A top by
 **Pin verifier: not in the public repo.** The pin verifier `tools/bots/re/verify_pins.py` is not in this repository, so its commands cannot run from a clone.
 From this doc, it checked the pinned prologue bytes of every engine function called (the pins in `plugin/bots/bots_addrs.h`, the fast-travel pins included) against the exe.
 Its `--table` output is the source of the ~170 call sites of `GetControlState` given above. The C++ test with `BOTS_EXE` also checks the pins (C++ tests: `plugin\bots\run_tests.cmd`).
+
 ### Round 3 additions (static RE, nothing run in game)
 - **Inventory totals** (confirmed): `bot.inventory` answers with 0x4C8F30 (base container + delta, equipped included) for explicit `items`, and for every ExtraContainerChanges entry otherwise.
 - **Speech checks:** `bot.say` allows INFOs for which 0x7627E0/0x762820 is true (reply `speechCheck:true`; `Bot.choose_topic` returns `data.speech_check`). HandleClick only plays a UI sound for them (0x4D5C60 with 0x1F or 0xC), then runs the same select/click/after/speak tail we replicate, so the engine rolls the check in its own speak path 0x762FF0 and the host result syncs through the normal dialogue layer. Flag-0x80 INFOs (0x7627C0) stay refused: they take another branch (item select 0x83E850, speak flag 1).
