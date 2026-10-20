@@ -4,6 +4,7 @@
     with lease("scn-goodsprings", n=2, ttl_s=900, timeout_s=600) as L:
         L.instances            # [0, 1]  lowest id first (host first)
         nv = L.bridge(0)       # NvBridge, already holding the bridge lock.* lease for L.owner
+        L.boot(0)              # id of that game process; never repeats, also not after a pool restart
         L.dirty(0, "loaded a foreign save")   # this instance is recycled on release
         L.renew()              # extend the ttl during a long test
     # leaving the block releases the lease (dirty if the block raised)
@@ -83,6 +84,7 @@ class Lease:
         self.instances: List[int] = list(data["instances"])
         self.ttl_s: float = data["ttl_s"]
         self._gens = {int(k): v for k, v in data["gens"].items()}
+        self._boots = {int(k): str(v or "") for k, v in (data.get("boots") or {}).items()}
         self._bridges: Dict[int, Any] = {}
         self.released = False
         self._loaded: Dict[int, str] = {}
@@ -113,6 +115,12 @@ class Lease:
     @property
     def generation(self) -> int:
         return self._gens[self.instances[0]]
+
+    def boot(self, i: Optional[int] = None) -> str:
+        """Id of the game process behind instance i: its pid plus a token the pool draws at each start. A new game
+        process always gets a new id, also after a pool restart (the generation starts again at 1 then). Key state
+        that must not outlive the game process by this id. "" when the pool does not report one."""
+        return self._boots.get(self.instances[0] if i is None else i, "")
 
     def mark_loaded(self, save: str, i: Optional[int] = None) -> None:
         self._loaded[self.instances[0] if i is None else i] = save

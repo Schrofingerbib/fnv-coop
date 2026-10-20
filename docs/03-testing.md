@@ -33,7 +33,7 @@ Known facts and tricks:
   - NVSE `-noaudio`-like flags do not exist. [U]
   - Disable intro movies: `SIntroSequence=` empty and `uMainMenuDelayBeforeAllowSkip=0`. [K]
   - Windowed borderless plus minimised windows may pause rendering/focus-dependent code. Set `bBackground Keyboard=1` and `bBackground Mouse=1` so the game keeps running without focus. [K]
-  - Unfocused FNV still ticks if `bAlwaysActive=1` in Fallout.ini. [K]
+  - Unfocused FNV still ticks if `bAlwaysActive=1` in Fallout.ini, but only until the window is deactivated during gameplay: the window procedure (0x86A0A0) then opens the pause menu (StartMenu 1013), and the world stops while frames and console commands still run. Measured 2026-10-20 on a minimized test copy. `plugin/splitscreen/focus_guard` keeps the deactivation from the engine; check `focus.status` and game time, not the frame counter. [V]
 - **Headless-ish.** [U] There is no true headless mode. D3D9 device creation is required, since the engine has an Ni renderer baked in.
   - Options: a tiny window, a hooked `Present` that skips work, a "null" D3D9 wrapper (e.g. a stub d3d9.dll like the one used for CI in other old engines), or running on WARP software rasterisation inside a VM. Spike this.
   - The plugin can also reduce load by suppressing render via `SetGlobalTimeMultiplier` and similar. Do not rely on this.
@@ -174,7 +174,7 @@ Spikes (each 0.5-1 day, ordered):
 1. **Two instances launch.** Confirm what blocks the 2nd exe (mutex? window class? `.lock`?), via Process Monitor/API Monitor and by reading NV:MP's launcher. Try the Sandboxie-Plus path; otherwise hook `CreateMutex`.
 2. **Per-instance INI/Saves.** Confirm `bUseMyGamesDirectory=0` or junction approach with xNVSE and hardlinked Data.
 3. **Auto-load save + pipe**: plugin test harness: main-thread command queue, `console`, `load`, `dump_state` of one quest, round trip from Python.
-4. **Background running**: unfocused/minimised windows keep ticking; frame cap and CPU use; whether cells unloading breaks multi-quest stage tests.
+4. **Background running**: unfocused/minimised windows keep ticking only with the focus guard (see above); frame cap and CPU use; whether cells unloading breaks multi-quest stage tests.
 5. **ESM manifest**: xEdit script and/or Mutagen/own parser export one quest fully (compare to GECK). Decide the tool.
 6. **Net loopback**: host+client sync one `SetStage`, diff, intentionally broken twin fails.
 7. **Read NV:MP code** (`app_client_headless`, launcher, injection), lifting design and licence-compatible pieces. Brief says GitHub; nothing was fetched here.

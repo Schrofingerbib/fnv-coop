@@ -21,6 +21,7 @@ REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import instances  # noqa: E402
 import launchprobe  # noqa: E402
+import mygames  # noqa: E402
 import nvbridge  # noqa: E402
 import run  # noqa: E402
 import winproc  # noqa: E402
@@ -65,7 +66,7 @@ def main():
             instances.provision(i, role="host" if i == 0 else "client", plugin_dll=Path(a.dll),
                                 autoload="autosave", autoload_delay_frames=600, extra_ini={"coop": {"enable": "0"}})
             sav = instances.instance_dir(i) / "Saves"
-            src = Path.home() / "Documents" / "My Games" / "FalloutNV" / "Saves" / "autosave.fos"
+            src = mygames.saves_dir() / "autosave.fos"
             shutil.copy2(src, sav / "autosave.fos")
         class A:  # args for run.cmd_up
             n, wait_pipe, stagger, wait_pipe_each, ttl, slot_wait, allow_foreign = a.n, 0, 2.0, 300, 1800, 60, False

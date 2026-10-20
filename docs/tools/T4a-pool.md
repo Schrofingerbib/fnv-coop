@@ -30,6 +30,10 @@ python -I tools/pool/pool.py down
 ```
 
 Instances must be provisioned first (`python -I tools/runner/run.py provision --n 2`). `up` does not provision.
+Provisioning rewrites each instance's nvcoop.ini. Give extra entries with the repeatable `--ini SECTION.KEY=VALUE`
+(for example `--ini coop.enable=1 --ini dev.bots=1`), not with a hand edit. One `--ini` value applies to every
+instance. So with `--n 2` or more, the per-instance keys `bridge.instance`, `coop.instanceId`, `coop.pipe` and
+`coop.role` are an error (exit 2). Provisioning sets them for each instance.
 `--fake` runs an in-memory fake game (no launch, no pipes).
 The daemon listens on 127.0.0.1 only; port and a random token are in `runs/pool/pool.json` (`POOL_DIR` overrides
 the folder). Log: `runs/pool/daemon.log`.
@@ -41,12 +45,19 @@ sys.path.insert(0, "tools/pool"); from client import lease
 with lease("scn-goodsprings", n=2, ttl_s=900, timeout_s=600) as L:
     L.instances      # [0, 1], host first
     nv = L.bridge(0) # NvBridge that already holds the bridge lock.* lease for L.owner
+    L.boot(0)        # id of that game process: "<pid>-<random token>"
     L.dirty(0, "why")  # instance is recycled on release
     L.renew()
 ```
 
 - Leaving the block releases the lease; an exception inside marks every instance dirty.
 - If an instance was restarted under you, `L.bridge()` raises `PoolError` (generation changed).
+- `L.boot(i)` (`boots` in the lease JSON, `boot` per instance in `status`) names the game process. The pool draws a new
+  one at every successful start, so it never repeats, also not after `down` and `up`. The generation (`gen`) starts again
+  at 1 on every pool start, so do not key state that must die with the game by `gen`. T4b keys its scenario state by
+  `boot` (docs/tools/T4b-scenarios.md, "State keys"). A health-check restart at lease time updates `boots` as it updates
+  `gens`. Tests: `check_boot_id_per_process` (twin `gen_boot`: the boot id is the generation alone) and
+  `check_boot_refreshed_at_lease` (twin `stale_boot`: the lease keeps the boot id of the replaced process).
 - `PoolBusy` means no free warm instance within `timeout_s`. `PoolNotRunning` means no daemon.
 - The pool does not reset game state between leases. Resetting in place is the scenario runner's job (T4b); it
   calls `L.dirty()` when it could not reset cleanly. `--base-save` loads a save once into each freshly booted instance.
@@ -70,7 +81,7 @@ a wrong guess costs nothing but the saving is unknown. `opt-in` rows are off unl
 | File | Section | Key | Value | Why | Status |
 |---|---|---|---|---|---|
 | Fallout.ini | General | `bUseMyGamesDirectory` | `0` | read INIs and saves from the instance dir, never from Documents\My Games | not in owner INI (added) |
-| Fallout.ini | General | `bAlwaysActive` | `1` | keep ticking while minimized (the pool keeps windows minimized) | present in owner INI |
+| Fallout.ini | General | `bAlwaysActive` | `1` | keep ticking while minimized (the pool keeps windows minimized). Not enough on its own: a deactivation in gameplay opens the pause menu, so nvcoop.dll also needs its focus guard (`[bridge] focusGuard`, on by default with `minimized=1`) | present in owner INI |
 | FalloutPrefs.ini | Display | `bFull Screen` | `0` | windowed so it can stay minimized without a mode switch | present in owner INI |
 | FalloutPrefs.ini | Display | `iSize W` | `640` | smallest practical resolution; fewer pixels to shade and a smaller back buffer | present in owner INI |
 | FalloutPrefs.ini | Display | `iSize H` | `480` | see iSize W | present in owner INI |

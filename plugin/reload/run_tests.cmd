@@ -1,7 +1,8 @@
 @echo off
 rem Build (x86, Ninja) and run the reload state tests + mutation twins. Prints ALL OK on success.
 rem   1. registry unit tests (real must pass; NVRELOAD_MUTANT 1..8 must each fail)
-rem   2. host-process test: 100 unload/reload cycles of a real test core (real must pass; TESTCORE_MUTANT 1..6 must each fail)
+rem   2. host-process test: 100 unload/reload cycles of a real test core (real must pass; TESTCORE_MUTANT 1..9 must each fail)
+rem   3. the same host test against loader twins noconfig / configonce (config not copied to the cache): each must fail
 rem Usage: plugin\reload\run_tests.cmd [clean]
 setlocal EnableDelayedExpansion
 set "CMAKE_TOOLCHAIN_FILE="
@@ -42,6 +43,12 @@ for %%N in (1 2 3 4 5 6 7 8 9) do (
   "%OUT%\nvreload_host_test.exe" "%OUT%\nvtestcore_m%%N.dll" "%SCR%\host_m%%N" >nul 2>&1
   if not errorlevel 1 (echo HOST MUTANT %%N SURVIVED & exit /b 1)
   echo host mutant %%N caught
+)
+for %%M in (noconfig configonce) do (
+  "%OUT%\nvreload_host_test_%%M.exe" "%OUT%\nvtestcore_m0.dll" "%SCR%\host_%%M" > "%SCR%\host_%%M.txt" 2>&1
+  if not errorlevel 1 (echo HOST LOADER MUTANT %%M SURVIVED & exit /b 1)
+  findstr /C:"read the ini" /C:"read nvcoop.ini" "%SCR%\host_%%M.txt" >nul || (echo HOST LOADER MUTANT %%M failed for another reason & exit /b 1)
+  echo host loader mutant %%M caught
 )
 echo ALL OK
 endlocal

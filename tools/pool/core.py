@@ -11,6 +11,7 @@ Rules (docs/TOOLS-BRIEF.md T4a):
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -34,6 +35,10 @@ class Inst:
         self.state = "down"          # down | starting | warm | leased
         self.tests = 0               # leases completed since the last (re)start
         self.gen = 0                 # +1 on every (re)start; a lessee compares it to detect a restart
+        # Id of the running game process: its pid plus a random token drawn at each successful start. Unlike gen (which
+        # starts again at 1 on every pool start) it never repeats, so state a lessee keys by it never matches an earlier
+        # game process. "" while no game process runs.
+        self.boot = ""
         self.base_ws_mb = 0
         self.lease: Optional[str] = None
         self.fails = 0               # consecutive failed starts
@@ -42,7 +47,7 @@ class Inst:
 
     def view(self) -> Dict:
         return {"id": self.id, "pid": self.pid, "state": self.state, "tests": self.tests, "gen": self.gen,
-                "base_ws_mb": self.base_ws_mb, "lease": self.lease, "fails": self.fails,
+                "boot": self.boot, "base_ws_mb": self.base_ws_mb, "lease": self.lease, "fails": self.fails,
                 "last_error": self.last_error, "recycled_for": self.recycled_for}
 
 
@@ -126,7 +131,7 @@ class Pool:
             if inst.pid:
                 self.b.kill(inst.pid)
             with self.cv:
-                inst.pid, inst.state = 0, "down"
+                inst.pid, inst.state, inst.boot = 0, "down", ""
                 inst.fails += 1
                 inst.last_error = f"{type(e).__name__}: {e}"
                 self._save()
@@ -135,16 +140,23 @@ class Pool:
         with self.cv:
             inst.base_ws_mb, inst.tests, inst.fails, inst.last_error = ws, 0, 0, ""
             inst.gen += 1
+            inst.boot = self._boot_id(inst, pid)
             inst.state = "leased" if inst.lease else "warm"
             self._save()
             self.cv.notify_all()
         return True
 
+    def _boot_id(self, inst: Inst, pid: int) -> str:
+        """A new id for a new game process. It must differ from every earlier one, also across pool restarts."""
+        if self.mutant == "gen_boot":    # test-only: the generation alone, which repeats after a pool restart
+            return str(inst.gen)
+        return f"{pid}-{secrets.token_hex(6)}"
+
     def _kill_inst(self, inst: Inst) -> None:
         if inst.pid:
             self.b.kill(inst.pid)
         with self.cv:
-            inst.pid = 0
+            inst.pid, inst.boot = 0, ""
             self._save()
 
     def _recycle(self, inst: Inst, reason: str) -> None:
@@ -197,6 +209,7 @@ class Pool:
                         i.state, i.lease = "leased", lid
                     self.leases[lid] = {"id": lid, "owner": owner, "instances": [i.id for i in picked],
                                         "gens": {str(i.id): i.gen for i in picked},
+                                        "boots": {str(i.id): i.boot for i in picked},
                                         "ttl_s": ttl_s, "expires": self.clock() + ttl_s, "dirty": {}}
                     self.stats["leases"] += 1
                     break
@@ -217,6 +230,9 @@ class Pool:
         with self.cv:
             out["gens"] = {str(i.id): i.gen for i in picked}
             self.leases[lid]["gens"] = dict(out["gens"])
+            if self.mutant != "stale_boot":   # test-only mutant: keep the boot id of the process the health check replaced
+                out["boots"] = {str(i.id): i.boot for i in picked}
+                self.leases[lid]["boots"] = dict(out["boots"])
         return out
 
     def renew(self, lid: str, ttl_s: Optional[float] = None) -> bool:

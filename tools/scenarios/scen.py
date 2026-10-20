@@ -20,6 +20,7 @@ import scenlib  # noqa: E402
 import runner  # noqa: E402
 
 REPO = HERE.parents[1]
+STATE = REPO / "out" / "scenarios" / "state.json"   # runner state, keyed by game process
 
 
 def _paths(names):
@@ -66,7 +67,9 @@ def cmd_plan(a):
     return 0
 
 
-def _with_lease(a, fn):
+def _with_lease(a, fn, lease_fn=None, state_path=STATE, **kw):
+    """Lease the instances, then fn(runner, scenarios). State is keyed by game process (runner.for_lease), so a new game
+    never inherits what an earlier game had loaded. lease_fn and kw (passed to runner.Runner) are for the tests."""
     sys.path.insert(0, str(REPO / "tools" / "pool"))
     try:
         from client import lease, PoolError
@@ -76,18 +79,14 @@ def _with_lease(a, fn):
     scs = [scenlib.load_scenario(p) for p in _paths(a.names)]
     n = max(scenlib.players_of(s) for s in scs)
     try:
-        with lease("scenarios", n=n, ttl_s=1800) as L:
-            gens = getattr(L, "_gens", {})
-            keys = [runner.StateStore.key(i, gens.get(i, 0)) for i in L.instances]
-            store = runner.StateStore(REPO / "out" / "scenarios" / "state.json")
-            rn = runner.Runner([L.bridge(i) for i in L.instances], store, keys)
-            return fn(rn, scs)
+        with (lease_fn or lease)("scenarios", n=n, ttl_s=1800) as L:
+            return fn(runner.for_lease(L, state_path, **kw), scs)
     except PoolError as e:
         print("pool: %s" % e)
         return 2
 
 
-def cmd_run(a):
+def cmd_run(a, **kw):
     def go(rn, scs):
         results = [rn.run(s, a.force_reload) for s in scs if scenlib.players_of(s) <= len(rn.nvs)]
         print(runner.summarize(results))
@@ -95,15 +94,15 @@ def cmd_run(a):
             Path(a.json).parent.mkdir(parents=True, exist_ok=True)
             Path(a.json).write_text(json.dumps(results, indent=1), encoding="utf-8")
         return 0 if all(r["status"] in ("pass", "partial") for r in results) else 1
-    return _with_lease(a, go)
+    return _with_lease(a, go, **kw)
 
 
-def cmd_jump(a):
+def cmd_jump(a, **kw):
     def go(rn, scs):
         j = rn.jump(scs[0], a.force_reload)
         print(json.dumps({k: j[k] for k in ("reload", "reasons", "seconds")}, indent=1))
         return 0
-    return _with_lease(a, go)
+    return _with_lease(a, go, **kw)
 
 
 def main(argv=None):

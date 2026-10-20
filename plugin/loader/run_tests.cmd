@@ -18,7 +18,7 @@ cmake -S "%HERE%." -B "%BLD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_CO
 cmake --build "%BLD%" || (echo BUILD FAILED & exit /b 1)
 set "OUT=%REPO%\out\T3a"
 "%OUT%\nvloader_test.exe" "%OUT%" || (echo TESTS FAILED & exit /b 1)
-for %%M in (nocopy nopurge noveto norollback) do call :mutant %%M || exit /b 1
+for %%M in (nocopy nopurge noveto norollback noconfig configonce noprune noattrs novolatile coredirconfig retryall noretry) do call :mutant %%M || exit /b 1
 echo ALL OK
 endlocal
 exit /b 0

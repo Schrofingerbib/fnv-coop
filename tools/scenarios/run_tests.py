@@ -4,19 +4,31 @@
 Part 1: unit tests (validator, translation, comparison, jump planning, runner against tools/scenarios/fakegame.py).
 Part 2: twin. The same unit tests are run again under each SCEN_MUTANT value; every mutant must make at least one test fail.
 """
+import argparse
+import contextlib
 import copy
+import io
 import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
+import types
 import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parents[1] / "tools" / "pool"))
 import scenlib  # noqa: E402
 import runner  # noqa: E402
 import fakegame  # noqa: E402
+import proof  # noqa: E402
+import scen  # noqa: E402
+import backend as pool_backend  # noqa: E402  (tools/pool: the pool policy on its in-memory fake backend; no game)
+import core as pool_core  # noqa: E402
+import client as pool_client  # noqa: E402
 
 SCN = scenlib.SCEN_DIR
 ORDER = scenlib.load_order()
@@ -30,18 +42,62 @@ def hexof(sc, alias):
     return scenlib.Resolver(sc, ORDER).hex("$" + alias)
 
 
-def run_pair(names, caps=None, **flags):
-    """Run scenarios in order on one fake 2-player world. Returns (world, results, nvs)."""
-    w, clock, nvs = fakegame.make(2, **flags)
-    sc0 = load(names[0])
+def prime(w):
+    """Give a fake world the refs and quests the shipped scenarios use."""
     w.bases = {hexof(load("loot_race"), "teddyRef"): hexof(load("loot_race"), "teddy")}
     nov = hexof(load("ownership_handoff"), "novac")
     w.flags.setdefault("novac", nov)
     w.flags.setdefault("vcg02", hexof(load("quest_stage_sync"), "vcg02"))
     w.flags.setdefault("vmq05", hexof(load("pnr_vote"), "vmq05"))
+
+
+def run_pair(names, caps=None, **flags):
+    """Run scenarios in order on one fake 2-player world. Returns (world, results, nvs)."""
+    w, clock, nvs = fakegame.make(2, **flags)
+    prime(w)
     r = runner.Runner(nvs, runner.StateStore(), capabilities=caps, sleep=clock.sleep, now=clock.now, log=lambda *a: None, order=ORDER)
     results = [r.run(load(n)) for n in names]
     return w, results, r
+
+
+class FakePoolLease(pool_client.Lease):
+    """The real client.Lease, built from a lease of a real core.Pool on the fake backend. bridge() gives fakegame bridges."""
+
+    def __init__(self, data, nvs):
+        super().__init__(data)
+        self.nvs = nvs
+
+    def bridge(self, i=None):
+        i = self.instances[0] if i is None else i
+        return self.nvs[self.instances.index(i)]
+
+
+class PoolRun:
+    """One pool start on the fake machine (tools/pool core + FakeBackend). Its games start with nothing loaded, as a real
+    fresh game does. lease() has the signature of client.lease, so proof.py and scen.py can use it."""
+
+    def __init__(self, size=2):
+        self.pool = pool_core.Pool(pool_backend.FakeBackend(), pool_backend.FakeSlots(), size=size, sync=True)
+        self.pool.up()
+        self.world, self.clock, self.nvs = fakegame.make(size)
+        prime(self.world)
+
+    @contextlib.contextmanager
+    def lease(self, owner, n=1, ttl_s=900, timeout_s=600):
+        d = self.pool.lease(owner, n, ttl_s, timeout_s)
+        try:
+            yield FakePoolLease(d, self.nvs[:n])
+        finally:
+            self.pool.release(d["id"])
+
+    def kw(self):
+        return dict(sleep=self.clock.sleep, now=self.clock.now, log=lambda *a: None, order=ORDER)
+
+    def down(self):
+        self.pool.down()
+
+
+NOTHING_LOADED = "no save loaded on this instance yet"
 
 
 ALL_CAPS = set(scenlib.CAPABILITIES)
@@ -398,6 +454,247 @@ class InstantJump(unittest.TestCase):
             self.assertIsNone(runner.StateStore(p).get("0@2"))      # new generation = nothing loaded
 
 
+class GameProcessKeys(unittest.TestCase):
+    """The state store is keyed by game process. A new game process must reload the save, also after a pool restart where
+    the old instance@generation key repeats. The same live game keeps its key, so a later lease still jumps in place."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "state.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_new_game_process_with_the_same_old_key_reloads(self):
+        a = PoolRun()
+        with a.lease("t", n=2) as L:
+            first = runner.for_lease(L, self.state, **a.kw()).run(load("quest_stage_sync"))
+            old_gens = dict(L._gens)
+        self.assertTrue(first["jump"]["reload"])
+        with a.lease("t", n=2) as L:          # same live games, next lease (a second CLI run): in place, in seconds
+            same = runner.for_lease(L, self.state, **a.kw()).run(load("door_terminal_container_matrix"))
+        self.assertFalse(same["jump"]["reload"], same["jump"])
+        self.assertEqual(len(a.world.loads), 2)
+        a.down()
+        b = PoolRun()                           # pool restart: new games at the main menu, generation 1 again
+        with b.lease("t", n=2) as L:
+            self.assertEqual(L._gens, old_gens)  # so the old key instance@generation is the same as before
+            # unrelated to what the last scenario dirtied: with the old key this jump went in place on an empty game
+            r = runner.for_lease(L, self.state, **b.kw()).run(load("quest_stage_sync"))
+        b.down()
+        self.assertTrue(r["jump"]["reload"], r["jump"])
+        self.assertIn(NOTHING_LOADED, r["jump"]["reasons"])
+        self.assertEqual(sorted(b.world.loads), [(0, "autosave"), (1, "autosave")])
+        self.assertEqual(r["status"], "pass")
+
+    def test_lease_without_a_process_id_reloads_first(self):
+        # an older pool reports no process id; the store holds what the old keying wrote for an earlier game
+        store = runner.StateStore(self.state)
+        for k in ("0@1", "1@1"):
+            store.put(k, {"loaded": True, "save": "autosave", "dirty": [], "failed": False, "quest_hex": [],
+                          "scenario": "quest_stage_sync"})
+        w, clock, nvs = fakegame.make(2)
+        L = types.SimpleNamespace(instances=[0, 1], _gens={0: 1, 1: 1}, bridge=lambda i: nvs[i])
+        keys = runner.StateStore.lease_keys(L)
+        self.assertNotEqual(keys, runner.StateStore.lease_keys(L))
+        rn = runner.for_lease(L, self.state, sleep=clock.sleep, now=clock.now, log=lambda *a: None, order=ORDER)
+        j = rn.jump(load("door_terminal_container_matrix"))
+        self.assertTrue(j["reload"], j)
+        self.assertIn(NOTHING_LOADED, j["reasons"])
+        self.assertFalse(rn.jump(load("quest_stage_sync"))["reload"])   # later jumps of the same run go in place
+
+    def test_runner_without_keys_never_borrows_old_state(self):
+        w1, c1, nvs1 = fakegame.make(2)
+        runner.Runner(nvs1, runner.StateStore(self.state), sleep=c1.sleep, now=c1.now, log=lambda *a: None,
+                      order=ORDER).run(load("quest_stage_sync"))
+        w2, c2, nvs2 = fakegame.make(2)       # another game, same store file, no keys given
+        j = runner.Runner(nvs2, runner.StateStore(self.state), sleep=c2.sleep, now=c2.now, log=lambda *a: None,
+                          order=ORDER).jump(load("door_terminal_container_matrix"))
+        self.assertTrue(j["reload"], j)
+        self.assertEqual(len(w2.loads), 2)
+
+    def test_proof_jump_keys_by_game_process(self):
+        a = PoolRun()
+        rows = proof.mode_jump(a.lease, self.state, **a.kw())
+        self.assertTrue(rows[0]["reload"])
+        rows = proof.mode_jump(a.lease, self.state, **a.kw())      # same live game: the first jump stays in place
+        self.assertFalse(rows[0]["reload"], rows[0])
+        a.down()
+        b = PoolRun()
+        rows = proof.mode_jump(b.lease, self.state, **b.kw())      # new game process: the first jump must reload
+        b.down()
+        self.assertTrue(rows[0]["reload"], rows[0])
+        self.assertIn(NOTHING_LOADED, rows[0]["reasons"])
+        self.assertIn((0, "autosave"), b.world.loads)
+
+    def test_proof_suite_keys_by_game_process(self):
+        quiet = dict(show=lambda *a: None)
+        a = PoolRun()
+        res = proof.mode_suite(a.lease, self.state, **quiet, **a.kw())
+        self.assertIn(NOTHING_LOADED, res[0]["jump"]["reasons"])
+        res = proof.mode_suite(a.lease, self.state, **quiet, **a.kw())
+        self.assertNotIn(NOTHING_LOADED, res[0]["jump"]["reasons"])   # same live games: the state is found
+        a.down()
+        b = PoolRun()
+        res = proof.mode_suite(b.lease, self.state, **quiet, **b.kw())
+        b.down()
+        self.assertTrue(res[0]["jump"]["reload"])
+        self.assertIn(NOTHING_LOADED, res[0]["jump"]["reasons"])
+
+    def test_scen_cli_keys_by_game_process(self):
+        def jump(run, name):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = scen.cmd_jump(argparse.Namespace(names=[name], force_reload=False, json=None),
+                                   lease_fn=run.lease, state_path=self.state, **run.kw())
+            self.assertEqual(rc, 0, buf.getvalue())
+            return json.loads(buf.getvalue())
+        a = PoolRun()
+        self.assertTrue(jump(a, "quest_stage_sync")["reload"])
+        self.assertFalse(jump(a, "door_terminal_container_matrix")["reload"])
+        a.down()
+        b = PoolRun()
+        j = jump(b, "quest_stage_sync")
+        b.down()
+        self.assertTrue(j["reload"], j)
+        self.assertIn(NOTHING_LOADED, j["reasons"])
+        self.assertEqual(sorted(b.world.loads), [(0, "autosave"), (1, "autosave")])
+
+
+def clean_state(scenario="quest_stage_sync", dirty=()):
+    return {"loaded": True, "save": "autosave", "dirty": sorted(dirty), "failed": False, "quest_hex": [],
+            "scenario": scenario}
+
+
+def hammer(path, prefix, n, ready, go):
+    """Worker of SharedStateFile.test_two_processes_hammering_put_keep_all_keys (run_tests.py --hammer ...): make one
+    store, report ready, wait for the go file, then put n different keys one by one."""
+    store = runner.StateStore(path)
+    Path(ready).write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 60
+    while not Path(go).exists():
+        if time.monotonic() > deadline:
+            return 3
+        time.sleep(0.002)
+    for i in range(n):
+        store.put("%s%03d@hammer" % (prefix, i), {"by": prefix, "i": i})
+    return 0
+
+
+class SharedStateFile(unittest.TestCase):
+    """Two scen.py (or two proof.py) processes can share one state file, with leases on different instances at the same
+    time. A put must not lose a key that another store wrote, a plan must see what another store wrote, and a put never
+    leaves a partial or invalid file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.state = self.dir / "state.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def on_disk(self):
+        return json.loads(self.state.read_text(encoding="utf-8"))
+
+    def test_two_stores_on_one_file_keep_each_others_keys(self):
+        old = clean_state()
+        runner.StateStore(self.state).put("0@gameA", old)        # an earlier run left game A clean
+        a = runner.StateStore(self.state)
+        b = runner.StateStore(self.state)                        # both loaded before either put
+        newer = clean_state("goodsprings_fight", ["00104C70"])
+        a.put("0@gameA", newer)                                  # process A (lease on instance 0) dirties game A
+        b.put("1@gameB", clean_state("loot_race"))               # process B (lease on instance 1), stale copy of 0@gameA
+        disk = self.on_disk()
+        self.assertEqual(sorted(disk), ["0@gameA", "1@gameB"])
+        self.assertEqual(disk["0@gameA"], newer)                 # B did not write back its older copy of A's key
+        fresh = runner.StateStore(self.state)
+        self.assertEqual(fresh.get_many(["0@gameA", "1@gameB"]), [newer, clean_state("loot_race")])
+
+    def test_plan_sees_dirty_state_written_by_another_store(self):
+        keys = ["0@gameA", "1@gameB"]
+        runner.StateStore(self.state).put_many({k: clean_state() for k in keys})
+        w, clock, nvs = fakegame.make(2)
+        prime(w)
+        b = runner.StateStore(self.state)                        # this runner's store, made first
+        rn = runner.Runner(nvs, b, keys, sleep=clock.sleep, now=clock.now, log=lambda *a: None, order=ORDER)
+        sc = load("goodsprings_fight")
+        fp = scenlib.footprint(sc, order=ORDER)
+        self.assertFalse(scenlib.plan_jump(rn._same_world(), sc, fp)["reload"])   # clean: the jump would go in place
+        a = runner.StateStore(self.state)                        # another process writes after b was made
+        a.put_many({k: clean_state("goodsprings_fight", fp["dirty"]) for k in keys})
+        j = rn.jump(sc)
+        self.assertTrue(j["reload"], j)
+        self.assertTrue(any("changed refs" in x for x in j["reasons"]), j["reasons"])
+        self.assertEqual(sorted(w.loads), [(0, "autosave"), (1, "autosave")])
+
+    def test_failed_put_leaves_the_old_valid_file(self):
+        store = runner.StateStore(self.state)
+        store.put("0@old", clean_state())
+        before = self.state.read_bytes()
+        names = sorted(os.listdir(self.dir))
+        seen = {}
+
+        def crash(src, dst):
+            seen["dir"] = Path(src).parent
+            seen["new"] = json.loads(Path(src).read_text(encoding="utf-8"))
+            raise OSError("simulated failure between the write and the replace")
+        store._replace = crash
+        with self.assertRaises(OSError):
+            store.put("1@new", clean_state("loot_race"))
+        self.assertEqual(seen["dir"], self.dir)                  # the temporary file is in the same folder
+        self.assertIn("1@new", seen["new"])                      # and it was written in full before the replace
+        self.assertEqual(self.state.read_bytes(), before)        # the target is still the old file
+        self.assertEqual(self.on_disk(), {"0@old": clean_state()})
+        self.assertEqual(sorted(os.listdir(self.dir)), names)    # no temporary file is left
+        fresh = runner.StateStore(self.state)
+        self.assertEqual(fresh.get_many(["0@old", "1@new"]), [clean_state(), None])
+
+    def test_lock_timeout_gives_a_clear_error(self):
+        holder = runner.StateStore(self.state)
+        waiter = runner.StateStore(self.state, lock_timeout_s=0.3)
+        with holder._lock():
+            t0 = time.monotonic()
+            with self.assertRaises(runner.StateLockTimeout) as cm:
+                waiter.put("0@x", clean_state())
+            self.assertLess(time.monotonic() - t0, 5)
+        self.assertIn(str(self.state) + ".lock", str(cm.exception))
+        self.assertIn("another process held the lock", str(cm.exception))
+        self.assertFalse(self.state.exists())                    # nothing was written while the lock was held
+        waiter.put("0@x", clean_state())                         # free again: the put goes through
+        self.assertEqual(self.on_disk(), {"0@x": clean_state()})
+
+    def test_two_processes_hammering_put_keep_all_keys(self):
+        n = 200
+        go = self.dir / "go"
+        procs = []
+        try:
+            for name in ("a", "b"):
+                procs.append(subprocess.Popen(
+                    [sys.executable, "-I", str(HERE / "run_tests.py"), "--hammer", str(self.state), name, str(n),
+                     str(self.dir / (name + ".ready")), str(go)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+            deadline = time.monotonic() + 60
+            while not all((self.dir / (x + ".ready")).exists() for x in ("a", "b")):
+                self.assertTrue(all(p.poll() is None for p in procs), "a worker stopped before it was ready")
+                self.assertLess(time.monotonic(), deadline, "workers not ready after 60 s")
+                time.sleep(0.01)
+            go.write_text("go", encoding="utf-8")                # both stores are loaded before the first put
+            for p in procs:
+                out, err = p.communicate(timeout=180)
+                self.assertEqual(p.returncode, 0, out + err)
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+                    p.communicate()
+        want = {"%s%03d@hammer" % (x, i): {"by": x, "i": i} for x in ("a", "b") for i in range(n)}
+        self.assertEqual(len(self.on_disk()), 2 * n)
+        self.assertEqual(self.on_disk(), want)
+        self.assertEqual(runner.StateStore(self.state).get_many(sorted(want)), [want[k] for k in sorted(want)])
+        self.assertEqual([x for x in os.listdir(self.dir) if x.endswith(".tmp")], [])
+
+
 class Cli(unittest.TestCase):
     def test_validate_and_list_exit_codes(self):
         py = [sys.executable, "-I", "-X", "utf8", str(HERE / "scen.py")]
@@ -418,6 +715,10 @@ MUTANTS = {
     "nodirty": "scenarios never record what they changed",
     "passall": "every check passes",
     "firsthost": "every step runs only on the host",
+    "oldkey": "state key is instance@generation again (repeats after a pool restart)",
+    "wholedict": "put writes the whole in-memory dict (loses keys of other processes)",
+    "noreread": "the plan uses the state read at start, not the file now",
+    "inplace": "put writes into the state file itself, no temp file and replace",
 }
 
 
@@ -445,4 +746,7 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--hammer"]:   # worker of the two-process state file test
+        _, _, path, prefix, n, ready, go = sys.argv
+        sys.exit(hammer(path, prefix, int(n), ready, go))
     sys.exit(main())
