@@ -42,6 +42,7 @@ SUITES = [
     ("T3b reload state", ["cmd", "/c", r"plugin\reload\run_tests.cmd"], True),
     ("T3a loader", ["cmd", "/c", r"plugin\loader\run_tests.cmd"], True),
     ("T7 animprobe core", ["cmd", "/c", r"plugin\animprobe\run_tests.cmd"], True),
+    ("Track B splitscreen focus guard", ["cmd", "/c", r"plugin\splitscreen\run_tests.cmd"], True),
 ]
 
 
