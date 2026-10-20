@@ -18,12 +18,26 @@
 #include "apply_remote.h"
 #include "common/minijson.h"
 #include "common/nvcoop_api.h"
+#include "reload/reload_state.h"
 #include "baseline_file.h"
 #include "coop_runtime.h"
+#ifdef NVCOOP_WITH_FLIGHT
+#include "flight/flight_service.h"
+#endif
 #include "effect_json.h"
+#ifdef NVCOOP_WITH_UI
+#include "hooks_ui/ui_hooks.h"
+#include "info_reader.h"
+#endif
 #include "engine_hooks.h"
+#ifdef NVCOOP_WITH_NVMP
+#include "nvmp/ghost_ref.h"
+#endif
 #ifdef NVCOOP_WITH_SNAPSHOT
 #include "fnvcoop_snapshot/baseline_dump.h"
+#endif
+#ifdef NVCOOP_WITH_WORLD
+#include "world_hooks.h"
 #endif
 
 namespace {
@@ -31,9 +45,38 @@ using namespace nvcoop::coop;
 
 bool g_scriptedLock = false;   // SetPlayerControls from the host's scripts (rules engine scope=all)
 
+#ifdef NVCOOP_WITH_WORLD
+// L12 world effects: SpawnRef / DespawnRef / RefScriptVar go through nvworld::WorldApplier (host-ref -> local-ref map, cell-not-ready queue,
+// duplicate guard); the lane-local WorldEffects (NPC actor values, essential/restrained, relations, packages) ride Runtime::pushWorldEffect.
+std::unique_ptr<nvworld::WorldApplier> g_worldApplier;
+
+// Coalescing key: state-like effects replace the earlier push for the same subject, deltas accumulate (empty key).
+std::string WorldEffectKey(const nvworld::WorldEffect& e) {
+    auto r = [](const fnvcoop::FormRef& f) { return nvhooks::refToStr(f); };
+    if (auto* x = std::get_if<nvworld::SetActorValueRef>(&e))
+        return x->mode == nvworld::AvMode::Set ? "av:" + r(x->actor) + ":" + std::to_string(x->av) : std::string();
+    if (auto* x = std::get_if<nvworld::SetEssential>(&e)) return "ess:" + r(x->actor) + (x->refOnly ? ":ref" : ":base");
+    if (auto* x = std::get_if<nvworld::SetRestrained>(&e)) return "rst:" + r(x->actor);
+    if (auto* x = std::get_if<nvworld::SetRelation>(&e)) return "rel:" + r(x->a) + ":" + r(x->b);
+    if (auto* x = std::get_if<nvworld::SetScriptPackage>(&e)) return "pkg:" + r(x->actor) + ":" + r(x->package);
+    return std::string();
+}
+#endif
+
 class EngineWorld : public IWorldApplier {
 public:
     ApplyResult apply(const fnvcoop::Effect& e, const fnvcoop::IEffectSink::Context& ctx) override {
+#ifdef NVCOOP_WITH_WORLD
+        if (nvworld::handlesEffect(e)) {
+            if (!g_worldApplier) return {false, "NoWorldApplier"};
+            nvhooks::ApplyStatus st = g_worldApplier->apply(e);
+            ApplyResult r;
+            r.ok = st == nvhooks::ApplyStatus::Ok;
+            r.status = nvhooks::applyStatusName(st);
+            if (!r.ok && !g_worldApplier->lastError().empty()) r.status += ": " + g_worldApplier->lastError();
+            return r;
+        }
+#endif
         // session-level effects the engine layer realizes locally (no engine primitive involved)
         if (auto* sc = std::get_if<fnvcoop::SetPlayerControls>(&e)) {
             g_scriptedLock = !sc->enable;   // coarse v1: any disable locks all seven control classes (mask granularity: L5 TODO)
@@ -139,7 +182,15 @@ std::unordered_map<std::string, std::string> LoadStringMap(const std::string& pa
     return m;
 }
 std::unordered_map<std::string, std::string> g_edids, g_infoQuest;
-std::function<uint32_t(fnvcoop::PlayerId)> g_ghostOf;   // slot -> the guest's ghost refID on the host (L6); empty = stand-in player
+// slot -> the guest's ghost refID on the host (L6 nvmp::GhostRefOfPlayer); 0 = unknown / NV:MP not present => stand-in player (ACTING-STANDIN)
+uint32_t GhostOf(fnvcoop::PlayerId slot) {
+#ifdef NVCOOP_WITH_NVMP
+    return slot == fnvcoop::kHostPlayer ? 0u : nvmp::GhostRefOfPlayer(static_cast<uint8_t>(slot));
+#else
+    (void)slot;
+    return 0u;
+#endif
+}
 fnvcoop::FormRef g_passQuest;      // [coop] scenepass=<EDID>:<stage>: local player counts as "finished" when the quest reaches the stage
 int g_passStage = -1;
 bool g_passSent = false;
@@ -216,8 +267,15 @@ void TryStart() {
     }
     g_applier.reset(new nvhooks::RemoteApplier(*hub, nvhooks::resolver()));
     g_world.applier = g_applier.get();
+#ifdef NVCOOP_WITH_WORLD
+    g_worldApplier.reset(new nvworld::WorldApplier(*hub, nvhooks::resolver()));
+    g_worldApplier->setExecLine([](const std::string& line, uint32_t refID) { return nvhooks::execConsoleLineOn(line, refID); });
+#endif
     g_rt.reset(new Runtime(g_cfg, hub, &g_world, NowMs));
     g_rt->setDumper(&g_dumper);
+#ifdef NVCOOP_WITH_FLIGHT
+    if (auto* fr = nvcoop::flight::service().recorder()) g_rt->setFlight(fr);   // T1a: record every datagram and applied / committed effect
+#endif
     if (g_cfg.handshake) {
         g_rt->setHandshakeBase(MakeHandshake());
         if (g_cfg.rulesFile.empty()) {   // clients hash the same rules.json the host loads
@@ -272,8 +330,15 @@ void TryStart() {
         // v1 acting player = the host's own player (0x14) so `IsActionRef player` / `GetDistance player` pass; the guest's ghost ref
         // (L6) replaces it once available. Effects are attributed to the guest by origin (known limitation: the host's player
         // really receives the item too).
-        uint32_t actor = g_ghostOf ? g_ghostOf(slot) : 0;
-        if (!actor) actor = 0x14;
+        uint32_t actor = GhostOf(slot);
+        static std::unordered_map<int, bool> logged;   // log the mode once per slot and mode change
+        bool standIn = actor == 0;
+        if (standIn) actor = 0x14;
+        if (!logged.count((int)slot) || logged[(int)slot] != standIn) {
+            logged[(int)slot] = standIn;
+            if (standIn) nvcoop::Log("coop: ACTING-STANDIN slot %d: no ghost ref (NV:MP absent or ghost not spawned); host player 14 acts", (int)slot);
+            else nvcoop::Log("coop: acting player for slot %d = ghost ref %08X", (int)slot, actor);
+        }
         fnvcoop::Cause c;
         c.kind = fnvcoop::CauseKind::Intent;
         c.source = ref;
@@ -299,6 +364,39 @@ void TryStart() {
         h.sink = [](const fnvcoop_dlg::Event& e) { nvcoop::PushEvent("dlg.event", std::string("{\"kind\":") + std::to_string((int)e.kind) + "}"); };
         g_rt->enableDialogue(h);
     }
+#ifdef NVCOOP_WITH_UI
+    {   // L11 wiring (internal lane notes): router bridge, 0xE5 slideshow channel, SlideshowEnd, INFO reader
+        struct ProcMem : fndlg::IMemory {
+            bool read(fndlg::Addr32 a, void* out, size_t n) const override {
+                SIZE_T got = 0;
+                return a >= 0x10000 && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(uintptr_t(a)), out, n, &got) && got == n;
+            }
+        };
+        static ProcMem mem;
+        static fndlg::ResponseLayout layout;   // headOffset -1 until probeResponseOffset finds it: the reader then returns no lines
+        UiWiring w;
+        w.router = []() { return nvui::router(); };
+        w.slideHost = [](nvui::SlideHost::Send s) -> nvui::SlideHost& { return nvui::slideHost(std::move(s)); };
+        w.slideClient = []() -> nvui::SlideClient& { return nvui::slideClient(); };
+        w.consentFile = DllDir() + "nvcoop_consent_messages.txt";
+        w.installInfoReader = [](std::function<std::vector<fnvcoop_dlg::Line>(uint32_t)> f) { nvui::setInfoReader(std::move(f)); };
+        w.infoReader = fndlg::makeInfoReader(mem, &layout);
+        g_rt->enableUi(std::move(w));
+    }
+#endif
+    g_rt->bindPlayerRefs([](fnvcoop::PlayerId s) { return GhostOf(s); },
+                         [](uint32_t id, fnvcoop::FormRef& out) { return nvhooks::resolver().toRef(id, &out); });   // PartyWarp needs this
+#ifdef NVCOOP_WITH_WORLD
+    if (g_cfg.role == Role::Client)
+        g_rt->setWorldEffectApplier([](const std::string& json) -> std::string {
+            nvworld::WorldEffect we;
+            std::string werr;
+            if (!g_worldApplier) return "NoWorldApplier";
+            if (!nvworld::worldEffectFromJson(json, &we, &werr)) return "BadWorldEffect: " + werr;
+            nvhooks::ApplyStatus st = g_worldApplier->applyWorld(we);
+            return nvhooks::applyStatusName(st);
+        });
+#endif
     std::string err;
     if (!g_rt->start(&err)) {
         g_failed = true;
@@ -439,6 +537,35 @@ bool MExplain(const std::string& params, std::string& out) {
     return true;
 }
 
+// coop.leave {}: drop out of the session cleanly (peers see a disconnect now); the game keeps running and the world stays as it is.
+bool MLeave(const std::string&, std::string& out) {
+    if (!g_rt) { out = "coop not running"; return false; }
+    std::string err;
+    if (!g_rt->leave(&err)) { out = err; return false; }
+    nvcoop::PushEvent("coop.left", "{}");
+    out = "{\"ok\":true}";
+    return true;
+}
+
+// coop.join {host?, port?}: build a new session (the baseline / rejoin path) with the configured or given address.
+bool MJoin(const std::string& params, std::string& out) {
+    if (!g_rt) { out = "coop not running"; return false; }
+    nvcoop::json::Value p;
+    std::string err;
+    if (!params.empty() && !nvcoop::json::parse(params, p, err)) { out = "bad params: " + err; return false; }
+    if (!g_rt->join(p.get("host").asString(""), (uint16_t)p.get("port").asInt(0), &err)) { out = err; return false; }
+    nvcoop::PushEvent("coop.joining", g_rt->statusJson());
+    out = "{\"ok\":true}";
+    return true;
+}
+
+// coop.owner {ref}: the actor-ownership service is not in the plugin yet. T2a's engine layer owns the data (synccore/enginemodel); when it
+// is wired in, this reads (owner slot, epoch) from the service's owner table and answers {"owner": n, "epoch": n}.
+bool MOwner(const std::string&, std::string& out) {
+    out = "{\"unsupported\":true,\"reason\":\"actor-ownership service is not in the plugin yet\"}";
+    return true;
+}
+
 bool MInject(const std::string& params, std::string& out) {
     if (!g_rt) { out = "coop not running"; return false; }
     std::string res, err;
@@ -456,13 +583,31 @@ void OnLoad(void*) {
     nvcoop::RegisterMethod("coop.baseline.vars", MBaselineVars, true);
     nvcoop::RegisterMethod("coop.explain", MExplain, true);
     nvcoop::RegisterMethod("coop.action", MAction, true);
+    nvcoop::RegisterMethod("coop.leave", MLeave, true);
+    nvcoop::RegisterMethod("coop.join", MJoin, true);
+    nvcoop::RegisterMethod("coop.owner", MOwner, true);
     nvcoop::RegisterMethod("coop.scenePass", MScenePass, true);
     nvcoop::RegisterMethod("coop.stageRequested", MStageRequested, true);   // client: {kind:"activate|pickup|trigger", ref:"falloutnv.esm:00ABCD"}
 }
 
+fnvcoop::Bytes g_reloadSidecar;   // hot reload: the previous core's session sidecar, applied once the new runtime is running
+
 void OnFrame() {
     if (!g_rt) TryStart();
+    if (g_rt && g_rt->running() && !g_reloadSidecar.empty()) {
+        std::string what;
+        bool ok = g_rt->onGameLoaded(&g_reloadSidecar, &what);
+        nvcoop::Log("coop: hot reload resumed the session (%s): %s", what.c_str(), ok ? "ok" : "not handled");
+        g_reloadSidecar.clear();
+    }
     if (g_rt) {
+#ifdef NVCOOP_WITH_WORLD
+        if (g_rt->host()) {   // NPC state captured by L12's hooks since the last frame -> every guest (and late joiners)
+            for (const auto& we : nvworld::drainWorldEffects()) g_rt->pushWorldEffect(WorldEffectKey(we), nvworld::worldEffectToJson(we));
+        } else if (g_worldApplier) {
+            g_worldApplier->flushQueued();   // spawns that waited for their cell to load
+        }
+#endif
         g_rt->frame();
         if (g_rt->replicator() && g_cfg.baseline) {   // polling needs a known host world (baseline) or the first poll would flood
             if (!g_polling) { nvhooks::enableStatePolling(true); g_polling = true; }
@@ -546,3 +691,49 @@ void OnMessage(uint32_t type, void* data, uint32_t len) {
 }  // namespace
 
 NVCOOP_MODULE(l10_coop, "l10_coop", OnLoad, OnMessage, OnFrame);
+
+// Hot reload (T3b, docs/tools/T3b-state.md). The session survives through the same sidecar a save/load uses: the host keeps its
+// world, epoch and token map, so rejoining clients are recognised. The transport is closed and reopened (ENet cannot adopt a
+// socket), so peers see a short disconnect and rejoin. The client token is carried over so a client keeps its slot.
+namespace {
+void ReloadShutdown() {
+    if (g_rt) {
+        nvhooks::SetPlayerControlsLocked(false);
+        g_rt->stop();
+    }
+    g_rt.reset();
+    g_applier.reset();
+#ifdef NVCOOP_WITH_WORLD
+    g_worldApplier.reset();
+#endif
+}
+}  // namespace
+
+NVCOOP_RELOAD_STATE(l10_coop, "l10_coop", 1, 50,
+    /*canUnload*/ [] { return g_rt && g_rt->syncing() ? std::string("world baseline transfer in progress") : std::string(); },
+    /*save*/ [](nvreload::Writer& w) {
+        w.boolean(g_gameLoaded);
+        w.boolean(g_passSent);
+        w.boolean(g_scriptedLock);
+        bool live = g_rt && g_rt->running();
+        w.boolean(live);
+        w.u64(g_rt ? g_rt->config().token : g_cfg.token);
+        fnvcoop::Bytes side;
+        if (live && g_cfg.baseline) side = g_rt->saveSidecar();
+        w.bytes(side);
+        return true;
+    },
+    /*restore*/ [](uint32_t, nvreload::Reader& r) {
+        g_gameLoaded = r.boolean();
+        g_passSent = r.boolean();
+        g_scriptedLock = r.boolean();
+        bool live = r.boolean();
+        uint64_t token = r.u64();
+        fnvcoop::Bytes side = r.bytes();
+        if (live && token && !g_cfg.token) g_cfg.token = token;
+        g_reloadSidecar = std::move(side);
+        return true;
+    },
+    /*migrate*/ nullptr,
+    /*shutdown*/ [] { ReloadShutdown(); },
+    /*fresh*/ nullptr);

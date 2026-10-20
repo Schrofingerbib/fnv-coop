@@ -10,6 +10,7 @@
 
 #include "capture_hub.h"
 #include "hook_patch.h"
+#include "party_cond.h"
 #include "suppress_policy.h"
 
 namespace nvhooks {
@@ -44,6 +45,8 @@ enum class Role { Host, Client, Guest };
 // expected bytes is skipped (reported in InitReport), never forced.
 InitReport Init(CaptureHub& hub, Role role, FormResolver* resolver = nullptr);
 void Shutdown();  // restores every patched byte (only if still ours)
+// Hot reload preflight: how many of our installed hooks another patcher has chained over (0 = safe to unload).
+int auditTamperedHooks();
 
 CaptureHub* hub();
 FormResolver& resolver();
@@ -86,9 +89,22 @@ struct ScriptStats {
     uint64_t gated = 0;             // calls swallowed by a closed ScriptGate
     uint64_t ran = 0;               // calls that executed
     uint64_t ranWhileApplying = 0;  // subset of `ran` during a RemoteApplier::apply (must be 0 with the gate on)
+    uint64_t localRan = 0;          // GuestLocalRun allow-listed scripts that executed (subset of `ran`)
     uint64_t applierLines = 0;      // console lines the applier itself executed (kill/resurrect/move); not counted above
 };
 const ScriptStats& scriptStats();
+// Distinct GuestLocalRun script refIDs that ran, with run counts (diagnostic; at most 64 entries).
+std::vector<std::pair<uint32_t, uint32_t>> localRunCounts();
+// Cost of OUR code inside the Script::Execute detour (everything except the engine's own execution), measured with QueryPerformanceCounter
+// while enabled. Diagnostic for the per-frame budget (L4: 33 ms frame, host tick p50 38 us).
+struct HookPerf {
+    uint64_t calls = 0;         // detour calls measured
+    uint64_t overheadTicks = 0; // QPC ticks spent in our pre/post code
+    uint64_t freq = 1;          // QPC ticks per second
+};
+void setHookPerf(bool on);
+HookPerf hookPerf();
+const Suppressed& suppressStats();
 // Bracket the applier's own console-line executions so they are not mistaken for leaked result scripts.
 class ApplierExecScope {
 public:
@@ -158,6 +174,28 @@ public:
     ActingPlayerScope& operator=(const ActingPlayerScope&) = delete;
 };
 uint32_t actingPlayer();
+// Party slot of actingPlayer(): 0 = host player; guests' ghosts are registered by the session (L6/L10) when they join.
+void registerPlayerSlot(uint32_t ghostRefID, uint8_t slot);
+uint8_t actingSlot();
+
+// Party-aware condition evaluation (party_cond.h). The provider lists the PRESENT party members (the local player as refID 0x14 + every
+// other member's ghost reference); the reducer is RulesEngine::reduceCondition (values per member -> one answer). Both unset = vanilla.
+using PartyProvider = std::function<std::vector<PartyMember>()>;
+void setPartyConditions(PartyProvider provider, ConditionReducer reducer);
+struct CondStats {
+    uint64_t evals = 0;       // evaluator calls seen (party-aware functions only)
+    uint64_t partyEvals = 0;  // calls that had the player as operand and ran once per member
+    uint64_t reduced = 0;     // calls whose result came from the reducer
+};
+const CondStats& condStats();
+// While alive, party conditions are reduced under this quest's PartyAwareCond rule (set by dialogue / quest-condition callers that know it).
+class ConditionQuestScope {
+public:
+    explicit ConditionQuestScope(const fnvcoop::FormRef& quest, fnvcoop::CondPhase phase = fnvcoop::CondPhase::Entry);
+    ~ConditionQuestScope();
+    ConditionQuestScope(const ConditionQuestScope&) = delete;
+    ConditionQuestScope& operator=(const ConditionQuestScope&) = delete;
+};
 
 // GuestLocalRun allow-list (rules.json): quest-owned SCRIPT forms that keep running on guests (achievements, rumble, DLC setup, fades).
 // Unknown plugins/ids are ignored. Replaces the previous list.
@@ -181,6 +219,9 @@ bool blockMutationNow();
 // effects (hub()->record). Unset = only counted in unmapped().avOnNonPlayer.
 using NonPlayerAvObserver = std::function<void(const fnvcoop::FormRef& actor, uint32_t av, uint8_t kind, float before, float after)>;
 void setNonPlayerAvObserver(NonPlayerAvObserver obs);
+// AddScriptPackage / RemoveScriptPackage (host, capturing, after the original command succeeded).
+using ScriptPackageObserver = std::function<void(const fnvcoop::FormRef& actor, const fnvcoop::FormRef& package, bool add)>;
+void setScriptPackageObserver(ScriptPackageObserver obs);
 
 // Counters for effects the engine produced that have no Effect type yet (e.g. CompleteQuest, container AddItem on a
 // non-player). Exposed so tests/telemetry can show gaps instead of silently dropping them.

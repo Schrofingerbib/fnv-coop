@@ -63,6 +63,8 @@ public:
     // Manual control (RPC, main thread). Returns the status; the patch must be a client.dll patch of the table.
     PatchStatus Apply(const std::string& name);
     PatchStatus Revert(const std::string& name);
+    // Hot reload: revert every patch we applied (the next core applies them again). Returns how many could not be reverted.
+    int RevertAll();
 
     Phase phase() const { return phase_; }
     uint64_t frames() const { return frame_; }

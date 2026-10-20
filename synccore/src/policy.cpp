@@ -184,7 +184,11 @@ size_t normalizeTxn(EffectTxn& txn, const SharePolicy& p) {
                 keep = p.kills;
             } else if constexpr (std::is_same_v<T, AddItem> || std::is_same_v<T, RemoveItem> ||
                                  std::is_same_v<T, ModActorValue>) {
-                resolve(x.to, reward, txn.origin, p);
+                // Payment: a removal in a topic result is the speaker's cost (the initiator pays), while its rewards go to the party.
+                bool shared = reward;
+                if constexpr (std::is_same_v<T, RemoveItem>)
+                    if (txn.cause.kind == CauseKind::DialogueResult && !mutations().paymentSharesAll) shared = false;
+                resolve(x.to, shared, txn.origin, p);
                 keep = x.to.mask != 0;
             } else if constexpr (std::is_same_v<T, ModKarma>) {
                 resolve(x.to, p.karma, txn.origin, p);

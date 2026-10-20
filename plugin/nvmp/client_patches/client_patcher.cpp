@@ -175,6 +175,17 @@ PatchStatus ClientPatcher::Revert(const std::string& name) {
     return s;
 }
 
+int ClientPatcher::RevertAll() {
+    int bad = 0;
+    for (auto& [name, rec] : recs_) {
+        if (!rec.state.applied) continue;
+        PatchStatus s = RevertPatch(rec.state, writer_);
+        if (s == PatchStatus::Reverted) rec.status = s;
+        else ++bad;
+    }
+    return bad;
+}
+
 std::string ClientPatcher::StatusJson() const {
     const char* ph = phase_ == Phase::Waiting ? "waiting" : phase_ == Phase::Done ? "done" : "gave-up";
     std::string j = std::string("{\"phase\":\"") + ph + "\",\"frames\":" + std::to_string(frame_) + ",\"module\":";

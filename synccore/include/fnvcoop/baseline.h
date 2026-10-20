@@ -81,6 +81,13 @@ std::vector<uint32_t> shardHashes(const std::vector<BaselineEntry>& entries);
 // Shard hashes straight from the maps (no per-entry objects or allocations): what digests use. Same result as shardHashes(baselineEntries(w)).
 std::vector<uint32_t> shardHashesOf(const ShadowState& w);
 
+// One-level Merkle digest for the flight recorder (T1a): 256 order-independent bucket sums, bucket = key & 0xFF, entry term =
+// bucketMix(key, value hash). Same entries as baselineEntries(), computed straight from the maps (no per-entry objects).
+uint32_t bucketMix(uint64_t key, uint32_t value);
+std::vector<uint32_t> bucketHashesOf(const ShadowState& w, size_t* count = nullptr);
+// Same result, incremental: only the segments an applied effect touched since the last call are recomputed (state.bucketCache).
+std::vector<uint32_t> bucketHashesCached(const ShadowState& w, size_t* count = nullptr);
+
 // Compact human-readable description of an entry effect ("SetStage 0x1234@falloutnv.esm = 40").
 std::string describeEntry(const Effect& e);
 

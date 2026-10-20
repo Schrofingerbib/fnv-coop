@@ -22,8 +22,14 @@ inline constexpr nvhooks::HookSpec Cmd_SetEnemy = {"Cmd_SetEnemy", 0x5c81f0u, {0
 inline constexpr nvhooks::HookSpec Cmd_SetAlly = {"Cmd_SetAlly", 0x5c8120u, {0x55, 0x8b, 0xec, 0x83, 0xec, 0x10, 0xc7, 0x45, 0xf0, 0x00, 0x00, 0x00, 0x00, 0xc7, 0x45, 0xf4}, 16, 6, 0};
 // opcode 0x1182, needsParent, params (ActorValue, float); ret at 0x5BE18E
 inline constexpr nvhooks::HookSpec Cmd_RestoreActorValue = {"Cmd_RestoreActorValue", 0x5be080u, {0x55, 0x8b, 0xec, 0x83, 0xec, 0x10, 0xc7, 0x45, 0xf8, 0x00, 0x00, 0x00, 0x00, 0xd9, 0xee, 0xd9}, 16, 6, 0};
+// opcode 0x10AB, needsParent, params (int): actor ignore-crime flag = value > 0; table entry 0x11923C8; ret in epilogue
+inline constexpr nvhooks::HookSpec Cmd_IgnoreCrime = {"Cmd_IgnoreCrime", 0x5db3f0u, {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x8d, 0x45, 0xfc}, 16, 6, 0};
+// opcode 0x10C6, params (Faction, int): faction player-enemy flag = value != 0 (TESFaction fn 0x47EB90); table entry 0x1192800
+inline constexpr nvhooks::HookSpec Cmd_SetPCEnemyOfFaction = {"Cmd_SetPCEnemyOfFaction", 0x5ce190u, {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0xc7, 0x45, 0xf8, 0x00, 0x00, 0x00, 0x00, 0xc7, 0x45, 0xfc}, 16, 6, 0};
+// opcode 0x11C9, params (Faction): same TESFaction fn 0x47EB90 with 0; table entry 0x1195078; prologue spans 11 bytes to an instruction boundary
+inline constexpr nvhooks::HookSpec Cmd_ClearFactionPlayerEnemyFlag = {"Cmd_ClearFactionPlayerEnemyFlag", 0x5d9500u, {0x55, 0x8b, 0xec, 0x51, 0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x8d, 0x45, 0xfc, 0x50, 0x8b}, 16, 11, 0};
 
-inline const nvhooks::HookSpec* const kAll[] = {&Cmd_MarkForDelete, &Cmd_SetEssential, &Cmd_SetActorRefEssential, &Cmd_SetRestrained, &Cmd_SetEnemy, &Cmd_SetAlly, &Cmd_RestoreActorValue};
+inline const nvhooks::HookSpec* const kAll[] = {&Cmd_MarkForDelete, &Cmd_SetEssential, &Cmd_SetActorRefEssential, &Cmd_SetRestrained, &Cmd_SetEnemy, &Cmd_SetAlly, &Cmd_RestoreActorValue, &Cmd_IgnoreCrime, &Cmd_SetPCEnemyOfFaction, &Cmd_ClearFactionPlayerEnemyFlag};
 inline constexpr size_t kCount = sizeof(kAll) / sizeof(kAll[0]);
 
 // Engine functions we call (not detour). Re-verified against these bytes before the first use at run time.

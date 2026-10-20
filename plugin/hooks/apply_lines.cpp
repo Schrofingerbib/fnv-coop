@@ -50,6 +50,9 @@ std::string setTimeScaleCmd(float s) {
     std::snprintf(b, sizeof b, "SetGlobalTimeMultiplier %.4f", s);
     return b;
 }
+std::string enableFastTravelCmd(bool enable) { return enable ? "EnableFastTravel 1" : "EnableFastTravel 0"; }
+std::string setTeammateCmd(bool on) { return on ? "SetPlayerTeammate 1" : "SetPlayerTeammate 0"; }
+bool companionForMe(uint8_t owner, uint8_t localSlot) { return owner == localSlot; }
 std::string showMapCmd(uint32_t m, bool travel) {
     char b[64];
     std::snprintf(b, sizeof b, travel ? "ShowMap %08X 1" : "ShowMap %08X", m);
@@ -72,6 +75,25 @@ std::string setPosCmd(char axis, float value) {
     char b[48];
     std::snprintf(b, sizeof b, "SetPos %c %.4f", axis, value);
     return b;
+}
+
+std::string setAngleCmd(char axis, float degrees) {
+    char b[48];
+    std::snprintf(b, sizeof b, "SetAngle %c %.4f", axis, degrees);
+    return b;
+}
+
+int axisIndexOf(unsigned c) {
+#ifdef NVHOOKS_MUTANT
+    return c == 'X' ? 0 : c == 'Y' ? 1 : c == 'Z' ? 2 : -1;  // forgets lower case
+#else
+    switch (c) {
+        case 'X': case 'x': return 0;
+        case 'Y': case 'y': return 1;
+        case 'Z': case 'z': return 2;
+        default: return -1;
+    }
+#endif
 }
 
 bool isReferenceFormType(unsigned t) {

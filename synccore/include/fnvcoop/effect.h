@@ -169,7 +169,12 @@ struct SetLock {
     FormRef ref;
     bool locked = false;
     int32_t level = 0;
-    bool operator==(const SetLock& o) const { return ref == o.ref && locked == o.locked && level == o.level; }
+    bool hasBefore = false, beforeLocked = false;   // pre-image: the lock read just before this change (restores a lock the loaded save never touched)
+    int32_t beforeLevel = 0;
+    bool operator==(const SetLock& o) const {
+        return ref == o.ref && locked == o.locked && level == o.level && hasBefore == o.hasBefore &&
+               (!hasBefore || (beforeLocked == o.beforeLocked && beforeLevel == o.beforeLevel));
+    }
 };
 // Faction membership/rank of an actor; rank < 0 = removed. Host order.
 struct SetFactionRank {
@@ -217,8 +222,11 @@ struct SpawnRef {
 };
 struct DespawnRef {
     uint32_t id = kCreatedRefPrefix;
+    // forget: undo a spawn instead of recording a despawn (a rebase after a host load): the ref disappears and leaves NO tombstone, so the
+    // host's rewound id counter can hand the same id out again. On a ref that is only a tombstone it just drops the tombstone.
+    bool forget = false;
     FormRef ref() const { return createdRef(id); }
-    bool operator==(const DespawnRef& o) const { return id == o.id; }
+    bool operator==(const DespawnRef& o) const { return id == o.id && forget == o.forget; }
 };
 // Object state. mask bit0: set open/closed, bit1: set lock (locked + level), bit2: destroyed (sticky), bit3: activate-once done (sticky).
 constexpr uint8_t kObjOpen = 1, kObjLock = 2, kObjDestroyed = 4, kObjActivated = 8;
@@ -228,9 +236,15 @@ struct ObjectState {
     bool open = false, locked = false;
     int32_t level = 0;
     bool destroyed = false, activatedOnce = false;
+    // Pre-image of the lock (mask bit1): the lock state the capturing machine read just before this change. Lets a rebase restore a lock the
+    // loaded save never changed. `open` needs none (closed is the default and an open door is the exception), destroyed / activated-once are
+    // sticky in the engine and cannot be undone at all.
+    bool hasBefore = false, beforeLocked = false;
+    int32_t beforeLevel = 0;
     bool operator==(const ObjectState& o) const {
         return ref == o.ref && mask == o.mask && open == o.open && locked == o.locked && level == o.level && destroyed == o.destroyed &&
-               activatedOnce == o.activatedOnce;
+               activatedOnce == o.activatedOnce && hasBefore == o.hasBefore &&
+               (!hasBefore || (beforeLocked == o.beforeLocked && beforeLevel == o.beforeLevel));
     }
 };
 // Script variable of a non-quest owner (object / NPC script). Host order, last write wins.
@@ -238,7 +252,11 @@ struct RefScriptVar {
     FormRef ref;
     uint16_t index = 0;
     double value = 0;
-    bool operator==(const RefScriptVar& o) const { return ref == o.ref && index == o.index && value == o.value; }
+    bool hasBefore = false;   // pre-image: the value read just before this write (restores a var the loaded save never wrote)
+    double before = 0;
+    bool operator==(const RefScriptVar& o) const {
+        return ref == o.ref && index == o.index && value == o.value && hasBefore == o.hasBefore && (!hasBefore || before == o.before);
+    }
 };
 // Inventory of a non-player ref (container, NPC). Deltas relative to the baseline world; RemoveAllItems clears.
 struct RefAddItem {
@@ -251,9 +269,15 @@ struct RefRemoveItem {
     int32_t count = 0;
     bool operator==(const RefRemoveItem& o) const { return ref == o.ref && item == o.item && count == o.count; }
 };
+// Pre-image of a clear: `items` = the contents (absolute counts) the capturing machine read just before emptying the container. A rebase
+// after a host load puts them back with `undo` (the container becomes un-cleared and `items` are re-added). Without a pre-image
+// (hasBefore == false) the clear can never be undone.
 struct RemoveAllItems {
     FormRef ref;
-    bool operator==(const RemoveAllItems& o) const { return ref == o.ref; }
+    bool undo = false;
+    bool hasBefore = false;
+    std::vector<std::pair<FormRef, int32_t>> items;
+    bool operator==(const RemoveAllItems& o) const { return ref == o.ref && undo == o.undo && hasBefore == o.hasBefore && items == o.items; }
 };
 // Journal. Topics, notes and map markers are shared; the active (focused) quest is per player.
 struct AddTopic {
@@ -272,7 +296,11 @@ constexpr uint8_t kMarkerVisible = 1, kMarkerTravel = 2;
 struct SetMapMarker {
     FormRef marker;
     uint8_t flags = 0;   // kMarkerVisible | kMarkerTravel (fast-travel allowed)
-    bool operator==(const SetMapMarker& o) const { return marker == o.marker && flags == o.flags; }
+    bool hasBefore = false;   // pre-image: the flags read just before this change
+    uint8_t before = 0;
+    bool operator==(const SetMapMarker& o) const {
+        return marker == o.marker && flags == o.flags && hasBefore == o.hasBefore && (!hasBefore || before == o.before);
+    }
 };
 struct ForceActiveQuest {
     FormRef quest;
@@ -289,15 +317,38 @@ struct RequestSave {
 struct SetWeather {
     FormRef weather;
     bool force = false;   // ForceWeather (instant) vs SetWeather (transition)
-    bool operator==(const SetWeather& o) const { return weather == o.weather && force == o.force; }
+    bool hasBefore = false;   // pre-image: the weather read just before this change
+    FormRef before;
+    bool beforeForce = false;
+    bool operator==(const SetWeather& o) const {
+        return weather == o.weather && force == o.force && hasBefore == o.hasBefore && (!hasBefore || (before == o.before && beforeForce == o.beforeForce));
+    }
 };
 struct SetTimeScale {
     float scale = 0;      // SetGlobalTimeMultiplier; 0 = never set
-    bool operator==(const SetTimeScale& o) const { return scale == o.scale; }
+    bool hasBefore = false;   // pre-image: the multiplier read just before this change
+    float before = 0;
+    bool operator==(const SetTimeScale& o) const { return scale == o.scale && hasBefore == o.hasBefore && (!hasBefore || before == o.before); }
 };
 struct AdvanceTime {      // sleep / wait: EVENT (everyone's clock jumps)
     uint32_t minutes = 0;
     bool operator==(const AdvanceTime& o) const { return minutes == o.minutes; }
+};
+
+// SetAngle: one rotation axis of a reference, in degrees (0 = X, 1 = Y, 2 = Z). Host order; the committed (host) value wins.
+// `before` is the pre-image: the angle the capturing machine read just before this change. The shadow keeps the FIRST one it sees per
+// (ref, axis) as that axis's original, so a rebase after a host load can restore a ref the loaded save never rotated. Setting an axis back
+// to its original removes it from the state. hasBefore = false when the capturer could not read it (such an axis can never be reverted).
+constexpr uint8_t kAxisX = 0, kAxisY = 1, kAxisZ = 2;
+struct RefAngle {
+    FormRef ref;
+    uint8_t axis = kAxisZ;
+    float degrees = 0;
+    bool hasBefore = false;
+    float before = 0;
+    bool operator==(const RefAngle& o) const {
+        return ref == o.ref && axis == o.axis && degrees == o.degrees && hasBefore == o.hasBefore && (!hasBefore || before == o.before);
+    }
 };
 
 // Convenience: the actor-value id the hooks use for experience (RewardXP folds into ModActorValue).
@@ -309,7 +360,7 @@ using Effect = std::variant<SetStage, SetObjective, SetGlobal, EnableRef, Disabl
                             CompanionOwner, ForcedDialogue, BarrierArrive, BarrierRelease, SayOnceFlag, CompleteQuest,
                             CompleteAllObjectives, SetLock, SetFactionRank, SetPerk, SwapTexture, SetFastTravelLock, FailQuest, SpawnRef, DespawnRef, ObjectState, RefScriptVar, RefAddItem,
                             RefRemoveItem, RemoveAllItems, AddTopic, AddNote, RemoveNote, SetMapMarker, ForceActiveQuest, RequestSave,
-                            SetWeather, SetTimeScale, AdvanceTime>;
+                            SetWeather, SetTimeScale, AdvanceTime, RefAngle>;
 
 const char* effectName(const Effect& e);
 

@@ -231,3 +231,59 @@ TEST(twin, rejoin_sidecar_loses_ledger) {
     for (uint64_t seed = 1; seed <= 3 && ok; ++seed) ok = restartWithSaveNoDuplicates(seed, false, &why);
     CHECK(!ok);
 }
+
+// =====================================================================================================================
+// Restart whose sidecar cannot be resumed (saved with an intent in flight): the shadow is discarded and the client rejoins with a baseline
+// against a host whose ledger is intact. The reward ids stored in the sidecar keep the rewards its save already holds from coming again.
+// =====================================================================================================================
+namespace {
+bool restartBaselineRejoinNoDuplicates(uint64_t seed, std::string* why) {
+    auto fail = [&](const char* w) { if (why) *why = w; return false; };
+    Rig r(seed);
+    r.addClient(1); r.addClient(2);
+    r.joinAll(); r.run(1500);
+    if (!r.allLive()) return fail("not live");
+    for (uint32_t i = 0; i < 3; ++i) r.reward(0x400 + i);
+    r.run(500);
+    Cause c; c.kind = CauseKind::Intent;
+    r.cl[1]->cs->submitIntent(c, {SetGlobal{Q(0x3001), 7.f}});     // in flight at save time: the sidecar is not resumable
+    Bytes mySave = r.cl[1]->cs->saveState();
+    if (r.cl[1]->cs->canSaveState()) return fail("test setup: the sidecar should be unclean");
+    r.reward(0x403); r.reward(0x404);                               // after the save: not in the player's save game
+    r.run(500);
+    r.drop(1);
+    r.cl[1]->sink.items.clear();
+    r.cl[1]->sink.trail.clear();
+    r.cl[1]->dump = world(20, 9);
+    r.story.setConnected(r.cl[1]->peer, true);
+    if (!r.cl[1]->cs->onLocalSaveLoaded(r.now, &mySave)) return fail("load refused");
+    r.run(4000);
+    if (!r.allLive()) return fail("not live after restart");
+    auto& it = r.cl[1]->sink.items;
+    for (uint32_t i = 0; i < 3; ++i) if (it[0x400 + i] != 0) return fail("a reward the save already holds was delivered again");
+    if (it[0x403] != 1 || it[0x404] != 1) return fail("a reward after the save was not delivered exactly once");
+    r.reward(0x405); r.run(600);
+    if (it[0x405] != 1) return fail("new reward not delivered exactly once");
+    // a second restart from the same sidecar after those: only what is newer than the save comes again, still once
+    r.drop(1);
+    r.cl[1]->sink.items.clear();
+    r.story.setConnected(r.cl[1]->peer, true);
+    if (!r.cl[1]->cs->onLocalSaveLoaded(r.now, &mySave)) return fail("second load refused");
+    r.run(4000);
+    for (uint32_t i = 0; i < 3; ++i) if (r.cl[1]->sink.items[0x400 + i] != 0) return fail("second restart: old reward again");
+    for (auto& kv : r.cl[1]->sink.items) if (kv.second > 1) return fail("second restart: duplicate");
+    return true;
+}
+}  // namespace
+
+TEST(rejoin, baseline_rejoin_after_an_unresumable_sidecar_delivers_only_missing_rewards) {
+    for (uint64_t seed = 1; seed <= 5; ++seed) {
+        std::string why;
+        CHECK_MSG(restartBaselineRejoinNoDuplicates(seed, &why), "seed " + std::to_string(seed) + ": " + why);
+    }
+}
+TEST(twin, rejoin_no_reward_ids) {
+    MutationScope m([] { Mutations x; x.noRewardIds = true; return x; }());
+    std::string why;
+    CHECK(!restartBaselineRejoinNoDuplicates(1, &why));
+}

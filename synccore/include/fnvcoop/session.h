@@ -202,6 +202,7 @@ private:
     bool haveBaseline_ = false;
     uint64_t contentHash_ = 0, baselineCounter_ = 0;
     int64_t baseKarma_[kMaxSlots] = {};
+    std::vector<RewardGrant> grants_[kMaxSlots];   // every reward committed this epoch, per slot (the ledger split by id); cleared with the ledger
     std::map<FormRef, std::pair<int64_t, int64_t>> baseRep_[kMaxSlots];
     uint32_t epoch_ = 1;
     uint32_t createdNext_ = 0;
@@ -225,7 +226,7 @@ public:
 
     void connect(uint64_t nowMs, uint32_t session);  // session: strictly increasing per token, never 0
     void disconnect();                               // local drop; state is kept for a later rejoin
-    void resetState();                               // models a fresh install/restart: forgets everything
+    void resetState();                               // models a fresh install/restart: forgets everything (including which rewards were delivered)
     void tick(uint64_t nowMs);
 
     // Report a local action already applied to the local world. Queued durably (survives disconnect, lost on
@@ -295,6 +296,8 @@ private:
     Hello makeHello() const;
     void doRebase();
     bool loadStateBytes(const Bytes& b);
+    void resetSession();
+    void noteDelivered(const EffectTxn& txn);
     void sendSummaryWindow(bool retransmit);
     void stampSummary();
     void applyReadyDiffChunks();
@@ -342,7 +345,11 @@ private:
     uint32_t summaryNext_ = 0;
     std::map<uint32_t, BaselineDiffChunk> diffGot_;
     uint32_t diffNext_ = 0, diffTotal_ = 0;
+    std::vector<Effect> diffEffects_;       // baseline diff effects / reverts, applied together once the last chunk arrived (reverts first)
+    std::vector<uint64_t> diffReverts_;
     std::vector<Effect> heldDiff_;
+    std::vector<uint64_t> heldRewardIds_;   // ids of the rewards in heldDiff_: delivered once finishBaseline applies them
+    std::set<uint64_t> delivered_;          // ids of the rewards this player's world already holds (persisted in the client sidecar)
     BaselineResult baselineResult_;
     uint32_t worldEpoch_ = 0;
     bool rebaseRequired_ = false, everJoined_ = false;

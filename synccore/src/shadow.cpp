@@ -22,7 +22,75 @@ void ShadowState::applyTxn(const EffectTxn& txn, PlayerId me, std::vector<Effect
     seq = txn.seq;
 }
 
+namespace {
+// Bucket-digest segments an effect can change (bit per BucketCache segment, see baseline.cpp walkSegment). Unknown kinds dirty everything.
+constexpr uint64_t S(unsigned i) { return 1ull << i; }
+uint64_t segmentsOf(const Effect& eff) {
+    constexpr uint64_t none = 0, all = ~0ull;
+    return std::visit(Overloaded{
+        [](const SetStage&) { return S(3); },
+        [](const SetObjective&) { return S(4); },
+        [](const SetGlobal&) { return S(7); },
+        [](const EnableRef&) { return S(8); },
+        [](const DisableRef&) { return S(8); },
+        [](const StartQuest&) { return S(0); },
+        [](const StopQuest&) { return S(0); },
+        [](const MoveRef&) { return S(10); },
+        [](const KillActor&) { return S(9); },
+        [](const ResurrectActor&) { return S(9); },
+        [](const SetScriptVar&) { return S(6); },
+        [](const PartyTether&) { return S(22); },
+        [](const SlideshowEnd&) { return S(26); },
+        [](const SaveSuppress&) { return S(27); },
+        [](const CompanionOwner&) { return S(13); },
+        [](const SayOnceFlag&) { return S(25); },
+        [](const CompleteQuest&) { return S(1); },
+        [](const FailQuest&) { return S(1) | S(2); },
+        [](const CompleteAllObjectives&) { return S(5); },
+        [](const SetLock&) { return S(11); },
+        [](const SetFactionRank&) { return S(23); },
+        [](const SwapTexture&) { return S(12); },
+        [](const SetFastTravelLock&) { return S(24); },
+        [](const ObjectState&) { return S(14) | S(11); },
+        [](const RefScriptVar&) { return S(15); },
+        [](const AddTopic&) { return S(16); },
+        [](const AddNote&) { return S(17); },
+        [](const RemoveNote&) { return S(17); },
+        [](const SetMapMarker&) { return S(18); },
+        [](const SetWeather&) { return S(19); },
+        [](const SetTimeScale&) { return S(20); },
+        [](const RefAngle&) { return S(21); },
+        // ledger, event and spawn/inventory effects are not baseline entries
+        [](const AddItem&) { return none; }, [](const RemoveItem&) { return none; }, [](const ModActorValue&) { return none; },
+        [](const ModReputation&) { return none; }, [](const ModKarma&) { return none; }, [](const SetPlayerControls&) { return none; },
+        [](const ForcedDialogue&) { return none; }, [](const BarrierArrive&) { return none; }, [](const BarrierRelease&) { return none; },
+        [](const SetPerk&) { return none; }, [](const SpawnRef&) { return S(30) | S(31); }, [](const DespawnRef&) { return S(30) | S(31); },
+        [](const RefAddItem&) { return S(28); }, [](const RefRemoveItem&) { return S(28); }, [](const RemoveAllItems&) { return S(28) | S(29); },
+        [](const ForceActiveQuest&) { return none; }, [](const RequestSave&) { return none; }, [](const AdvanceTime&) { return none; },
+        [](const auto&) { return all; },
+    }, eff);
+}
+
+// Queue a single-key update for the big maps when their per-entry terms are valid; false => the caller dirties the whole segment.
+bool noteKeyed(BucketCache& c, unsigned seg, const FormRef& ref) {
+    if ((c.dirty >> seg & 1u) || !(c.termsMask >> seg & 1u) || c.pending.size() >= 512) return false;
+    c.pending.emplace_back(static_cast<uint8_t>(seg), ref);
+    return true;
+}
+bool noteKeyedEffect(BucketCache& c, const Effect& eff) {
+    return std::visit(Overloaded{
+        [&](const SetStage& e) { return noteKeyed(c, 3, e.quest); },
+        [&](const SetGlobal& e) { return noteKeyed(c, 7, e.global); },
+        [&](const EnableRef& e) { return noteKeyed(c, 8, e.ref); },
+        [&](const DisableRef& e) { return noteKeyed(c, 8, e.ref); },
+        [&](const MoveRef& e) { return noteKeyed(c, 10, e.ref); },
+        [](const auto&) { return false; },
+    }, eff);
+}
+}  // namespace
+
 void ShadowState::applyEffect(const Effect& eff, PlayerId origin, PlayerId me, std::vector<Effect>* out) {
+    if (!noteKeyedEffect(bucketCache, eff)) bucketCache.dirty |= segmentsOf(eff);
     auto emit = [&](const Effect& e) { if (out) out->push_back(e); };
     auto toMe = [&](const Recipient& r) {
         return me != kNoPlayer && (recipientMask(r, origin) >> me & 1u);
@@ -37,16 +105,16 @@ void ShadowState::applyEffect(const Effect& eff, PlayerId origin, PlayerId me, s
             if (nv != it->second) { it->second = nv; emit(SetStage{e.quest, nv}); }
         },
         [&](const SetObjective& e) {
+            // Host-authoritative last writer: a host-origin write is the exact flag state (so a hide, displayed 1 -> 0, sticks through resync and
+            // late join). A guest-origin write can only add bits (a stale or local report never un-completes or un-hides what the host decided).
             auto key = std::make_pair(e.quest, e.objective);
             auto it = objectives.find(key);
             if (it == objectives.end()) { objectives[key] = e.flags; emit(e); return; }
+            const bool exact = origin == kHostPlayer && !mut.objectiveOr;
             uint8_t nv = mut.flagsAnd ? static_cast<uint8_t>(it->second & e.flags)
-                                      : static_cast<uint8_t>(it->second | e.flags);
-            if (nv != it->second) {
-                uint8_t added = static_cast<uint8_t>(nv & ~it->second);
-                it->second = nv;
-                emit(SetObjective{e.quest, e.objective, added ? added : nv});
-            }
+                       : exact ? e.flags
+                               : static_cast<uint8_t>(it->second | e.flags);
+            if (nv != it->second) { it->second = nv; emit(SetObjective{e.quest, e.objective, nv}); }
         },
         [&](const SetGlobal& e) {
             auto it = globals.find(e.global);
@@ -168,9 +236,7 @@ void ShadowState::applyEffect(const Effect& eff, PlayerId origin, PlayerId me, s
         },
         [&](const CompleteAllObjectives& e) { if (allObjectivesDone.insert(e.quest).second) emit(e); },
         [&](const SetLock& e) {
-            auto v = std::make_pair(e.locked, e.locked ? e.level : 0);
-            auto it = locks.find(e.ref);
-            if (it == locks.end() || it->second != v) { locks[e.ref] = v; emit(e); }
+            if (foldLock(locks, origins, e.ref, e.locked, e.level, e.hasBefore, e.beforeLocked, e.beforeLevel)) emit(e);
         },
         [&](const SetFactionRank& e) {
             auto key = std::make_pair(e.actor, e.faction);
@@ -208,6 +274,12 @@ void ShadowState::applyEffect(const Effect& eff, PlayerId origin, PlayerId me, s
             if (it == spawned.end() || !(it->second == n)) { spawned[e.ref()] = n; emit(e); }
         },
         [&](const DespawnRef& e) {
+            if (e.forget) {
+                bool had = spawned.erase(e.ref()) > 0;
+                bool tomb = despawned.erase(e.ref()) > 0;
+                if (had || tomb) emit(e);
+                return;
+            }
             bool had = spawned.erase(e.ref()) > 0;
             const uint32_t id = e.id & 0x00FFFFFFu;
             if (id > createdCounter) createdCounter = id;
@@ -224,18 +296,14 @@ void ShadowState::applyEffect(const Effect& eff, PlayerId origin, PlayerId me, s
             if (e.mask & kObjDestroyed) o.destroyed = mut.stickyObjectsReset ? e.destroyed : (o.destroyed || e.destroyed);       // sticky
             if (e.mask & kObjActivated) o.activated = mut.stickyObjectsReset ? e.activatedOnce : (o.activated || e.activatedOnce);   // sticky
             if (!(o == before)) changed = true;
-            if (e.mask & kObjLock) {
-                auto v = std::make_pair(e.locked, e.locked ? e.level : 0);
-                auto lt = locks.find(e.ref);
-                if (lt == locks.end() || lt->second != v) { locks[e.ref] = v; changed = true; }
-            }
+            if (e.mask & kObjLock)
+                if (foldLock(locks, origins, e.ref, e.locked, e.level, e.hasBefore, e.beforeLocked, e.beforeLevel)) changed = true;
             if (o.isDefault()) objects.erase(e.ref); else objects[e.ref] = o;
             if (changed) emit(e);
         },
         [&](const RefScriptVar& e) {
             auto key = std::make_pair(e.ref, e.index);
-            auto it = refVars.find(key);
-            if (it == refVars.end() || it->second != e.value) { refVars[key] = e.value; emit(e); }
+            if (foldRefVar(refVars, origins, e)) emit(e);
         },
         [&](const RefAddItem& e) {
             if (e.count == 0) return;
@@ -251,19 +319,12 @@ void ShadowState::applyEffect(const Effect& eff, PlayerId origin, PlayerId me, s
             if (inv.delta.empty() && !inv.cleared) refInv.erase(e.ref);
             emit(e);
         },
-        [&](const RemoveAllItems& e) {
-            RefInv& inv = refInv[e.ref];
-            if (mut.refInvNoClear) return;
-            inv.cleared = true;
-            inv.delta.clear();
-            emit(e);
-        },
+        [&](const RemoveAllItems& e) { if (foldRefClear(refInv, e, mut.refInvNoClear)) emit(e); },
         [&](const AddTopic& e) { if (topics.insert(e.topic).second) emit(e); },
         [&](const AddNote& e) { if (notes.insert(e.note).second) emit(e); },
         [&](const RemoveNote& e) { if (notes.erase(e.note)) emit(e); },
         [&](const SetMapMarker& e) {
-            auto it = mapMarkers.find(e.marker);
-            if (it == mapMarkers.end() || it->second != e.flags) { mapMarkers[e.marker] = e.flags; emit(e); }
+            if (foldMarker(mapMarkers, origins, e)) emit(e);
         },
         [&](const ForceActiveQuest& e) {
             uint8_t m = recipientMask(e.to, origin);
@@ -278,18 +339,25 @@ void ShadowState::applyEffect(const Effect& eff, PlayerId origin, PlayerId me, s
         },
         [&](const RequestSave& e) { emit(e); },   // event: no state
         [&](const SetWeather& e) {
-            if (!weatherSet || !(weather == e.weather) || weatherForced != e.force) {
-                weather = e.weather; weatherSet = true; weatherForced = e.force; emit(e);
-            }
+            if (foldWeather(weather, weatherSet, weatherForced, origins, e)) emit(e);
         },
-        [&](const SetTimeScale& e) { if (timeScale != e.scale) { timeScale = e.scale; emit(e); } },
+        [&](const SetTimeScale& e) { if (foldTimeScale(timeScale, origins, e)) emit(e); },
         [&](const AdvanceTime& e) { emit(e); },   // event: no state
+        [&](const RefAngle& e) {
+            if (mut.angleKeepsFirst && angles.count({e.ref, e.axis})) return;
+            if (foldAngle(angles, angleOrig, e)) emit(e);
+        },
         [&](const SwapTexture& e) {
             auto key = std::make_pair(e.ref, e.slot);
             auto it = textures.find(key);
             if (it == textures.end() || !(it->second == e.texture)) { textures[key] = e.texture; emit(e); }
         },
     }, eff);
+}
+
+static const Origin* orgOf(const ShadowState& w, uint8_t kind, const FormRef& r, uint16_t idx) {
+    auto it = w.origins.find(OriginKey{kind, r, idx});
+    return it == w.origins.end() ? nullptr : &it->second;
 }
 
 void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, PlayerId me, std::vector<Effect>& out) {
@@ -301,8 +369,7 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
         auto it = from.objectives.find(k);
         uint8_t have = it == from.objectives.end() ? 0 : it->second;
         if (it == from.objectives.end() || have != fl) {
-            uint8_t add = static_cast<uint8_t>(fl & ~have);
-            out.push_back(SetObjective{k.first, k.second, add ? add : fl});
+            out.push_back(SetObjective{k.first, k.second, fl});   // exact state (host-authoritative), not the added bits
         }
     }
     for (auto& [g, v] : to.globals) {
@@ -347,6 +414,10 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
     }
     for (auto& [n, o] : from.companionOwner) if (!to.companionOwner.count(n)) out.push_back(CompanionOwner{n, o, false, 0});
     // round 3
+    if (!mutations().originsIgnored) {   // spawned / despawned in `from` but not in `to`: take the spawn back, drop the tombstone (before any respawn below)
+        for (auto& [r, info] : from.spawned) if (!to.spawned.count(r) && !to.despawned.count(r)) { DespawnRef f{r.localId}; f.forget = true; out.push_back(f); }
+        for (auto& r : from.despawned) if (!to.despawned.count(r)) { DespawnRef f{r.localId}; f.forget = true; out.push_back(f); }
+    }
     for (auto& [r, info] : to.spawned) {
         auto it = from.spawned.find(r);
         if (it == from.spawned.end() || !(it->second == info)) out.push_back(SpawnRef{r.localId, info.base, info.cell, info.x, info.y, info.z, info.leveled});
@@ -369,8 +440,16 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
     }
     for (auto& [k, v] : to.refVars) {
         auto it = from.refVars.find(k);
-        if (it == from.refVars.end() || it->second != v) out.push_back(RefScriptVar{k.first, k.second, v});
+        if (it == from.refVars.end() || it->second != v) {
+            RefScriptVar x{k.first, k.second, v};
+            if (const Origin* o = orgOf(to, kOrgRefVar, k.first, k.second)) { x.hasBefore = true; x.before = o->d; }
+            out.push_back(x);
+        }
     }
+    if (!mutations().originsIgnored)
+        for (auto& [k, v] : from.refVars)
+            if (!to.refVars.count(k))
+                if (const Origin* o = orgOf(from, kOrgRefVar, k.first, k.second)) out.push_back(RefScriptVar{k.first, k.second, o->d, true, o->d});
     {
         std::set<FormRef> refs;
         for (auto& [r, i] : to.refInv) refs.insert(r);
@@ -380,6 +459,12 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
             if (auto it = from.refInv.find(r); it != from.refInv.end()) a = it->second;
             if (auto it = to.refInv.find(r); it != to.refInv.end()) b = it->second;
             if (b.cleared && !a.cleared) { out.push_back(RemoveAllItems{r}); a.delta.clear(); }
+            else if (a.cleared && !b.cleared && a.hasPre && !mutations().originsIgnored) {   // cleared in `from`, not in `to`: put the contents back
+                RemoveAllItems u; u.ref = r; u.undo = true;
+                for (auto& [f, c] : a.pre) u.items.emplace_back(f, static_cast<int32_t>(c));
+                out.push_back(u);
+                a.cleared = false;
+            }
             std::set<FormRef> items;
             for (auto& [i, d] : a.delta) items.insert(i);
             for (auto& [i, d] : b.delta) items.insert(i);
@@ -399,11 +484,42 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
     for (auto& t : from.notes) if (!to.notes.count(t)) out.push_back(RemoveNote{t});
     for (auto& [m, f] : to.mapMarkers) {
         auto it = from.mapMarkers.find(m);
-        if (it == from.mapMarkers.end() || it->second != f) out.push_back(SetMapMarker{m, f});
+        if (it == from.mapMarkers.end() || it->second != f) {
+            SetMapMarker x{m, f};
+            if (const Origin* o = orgOf(to, kOrgMarker, m, 0)) { x.hasBefore = true; x.before = static_cast<uint8_t>(o->n); }
+            out.push_back(x);
+        }
     }
-    if (to.weatherSet && (!from.weatherSet || !(from.weather == to.weather) || from.weatherForced != to.weatherForced))
-        out.push_back(SetWeather{to.weather, to.weatherForced});
-    if (to.timeScale != from.timeScale) out.push_back(SetTimeScale{to.timeScale});
+    if (!mutations().originsIgnored)
+        for (auto& [m, f] : from.mapMarkers)
+            if (!to.mapMarkers.count(m))
+                if (const Origin* o = orgOf(from, kOrgMarker, m, 0)) out.push_back(SetMapMarker{m, static_cast<uint8_t>(o->n), true, static_cast<uint8_t>(o->n)});
+    if (to.weatherSet && (!from.weatherSet || !(from.weather == to.weather) || from.weatherForced != to.weatherForced)) {
+        SetWeather x{to.weather, to.weatherForced};
+        if (const Origin* o = orgOf(to, kOrgWeather, FormRef(), 0)) { x.hasBefore = true; x.before = o->f; x.beforeForce = o->b; }
+        out.push_back(x);
+    } else if (!to.weatherSet && from.weatherSet && !mutations().originsIgnored) {
+        if (const Origin* o = orgOf(from, kOrgWeather, FormRef(), 0)) out.push_back(SetWeather{o->f, o->b, true, o->f, o->b});
+    }
+    if (to.timeScale != 0 && to.timeScale != from.timeScale) {
+        SetTimeScale x{to.timeScale};
+        if (const Origin* o = orgOf(to, kOrgTimeScale, FormRef(), 0)) { x.hasBefore = true; x.before = static_cast<float>(o->d); }
+        out.push_back(x);
+    } else if (to.timeScale == 0 && from.timeScale != 0 && !mutations().originsIgnored) {
+        if (const Origin* o = orgOf(from, kOrgTimeScale, FormRef(), 0)) out.push_back(SetTimeScale{static_cast<float>(o->d), true, static_cast<float>(o->d)});
+    }
+    for (auto& [k, deg] : to.angles) {
+        auto it = from.angles.find(k);
+        if (it == from.angles.end() || it->second != deg) {
+            auto o = to.angleOrig.find(k);
+            out.push_back(RefAngle{k.first, k.second, deg, o != to.angleOrig.end(), o != to.angleOrig.end() ? o->second : 0.f});
+        }
+    }
+    if (!mutations().anglePreimageIgnored)
+        for (auto& [k, deg] : from.angles) {   // rotated in `from` but not in `to`: restore the original
+            auto o = from.angleOrig.find(k);
+            if (!to.angles.count(k) && o != from.angleOrig.end()) out.push_back(RefAngle{k.first, k.second, o->second, true, o->second});
+        }
     for (auto& [b, st] : to.barriers) {
         auto it = from.barriers.find(b);
         if (st.released && (it == from.barriers.end() || !it->second.released)) out.push_back(BarrierRelease{b});
@@ -414,8 +530,16 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
     for (auto& k : to.allObjectivesDone) if (!from.allObjectivesDone.count(k)) out.push_back(CompleteAllObjectives{k});
     for (auto& [r, v] : to.locks) {
         auto it = from.locks.find(r);
-        if (it == from.locks.end() || it->second != v) out.push_back(SetLock{r, v.first, v.second});
+        if (it == from.locks.end() || it->second != v) {
+            SetLock l{r, v.first, v.second};
+            if (const Origin* o = orgOf(to, kOrgLock, r, 0)) { l.hasBefore = true; l.beforeLocked = o->b; l.beforeLevel = o->n; }
+            out.push_back(l);
+        }
     }
+    if (!mutations().originsIgnored)
+        for (auto& [r, v] : from.locks)   // locked / unlocked in `from` but never touched in `to`: restore the original
+            if (!to.locks.count(r))
+                if (const Origin* o = orgOf(from, kOrgLock, r, 0)) out.push_back(SetLock{r, o->b, o->n, true, o->b, o->n});
     for (auto& [k, rk] : to.factionRank) {
         auto it = from.factionRank.find(k);
         if (it == from.factionRank.end() || it->second != rk) out.push_back(SetFactionRank{k.first, k.second, rk});
@@ -493,6 +617,9 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
     }
 }
 
+// Origins are metadata (what a revert needs); entries created from a dump carry none, so they are not part of state equality.
+bool ShadowState::sameOrigins(const ShadowState& o) const { return origins == o.origins; }
+
 bool ShadowState::operator==(const ShadowState& o) const {
     return seq == o.seq && stages == o.stages && objectives == o.objectives && globals == o.globals &&
            enabled == o.enabled && kills == o.kills && questRunning == o.questRunning && placed == o.placed &&
@@ -503,7 +630,7 @@ bool ShadowState::operator==(const ShadowState& o) const {
            spawned == o.spawned && despawned == o.despawned && createdCounter == o.createdCounter && objects == o.objects &&
            refVars == o.refVars && refInv == o.refInv && topics == o.topics && notes == o.notes && mapMarkers == o.mapMarkers &&
            companionKind == o.companionKind && weatherSet == o.weatherSet && (!weatherSet || (weather == o.weather && weatherForced == o.weatherForced)) &&
-           timeScale == o.timeScale;
+           timeScale == o.timeScale && angles == o.angles && angleOrig == o.angleOrig;
 }
 
 std::string ShadowState::describeDifference(const ShadowState& o) const {
@@ -525,6 +652,7 @@ std::string ShadowState::describeDifference(const ShadowState& o) const {
     if (refInv != o.refInv) return "refInv";
     if (topics != o.topics || notes != o.notes || mapMarkers != o.mapMarkers) return "journal";
     if (weatherSet != o.weatherSet || timeScale != o.timeScale) return "weather/time";
+    if (angles != o.angles || angleOrig != o.angleOrig) return "angles";
     return "round2-state";
 }
 
@@ -644,6 +772,8 @@ void ioRound2(Archive& a, ShadowState& s) {
          [&](RefInv& v) {
              a.boolean(v.cleared);
              ioKV(a, v.delta, [&](FormRef& k) { io(a, k); }, [&](int64_t& d) { a.vari(d); });
+             a.boolean(v.hasPre);
+             ioKV(a, v.pre, [&](FormRef& k) { io(a, k); }, [&](int64_t& d) { a.vari(d); });
          });
     ioSet(a, s.topics);
     ioSet(a, s.notes);
@@ -653,12 +783,26 @@ void ioRound2(Archive& a, ShadowState& s) {
     a.boolean(s.weatherForced);
     io(a, s.weather);
     a.f32(s.timeScale);
+    auto angleKey = [&](std::pair<FormRef, uint8_t>& k) { io(a, k.first); a.u8(k.second); if (a.reading() && k.second > kAxisZ) a.fail(); };
+    ioKV(a, s.angles, angleKey, [&](float& v) { a.f32(v); });
+    ioKV(a, s.angleOrig, angleKey, [&](float& v) { a.f32(v); });
+    ioKV(a, s.origins,
+         [&](OriginKey& k) {
+             uint8_t kind = std::get<0>(k);
+             uint32_t idx = std::get<2>(k);
+             a.u8(kind);
+             io(a, std::get<1>(k));
+             a.varu32(idx);
+             if (a.reading()) { if (kind < kOrgWeather || kind > kOrgLock || idx > 0xFFFF) a.fail(); std::get<0>(k) = kind; std::get<2>(k) = static_cast<uint16_t>(idx); }
+         },
+         [&](Origin& o) { io(a, o.f); a.f64(o.d); a.vari32(o.n); a.boolean(o.b); });
 }
 }  // namespace
 
 void io(Archive& a, ShadowState& s) {
     a.varu(s.seq);
     auto rd = a.reading();
+    if (rd) s.bucketCache.dirty = ~0ull;
     {
         size_t n = s.stages.size();
         if (a.count(n, kMaxEntries)) {

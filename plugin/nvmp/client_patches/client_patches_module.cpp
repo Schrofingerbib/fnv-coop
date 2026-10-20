@@ -26,6 +26,7 @@
 
 #include "../../common/minijson.h"
 #include "../../common/nvcoop_api.h"
+#include "../../reload/reload_state.h"
 #include "client_patcher.h"
 #include "players.h"
 #include "../ghost_ref.h"
@@ -280,6 +281,45 @@ uint32_t NetIdByName(const std::string& name) {
 
 namespace client {
 NVCOOP_MODULE(nvmp_client_patches, "nvmp_client_patches", OnLoad, nullptr, OnFrame);
+
+// Hot reload (T3b): our edits inside NV:MP's client.dll are reverted (the next core applies them again from its own config), the
+// optional loader-lock DLL notification is unregistered (it points into this DLL), and the slot -> net id bindings are carried over.
+typedef LONG(NTAPI* LdrUnregFn)(PVOID cookie);
+NVCOOP_RELOAD_STATE(nvmp_client_patches, "nvmp_client_patches", 1, 70, nullptr,
+    /*save*/ [](nvreload::Writer& w) {
+        std::lock_guard<std::mutex> g(g_bindMu);
+        w.u32(static_cast<uint32_t>(g_bindings.size()));
+        for (const auto& b : g_bindings) { w.u8(b.slot); w.u32(b.netId); }
+        return true;
+    },
+    /*restore*/ [](uint32_t, nvreload::Reader& r) {
+        std::vector<SlotBindings> v;
+        uint32_t n = r.u32();
+        for (uint32_t i = 0; i < n && r.ok(); ++i) {
+            SlotBindings b{};
+            b.slot = r.u8();
+            b.netId = r.u32();
+            v.push_back(b);
+        }
+        if (!r.ok()) return false;
+        std::lock_guard<std::mutex> g(g_bindMu);
+        g_bindings = std::move(v);
+        return true;
+    },
+    /*migrate*/ nullptr,
+    /*shutdown*/ [] {
+        if (g_cookie) {
+            if (HMODULE nt = GetModuleHandleA("ntdll.dll"))
+                if (auto unreg = (LdrUnregFn)GetProcAddress(nt, "LdrUnregisterDllNotification")) unreg(g_cookie);
+            g_cookie = nullptr;
+        }
+        if (g_patcher) {
+            int bad = g_patcher->RevertAll();
+            if (bad) nvcoop::Log("nvmp patches: %d patch(es) could not be reverted for the reload", bad);
+        }
+        g_patcher.reset();
+    },
+    /*fresh*/ nullptr);
 }  // namespace client
 
 }  // namespace nvmp

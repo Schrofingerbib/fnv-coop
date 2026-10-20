@@ -49,7 +49,7 @@ void CaptureHub::emit(const fnvcoop::Cause& cause) {
 }
 
 bool CaptureHub::beginWeak(uint32_t scriptRefID) {
-    if (!enabled_ || !frames_.empty()) return false;
+    if (!on() || !frames_.empty()) return false;
 #ifdef NVHOOKS_MUTANT
     return false;  // mutant: ambient script mutations are dropped again (droppedNoScope)
 #else
@@ -69,7 +69,7 @@ void CaptureHub::endWeak() {
 }
 
 void CaptureHub::begin(const fnvcoop::Cause& cause) {
-    if (!enabled_) return;
+    if (!on()) return;
     bool hasStrong = false;
     for (const Frame& f : frames_) hasStrong |= !f.weak;
     if (!hasStrong && frames_.size() == 1 && frames_[0].weak && !cap_.empty() && weakResolver_) {
@@ -86,7 +86,7 @@ void CaptureHub::begin(const fnvcoop::Cause& cause) {
 }
 
 void CaptureHub::end() {
-    if (!enabled_ || frames_.empty()) return;
+    if (!enabled_ || frames_.empty()) return;  // not on(): a scope opened before a mute still closes
     if (frames_.back().weak) {  // weak frames only ever sit at the bottom
         if (weakResolver_ && !cap_.empty()) {
             ++stats_.weakTxns;
@@ -114,6 +114,17 @@ void CaptureHub::end() {
     frames_.pop_back();
 }
 
+bool CaptureHub::currentSource(fnvcoop::FormRef* out) const {
+    if (!on() || frames_.empty()) return false;
+    const Frame* pick = &frames_.front();
+    for (const Frame& f : frames_)
+        if (!f.weak) { pick = &f; break; }  // outermost explicit scope wins over the implicit script scope below it
+    fnvcoop::Cause c = pick->weak ? (weakResolver_ ? weakResolver_(pick->lazyId) : fnvcoop::Cause{}) : pick->cause;
+    if (c.source.plugin.empty() && c.source.localId == 0) return false;
+    if (out) *out = c.source;
+    return true;
+}
+
 size_t CaptureHub::reapStale() {
 #ifdef NVHOOKS_MUTANT
     return 0;  // never recovers: every later capture disappears into the stuck scope
@@ -132,6 +143,7 @@ static bool idempotentState(const fnvcoop::Effect& e) {
 }
 
 bool CaptureHub::record(const fnvcoop::Effect& e) {
+    if (muted_ > 0 && enabled_) { ++stats_.droppedLocal; return false; }
     if (!enabled_) return false;
     if (frames_.empty() && !kMutRecordAmbient) {
         ++stats_.droppedNoScope;

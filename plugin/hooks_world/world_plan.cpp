@@ -169,8 +169,111 @@ Plan planWorldEffect(const WorldEffect& e, PlanEnv& env) {
         p.steps.push_back(st);
         return p;
     }
+    if (auto* x = std::get_if<SetIgnoreCrime>(&e)) return onRef(x->actor, ignoreCrimeLine(x->on));
+    if (auto* x = std::get_if<SetFactionPlayerEnemy>(&e)) {
+        uint32_t f = 0;
+        if (!exists(env, x->faction, &f)) return missing(x->faction);
+        Step st;
+        st.kind = StepKind::ConsoleGlobal;
+        st.line = setPCEnemyOfFactionLine(f, x->on);
+        p.steps.push_back(st);
+        return p;
+    }
     p.status = PlanStatus::Unsupported;
     return p;
+}
+
+Plan planReconcile(const std::vector<fnvcoop::SpawnRef>& live, PlanEnv& env) {
+    Plan p;
+    for (uint32_t local : env.ledger.reconcile(live)) {
+        Step st;
+        st.kind = StepKind::ConsoleOnRef;
+        st.refID = local;
+        st.line = markForDeleteLine();
+        p.steps.push_back(st);
+    }
+    return p;
+}
+
+namespace {
+Outcome runPlan(const Plan& p, const RunPlan& run) {
+    switch (p.status) {
+        case PlanStatus::FormMissing: return Outcome::Missing;
+        case PlanStatus::Unsupported: return Outcome::Other;
+        case PlanStatus::Queued: return Outcome::Ok;
+        case PlanStatus::Ok: break;
+    }
+    if (p.steps.empty()) return Outcome::Ok;
+    return run(p);
+}
+}  // namespace
+
+Outcome applyRouted(const fnvcoop::Effect& e, PlanEnv& env, const RunPlan& run, const FallbackApply& other, int attempts) {
+    FormRef wait;
+    if (routeEffect(e, env.ledger.map(), &wait) == Route::HoldForCreated) {
+        HeldEffect h;
+        h.fx = e;
+        h.waitOn = wait;
+        h.onCreated = true;
+        h.attempts = attempts;
+        env.ledger.deferred().hold(std::move(h));
+        return Outcome::Ok;
+    }
+    Outcome o = handlesEffect(e) ? runPlan(planEffect(e, env), run) : (other ? other(e) : Outcome::Other);
+#if NVWORLD_MUT != 37
+    if (o != Outcome::Ok && retriable(e, o)) {  // MUTANT 37: a form that is not loaded yet is simply lost
+        HeldEffect h;
+        h.fx = e;
+        h.attempts = attempts;
+        env.ledger.deferred().hold(std::move(h));
+        return Outcome::Ok;
+    }
+#endif
+#if NVWORLD_MUT != 42
+    if (o == Outcome::Ok && std::holds_alternative<fnvcoop::SpawnRef>(e))  // MUTANT 42: follow-ups wait for the next tick
+        flushDeferred(env, run, other, false);
+#endif  // the object exists now: its follow-ups can run
+    return o;
+}
+
+Outcome applyWorldRouted(const WorldEffect& e, PlanEnv& env, const RunPlan& run, int attempts) {
+    FormRef wait;
+    if (routeEffect(e, env.ledger.map(), &wait) == Route::HoldForCreated) {
+        HeldEffect h;
+        h.world = true;
+        h.wfx = e;
+        h.waitOn = wait;
+        h.onCreated = true;
+        h.attempts = attempts;
+        env.ledger.deferred().hold(std::move(h));
+        return Outcome::Ok;
+    }
+    Outcome o = runPlan(planWorldEffect(e, env), run);
+    if (o != Outcome::Ok && retriable(e, o)) {
+        HeldEffect h;
+        h.world = true;
+        h.wfx = e;
+        h.attempts = attempts;
+        env.ledger.deferred().hold(std::move(h));
+        return Outcome::Ok;
+    }
+    return o;
+}
+
+size_t flushDeferred(PlanEnv& env, const RunPlan& run, const FallbackApply& other, bool retryTick, int maxAttempts) {
+    std::vector<HeldEffect> ready = env.ledger.deferred().takeBound(env.ledger.map());
+    if (retryTick) {
+        auto r = env.ledger.deferred().takeRetries(maxAttempts);
+        for (auto& h : r) ready.push_back(std::move(h));
+    }
+    size_t n = 0;
+    for (const HeldEffect& h : ready) {
+        const size_t holdsBefore = env.ledger.deferred().holds();
+        Outcome o = h.world ? applyWorldRouted(h.wfx, env, run, h.attempts) : applyRouted(h.fx, env, run, other, h.attempts);
+        // an effect that was held again (target still not loaded) answers Ok too, but it did not run
+        if (o == Outcome::Ok && env.ledger.deferred().holds() == holdsBefore) ++n;
+    }
+    return n;
 }
 
 }  // namespace nvworld

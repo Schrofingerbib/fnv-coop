@@ -61,7 +61,7 @@ TEST(wire, roundtrip_every_effect_type) {
         SpawnRef{0xFF000001, f, g, 1.f, 2.f, 3.f, true}, DespawnRef{0xFF000001},
         ObjectState{f, 15, true, true, 50, true, true}, RefScriptVar{f, 9, 2.5}, RefAddItem{f, g, 3}, RefRemoveItem{f, g, 2},
         RemoveAllItems{f}, AddTopic{g}, AddNote{f}, RemoveNote{f}, SetMapMarker{g, 3}, ForceActiveQuest{f, Recipient::origin()},
-        RequestSave{2}, SetWeather{f, true}, SetTimeScale{20.f}, AdvanceTime{480}};
+        RequestSave{2}, SetWeather{f, true}, SetTimeScale{20.f}, AdvanceTime{480}, RefAngle{f, kAxisY, -45.5f, true, 10.f}};
     CHECK(all.size() == std::variant_size_v<Effect>);
     EffectTxn t; t.seq = 77; t.origin = 2; t.cause = {CauseKind::QuestResult, f, 40}; t.effects = all; t.flags = 1; t.originEpoch = 9;
     TxnBatch b{5, {t}};
@@ -74,6 +74,21 @@ TEST(wire, roundtrip_every_effect_type) {
     CHECK(ob->session == 5);
     REQUIRE(ob->txns.size() == 1);
     CHECK(ob->txns[0] == t);
+}
+
+TEST(wire, ref_angle_with_and_without_a_pre_image) {
+    FormRef f("falloutnv.esm", 0x1234);
+    for (RefAngle a : {RefAngle{f, kAxisX, 12.5f}, RefAngle{f, kAxisZ, 270.f, true, -0.5f}}) {
+        EffectTxn t; t.seq = 1; t.effects = {a};
+        Bytes enc = encodeMessage(TxnBatch{1, {t}});
+        Message out;
+        REQUIRE(decodeMessage(enc, out) == DecodeStatus::Ok);
+        CHECK(std::get<RefAngle>(std::get<TxnBatch>(out).txns[0].effects[0]) == a);
+    }
+    RefAngle bad{f, 3, 1.f};   // axis out of range is rejected on decode
+    EffectTxn t; t.seq = 1; t.effects = {bad};
+    Message out;
+    CHECK(decodeMessage(encodeMessage(TxnBatch{1, {t}}), out) != DecodeStatus::Ok);
 }
 
 TEST(wire, roundtrip_random_messages_canonical) {

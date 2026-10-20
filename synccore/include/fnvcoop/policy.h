@@ -81,4 +81,40 @@ size_t normalizeTxn(EffectTxn& txn, const SharePolicy& policy);
 // Slot mask for a recipient (All = every slot; Default/Origin = origin only). Normalized txns only contain Mask.
 uint8_t recipientMask(const Recipient& r, PlayerId origin);
 
+// ---- per-reward identity (restart-rejoin without duplicates) ----
+// A reward is an additive per-player effect of a committed txn (items and actor values; karma / reputation are synced as absolutes).
+// Its id is derived from where it was committed, so the host, the receiving client and the client's save sidecar all compute the same
+// value without any extra wire field: (world epoch, txn seq, effect index). A new epoch can never collide with an older one.
+inline uint64_t rewardId(uint32_t epoch, uint64_t seq, uint32_t index) {
+    return (uint64_t(epoch & 0xFFFFu) << 48) | ((seq & 0xFFFFFFFFull) << 16) | (index & 0xFFFFu);
+}
+inline bool isRewardEffect(const Effect& e) {
+    return std::holds_alternative<AddItem>(e) || std::holds_alternative<RemoveItem>(e) || std::holds_alternative<ModActorValue>(e);
+}
+struct RewardGrant {
+    uint64_t id = 0;
+    Effect effect;   // addressed to exactly one slot
+};
+// fn(slot, id, effect) for every reward effect of a normalized (committed) txn, once per recipient slot.
+template <class F>
+void forEachReward(const EffectTxn& t, uint32_t epoch, F&& fn) {
+    for (size_t i = 0; i < t.effects.size(); ++i) {
+        const Effect& e = t.effects[i];
+        if (!isRewardEffect(e)) continue;
+        const Recipient* to = nullptr;
+        if (auto* a = std::get_if<AddItem>(&e)) to = &a->to;
+        else if (auto* r = std::get_if<RemoveItem>(&e)) to = &r->to;
+        else if (auto* m = std::get_if<ModActorValue>(&e)) to = &m->to;
+        const uint8_t mask = recipientMask(*to, t.origin);
+        for (unsigned s = 0; s < kMaxSlots; ++s) {
+            if (!(mask >> s & 1u)) continue;
+            Effect one = e;
+            if (auto* a = std::get_if<AddItem>(&one)) a->to = Recipient::slot(PlayerId(s));
+            else if (auto* r = std::get_if<RemoveItem>(&one)) r->to = Recipient::slot(PlayerId(s));
+            else if (auto* m = std::get_if<ModActorValue>(&one)) m->to = Recipient::slot(PlayerId(s));
+            fn(PlayerId(s), rewardId(epoch, t.seq, uint32_t(i)), one);
+        }
+    }
+}
+
 }  // namespace fnvcoop

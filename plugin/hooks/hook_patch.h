@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -53,18 +54,40 @@ enum class PatchStatus {
     Restored,          // last ref dropped, original bytes restored
 };
 const char* statusName(PatchStatus s);
+
+// Process-wide accounting for hot reload (docs/tools/T3b-state.md). liveHookCount() is the number of entry patches that are
+// installed right now across every HookRegistry in this module; it must be 0 after a core DLL's shutdown or FreeLibrary would
+// leave game code jumping into freed memory. tamperedCount() counts hooks we could not restore because another patcher chained
+// over ours: those keep their trampoline alive, and a reload must refuse to unload while it is non-zero.
+int liveHookCount();
+int tamperedCount();
 inline bool installed(PatchStatus s) { return s == PatchStatus::Ok || s == PatchStatus::AlreadyInstalled; }
 
 class HookRegistry {
 public:
-    explicit HookRegistry(MemoryOps& mem) : mem_(mem) {}
+    explicit HookRegistry(MemoryOps& mem);
     ~HookRegistry();  // restores everything still installed
     // On success *trampolineOut is the address to call for the original function.
-    PatchStatus acquire(const HookSpec& spec, Addr detour, Addr* trampolineOut);
+    // `origSlot` (optional, 32-bit): written with the trampoline address BEFORE the entry is patched, so a thread that enters the detour
+    // the instant the patch lands already finds a valid "original" pointer (the detours call through it).
+    PatchStatus acquire(const HookSpec& spec, Addr detour, Addr* trampolineOut, Addr* origSlot = nullptr);
     PatchStatus release(const HookSpec& spec);
     int refCount(const HookSpec& spec) const;
     size_t installedCount() const { return hooks_.size(); }
     std::string lastError() const { return lastError_; }
+    // Reload support: release every hook (ignoring refcounts), then read each patched entry back and compare it with the bytes
+    // we saved at install time. Returns the number of hooks that could NOT be proven restored (0 = clean).
+    int restoreAllAndVerify();
+    // Read-only preflight for a reload: how many installed hooks no longer have our patch bytes at the entry
+    // (another patcher chained over it). Such a hook cannot be restored safely, so the reload must be refused.
+    int auditTampered() const;
+    // Reload drain, step 1: put the original bytes back at every entry but keep the trampolines and the bookkeeping, so no thread
+    // can ENTER a detour any more while threads already inside it finish. Returns how many hooks could not be suspended (0 = all).
+    // resumeAll() re-patches every suspended hook (used when the drain times out and the reload is refused).
+    int suspendAll();
+    int resumeAll();
+    // Appends [trampoline, trampoline+size) of every installed hook (threads may still be executing inside them).
+    void collectTrampolines(std::vector<std::pair<Addr, size_t>>* out) const;
 
 private:
     struct Installed {
@@ -75,11 +98,26 @@ private:
         uint8_t original[16] = {};
         uint8_t patch[16] = {};
         int refs = 0;
+        bool suspended = false;
     };
     MemoryOps& mem_;
     std::map<Addr, Installed> hooks_;
     std::string lastError_;
 };
+
+// Cross-thread safe patching. Writing a jump over code another thread is executing can leave that thread running torn bytes.
+// The reload layer installs a guard that freezes every other thread around each entry write and moves any thread that is
+// stopped inside the patched bytes between the original entry and its trampoline copy (same offsets). Default: none.
+//   begin(target, stolen, trampoline, installing): installing = the entry is about to get the jump; false = original bytes go back.
+//   end(): resume everything. Between the two calls only the memory write runs (no allocation, no locks).
+using WriteGuardBegin = void (*)(Addr target, uint8_t stolen, Addr trampoline, bool installing);
+using WriteGuardEnd = void (*)();
+void setWriteGuard(WriteGuardBegin begin, WriteGuardEnd end);
+
+// Process-wide helpers over every live HookRegistry (L5, L11 and L12 each own one). Used by the reload drain (plugin/reload).
+int suspendAllHooks();
+int resumeAllHooks();
+void collectAllTrampolines(std::vector<std::pair<Addr, size_t>>* out);
 
 // Validate a spec without touching memory (rule 2).
 bool specIsValid(const HookSpec& s, std::string* why = nullptr);

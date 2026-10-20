@@ -200,6 +200,61 @@ class MutationTwins(unittest.TestCase):
         self.assertTrue(check_catches_stage_change(mutant_no_guard))  # control
 
 
+class LocalRunClassification(unittest.TestCase):
+    """GuestLocalRun quests are per-machine by definition: shared compare must ignore them."""
+    LIVE = os.path.abspath(os.path.join(HERE, "..", "..", "..", "out", "L10", "twogame", "live"))
+
+    def _local_edid(self):
+        return sorted(snaplib.load_local_allowlist()[0])[0]
+
+    def _pair(self):
+        a = g("base")
+        b = copy.deepcopy(a)
+        qk = next(iter(b["shared"]["quests"]))
+        a["shared"]["quests"][qk]["edid"] = b["shared"]["quests"][qk]["edid"] = self._local_edid()
+        b["shared"]["quests"][qk]["currentStage"] += 10
+        return a, b, qk
+
+    def test_local_quest_diff_ignored_in_shared(self):
+        a, b, _ = self._pair()
+        self.assertEqual(real_compare(a, b), 0)
+
+    def test_local_quest_moved_to_perplayer(self):
+        a, b, qk = self._pair()
+        la = snaplib.localize(b)
+        self.assertNotIn(qk, la["shared"]["quests"])
+        self.assertIn(qk, la["perPlayer"]["host"]["localQuests"])
+        self.assertEqual(real_compare(a, b, sections=("shared", "perPlayer")), 1)
+
+    def test_twin_keeping_local_shared_still_diffs(self):
+        a, b, _ = self._pair()
+        self.assertEqual(snapdiff.compare(a, b, local_split=False)[0], 1)
+
+    def test_non_local_quest_still_caught(self):
+        a, b, qk = self._pair()
+        a["shared"]["quests"][qk]["edid"] = b["shared"]["quests"][qk]["edid"] = "NotOnTheList"
+        self.assertEqual(real_compare(a, b), 1)
+
+    def test_faction_rank_listed_is_local(self):
+        a, b = g("base"), g("base")
+        b["shared"].setdefault("factionRanks", {})["X.esm:000ABC"] = {"edid": "", "rank": 1}
+        al = (set(), {"X.esm:000abc"})
+        self.assertEqual(snaplib.diff(snaplib.localize(a, al), snaplib.localize(b, al)), [])
+        self.assertEqual(len(snaplib.diff(a, b, local_split=False)), 2)
+
+    @unittest.skipUnless(os.path.exists(os.path.join(LIVE, "S_client.json")), "L10 live fixture absent")
+    def test_l10_live_fixture(self):
+        a = snaplib.load(os.path.join(self.LIVE, "S_host.json"))
+        b = snaplib.load(os.path.join(self.LIVE, "S_client.json"))
+        twin = snaplib.diff(a, b, local_split=False)
+        real = snaplib.diff(a, b)
+        self.assertGreaterEqual(len(twin), 40)
+        self.assertLess(len(real), len(twin) - 25)
+        names = snaplib.load_local_allowlist()[0]
+        for e in real:
+            self.assertNotIn(e["label"].split(" ")[0].split("/")[-1].lower(), names, e)
+
+
 class GoldensProtected(unittest.TestCase):
     def test_manifest_matches(self):
         with open(os.path.join(GOLD, "MANIFEST.sha256")) as f:

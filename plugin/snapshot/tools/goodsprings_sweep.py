@@ -88,6 +88,32 @@ def acquire_slot(ttl, wait):
     return int(m.group(1)) if m else 0
 
 
+def restore_files(pairs, game=None, timeout=90.0):
+    """Write each (path, bytes) back, retrying until the file is writable (a dying FalloutNV.exe keeps nvcoop.dll locked for a while).
+    Kills our own game pid first; never raises before every file was tried. Returns the paths that could not be restored."""
+    if game is not None:
+        try:
+            game.kill()
+        except Exception:   # noqa: BLE001
+            pass
+    failed = []
+    for path, data in pairs:
+        if data is None or path is None:
+            continue
+        deadline = time.time() + timeout
+        while True:
+            try:
+                path.write_bytes(data)
+                break
+            except OSError as e:
+                if time.time() > deadline:
+                    print("RESTORE FAILED %s: %s" % (path, e))
+                    failed.append(path)
+                    break
+                time.sleep(1.0)
+    return failed
+
+
 class Game:
     def __init__(self, frames, instance=0):
         import nvbridge, run as runner, winproc  # noqa: E401
@@ -109,13 +135,18 @@ class Game:
     def launch(self):
         self.kill()
         os.environ["FNV_LANE"] = OWNER     # run.launch_instance registers the pid on our lease (tools/gameslot.py register-pid)
+        t0 = time.time()
         self.pid = self.runner.launch_instance(self.instance)
+        print("launch: process started %.0fs" % (time.time() - t0))
         st = self.runner.load_state()
         st["pids"][str(self.instance)] = self.pid
         self.runner.save_state(st)
         self.nv = self.nvbridge.NvBridge.connect(self.instance, wait_s=240)
+        print("launch: bridge connected %.0fs" % (time.time() - t0))
         self.nv.wait_event("autoload.done", timeout_s=240)
+        print("launch: autoload.done %.0fs" % (time.time() - t0))
         self.wait_frames(self.frames)
+        print("launch: ready %.0fs" % (time.time() - t0))
         self.launches += 1
 
     def kill(self):
@@ -124,6 +155,11 @@ class Game:
                 self.nv.quit()
             except Exception:
                 pass
+        if not self.pid:   # launch may have died after spawning: fall back to the pid recorded in the runner state
+            try:
+                self.pid = self.runner.load_state()["pids"].get(str(self.instance))
+            except Exception:   # noqa: BLE001
+                self.pid = None
         if self.pid:
             for _ in range(40):
                 if not self.winproc.pid_alive(self.pid):
@@ -194,6 +230,9 @@ def run_setup_cmd(nv, plan, cmd):
         raise SetupError("%s -> %s" % (cmd, out.strip()[:120] or r))
 
 
+WORLD_EFFECTS = {"moveref", "enableref", "disableref", "kill", "additem", "removeitem", "placeatme", "resurrect", "setowner", "equipitem"}
+
+
 def run_item(game, plan, item, oracle, outdir, save, frames, control_s, settle_s, first):
     nv = game.nv
     tmp = outdir / "tmp"
@@ -202,9 +241,18 @@ def run_item(game, plan, item, oracle, outdir, save, frames, control_s, settle_s
     name = item_name(edid, stage, var["name"] if var else None)
     s = {k: tmp / ("%s_%s.json" % (name, k)) for k in ("S0", "S1", "S2")}
     t0 = time.time()
+    ph = {}
+    tp = [t0]
+
+    def mark(k):
+        now = time.time()
+        ph[k] = round(now - tp[0], 1)
+        tp[0] = now
     if not first:
         nv.load_save(save)
+        mark("load")
         game.wait_frames(frames)
+        mark("frames")
     rst = nv.call("test.quest.reset", {"quests": plan["reset_ids"]})
     cmds = list(q["setup"]) + list(st["setup"]) + (list(var["setup"]) if var else [])
     for c in cmds:
@@ -212,9 +260,12 @@ def run_item(game, plan, item, oracle, outdir, save, frames, control_s, settle_s
         time.sleep(0.3)
     if cmds:
         time.sleep(1.5)
+    mark("setup")
     nv.state_to_file(str(s["S0"]))
+    mark("dumpS0")
     time.sleep(control_s)
     nv.state_to_file(str(s["S1"]))
+    mark("control+S1")
     nv.call("capture.begin")
     nv.exec(st["command"])
     m = re.match(r"\s*setstage\s+([0-9A-Fa-f]+)\s+(\d+)", st["command"], re.I)
@@ -224,8 +275,10 @@ def run_item(game, plan, item, oracle, outdir, save, frames, control_s, settle_s
         except Exception:   # readback can legitimately differ (e.g. 255, or a script resets it)
             pass
     time.sleep(settle_s)
+    mark("stage+settle")
     cap = nv.call("capture.end")
     nv.state_to_file(str(s["S2"]))
+    mark("end+S2")
     snaps = {k: json.loads(v.read_text(encoding="utf-8")) for k, v in s.items()}
     res = sweep_lib.analyze_stage(oracle, edid, stage, snaps["S0"], snaps["S1"], snaps["S2"], cap)
     res["variant"] = var["name"] if var else None
@@ -234,6 +287,8 @@ def run_item(game, plan, item, oracle, outdir, save, frames, control_s, settle_s
     res["captured"] = sweep_lib.captured_effects(cap)
     res["reset"] = rst
     res["capture_stats"] = {k: cap.get(k) for k in ("stats", "unmapped", "scripts")}
+    mark("analyze")
+    res["phases"] = ph
     res["seconds"] = round(time.time() - t0, 1)
     if res["status"] == "fail":
         res["capture_raw"] = cap
@@ -374,6 +429,10 @@ def latest_unfinished(root):
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)   # redirected logs must show progress live
+    except Exception:   # noqa: BLE001
+        pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="")
     ap.add_argument("--run-id", default="")
@@ -388,6 +447,9 @@ def main():
     ap.add_argument("--time-budget", type=int, default=2400)
     ap.add_argument("--max-relaunch", type=int, default=8)
     ap.add_argument("--wait", type=int, default=3600)
+    ap.add_argument("--reload-every", type=int, default=1,
+                    help="load the save once per N stages; in between only test.quest.reset (falls back to a reload after a failing stage or "
+                         "one whose capture touched the world: moves, enable/disable, kills, items)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--finalize", action="store_true")
     ap.add_argument("--probe-console", action="store_true")
@@ -467,13 +529,13 @@ def main():
             game = Game(a.frames, instance)
         except BaseException:   # any failure while preparing the instance: restore what we touched, free the slot
             if saved_dll is not None:
-                inst_dll.write_bytes(saved_dll)
-                inst_ini.write_bytes(saved_ini)
+                restore_files([(inst_dll, saved_dll), (inst_ini, saved_ini)])
             lease("release")
             raise
         t_start = time.time()
         relaunches = 0
         first = True
+        since_load, prev_clean = 1, False
         try:
             game.launch()
             hs = game.nv.call("hooks.status")
@@ -486,12 +548,18 @@ def main():
                 todo = []
             for it in todo:
                 key = (it["edid"], it["stage"], it["variant"]["name"] if it["variant"] else None)
+                if (REPO / "out" / "L7tmp" / "PAUSE").exists():
+                    print("PAUSE file present; stopping after the last finished stage; continue with --resume")
+                    break
                 if time.time() - t_start > a.time_budget:
                     print("time budget reached; continue with --resume")
                     break
                 try:
-                    res = run_item(game, plan, it, oracle, outdir, a.save, a.frames, a.control, a.settle, first)
+                    skip_load = first or (since_load < a.reload_every and prev_clean)
+                    since_load = 1 if not skip_load or first else since_load + 1
+                    res = run_item(game, plan, it, oracle, outdir, a.save, a.frames, a.control, a.settle, skip_load)
                     first = False
+                    prev_clean = res.get("status") == "pass" and not (WORLD_EFFECTS & {e.get("type") for e in res.get("captured", [])})
                 except SetupError as e:
                     res = {"quest": it["edid"], "stage": it["stage"], "variant": key[2], "status": "error",
                            "detail": "SetupError: %s" % e, "reasons": ["setup: %s" % str(e)[:160]], "seconds": 0.0}
@@ -517,9 +585,7 @@ def main():
                 print("%-5s %s %3d %-10s %s  %ss  %s" % (res["status"].upper(), it["edid"], it["stage"], key[2] or "", res.get("counts", ""),
                                                       res.get("seconds"), "; ".join(map(str, res.get("reasons", [])))[:110]))
         finally:
-            game.kill()
-            inst_dll.write_bytes(saved_dll)
-            inst_ini.write_bytes(saved_ini)
+            restore_files([(inst_dll, saved_dll), (inst_ini, saved_ini)], game)
             lease("release")
     done = sum(1 for it in items if (it["edid"], it["stage"], it["variant"]["name"] if it["variant"] else None) in results)
     tot = write_report(outdir, plan, items, results, run_id)

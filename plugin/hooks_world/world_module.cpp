@@ -3,7 +3,9 @@
 //   (world.peek lives in world_peek.cpp, always built)
 //   world.drain                   -> {effects:[...]}   lane-local WorldEffects recorded on the host since the last drain
 //   world.apply {effect:{..}}     -> {status,error}    SpawnRef/DespawnRef/RefScriptVar (synccore Effect JSON) or a WorldEffect
-//   world.flush                   -> {created}         create queued spawns whose cell is loaded now
+//   world.flush                   -> {created}         create queued spawns whose cell is loaded now, release held follow-ups
+//   world.baseline                -> {effects:[...],world:[...]}  host: net spawns / ref vars / NPC state for a joiner
+//   world.applybaseline {effects,world} -> {applied}   client: delete stale spawns, apply the baseline
 //   world.refvars {}              -> {changes:[...]}   one full RefScriptVar poll pass (diagnostic)
 //   world.refvar {ref,index}      -> {value}           read a script variable of a reference
 //   world.watch {ref}             -> {}                poll this ref's script variables even outside the player's cell
@@ -24,6 +26,7 @@
 #include "common/nvcoop_api.h"
 #include "effect_json.h"
 #include "world_hooks.h"
+#include "reload/reload_state.h"
 
 using nvcoop::json::Value;
 
@@ -84,7 +87,9 @@ bool MStatus(const std::string&, std::string& out) {
         hs.push(e);
     }
     Value led = Value::object();
-    led.set("pending", (int64_t)nvworld::ledger().pending()).set("created", (int64_t)nvworld::ledger().map().size());
+    led.set("pending", (int64_t)nvworld::ledger().pending()).set("created", (int64_t)nvworld::ledger().map().size())
+        .set("deferred", (int64_t)nvworld::ledger().deferred().size()).set("deferredDropped", (int64_t)nvworld::ledger().deferred().dropped())
+        .set("deferredExpired", (int64_t)nvworld::ledger().deferred().expired());
     Value o = Value::object();
     o.set("inited", g_inited).set("role", RoleName(g_role)).set("installed", g_report.ok).set("failed", g_report.failed)
         .set("hooks", hs).set("ledger", led);
@@ -133,6 +138,44 @@ bool MFlush(const std::string&, std::string& out) {
     if (!g_applier) { out = "world hooks not initialised"; return false; }
     Value o = Value::object();
     o.set("created", (int64_t)g_applier->flushQueued());
+    out = o.dump();
+    return true;
+}
+
+bool MBaseline(const std::string&, std::string& out) {
+    nvworld::BaselineSnapshot b = nvworld::hostBaseline();
+    Value fx = Value::array(), wf = Value::array();
+    for (auto& e : b.effects) fx.push(nvhooks::effectToJson(e));
+    for (auto& w : b.world) {
+        Value v;
+        std::string err;
+        nvcoop::json::parse(nvworld::worldEffectToJson(w), v, err);
+        wf.push(v);
+    }
+    Value o = Value::object();
+    o.set("effects", fx).set("world", wf);
+    out = o.dump();
+    return true;
+}
+
+bool MApplyBaseline(const std::string& params, std::string& out) {
+    if (!g_inited || !g_applier) { out = "world hooks not initialised"; return false; }
+    Value p;
+    if (!Parse(params, p, out)) return false;
+    nvworld::BaselineSnapshot b;
+    std::string err;
+    for (const Value& v : p.get("effects").items()) {
+        fnvcoop::Effect e;
+        if (!nvhooks::effectFromJson(v, &e, &err)) { out = "bad effect: " + err; return false; }
+        b.effects.push_back(e);
+    }
+    for (const Value& v : p.get("world").items()) {
+        nvworld::WorldEffect w;
+        if (!nvworld::worldEffectFromJson(v.dump(), &w, &err)) { out = "bad world effect: " + err; return false; }
+        b.world.push_back(w);
+    }
+    Value o = Value::object();
+    o.set("applied", (int64_t)g_applier->applyBaseline(b));
     out = o.dump();
     return true;
 }
@@ -298,12 +341,12 @@ bool MQuery(const std::string& params, std::string& out) {
     return true;
 }
 
-// world.actors {max} -> {actors:[{id,ref,base}]}  characters in the player's cell
+// world.actors {max, type?} -> {actors:[{id,ref,base}]}  characters (type 0x3B), containers (0x1B) or doors (0x1C) in the player's cell
 bool MActors(const std::string& params, std::string& out) {
     Value p;
     if (!Parse(params, p, out)) return false;
     Value arr = Value::array();
-    for (auto& a : nvworld::actorsInPlayerCell(static_cast<size_t>(p.get("max").asInt(30)))) {
+    for (auto& a : nvworld::actorsInPlayerCell(static_cast<size_t>(p.get("max").asInt(30)), static_cast<uint32_t>(p.get("type").asInt(0x3B)))) {
         Value e = Value::object();
         e.set("id", (int64_t)a.refID).set("ref", a.ref).set("base", (int64_t)a.baseID);
         arr.push(e);
@@ -325,6 +368,12 @@ bool MWeather(const std::string&, std::string& out) {
     return true;
 }
 
+bool MReset(const std::string&, std::string& out) {
+    nvworld::resetSession();
+    out = "{}";
+    return true;
+}
+
 bool MTick(const std::string&, std::string& out) {
     for (int i = 0; i < 15; ++i) nvworld::hostTick();
     out = "{}";
@@ -336,10 +385,13 @@ void OnLoad(void*) {
     nvcoop::RegisterMethod("world.drain", MDrain, true);
     nvcoop::RegisterMethod("world.apply", MApply, true);
     nvcoop::RegisterMethod("world.flush", MFlush, true);
+    nvcoop::RegisterMethod("world.baseline", MBaseline, true);
+    nvcoop::RegisterMethod("world.applybaseline", MApplyBaseline, true);
     nvcoop::RegisterMethod("world.refvars", MRefVars, true);
     nvcoop::RegisterMethod("world.refvar", MRefVar, true);
     nvcoop::RegisterMethod("world.watch", MWatch, true);
     nvcoop::RegisterMethod("world.tick", MTick, true);
+    nvcoop::RegisterMethod("world.reset", MReset, true);
     nvcoop::RegisterMethod("world.probe", MProbe, true);
     nvcoop::RegisterMethod("world.scripted", MScripted, true);
     nvcoop::RegisterMethod("world.getvar", MGetVar, true);
@@ -353,6 +405,11 @@ void OnLoad(void*) {
 void OnMessage(uint32_t type, void*, uint32_t) {
     if (type == NVSEMessagingInterface::kMessage_ExitGame || type == NVSEMessagingInterface::kMessage_ExitGame_Console)
         nvworld::Shutdown();
+    else if (type == NVSEMessagingInterface::kMessage_PostLoadGame || type == NVSEMessagingInterface::kMessage_NewGame ||
+             type == NVSEMessagingInterface::kMessage_ExitToMainMenu)
+        nvworld::resetSession();
+    else if (type == NVSEMessagingInterface::kMessage_OnCellRefsLoaded && g_applier)
+        g_applier->flushQueued();  // spawns queued for a cell that just finished loading
 }
 
 }  // namespace
@@ -362,7 +419,25 @@ void L12OnFrame() {
     if (!g_inited) return;
     ++g_frame;
     if (g_role == nvhooks::Role::Host) nvworld::hostTick();
-    else if (g_applier && g_frame % 30 == 0) g_applier->flushQueued();
+    else if (g_applier && g_frame % 30 == 0) g_applier->tick(g_frame % 120 == 0);
 }
 
 NVCOOP_MODULE(l12_world, "l12_world", OnLoad, OnMessage, L12OnFrame);
+
+// Hot reload (T3b): see hooks/hooks_module.cpp. TryInit needs L5's hub, which the l5_hooks participant (order 10) restored first.
+NVCOOP_RELOAD_STATE(l12_world, "l12_world", 1, 30,
+    /*canUnload*/ [] {
+        int n = nvworld::auditTamperedHooks();
+        return n ? std::to_string(n) + " world hook(s) were chained over by another mod" : std::string();
+    },
+    /*save*/ [](nvreload::Writer& w) {
+        w.boolean(g_inited);
+        return true;
+    },
+    /*restore*/ [](uint32_t, nvreload::Reader& r) {
+        if (r.boolean()) TryInit();
+        return true;
+    },
+    /*migrate*/ nullptr,
+    /*shutdown*/ [] { if (g_inited) nvworld::Shutdown(); },
+    /*fresh*/ nullptr);

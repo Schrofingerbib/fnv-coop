@@ -26,10 +26,21 @@ bool SuppressPolicy::skipScript(uint16_t scriptType, uint32_t scriptRefID) {
     return true;
 }
 
+bool SuppressPolicy::sharesQuestVars(uint32_t questScriptRefID) const {
+#ifdef NVHOOKS_MUTANT
+    return true;  // mutant: per-machine quest vars leak onto the wire
+#else
+    return !isGuestLocalRun(questScriptRefID);
+#endif
+}
+
 bool SuppressPolicy::blockMutation() {
     if (!guest_) return false;
     if (applying_ > 0 && !kMutIgnoreApplying) return false;
     if (depth_ <= 0 && !kMutIgnoreDepth) return false;
+#ifndef NVHOOKS_MUTANT
+    if (localDepth_ > 0) return false;  // inside an allow-listed per-machine quest script
+#endif
     ++stats_.mutations;
     return true;
 }

@@ -1,6 +1,9 @@
 #include "world_core.h"
 
 #include <cmath>
+#include <set>
+#include <type_traits>
+#include <variant>
 #include <cstdio>
 #include <utility>
 
@@ -19,6 +22,8 @@ const char* worldEffectName(const WorldEffect& e) {
         case 2: return "SetRestrained";
         case 3: return "SetRelation";
         case 4: return "SetScriptPackage";
+        case 5: return "SetIgnoreCrime";
+        case 6: return "SetFactionPlayerEnemy";
     }
     return "?";
 }
@@ -82,6 +87,125 @@ uint32_t WorldResolver::fromRef(const FormRef& r) {
     return map_.local(r);
 }
 
+// ------------------------------------------------------------------------------------------------ created-ref targets
+bool createdTargetOf(const fnvcoop::Effect& e, FormRef* out) {
+    const FormRef* r = nullptr;
+    std::visit(
+        [&](const auto& x) {
+            using T = std::decay_t<decltype(x)>;
+            if constexpr (std::is_same_v<T, fnvcoop::EnableRef> || std::is_same_v<T, fnvcoop::DisableRef> ||
+                          std::is_same_v<T, fnvcoop::MoveRef> || std::is_same_v<T, fnvcoop::SetLock> ||
+                          std::is_same_v<T, fnvcoop::SwapTexture> || std::is_same_v<T, fnvcoop::ObjectState> ||
+                          std::is_same_v<T, fnvcoop::RefScriptVar> || std::is_same_v<T, fnvcoop::RefAddItem> ||
+                          std::is_same_v<T, fnvcoop::RefRemoveItem> || std::is_same_v<T, fnvcoop::RemoveAllItems>)
+                r = &x.ref;
+            else if constexpr (std::is_same_v<T, fnvcoop::KillActor> || std::is_same_v<T, fnvcoop::ResurrectActor> ||
+                               std::is_same_v<T, fnvcoop::SetFactionRank>)
+                r = &x.actor;
+            else if constexpr (std::is_same_v<T, fnvcoop::SetScriptVar>)
+                r = &x.owner;
+        },
+        e);
+    if (!r || r->plugin != fnvcoop::createdRefPlugin()) return false;
+    if (out) *out = *r;
+    return true;
+}
+
+bool createdTargetOf(const WorldEffect& e, FormRef* out) {
+    const FormRef* r = nullptr;
+    std::visit(
+        [&](const auto& x) {
+            using T = std::decay_t<decltype(x)>;
+            if constexpr (std::is_same_v<T, SetActorValueRef> || std::is_same_v<T, SetEssential> || std::is_same_v<T, SetRestrained> ||
+                          std::is_same_v<T, SetScriptPackage> || std::is_same_v<T, SetIgnoreCrime>)
+                r = &x.actor;
+        },
+        e);
+    if (!r || r->plugin != fnvcoop::createdRefPlugin()) return false;
+    if (out) *out = *r;
+    return true;
+}
+
+Route routeEffect(const fnvcoop::Effect& e, const CreatedRefMap& m, FormRef* waitOn) {
+    FormRef t;
+    if (!createdTargetOf(e, &t)) return Route::Apply;
+#if NVWORLD_MUT == 28
+    return Route::Apply;  // MUTANT: follow-ups on a not-yet-created ref are applied (and lost) instead of held
+#endif
+    if (m.local(t)) return Route::Apply;
+    if (waitOn) *waitOn = t;
+    return Route::HoldForCreated;
+}
+
+Route routeEffect(const WorldEffect& e, const CreatedRefMap& m, FormRef* waitOn) {
+    FormRef t;
+    if (!createdTargetOf(e, &t)) return Route::Apply;
+    if (m.local(t)) return Route::Apply;
+    if (waitOn) *waitOn = t;
+    return Route::HoldForCreated;
+}
+
+bool retriable(const fnvcoop::Effect& e, Outcome o) {
+    if (o == Outcome::Missing) return true;
+    // the variable list exists once the object's script has been instantiated (cell attached); a rejected write may succeed later
+    return o == Outcome::Rejected && std::holds_alternative<fnvcoop::RefScriptVar>(e);
+}
+bool retriable(const WorldEffect&, Outcome o) { return o == Outcome::Missing; }
+
+void DeferredQueue::hold(HeldEffect h) {
+    ++holds_;
+    if (q_.size() >= cap_ && cap_ > 0) {
+        q_.erase(q_.begin());
+        ++dropped_;
+    }
+    q_.push_back(std::move(h));
+}
+
+std::vector<HeldEffect> DeferredQueue::takeBound(const CreatedRefMap& m) {
+    std::vector<HeldEffect> out, keep;
+    for (auto& h : q_) {
+#if NVWORLD_MUT == 29
+        bool ready = h.onCreated;  // MUTANT: released before the ref is bound
+#else
+        bool ready = h.onCreated && m.local(h.waitOn) != 0;
+#endif
+        (ready ? out : keep).push_back(std::move(h));
+    }
+    q_ = std::move(keep);
+    return out;
+}
+
+std::vector<HeldEffect> DeferredQueue::takeRetries(int maxAttempts) {
+    std::vector<HeldEffect> out, keep;
+    for (auto& h : q_) {
+        ++h.attempts;
+        int limit = h.onCreated ? maxAttempts * 4 : maxAttempts;
+#if NVWORLD_MUT == 30
+        limit = 1 << 30;  // MUTANT: nothing ever expires
+#endif
+        if (h.attempts > limit) {
+            ++expired_;
+            continue;
+        }
+        (h.onCreated ? keep : out).push_back(std::move(h));
+    }
+    q_ = std::move(keep);
+    return out;
+}
+
+size_t DeferredQueue::dropFor(const FormRef& host) {
+    size_t n = 0;
+    for (auto it = q_.begin(); it != q_.end();) {
+        if (it->onCreated && it->waitOn == host) {
+            it = q_.erase(it);
+            ++n;
+        } else {
+            ++it;
+        }
+    }
+    return n;
+}
+
 // ------------------------------------------------------------------------------------------------ SpawnLedger
 SpawnAction SpawnLedger::onSpawn(const fnvcoop::SpawnRef& s, bool cellReady) {
 #if NVWORLD_MUT != 4
@@ -96,6 +220,9 @@ SpawnAction SpawnLedger::onSpawn(const fnvcoop::SpawnRef& s, bool cellReady) {
 
 DespawnResult SpawnLedger::onDespawn(const fnvcoop::DespawnRef& d) {
     DespawnResult r;
+#if NVWORLD_MUT != 31
+    deferred_.dropFor(d.ref());  // MUTANT 31: held follow-ups of a despawned ref survive and hit a recycled id later
+#endif
 #if NVWORLD_MUT != 5
     for (auto it = pending_.begin(); it != pending_.end(); ++it) {
         if (it->id == d.id) {
@@ -111,6 +238,30 @@ DespawnResult SpawnLedger::onDespawn(const fnvcoop::DespawnRef& d) {
     r.action = DespawnAction::DeleteLocal;
     r.localRefID = id;
     return r;
+}
+
+std::vector<uint32_t> SpawnLedger::reconcile(const std::vector<fnvcoop::SpawnRef>& live) {
+    std::set<uint32_t> alive;
+    for (const auto& s : live) alive.insert(s.id);
+    std::vector<uint32_t> stale;
+    std::vector<FormRef> forget;
+#if NVWORLD_MUT != 32
+    for (const auto& kv : map_.all()) {  // MUTANT 32: a rejoining client keeps spawns the host already despawned
+        if (!alive.count(kv.first.localId)) {
+            stale.push_back(kv.second);
+            forget.push_back(kv.first);
+        }
+    }
+#endif
+    for (const auto& f : forget) {
+        map_.forget(f);
+        deferred_.dropFor(f);
+    }
+    for (auto it = pending_.begin(); it != pending_.end();) {
+        if (!alive.count(it->id)) it = pending_.erase(it);
+        else ++it;
+    }
+    return stale;
 }
 
 std::vector<fnvcoop::SpawnRef> SpawnLedger::takeReady(const std::function<bool(const fnvcoop::SpawnRef&)>& ready) {
@@ -251,7 +402,14 @@ static std::string hex(uint32_t v) {
 static std::string num(float v) {
     char b[48];
     std::snprintf(b, sizeof b, "%.4f", v);
-    return b;
+    // Shortest form ("9", "2.5"): console commands whose value parameter is an int ignore a "9.0000" token (found in game:
+    // SetActorValue/ModActorValue with "9.0000" did nothing, the same value as "9" works).
+    std::string r = b;
+    if (r.find('.') != std::string::npos) {
+        while (r.back() == '0') r.pop_back();
+        if (r.back() == '.') r.pop_back();
+    }
+    return r;
 }
 
 std::string markForDeleteLine() { return "MarkForDelete"; }
@@ -279,6 +437,20 @@ std::string setRelationLine(Relation kind, uint32_t a, uint32_t b) {
 
 std::string scriptPackageLine(bool add, uint32_t packageID) {
     return std::string(add ? "AddScriptPackage " : "RemoveScriptPackage ") + hex(packageID);
+}
+
+std::string ignoreCrimeLine(bool on) {
+#if NVWORLD_MUT == 38
+    on = !on;  // MUTANT
+#endif
+    return on ? "IgnoreCrime 1" : "IgnoreCrime 0";
+}
+
+std::string setPCEnemyOfFactionLine(uint32_t factionID, bool on) {
+#if NVWORLD_MUT == 33
+    on = !on;  // MUTANT
+#endif
+    return "SetPCEnemyOfFaction " + hex(factionID) + (on ? " 1" : " 0");
 }
 
 std::string avLine(const SetActorValueRef& e) {
@@ -322,6 +494,14 @@ void WorldLog::push(const WorldEffect& e) {
             same = c->actor == d.actor && c->refOnly == d.refOnly;
         } else if (auto* f = std::get_if<SetRestrained>(&e)) {
             same = f->actor == std::get<SetRestrained>(q).actor;
+        } else if (auto* g = std::get_if<SetIgnoreCrime>(&e)) {
+#if NVWORLD_MUT == 39
+            same = false;  // MUTANT: IgnoreCrime never coalesces
+#else
+            same = g->actor == std::get<SetIgnoreCrime>(q).actor;
+#endif
+        } else if (auto* h = std::get_if<SetFactionPlayerEnemy>(&e)) {
+            same = h->faction == std::get<SetFactionPlayerEnemy>(q).faction;
         }
         if (same) {
             q = e;
@@ -336,6 +516,115 @@ std::vector<WorldEffect> WorldLog::drain() {
     std::vector<WorldEffect> out;
     out.swap(q_);
     return out;
+}
+
+// ------------------------------------------------------------------------------------------------ WorldBaseline
+void WorldBaseline::purge(const FormRef& ref) {
+    for (auto it = vars_.begin(); it != vars_.end();) {
+        if (it->first.first == ref) it = vars_.erase(it);
+        else ++it;
+    }
+    for (auto it = world_.begin(); it != world_.end();) {
+        FormRef t;
+        if (createdTargetOf(*it, &t) && t == ref) it = world_.erase(it);
+        else ++it;
+    }
+}
+
+void WorldBaseline::onEffect(const fnvcoop::Effect& e) {
+    if (auto* sp = std::get_if<fnvcoop::SpawnRef>(&e)) {
+        for (auto& x : spawns_)
+            if (x.id == sp->id) return;  // a replayed txn
+        spawns_.push_back(*sp);
+    } else if (auto* d = std::get_if<fnvcoop::DespawnRef>(&e)) {
+        for (auto it = spawns_.begin(); it != spawns_.end(); ++it)
+            if (it->id == d->id) {
+                spawns_.erase(it);
+                break;
+            }
+#if NVWORLD_MUT != 34
+        purge(d->ref());  // MUTANT 34: state of a despawned ref stays in the baseline
+#endif
+    } else if (auto* v = std::get_if<fnvcoop::RefScriptVar>(&e)) {
+        vars_[{v->ref, v->index}] = v->value;
+    }
+}
+
+namespace {
+// Folds one world effect into the net-state list.
+void fold(std::vector<WorldEffect>& q, const WorldEffect& e) {
+    if (auto* a = std::get_if<SetActorValueRef>(&e)) {
+        auto sameKey = [&](const WorldEffect& w) {
+            auto* b = std::get_if<SetActorValueRef>(&w);
+            return b && b->actor == a->actor && b->av == a->av;
+        };
+        if (a->mode == AvMode::Set) {
+#if NVWORLD_MUT != 35
+            for (auto it = q.begin(); it != q.end();)  // MUTANT 35: deltas from before the Set survive and are applied on top of it
+                if (sameKey(*it)) it = q.erase(it);
+                else ++it;
+#endif
+            q.push_back(e);
+            return;
+        }
+        for (size_t i = q.size(); i-- > 0;) {
+            if (!sameKey(q[i])) continue;
+            auto& b = std::get<SetActorValueRef>(q[i]);
+            if (b.mode == a->mode) {
+#if NVWORLD_MUT == 36
+                b.value = a->value;  // MUTANT: the latest delta replaces the sum
+#else
+                b.value += a->value;
+#endif
+                if (b.value == 0 && b.mode == AvMode::Mod) q.erase(q.begin() + i);
+                return;
+            }
+            break;  // a different kind was last: keep order, append
+        }
+        q.push_back(e);
+        return;
+    }
+    // everything else: last write per key wins, in place
+    auto same = [&](const WorldEffect& w) {
+        if (w.index() != e.index()) return false;
+        if (auto* x = std::get_if<SetEssential>(&e)) return std::get<SetEssential>(w).actor == x->actor && std::get<SetEssential>(w).refOnly == x->refOnly;
+        if (auto* x = std::get_if<SetRestrained>(&e)) return std::get<SetRestrained>(w).actor == x->actor;
+        if (auto* x = std::get_if<SetIgnoreCrime>(&e)) return std::get<SetIgnoreCrime>(w).actor == x->actor;
+        if (auto* x = std::get_if<SetFactionPlayerEnemy>(&e)) return std::get<SetFactionPlayerEnemy>(w).faction == x->faction;
+        if (auto* x = std::get_if<SetRelation>(&e)) return std::get<SetRelation>(w).a == x->a && std::get<SetRelation>(w).b == x->b;
+        if (auto* x = std::get_if<SetScriptPackage>(&e))
+            return std::get<SetScriptPackage>(w).actor == x->actor && std::get<SetScriptPackage>(w).package == x->package;
+        return false;
+    };
+    for (auto& w : q)
+        if (same(w)) {
+            w = e;
+            return;
+        }
+    q.push_back(e);
+}
+}  // namespace
+
+void WorldBaseline::onWorld(const WorldEffect& e) { fold(world_, e); }
+
+BaselineSnapshot WorldBaseline::snapshot() const {
+    BaselineSnapshot b;
+    for (const auto& s : spawns_) b.effects.push_back(s);
+    for (const auto& kv : vars_) b.effects.push_back(fnvcoop::RefScriptVar{kv.first.first, kv.first.second, kv.second});
+    b.world = world_;
+    return b;
+}
+
+std::vector<FormRef> WorldBaseline::liveSpawnRefs() const {
+    std::vector<FormRef> out;
+    for (const auto& s : spawns_) out.push_back(s.ref());
+    return out;
+}
+
+void WorldBaseline::clear() {
+    spawns_.clear();
+    vars_.clear();
+    world_.clear();
 }
 
 // ------------------------------------------------------------------------------------------------ JSON
@@ -357,6 +646,13 @@ std::string worldEffectToJson(const WorldEffect& e) {
         o.set("a", J(r->a)).set("b", J(r->b)).set("kind", (int64_t)r->kind);
     } else if (auto* p = std::get_if<SetScriptPackage>(&e)) {
         o.set("actor", J(p->actor)).set("package", J(p->package)).set("add", p->add);
+    } else if (auto* c = std::get_if<SetIgnoreCrime>(&e)) {
+        o.set("actor", J(c->actor));
+#if NVWORLD_MUT != 40
+        o.set("on", c->on);  // MUTANT 40: the flag is not serialised
+#endif
+    } else if (auto* f = std::get_if<SetFactionPlayerEnemy>(&e)) {
+        o.set("faction", J(f->faction)).set("on", f->on);
     }
     return o.dump();
 }
@@ -397,6 +693,16 @@ bool worldEffectFromJson(const std::string& text, WorldEffect* out, std::string*
         SetScriptPackage x;
         if (!ref("actor", &x.actor) || !ref("package", &x.package)) { if (err) *err = "bad ref"; return false; }
         x.add = v.get("add").asBool(true);
+        *out = x;
+    } else if (t == "SetIgnoreCrime") {
+        SetIgnoreCrime x;
+        if (!ref("actor", &x.actor)) { if (err) *err = "bad actor"; return false; }
+        x.on = v.get("on").asBool();
+        *out = x;
+    } else if (t == "SetFactionPlayerEnemy") {
+        SetFactionPlayerEnemy x;
+        if (!ref("faction", &x.faction)) { if (err) *err = "bad faction"; return false; }
+        x.on = v.get("on").asBool();
         *out = x;
     } else {
         if (err) *err = "unknown world effect type: " + t;

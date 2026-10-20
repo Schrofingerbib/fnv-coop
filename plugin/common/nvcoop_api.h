@@ -8,6 +8,7 @@
 //                          nvcoop target by a lane's own CMakeLists.txt get them called automatically.
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace nvcoop {
@@ -31,6 +32,11 @@ using MethodFn = bool (*)(const std::string& paramsJson, std::string& out);
 // mainThread=true: handler is invoked from the game main loop (safe for engine calls).
 // Replaces an existing registration of the same name. Built-in methods cannot be overridden.
 void RegisterMethod(const char* name, MethodFn fn, bool mainThread = true);
+// Loader support (T3a): same, with a closure and an owner tag (0 = none) so the hot-reload loader can remove all
+// methods that belong to a core DLL before unloading it.
+using MethodClosure = std::function<bool(const std::string& paramsJson, std::string& out)>;
+void RegisterMethodClosure(const char* name, MethodClosure fn, bool mainThread, int owner);
+void UnregisterMethodsByOwner(int owner);
 
 // ---- module lifecycle -----------------------------------------------------
 // nvseInterface is the NVSEInterface* passed to NVSEPlugin_Load (cast it yourself).

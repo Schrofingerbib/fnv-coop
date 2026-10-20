@@ -25,8 +25,8 @@ endfunction()
 
 # ---- synccore (L4) sources compiled into our own static lib (L4's CMake also builds its tests/sim) ----
 file(GLOB COOP_SYNCCORE_SRC CONFIGURE_DEPENDS ${COOP_REPO}/synccore/src/*.cpp)   # follows L4 as it adds files
-add_library(nvcoop_coop_synccore STATIC ${COOP_SYNCCORE_SRC})
-target_include_directories(nvcoop_coop_synccore PUBLIC ${COOP_REPO}/synccore/include)
+add_library(nvcoop_coop_synccore STATIC ${COOP_SYNCCORE_SRC} ${COOP_REPO}/synccore/flight/flight.cpp)   # + T1a flight recorder
+target_include_directories(nvcoop_coop_synccore PUBLIC ${COOP_REPO}/synccore/include ${COOP_REPO}/synccore)
 coop_flags(nvcoop_coop_synccore)
 # vendored ENet 1.3.18 (L4's third_party/enet), same sources as synccore's enet_static
 set(COOP_ENET ${COOP_REPO}/third_party/enet)
@@ -47,23 +47,38 @@ else()
   set(COOP_HOOKS_LIB nvcoop_coop_hooks)
 endif()
 
+# ---- L11 hooks_ui router (game-free): the plugin build already has it (nvui_core_m0); standalone builds compile ui_core.cpp ----
+if(TARGET nvui_core_m0)
+  set(COOP_UI_LIB nvui_core_m0)
+else()
+  add_library(nvcoop_coop_uicore STATIC ${COOP_DIR}/../hooks_ui/ui_core.cpp)
+  target_include_directories(nvcoop_coop_uicore PUBLIC ${COOP_DIR}/../hooks_ui ${COOP_DIR}/.. ${COOP_DIR}/../dialogue/include ${COOP_REPO}/synccore/include)
+  coop_flags(nvcoop_coop_uicore)
+  set(COOP_UI_LIB nvcoop_coop_uicore)
+endif()
+
 # ---- runtime + transport; _mut1 / _mut2 are mutation twins (see coop_runtime.cpp) ----
-foreach(v "" _mut1 _mut2 _mut3 _mut4)
+foreach(v "" _mut1 _mut2 _mut3 _mut4 _mut5)
   add_library(nvcoop_coop_core${v} STATIC ${COOP_DIR}/udp_transport.cpp ${COOP_DIR}/coop_runtime.cpp)
   target_include_directories(nvcoop_coop_core${v} PUBLIC ${COOP_DIR} ${COOP_DIR}/.. ${COOP_DIR}/../dialogue/include)
-  target_link_libraries(nvcoop_coop_core${v} PUBLIC nvcoop_coop_synccore ${COOP_HOOKS_LIB} ws2_32)
+  target_link_libraries(nvcoop_coop_core${v} PUBLIC nvcoop_coop_synccore ${COOP_HOOKS_LIB} ${COOP_UI_LIB} ws2_32)
   coop_flags(nvcoop_coop_core${v})
 endforeach()
 target_compile_definitions(nvcoop_coop_core_mut1 PRIVATE COOP_MUTANT=1)
 target_compile_definitions(nvcoop_coop_core_mut2 PRIVATE COOP_MUTANT=2)
 target_compile_definitions(nvcoop_coop_core_mut3 PRIVATE COOP_MUTANT=3)
 target_compile_definitions(nvcoop_coop_core_mut4 PRIVATE COOP_MUTANT=4)
+target_compile_definitions(nvcoop_coop_core_mut5 PRIVATE COOP_MUTANT=5)
 
 # ---- tests + fake peers (not shipped in the plugin) ----
 set(COOP_TEST_TARGETS)
 add_executable(coop_tests ${COOP_DIR}/tests/test_coop.cpp)
 target_link_libraries(coop_tests PRIVATE nvcoop_coop_core)
 list(APPEND COOP_TEST_TARGETS coop_tests)
+# L11 wiring twin: the same tests against the runtime with one wiring call dropped (COOP_UI_MUTANT=1..5); `coop_tests_ui_mut --ui` must FAIL for each
+add_executable(coop_tests_ui_mut ${COOP_DIR}/tests/test_coop.cpp)
+target_link_libraries(coop_tests_ui_mut PRIVATE nvcoop_coop_core_mut5)
+list(APPEND COOP_TEST_TARGETS coop_tests_ui_mut)
 foreach(pair "coop_peer:" "coop_peer_mut_sink:_mut1" "coop_peer_mut_commit:_mut2" "coop_peer_mut_action:_mut3" "coop_peer_mut_baseline:_mut4")
   string(REPLACE ":" ";" parts "${pair}")
   list(GET parts 0 exe)
@@ -89,4 +104,17 @@ add_test(NAME coop_unit COMMAND coop_tests)
 if(TARGET nvcoop AND TARGET nvcoop_hooks_game)
   target_sources(nvcoop PRIVATE ${COOP_DIR}/coop_module.cpp)   # NVCOOP_MODULE must be a direct source
   target_link_libraries(nvcoop PRIVATE nvcoop_coop_core)
+  if(TARGET nvcoop_hooks_ui_game)
+    target_compile_definitions(nvcoop PRIVATE NVCOOP_WITH_UI=1)   # coop_module.cpp wires L11 (router, slideshow channel, INFO reader)
+  endif()
+  if(TARGET nvcoop_world_game)
+    target_compile_definitions(nvcoop PRIVATE NVCOOP_WITH_WORLD=1)   # coop_module.cpp wires L12 (SpawnRef/RefScriptVar apply, NPC world effects)
+  endif()
+  # L8 INFO response reader (game-free) for nvui::setInfoReader
+  target_sources(nvcoop PRIVATE ${COOP_DIR}/../dialogue/engine/info_reader.cpp)
+  target_include_directories(nvcoop PRIVATE ${COOP_DIR}/../dialogue/engine ${COOP_DIR}/../dialogue/include ${COOP_DIR}/../hooks_ui)
+  if(TARGET nvcoop_nvmp)   # L6: GhostRefOfPlayer is the acting-player activator (ghost_ref.h); without it ACTING-STANDIN (host player)
+    target_compile_definitions(nvcoop PRIVATE NVCOOP_WITH_NVMP=1)
+    target_include_directories(nvcoop PRIVATE ${COOP_DIR}/..)
+  endif()
 endif()

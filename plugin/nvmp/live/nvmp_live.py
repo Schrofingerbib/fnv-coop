@@ -12,7 +12,7 @@ Sequence: server (offline, cwd = instance 0) -> instance 0 -> instance 1 via nvm
 -> wait for the nvcoop pipes -> collect nvmp.patches / nvmp.players / events from both -> teardown (kills only our pids,
 releases the slots). All output goes under out/L6/live/. Windows are started minimized without activation.
 """
-import argparse, json, os, subprocess, sys, time
+import argparse, json, os, re, subprocess, sys, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -98,6 +98,16 @@ def cmds(r: Path, mods: str):
     return server, clients
 
 
+def read_tail(p: Path, n: int = 400000) -> str:
+    try:
+        with open(p, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - n))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
 def spawn(cmd, cwd, env=None, log=None, minimized=True):
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -164,18 +174,67 @@ def go(r: Path, a) -> int:
             if not ok:
                 print(f"instance {i}: nvcoop pipe never answered")
                 return 6
-        time.sleep(a.settle)
-        for i in (0, 1):
-            with nvbridge.NvBridge.connect(i, wait_s=5.0) as b:
-                for m in ("nvmp.patches", "nvmp.players"):
-                    try:
-                        result["steps"][f"{m}_{i}"] = b.call(m, timeout_s=10)
-                    except Exception as e:  # report, keep going
-                        result["steps"][f"{m}_{i}"] = f"ERROR {e}"
+        # NV:MP has no auto world entry: the client sits at the main menu (the server creates the NetPlayer anyway) and
+        # the player enters the world by loading a save, so drive nvbridge loadSave on both clients once the menu is up.
+        if a.save:
+            for i in (0, 1):
+                src = Path(a.save_src)
+                dst = r / str(i) / "Saves" / (a.save + ".fos")
+                dst.parent.mkdir(exist_ok=True)
+                if not dst.exists():
+                    import shutil
+                    shutil.copyfile(src, dst)
+                result["steps"][f"savecopy{i}"] = str(dst)
+            t0 = time.time()
+            while time.time() - t0 < a.wait_ready:
                 try:
-                    result["steps"][f"events_{i}"] = b.call("events", {"since": 0}, timeout_s=10)
+                    with nvbridge.NvBridge.connect(0, wait_s=2.0) as b0, nvbridge.NvBridge.connect(1, wait_s=2.0) as b1:
+                        if b0.call("ping", timeout_s=15).get("menuReady") and b1.call("ping", timeout_s=15).get("menuReady"):
+                            break
+                except Exception:
+                    pass
+                time.sleep(5)
+            for i in (0, 1):
+                try:
+                    with nvbridge.NvBridge.connect(i, wait_s=5.0) as b:
+                        result["steps"][f"loadSave{i}"] = b.load_save(a.save, timeout_ms=300000)
                 except Exception as e:
-                    result["steps"][f"events_{i}"] = f"ERROR {e}"
+                    result["steps"][f"loadSave{i}"] = f"ERROR {e}"
+        # Wait for the game to be fully up (menuReady + a loaded game) on both instances; the PC is slow (5-17 fps).
+        t0 = time.time()
+        ready = {0: False, 1: False}
+        last = {}
+        while time.time() - t0 < a.wait_ready and not all(ready.values()):
+            for i in (0, 1):
+                try:
+                    with nvbridge.NvBridge.connect(i, wait_s=2.0) as b:
+                        pg = b.call("ping", timeout_s=15)
+                    last[i] = pg
+                    ready[i] = bool(pg.get("menuReady")) and int(pg.get("loadedCount", 0)) >= 1
+                except Exception as e:
+                    last[i] = f"ERROR {e}"
+            time.sleep(5)
+        result["steps"]["ready"] = ready
+        result["steps"]["last_ping"] = last
+        # Confirm both clients connected from the logs before querying.
+        conn_re = re.compile(r"(connected|joined|accepted|authenticated|welcome)", re.I)
+        t1 = time.time()
+        while time.time() - t1 < a.wait_connect:
+            txt = " ".join(read_tail(OUT / f) for f in ("server.log", "nvmp_start_0.log", "nvmp_start_1.log"))
+            if all(n in txt for n in NAMES.values()) and conn_re.search(read_tail(OUT / "server.log")):
+                break
+            time.sleep(5)
+        result["steps"]["server_log_hits"] = [l for l in read_tail(OUT / "server.log").splitlines() if conn_re.search(l) or "Strict" in l or "NVSE" in l][-40:]
+        for i in (0, 1):
+            result["steps"][f"client_log_hits_{i}"] = [l for l in read_tail(OUT / f"nvmp_start_{i}.log").splitlines()
+                                                       if re.search(r"connect|reject|kick|denied|mismatch|plugin|disconnect", l, re.I)][-40:]
+        for i in (0, 1):
+            for m, params in (("nvmp.patches", None), ("nvmp.players", None), ("events", {"since": 0})):
+                try:   # fresh connection per call so a timeout cannot desync reply ids
+                    with nvbridge.NvBridge.connect(i, wait_s=5.0) as b:
+                        result["steps"][f"{m}_{i}"] = b.call(m, params, timeout_s=60) if params else b.call(m, timeout_s=60)
+                except Exception as e:
+                    result["steps"][f"{m}_{i}"] = f"ERROR {e}"
         result["ok"] = True
         return 0
     finally:
@@ -193,10 +252,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["check", "go"])
     ap.add_argument("--confirm-firewall", action="store_true")
+    ap.add_argument("--save", default="autosave_l6nvmp", help="save name to load on both clients (copied into Saves/ if absent); empty = none")
+    ap.add_argument("--save-src", default=str(REPO.parent / "fnv-instances-l10" / "0" / "Saves" / "autosave.fos"))
     ap.add_argument("--ttl", type=int, default=1800)
     ap.add_argument("--slot-wait", type=int, default=1800)
     ap.add_argument("--wait-pipe", type=int, default=240)
-    ap.add_argument("--settle", type=int, default=45)
+    ap.add_argument("--wait-ready", type=int, default=900)
+    ap.add_argument("--wait-connect", type=int, default=120)
     a = ap.parse_args()
     r = root()
     if a.cmd == "go":

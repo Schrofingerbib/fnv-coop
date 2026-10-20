@@ -1,0 +1,48 @@
+# T6a bot input driver. Works two ways:
+#   * included by plugin/CMakeLists.txt: adds the in-process input driver + bot.* bridge methods to nvcoop.dll (x86 only, dev only)
+#   * standalone, for the game-free tests + mutation twins:  plugin\bots\run_tests.cmd
+cmake_minimum_required(VERSION 3.20)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_LIST_DIR)
+  project(nvcoop_bots CXX)
+  set(CMAKE_CXX_STANDARD 20)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
+
+set(NVBOTS_DIR "${CMAKE_CURRENT_LIST_DIR}")
+set(NVBOTS_INC "${NVBOTS_DIR}" "${NVBOTS_DIR}/.." "${NVBOTS_DIR}/../hooks")
+
+function(nvbots_flags tgt)
+  if(MSVC)
+    target_compile_options(${tgt} PRIVATE /W4 /EHsc /permissive- /utf-8 /wd4456 /wd4457 /wd4100 /wd4127)
+  endif()
+  target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)
+endfunction()
+
+set(NVBOTS_EXCL "")
+if(TARGET nvcoop)
+  set(NVBOTS_EXCL EXCLUDE_FROM_ALL)
+endif()
+foreach(n 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32)
+  add_executable(nvbots_tests_m${n} ${NVBOTS_EXCL} ${NVBOTS_DIR}/tests/test_bots.cpp ${NVBOTS_DIR}/../hooks/hook_patch.cpp)
+  target_include_directories(nvbots_tests_m${n} PRIVATE ${NVBOTS_INC})
+  target_compile_definitions(nvbots_tests_m${n} PRIVATE NVBOTS_MUTANT=${n})
+  nvbots_flags(nvbots_tests_m${n})
+  set_target_properties(nvbots_tests_m${n} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bots_tests")
+  foreach(cfg _DEBUG _RELEASE _RELWITHDEBINFO _MINSIZEREL)
+    set_target_properties(nvbots_tests_m${n} PROPERTIES RUNTIME_OUTPUT_DIRECTORY${cfg} "${CMAKE_BINARY_DIR}/bots_tests")
+  endforeach()
+endforeach()
+
+enable_testing()
+add_test(NAME bots_unit COMMAND nvbots_tests_m0)
+foreach(n 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32)
+  add_test(NAME bots_mutant_${n} COMMAND nvbots_tests_m${n})
+  set_tests_properties(bots_mutant_${n} PROPERTIES WILL_FAIL TRUE)
+endforeach()
+
+# ---- x86 game glue, linked into nvcoop.dll (dev only: does nothing unless nvcoop.ini [dev] bots=1) ----
+if(TARGET nvcoop AND TARGET nvcoop_hooks_game AND MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+  target_sources(nvcoop PRIVATE ${NVBOTS_DIR}/bots_module.cpp)
+  target_include_directories(nvcoop PRIVATE ${NVBOTS_INC})
+endif()

@@ -2,6 +2,7 @@
 // Delivery is message-oriented and may be lossy/duplicated/reordered: the sessions above are built for that.
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <queue>
@@ -43,6 +44,10 @@ public:
     ITransport* endpoint(PeerId id);                   // created on first use
     void setLink(const LinkParams& p) { link_ = p; }   // applies to every direction
     const LinkParams& link() const { return link_; }
+    // Optional link model replacing LinkParams (e.g. T5's chaos::Impairment). Called per datagram with the virtual time; it may
+    // flip bits in `data` and returns the delivery delays in ms (empty = dropped, 2+ = duplicates). Null = use LinkParams.
+    using Shaper = std::function<std::vector<uint32_t>(PeerId from, PeerId to, uint64_t nowMs, Bytes& data)>;
+    void setShaper(Shaper s) { shaper_ = std::move(s); }
     void setBandwidth(uint32_t bytesPerSec) { bandwidth_ = bytesPerSec; }   // per direction per peer pair; 0 = unlimited
     uint64_t queuedBytes(PeerId from, PeerId to) const;
     uint64_t bytesBetween(PeerId from, PeerId to) const { auto it = sentBytes_.find({from, to}); return it == sentBytes_.end() ? 0 : it->second; }   // accepted by the link, per direction
@@ -62,9 +67,10 @@ private:
     };
     class Endpoint;
     void sendFrom(PeerId from, PeerId to, Bytes data);
-    void enqueue(PeerId from, PeerId to, Bytes data);
+    void enqueue(PeerId from, PeerId to, Bytes data, int64_t forcedLatency = -1);
 
     Rng rng_;
+    Shaper shaper_;
     LinkParams link_;
     uint64_t now_ = 0, order_ = 0;
     uint32_t bandwidth_ = 0;

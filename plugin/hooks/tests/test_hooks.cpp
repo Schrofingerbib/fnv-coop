@@ -13,6 +13,11 @@
 #include "../change_tracker.h"
 #include "../inventory_diff.h"
 #include "../suppress_policy.h"
+#include "../guest_local_run.h"
+#include "../party_cond.h"
+#include "../rules_reducer.h"
+#include "fnvcoop/session.h"
+#include "fnvcoop/transport.h"
 
 using namespace nvhooks;
 
@@ -41,6 +46,7 @@ struct FakeMemory : MemoryOps {
     int writes = 0;          // total successful writes
     int imageWrites = 0;     // writes into the image (game code)
     bool failAlloc = false, failTrampWrite = false, failImageWrite = false;
+    bool dropImageWrite = false;  // write() claims success but changes nothing (a restore that does not stick)
     int freed = 0;
 
     uint8_t* at(Addr a, size_t n) {
@@ -58,6 +64,7 @@ struct FakeMemory : MemoryOps {
     bool write(Addr a, const void* in, size_t n) override {
         bool inImage = a >= kImage && a < kImage + kImageSize;
         if (inImage && failImageWrite) return false;
+        if (inImage && dropImageWrite) return true;
         if (!inImage && failTrampWrite) return false;
         uint8_t* p = at(a, n);
         if (!p) return false;
@@ -257,6 +264,130 @@ TEST(registry_destructor_restores_everything) {
     CHECK(m.image == pristine);
 }
 
+TEST(reload_cycles_restore_every_byte_and_balance_live_count) {
+    FakeMemory m;
+    HookSpec a = makeSpec(0x00400100), b = makeSpec(0x00400200, 5), c = makeSpec(0x00400300, 8);
+    m.place(a);
+    m.place(b);
+    m.place(c);
+    auto pristine = m.image;
+    int live0 = liveHookCount();
+    for (int i = 0; i < 100; ++i) {
+        HookRegistry reg(m);
+        CHECK(reg.acquire(a, 1, nullptr) == PatchStatus::Ok);
+        CHECK(reg.acquire(b, 2, nullptr) == PatchStatus::Ok);
+        CHECK(reg.acquire(c, 3, nullptr) == PatchStatus::Ok);
+        CHECK(reg.acquire(c, 3, nullptr) == PatchStatus::AlreadyInstalled);  // refcount 2: shutdown must ignore it
+        CHECK(liveHookCount() == live0 + 3);
+        CHECK(reg.restoreAllAndVerify() == 0);
+        CHECK(liveHookCount() == live0);
+        CHECK(m.image == pristine);
+        CHECK(m.heap.empty());
+    }
+}
+
+TEST(reload_restore_failure_is_reported_and_never_hangs) {
+    int live0 = liveHookCount();
+    {
+        FakeMemory m;
+        HookSpec s = makeSpec();
+        m.place(s);
+        HookRegistry reg(m);
+        CHECK(reg.acquire(s, 1, nullptr) == PatchStatus::Ok);
+        m.failImageWrite = true;
+        CHECK(reg.restoreAllAndVerify() == 1);  // could not restore: reported, loop ends
+        CHECK(reg.installedCount() == 0);
+    }
+    CHECK(liveHookCount() == live0);
+    {
+        FakeMemory m;
+        HookSpec s = makeSpec();
+        m.place(s);
+        HookRegistry reg(m);
+        CHECK(reg.acquire(s, 1, nullptr) == PatchStatus::Ok);
+        m.dropImageWrite = true;  // the write "worked" but the old bytes are still the jump
+        CHECK(reg.release(s) == PatchStatus::WriteFailed);
+        CHECK(m.heap.size() == 1);  // trampoline must stay: game code still jumps to our detour
+    }
+    CHECK(liveHookCount() == live0);
+}
+
+TEST(reload_preflight_finds_chained_hooks_without_touching_anything) {
+    FakeMemory m;
+    HookSpec a = makeSpec(0x00400100), b = makeSpec(0x00400200);
+    m.place(a);
+    m.place(b);
+    HookRegistry reg(m);
+    CHECK(reg.acquire(a, 1, nullptr) == PatchStatus::Ok);
+    CHECK(reg.acquire(b, 2, nullptr) == PatchStatus::Ok);
+    CHECK(reg.auditTampered() == 0);
+    m.image[b.target - FakeMemory::kImage + 2] ^= 0x10;
+    auto before = m.image;
+    int writes = m.writes;
+    CHECK(reg.auditTampered() == 1);
+    CHECK(m.image == before && m.writes == writes);
+    m.image[b.target - FakeMemory::kImage + 2] ^= 0x10;  // put it back so the destructor can restore
+}
+
+TEST(reload_suspend_resume_keeps_trampolines_and_release_still_restores) {
+    FakeMemory m;
+    HookSpec a = makeSpec(0x00400100), b = makeSpec(0x00400200, 5);
+    m.place(a);
+    m.place(b);
+    auto pristine = m.image;
+    HookRegistry reg(m);
+    CHECK(reg.acquire(a, 1, nullptr) == PatchStatus::Ok);
+    CHECK(reg.acquire(b, 2, nullptr) == PatchStatus::Ok);
+    auto hooked = m.image;
+    CHECK(reg.suspendAll() == 0);
+    CHECK(m.image == pristine);          // nobody can enter a detour any more
+    CHECK(m.heap.size() == 2);           // trampolines stay: threads already inside may still return through them
+    std::vector<std::pair<Addr, size_t>> ranges;
+    reg.collectTrampolines(&ranges);
+    CHECK(ranges.size() == 2);
+    CHECK(reg.auditTampered() == 0);     // suspended hooks are not "tampered"
+    CHECK(reg.resumeAll() == 0);
+    CHECK(m.image == hooked);            // refused reload: hooks are back exactly as they were
+    CHECK(reg.suspendAll() == 0);
+    int t0 = tamperedCount();
+    CHECK(reg.restoreAllAndVerify() == 0);  // shutdown after a successful drain
+    CHECK(m.image == pristine && m.heap.empty() && tamperedCount() == t0);
+}
+
+TEST(reload_suspend_leaves_chained_hooks_alone_and_process_wide_helpers_see_every_registry) {
+    FakeMemory m1, m2;
+    HookSpec a = makeSpec(0x00400100);
+    m1.place(a);
+    m2.place(a);
+    HookRegistry r1(m1), r2(m2);
+    CHECK(r1.acquire(a, 1, nullptr) == PatchStatus::Ok);
+    CHECK(r2.acquire(a, 1, nullptr) == PatchStatus::Ok);
+    auto p1 = m1.image;
+    m2.image[a.target - FakeMemory::kImage + 1] ^= 0x33;  // chained over in registry 2
+    CHECK(suspendAllHooks() >= 1);
+    CHECK(m1.bytes(a.target, 1)[0] != 0xE9);               // registry 1 suspended
+    std::vector<std::pair<Addr, size_t>> ranges;
+    collectAllTrampolines(&ranges);
+    CHECK(ranges.size() >= 2);
+    CHECK(resumeAllHooks() == 0);
+    CHECK(m1.bytes(a.target, 1)[0] == 0xE9);
+    m2.image[a.target - FakeMemory::kImage + 1] ^= 0x33;  // restore so the destructor is clean
+}
+
+TEST(reload_tampered_hook_is_counted_so_the_loader_can_refuse_to_unload) {
+    FakeMemory m;
+    HookSpec s = makeSpec();
+    m.place(s);
+    int t0 = tamperedCount();
+    {
+        HookRegistry reg(m);
+        CHECK(reg.acquire(s, 1, nullptr) == PatchStatus::Ok);
+        m.image[s.target - FakeMemory::kImage + 1] ^= 0x55;
+        CHECK(reg.restoreAllAndVerify() == 1);
+    }
+    CHECK(tamperedCount() == t0 + 1);
+}
+
 TEST(engine_address_table_is_sane) {
     std::map<Addr, const char*> seen;
     for (const HookSpec* s : addr::kAll) {
@@ -447,6 +578,25 @@ TEST(multiple_sinks_all_see_every_txn) {
     CHECK(a == 1 && b == 1 && aEff == 1 && bEff == 1);
 }
 
+TEST(ref_angle_json_and_capture) {
+    FormRef r("falloutnv.esm", 0x1234);
+    nvcoop::json::Value bad = effectToJson(RefAngle{r, kAxisY, 45.f});
+    Effect e;
+    std::string err;
+    CHECK(effectFromJson(bad, &e, &err) && e == Effect(RefAngle{r, kAxisY, 45.f}));
+    bad.set("axis", (int64_t)3);
+    CHECK(!effectFromJson(bad, &e, &err) && !err.empty());   // out-of-range axis is rejected, not clamped
+    CaptureHub h;
+    h.setEnabled(true);
+    std::vector<EffectTxn> out;
+    h.setSink([&](EffectTxn&& t) { out.push_back(std::move(t)); });
+    h.begin(qcause(1, 1));
+    CHECK(h.record(RefAngle{r, kAxisZ, 180.f}));
+    h.end();
+    CHECK(out.size() == 1 && out[0].effects.size() == 1 && std::holds_alternative<RefAngle>(out[0].effects[0]));
+    CHECK(std::string(effectName(Effect(RefAngle{}))) == "RefAngle");
+}
+
 TEST(effect_json_roundtrip_every_type) {
     FormRef q("falloutnv.esm", 0x10A214);
     std::vector<Effect> all = {SetStage{q, 10}, SetObjective{q, 20, 3}, SetGlobal{q, 2.5f}, EnableRef{q}, DisableRef{q},
@@ -456,7 +606,7 @@ TEST(effect_json_roundtrip_every_type) {
         SetScriptVar{q, 7, 3.25}, CompleteQuest{q}, CompleteAllObjectives{q}, SetLock{q, true, 50},
         SetFactionRank{q, FormRef("falloutnv.esm", 0x42), -1}, SetPerk{q, 2, Recipient::all()}, FailQuest{q}, SetPlayerControls{0x0B, false, Recipient::origin()},
         RefAddItem{q, q, 3}, RefRemoveItem{q, q, 1}, RemoveAllItems{q}, RefScriptVar{q, 4, 2.5}, AddTopic{q}, AddNote{q}, RemoveNote{q},
-        RequestSave{kSaveForce}, SetWeather{q, true}, SetTimeScale{30.f}, DespawnRef{0xFF000001u}, CompanionOwner{q, 0xFF}, SetMapMarker{q, kMarkerVisible | kMarkerTravel}};
+        RequestSave{kSaveForce}, SetWeather{q, true}, SetTimeScale{30.f}, RefAngle{q, kAxisZ, 90.5f}, RefAngle{q, kAxisX, -12.25f}, DespawnRef{0xFF000001u}, CompanionOwner{q, 0xFF}, SetMapMarker{q, kMarkerVisible | kMarkerTravel}};
     {
         ObjectState os;
         os.ref = q; os.mask = kObjLock | kObjOpen; os.locked = true; os.open = true; os.level = 50;
@@ -562,6 +712,8 @@ TEST(apply_lines_pin_command_names_and_parameter_order) {
     CHECK(resurrectCmd(true) == "ResurrectActor 1");
     CHECK(moveToMarkerCmd(0x32, 1.5f, -2.f, 0.f) == "MoveTo 00000032 1.5000 -2.0000 0.0000");
     CHECK(setPosCmd('Z', 12.25f) == "SetPos Z 12.2500");
+    CHECK(setAngleCmd('Z', 90.5f) == "SetAngle Z 90.5000" && setAngleCmd('X', -12.25f) == "SetAngle X -12.2500");
+    CHECK(axisIndexOf('X') == 0 && axisIndexOf('y') == 1 && axisIndexOf('Z') == 2 && axisIndexOf('z') == 2 && axisIndexOf(0) == -1 && axisIndexOf('Q') == -1);
     CHECK(setFactionRankCmd(0x104C22, -1) == "SetFactionRank 00104C22 -1");
     CHECK(removeFromFactionCmd(0x104C22) == "RemoveFromFaction 00104C22");
     CHECK(addPerkCmd(0x1234) == "AddPerk 00001234" && removePerkCmd(0x1234) == "RemovePerk 00001234");
@@ -730,6 +882,25 @@ TEST(weak_script_scope_captures_ambient_mutations_with_script_cause) {
     h.end();
 }
 
+TEST(muted_hub_captures_nothing_for_guest_local_scripts) {
+    CaptureHub h;
+    h.setEnabled(true);
+    std::vector<EffectTxn> out;
+    h.setSink([&](EffectTxn&& t) { out.push_back(std::move(t)); });
+    FormRef q("falloutnv.esm", 0x104EAE);
+    h.pushMute();
+    CHECK(!h.enabled() && !h.beginWeak(0x1));
+    h.begin(qcause(1, 1));          // a SetStage inside the local script
+    CHECK(!h.active() && !h.record(SetObjective{q, 70, 2}));
+    h.end();
+    h.popMute();
+    CHECK(out.empty() && h.enabled());
+    h.begin(qcause(1, 1));
+    CHECK(h.record(SetObjective{q, 70, 2}));
+    h.end();
+    CHECK(out.size() == 1);
+}
+
 TEST(explicit_scope_inside_weak_scope_keeps_its_own_cause) {
     CaptureHub h;
     h.setEnabled(true);
@@ -783,6 +954,276 @@ TEST(guest_local_run_allow_list_keeps_selected_quest_scripts_running) {
     CHECK(p.skipScript(kScriptTypeQuest, 0x500));   // list replaced
 }
 
+TEST(guest_local_run_script_may_mutate_on_guest_but_others_may_not) {
+    SuppressPolicy p;
+    p.setGuest(true);
+    p.setGuestLocalRun({0x500});
+    p.enterScript();                        // ordinary quest-driven/object script on a guest
+    CHECK(p.blockMutation());
+    p.leaveScript();
+    CHECK(p.isGuestLocalRun(0x500) && !p.isGuestLocalRun(0x501) && !p.isGuestLocalRun(0));
+    p.enterLocalScript();                   // allow-listed DLC setup script
+    CHECK(!p.blockMutation());
+    p.enterScript();                        // a nested ordinary script inherits the exemption (called from the local one)
+    CHECK(!p.blockMutation());
+    p.leaveScript();
+    p.leaveLocalScript();
+    p.enterScript();
+    CHECK(p.blockMutation());               // exemption ended with the local script
+    p.leaveScript();
+    CHECK(p.localScriptDepth() == 0 && p.scriptDepth() == 0);
+}
+
+TEST(guest_local_run_data_file_parses) {
+    GuestLocalRunList l;
+    std::string err;
+    const char* ok = R"({"scripts":[{"quest":"NVDLC02MQ00","script":"HonestHearts.esm:008A32"},
+        {"quest":"Bad1","script":"nocolon"},{"quest":"Bad2","script":"X.esm:zz"},{"quest":"Bad3"},
+        {"quest":"VDLCPackQuest","script":"FalloutNV.esm:17912E"}]})";
+    CHECK(parseGuestLocalRun(ok, &l, &err));
+    CHECK(l.scripts.size() == 2 && l.skipped == 3);
+    CHECK(l.scripts[0].plugin == "honesthearts.esm" && l.scripts[0].localId == 0x8A32 && l.quests[0] == "NVDLC02MQ00");
+    CHECK(l.scripts[1].localId == 0x17912E);
+    CHECK(!parseGuestLocalRun("{\"nope\":1}", &l, &err) && !err.empty());
+    CHECK(!parseGuestLocalRun("not json", &l, &err));
+}
+
+TEST(guest_local_run_shipped_list_covers_required_setup_quests) {
+    std::string path = std::string(NVH_DATA_DIR) + "/guest_local_run.json";
+    FILE* f = fopen(path.c_str(), "rb");
+    CHECK(f != nullptr);
+    if (!f) return;
+    std::string text;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+    fclose(f);
+    GuestLocalRunList l;
+    std::string err;
+    CHECK(parseGuestLocalRun(text, &l, &err));
+    CHECK(l.skipped == 0);
+    auto has = [&](const char* q) { for (auto& x : l.quests) if (x == q) return true; return false; };
+    for (const char* q : {"NVDLC01MQ00", "NVDLC02MQ00", "NVDLC03MQ00", "NVDLC04MQ00", "NVDLC05MQ00", "VDLCPackQuest", "AchievementQuest",
+                          "ControlRumble", "AutoDocTimerQuest", "ImplantTimerQuest"})
+        CHECK(has(q));
+    for (auto& r : l.scripts) CHECK(r.localId != 0 && !r.plugin.empty());
+}
+
+TEST(guest_local_run_two_game_diff_quests_are_per_machine) {
+    std::string path = std::string(NVH_DATA_DIR) + "/guest_local_run.json";
+    FILE* f = fopen(path.c_str(), "rb");
+    CHECK(f != nullptr);
+    if (!f) return;
+    std::string text;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+    fclose(f);
+    GuestLocalRunList l;
+    std::string err;
+    CHECK(parseGuestLocalRun(text, &l, &err));
+    auto idx = [&](const char* q) { for (size_t i = 0; i < l.quests.size(); ++i) if (l.quests[i] == q) return (int)i; return -1; };
+    // per-machine: documented with a reason
+    for (const char* q : {"VStreetLighting", "NVDLC02RainQuest", "NVDLC02RadioMessage", "VDLCPackQuest"}) {
+        int i = idx(q);
+        CHECK(i >= 0);
+        if (i >= 0) CHECK(!l.reasons[i].empty());
+    }
+    CHECK(idx("VCG04") >= 0);
+    // NOT per-machine: encounter spawners (a guest copy would spawn a second set of creatures) and story quests
+    for (const char* q : {"VERNovac01", "VERStalkersSouth01", "VCG02", "VMS01", "VMS21"}) CHECK(idx(q) < 0);
+}
+
+TEST(per_machine_quest_vars_are_not_shared) {
+    SuppressPolicy p;
+    p.setGuestLocalRun({0x500, 0x600});
+    CHECK(!p.sharesQuestVars(0x500) && !p.sharesQuestVars(0x600));  // GuestLocalRun quest: vars stay local
+    CHECK(p.sharesQuestVars(0x501));                                // story quest: shared as before
+    CHECK(p.sharesQuestVars(0));                                    // quest without a script
+}
+
+TEST(acting_slot_maps_ghosts_to_party_slots) {
+    ActingContext a;
+    CHECK(a.slot() == 0);                       // host player
+    a.registerSlot(0xFF001234, 2);
+    a.push(0xFF001234);
+    CHECK(a.slot() == 2);
+    a.push(0xFF00DEAD);                         // unregistered ghost -> host slot
+    CHECK(a.slot() == 0);
+    a.pop();
+    a.registerSlot(0xFF001234, 3);              // re-register replaces
+    CHECK(a.slot() == 3);
+    a.pop();
+    CHECK(a.slot() == 0);
+}
+
+TEST(companion_apply_is_for_the_owner_machine_only) {
+    CHECK(companionForMe(1, 1) && !companionForMe(0, 1) && !companionForMe(1, 0) && companionForMe(0, 0));
+    CHECK(setTeammateCmd(true) == "SetPlayerTeammate 1" && setTeammateCmd(false) == "SetPlayerTeammate 0");
+}
+
+TEST(fast_travel_locks_enable_travel_only_when_last_scope_releases) {
+    FastTravelLocks l;
+    FormRef a("falloutnv.esm", 1), b("falloutnv.esm", 2);
+    CHECK(l.travelEnabled());
+    CHECK(l.set(a, true) && !l.travelEnabled());   // first lock: state changes
+    CHECK(!l.set(b, true));                        // second lock: no engine change
+    CHECK(!l.set(a, false) && !l.travelEnabled()); // b still holds
+    CHECK(l.set(b, false) && l.travelEnabled());   // last release re-enables
+    CHECK(!l.set(b, false));                       // double release is a no-op
+    CHECK(enableFastTravelCmd(true) == "EnableFastTravel 1" && enableFastTravelCmd(false) == "EnableFastTravel 0");
+}
+
+TEST(current_source_names_the_outermost_explicit_scope_or_weak_script) {
+    CaptureHub h;
+    h.setEnabled(true);
+    h.setSink([](EffectTxn&&) {});
+    FormRef q;
+    CHECK(!h.currentSource(&q));                   // no scope
+    {
+        ScopedCapture sc(h, qcause(0x104C, 30));
+        CHECK(h.currentSource(&q) && q.localId == 0x104C);
+        ScopedCapture inner(h, qcause(0x2000, 5));
+        CHECK(h.currentSource(&q) && q.localId == 0x104C);  // outermost wins
+    }
+    h.setWeakCauseResolver([](uint32_t id) { Cause c; c.kind = CauseKind::Script; c.source = FormRef("falloutnv.esm", id); return c; });
+    CHECK(h.beginWeak(0x777));
+    CHECK(h.currentSource(&q) && q.localId == 0x777);
+    h.endWeak();
+    CHECK(!h.currentSource(&q));
+}
+
+TEST(party_condition_swap_plan_only_touches_the_player_operand) {
+    CHECK(planSwap(CondFunc::GetDistance, 0x1234, 0x14).param1 && !planSwap(CondFunc::GetDistance, 0x1234, 0x14).thisObj);
+    CHECK(planSwap(CondFunc::GetDistance, 0x14, 0x1234).thisObj && !planSwap(CondFunc::GetDistance, 0x14, 0x1234).param1);
+    CHECK(!planSwap(CondFunc::GetDistance, 0x1234, 0x5678).any());
+    CHECK(planSwap(CondFunc::GetInCell, 0x14, 0x14).thisObj && !planSwap(CondFunc::GetInCell, 0x14, 0x14).param1);  // param1 is a cell, never inspected
+    CHECK(!planSwap(CondFunc::IsInCombat, 0x1234, 0x14).any());
+    CHECK(planSwap(CondFunc::GetDetected, 0x1234, 0x14).param1);
+    CHECK(std::string(condFuncName(CondFunc::GetInSameCell)) == "GetInSameCell" && !param1IsReference(CondFunc::GetInCell));
+}
+
+TEST(party_condition_runs_once_per_member_and_reduces) {
+    std::vector<PartyMember> party = {{0, 0x14}, {1, 0xFF000001}, {2, 0xFF000002}};
+    int calls = 0;
+    auto evalAs = [&](const PartyMember& m, double* v) { ++calls; *v = m.slot == 0 ? 900.0 : (m.slot == 1 ? 120.0 : 450.0); return true; };
+    std::string seenFunc;
+    uint8_t seenInit = 99;
+    std::vector<CondValue> seen;
+    auto reduce = [&](const std::string& f, const std::vector<CondValue>& v, uint8_t init) {
+        seenFunc = f; seenInit = init; seen = v;
+        double m = v[0].value;
+        for (auto& x : v) if (x.value < m) m = x.value;  // min-over-party
+        return m;
+    };
+    double out = -1;
+    CHECK(evaluateOverParty(CondFunc::GetDistance, party, evalAs, reduce, 2, &out));
+    CHECK(calls == 3 && out == 120.0 && seenFunc == "GetDistance" && seenInit == 2 && seen.size() == 3 && seen[1].slot == 1);
+    // a ghost that is not loaded is skipped; the rest still reduce
+    auto evalSkip = [&](const PartyMember& m, double* v) { if (m.slot == 1) return false; *v = m.slot ? 5.0 : 9.0; return true; };
+    CHECK(evaluateOverParty(CondFunc::GetDistance, party, evalSkip, reduce, 0, &out) && out == 5.0 && seen.size() == 2);
+    // fewer than two evaluated members: caller falls back to the engine result
+    auto evalOne = [&](const PartyMember& m, double* v) { *v = 1; return m.slot == 0; };
+    CHECK(!evaluateOverParty(CondFunc::GetDistance, party, evalOne, reduce, 0, &out));
+    CHECK(!evaluateOverParty(CondFunc::GetDistance, {}, evalAs, reduce, 0, &out));
+    // no reducer: initiator-less default = first value
+    CHECK(evaluateOverParty(CondFunc::GetInCell, party, evalAs, nullptr, 0, &out) && out == 900.0);
+}
+
+namespace {
+const char* kReducerRules = R"({"schema":1,"quests":{
+ "Collect":{"tier":"T3","questline":"x","curated":false,"rules":[
+   {"kind":"PartyAwareCond","params":{"funcs":{"GetItemCount":"sum-over-party","GetAV":"max-over-party","GetDistance":"min-over-party","GetInCell":"entry:all-in,exit:any-in","IsInCombat":"any-party-member"}},"origin":"derived"}]},
+ "Plain":{"tier":"T3","questline":"x","curated":false,"rules":[
+   {"kind":"PartyAwareCond","params":{"funcs":{"GetActorValue":"min-over-party"}},"origin":"derived"}]}
+}})";
+bool reducerResolve(const std::string& edid, fnvcoop::FormRef& out) {
+    out = fnvcoop::FormRef("falloutnv.esm", edid == "Collect" ? 0x100u : edid == "Plain" ? 0x101u : 0x1FFu);
+    return true;
+}
+// Runs one party condition the way the engine detour does: evaluateOverParty with the rules reducer behind it.
+double overParty(fnvcoop::RulesEngine& eng, const fnvcoop::FormRef& quest, CondFunc f, const std::vector<double>& perSlot, uint8_t initiator,
+                 fnvcoop::CondPhase phase = fnvcoop::CondPhase::Entry) {
+    ConditionReducer red = makeRulesReducer(eng);
+    std::vector<PartyMember> party;
+    for (size_t i = 0; i < perSlot.size(); ++i) party.push_back({static_cast<uint8_t>(i), i == 0 ? kHostPlayerRef : 0xFF000000u + static_cast<uint32_t>(i)});
+    double out = -12345;
+    bool done = evaluateOverParty(
+        f, party, [&](const PartyMember& m, double* v) { *v = perSlot[m.slot]; return true; },
+        [&](const std::string& fn, const std::vector<CondValue>& vals, uint8_t init) { return red(quest, fn, vals, init, phase); }, initiator, &out);
+    return done ? out : perSlot.front();
+}
+}  // namespace
+
+TEST(party_conditions_reduce_through_the_rules_engine) {
+    fnvcoop::InMemoryNetwork net(1);
+    fnvcoop::HostSession host(*net.endpoint(0));
+    fnvcoop::RulesDb db;
+    std::string err;
+    CHECK(db.load(kReducerRules, &err));
+    fnvcoop::RulesEngine eng(host, db, reducerResolve);
+    fnvcoop::FormRef collect, plain, none;
+    reducerResolve("Collect", collect);
+    reducerResolve("Plain", plain);
+    reducerResolve("Other", none);
+    // sum-over-party: two totems spread over the party reach a count of 2 (any-party-member would say 1)
+    CHECK(overParty(eng, collect, CondFunc::GetItemCount, {1, 1, 0}, 0) == 2.0);
+    // max-over-party, the rule spells the function GetAV and the engine evaluator is GetActorValue
+    CHECK(overParty(eng, collect, CondFunc::GetActorValue, {60, 101, 80}, 0) == 101.0);
+    CHECK(ruleFuncName(eng, collect, "GetActorValue") == "GetAV");
+    CHECK(ruleFuncName(eng, plain, "GetActorValue") == "GetActorValue");
+    CHECK(overParty(eng, plain, CondFunc::GetActorValue, {60, 101, 80}, 0) == 60.0);   // min-over-party under its own spelling
+    // min-over-party: the closest member decides
+    CHECK(overParty(eng, collect, CondFunc::GetDistance, {900, 40, 300}, 0) == 40.0);
+    // any-party-member
+    CHECK(overParty(eng, collect, CondFunc::IsInCombat, {0, 0, 1}, 0) == 1.0);
+    // entry:all-in,exit:any-in needs the phase the caller declared
+    CHECK(overParty(eng, collect, CondFunc::GetInCell, {1, 0}, 0, fnvcoop::CondPhase::Entry) == 0.0);
+    CHECK(overParty(eng, collect, CondFunc::GetInCell, {1, 0}, 0, fnvcoop::CondPhase::Exit) == 1.0);
+    // no rule for the quest / the function: the initiator's own value
+    CHECK(overParty(eng, none, CondFunc::GetItemCount, {3, 4}, 1) == 4.0);
+    CHECK(overParty(eng, plain, CondFunc::GetItemCount, {3, 4}, 0) == 3.0);
+    // a one-member party never reaches the reducer (engine result is used)
+    CHECK(overParty(eng, collect, CondFunc::GetItemCount, {5}, 0) == 5.0);
+}
+
+TEST(every_hooked_condition_function_has_a_rule_in_rules_json) {
+    fnvcoop::RulesDb db;
+    std::string err;
+    CHECK(db.loadFile(NVH_RULES_JSON, &err));
+    auto lower = [](std::string s) { for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return s; };
+    for (int i = 0; i < static_cast<int>(CondFunc::Count); ++i) {
+        std::string name = lower(condFuncName(static_cast<CondFunc>(i)));
+        int uses = 0;
+        for (const auto& kv : db.quests())
+            if (const fnvcoop::Rule* r = kv.second.find("PartyAwareCond"))
+                for (const auto& f : r->funcs) {
+                    std::string k = lower(f.first);
+                    if (k == name || (name == "getactorvalue" && k == "getav")) ++uses;
+                }
+        if (uses == 0) std::printf("    no PartyAwareCond rule names %s\n", name.c_str());
+        CHECK(uses > 0);   // a hooked evaluator nobody can configure is dead weight
+    }
+}
+
+TEST(muted_hub_ignores_quest_var_of_guest_local_quest_owner) {
+    // Local-only effects: while a GuestLocalRun script runs nothing is captured, and its quest-var owner is flagged unshared.
+    SuppressPolicy p;
+    p.setGuestLocalRun({0x500});
+    CaptureHub h;
+    h.setEnabled(true);
+    std::vector<EffectTxn> out;
+    h.setSink([&](EffectTxn&& t) { out.push_back(std::move(t)); });
+    FormRef q("falloutnv.esm", 0x104EAE);
+    h.pushMute();
+    h.begin(qcause(1, 1));
+    CHECK(!h.recordScriptVar({q, 3, 1.0}) && !h.record(SetFactionRank{q, q, 1}) && !h.record(AddItem{q, 1, Recipient::all()}));
+    h.end();
+    h.popMute();
+    CHECK(out.empty() && h.stats().droppedLocal >= 3);
+    CHECK(!p.sharesQuestVars(0x500) && p.sharesQuestVars(0x501));
+}
+
 int main() {
     run("install_patches_entry_and_builds_trampoline", install_patches_entry_and_builds_trampoline);
     run("wrong_prologue_refuses_and_writes_nothing", wrong_prologue_refuses_and_writes_nothing);
@@ -794,8 +1235,23 @@ int main() {
     run("tampered_code_not_restored", tampered_code_not_restored);
     run("alloc_or_write_failure_leaves_game_code_untouched", alloc_or_write_failure_leaves_game_code_untouched);
     run("registry_destructor_restores_everything", registry_destructor_restores_everything);
+    run("reload_cycles_restore_every_byte_and_balance_live_count", reload_cycles_restore_every_byte_and_balance_live_count);
+    run("reload_restore_failure_is_reported_and_never_hangs", reload_restore_failure_is_reported_and_never_hangs);
+    run("reload_preflight_finds_chained_hooks_without_touching_anything", reload_preflight_finds_chained_hooks_without_touching_anything);
+    run("reload_suspend_resume_keeps_trampolines_and_release_still_restores", reload_suspend_resume_keeps_trampolines_and_release_still_restores);
+    run("reload_suspend_leaves_chained_hooks_alone_and_process_wide_helpers_see_every_registry", reload_suspend_leaves_chained_hooks_alone_and_process_wide_helpers_see_every_registry);
+    run("reload_tampered_hook_is_counted_so_the_loader_can_refuse_to_unload", reload_tampered_hook_is_counted_so_the_loader_can_refuse_to_unload);
     run("engine_address_table_is_sane", engine_address_table_is_sane);
     run("engine_table_signature_roundtrip_on_fake_image", engine_table_signature_roundtrip_on_fake_image);
+    run("guest_local_run_script_may_mutate_on_guest_but_others_may_not", guest_local_run_script_may_mutate_on_guest_but_others_may_not);
+    run("guest_local_run_data_file_parses", guest_local_run_data_file_parses);
+    run("guest_local_run_shipped_list_covers_required_setup_quests", guest_local_run_shipped_list_covers_required_setup_quests);
+    run("acting_slot_maps_ghosts_to_party_slots", acting_slot_maps_ghosts_to_party_slots);
+    run("companion_apply_is_for_the_owner_machine_only", companion_apply_is_for_the_owner_machine_only);
+    run("fast_travel_locks_enable_travel_only_when_last_scope_releases", fast_travel_locks_enable_travel_only_when_last_scope_releases);
+    run("current_source_names_the_outermost_explicit_scope_or_weak_script", current_source_names_the_outermost_explicit_scope_or_weak_script);
+    run("party_condition_swap_plan_only_touches_the_player_operand", party_condition_swap_plan_only_touches_the_player_operand);
+    run("party_condition_runs_once_per_member_and_reduces", party_condition_runs_once_per_member_and_reduces);
     run("no_scope_no_record", no_scope_no_record);
     run("scope_emits_one_txn_with_cause_and_order", scope_emits_one_txn_with_cause_and_order);
     run("nested_scopes_merge_into_outermost_txn", nested_scopes_merge_into_outermost_txn);

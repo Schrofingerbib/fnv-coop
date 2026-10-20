@@ -49,7 +49,21 @@ struct SetScriptPackage {
     bool operator==(const SetScriptPackage& o) const { return actor == o.actor && package == o.package && add == o.add; }
 };
 
-using WorldEffect = std::variant<SetActorValueRef, SetEssential, SetRestrained, SetRelation, SetScriptPackage>;
+// IgnoreCrime on a (story) NPC: crimes against / by it are not reported while on.
+struct SetIgnoreCrime {
+    fnvcoop::FormRef actor;
+    bool on = false;
+    bool operator==(const SetIgnoreCrime& o) const { return actor == o.actor && on == o.on; }
+};
+// SetPCEnemyOfFaction (on = 1/0) and ClearFactionPlayerEnemyFlag (on = 0): the faction's "player is its enemy" flag.
+struct SetFactionPlayerEnemy {
+    fnvcoop::FormRef faction;
+    bool on = false;
+    bool operator==(const SetFactionPlayerEnemy& o) const { return faction == o.faction && on == o.on; }
+};
+
+using WorldEffect = std::variant<SetActorValueRef, SetEssential, SetRestrained, SetRelation, SetScriptPackage, SetIgnoreCrime,
+                                 SetFactionPlayerEnemy>;
 
 const char* worldEffectName(const WorldEffect& e);
 

@@ -31,8 +31,9 @@ void ClearEvents();  // test hook
 StateProvider GetStateProvider();
 
 struct MethodEntry {
-    MethodFn fn;
+    MethodClosure fn;
     bool mainThread;
+    int owner = 0;
 };
 bool FindMethod(const std::string& name, MethodEntry& out);
 

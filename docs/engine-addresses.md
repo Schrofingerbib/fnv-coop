@@ -166,3 +166,22 @@ one emits the txn.
 | `0x5C8740` | `Cmd_StartConversation`; `0x5C8A50` `Cmd_Say`; `0x5C9100` `Cmd_SayTo` | script-level conversation starters |
 | `0x573170` | `TESObjectREFR::Activate(activator, u8, u32, u32)` thiscall, `ret 0x10` | 4 stack args at every call site (e.g. 0x5B5B18: `push 1; push 0; push 0; push activator`); body ends in a jump table. Hooked as an observer on Role::Guest (`setActivateObserver`) |
 All calling conventions of hooked functions are now pinned at compile time (`PIN_F`/`PIN_C` static_asserts compare each detour's stack bytes with `HookSpec::retBytes` from `tests/retbytes.json`).
+
+
+Condition evaluators are the 4th column of the script command table (`command_table.json`: opcode, execute, parse, **eval**, ...). Signature
+(read from the prologues and the caller `Condition::Evaluate` 0x681600): `bool eval(TESObjectREFR* thisObj, void* param1, void* param2, double* result)`,
+cdecl, `ret` (caller pops 0x10). `Condition::Evaluate` itself is `thiscall(Condition*, subject, target, bool* flag)`, `ret 0xC`, returns the COMPARISON
+result (bool), so the raw function value is only visible inside the eval handlers. The condition function index (`word [cond+8]`) is `opcode - 0x1000`
+and indexes the eval table at `0x11908F8 + 0x28*idx` (handler at +0x10).
+
+| address | function | conf | note |
+|---|---|---|---|
+| `0x59BFA0` | `GetDistance` eval | V | hooked (party-aware), stolen 7 |
+| `0x59EF60` | `GetInCell` eval | V | hooked, stolen 6 |
+| `0x59EE80` | `GetInSameCell` eval | V | hooked, stolen 6 |
+| `0x5A3180` | `IsInCombat` eval | V | hooked, stolen 6 |
+| `0x59D6E0` | `GetDetected` eval | V | hooked, stolen 6 |
+| `0x59C7E0` | `GetHealthPercentage` eval | V | hooked, stolen 11 |
+| `0x5D13E0` | `Cmd_EnableFastTravel` | V | hooked (capture -> SetFastTravelLock), stolen 6 |
+| `0x5C09C0` | `Cmd_SetAngle` | V | NOT hooked yet: needs a rotation Effect type from L4 |
+| `0x5CCB20` | MoveTo worker `(thisObj, marker, offX, offY, offZ)`, cdecl | M | called by `Cmd_MoveToMarker` 0x5CCF50 after ExtractArgs; destination = marker position + offsets |

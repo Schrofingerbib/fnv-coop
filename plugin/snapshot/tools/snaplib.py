@@ -237,9 +237,62 @@ def volatile_paths(snap):
     return res
 
 
+GUEST_LOCAL_RUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "hooks", "data",
+                                    "guest_local_run.json")
+
+
+def load_local_allowlist(path=None):
+    """(quest EDIDs, faction form keys) from the GuestLocalRun list (the same file the plugin deploys as
+    nvcoop_guest_local_run.json; its script ids are not quest ids, so quests match by EDID).
+    Quests there run per machine, so their state is per-machine by definition. The optional "factionRanks"
+    array lists faction form keys those scripts rank up per machine (L4/L5 decide)."""
+    with open(path or GUEST_LOCAL_RUN_PATH, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    quests = {e["quest"].lower() for e in d.get("scripts", [])}
+    quests |= {str(x).lower() for x in d.get("no_script", [])}
+    return quests, set(d.get("factionRanks", []))
+
+
+def _canon(key):
+    plug, _, fid = key.rpartition(":")
+    return "%s:%s" % (plug.lower(), fid.upper())
+
+
+def localize(snap, allowlist=None):
+    """Return a copy of snap where GuestLocalRun quests (and listed faction ranks) moved from shared to
+    perPlayer/<first player>/localQuests|localFactionRanks, so the shared compare ignores them."""
+    quests, factions = allowlist if allowlist is not None else load_local_allowlist()
+    factions = {_canon(f) for f in factions}
+    sh = snap.get("shared")
+    if not isinstance(sh, dict):
+        return snap
+    out = dict(snap)
+    out["shared"] = dict(sh)
+    pp = dict(snap.get("perPlayer") or {})
+    pid = next(iter(pp), None)
+    moved = {}
+    cur = sh.get("quests")
+    if isinstance(cur, dict):
+        is_l = lambda k, v: str((v or {}).get("edid", "")).lower() in quests
+        out["shared"]["quests"] = {k: v for k, v in cur.items() if not is_l(k, v)}
+        moved["localQuests"] = {k: v for k, v in cur.items() if is_l(k, v)}
+    cur = sh.get("factionRanks")
+    if isinstance(cur, dict):
+        out["shared"]["factionRanks"] = {k: v for k, v in cur.items() if _canon(k) not in factions}
+        moved["localFactionRanks"] = {k: v for k, v in cur.items() if _canon(k) in factions}
+    if pid is not None:
+        pp[pid] = dict(pp[pid])
+        pp[pid].update(moved)
+        out["perPlayer"] = pp
+    return out
+
+
 def diff(a, b, sections=("shared",), include_meta=False, tolerances=None, ignore=(),
-         default_ignores=True):
-    """Semantic diff. Returns list of dicts {kind: changed|added|removed, path, a, b, label}."""
+         default_ignores=True, local_split=True):
+    """Semantic diff. Returns list of dicts {kind: changed|added|removed, path, a, b, label}.
+    local_split=False keeps GuestLocalRun quests in shared (the pre-classification behaviour)."""
+    if local_split:
+        a, b = localize(a), localize(b)
     tolerances = list(tolerances or []) + DEFAULT_TOLERANCES
     ignore = list(ignore)
     if default_ignores:

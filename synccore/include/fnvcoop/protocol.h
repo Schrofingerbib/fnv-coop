@@ -2,6 +2,7 @@
 #pragma once
 #include <variant>
 #include "fnvcoop/baseline.h"
+#include "fnvcoop/policy.h"
 #include "fnvcoop/shadow.h"
 #include "fnvcoop/transport.h"
 #include "fnvcoop/wire.h"
@@ -40,6 +41,9 @@ struct Welcome {
     uint32_t baselineId = 0;   // != 0: a world-baseline transfer follows for this join
     uint8_t baselineAbs = 0;   // bit0: karma synced by baseline, bit1: reputation synced by baseline
     uint32_t worldEpoch = 0;   // the host world epoch this session belongs to
+    // Every reward (items / actor values) this slot received up to the snapshot, with its id. A baseline joiner applies only the ones it
+    // has not delivered yet (its save sidecar remembers the ids); everyone marks them delivered once the snapshot is in.
+    std::vector<RewardGrant> rewards;
 };
 struct Reject { uint32_t session = 0; uint8_t reason = 0; std::string text; };   // text: ready to show to the player
 // worldEpoch 0 = unspecified (accepted); otherwise txns/acks from another epoch are stale and dropped.
@@ -54,6 +58,8 @@ struct Rebase { uint32_t session = 0; uint32_t epoch = 0; };
 enum class IntentKind : uint8_t { AppliedEffects = 0, ActivateRef = 1, TriggerEnter = 2, PickUp = 3,
                              ScenePass = 4,    // the player finished their per-player step of quest `ref` (chargen etc.)
                              ReportCell = 5,   // the player is now in cell `ref` (party tether / presence)
+                             ReportNear = 6,   // the player is now within the tether radius of anchor ref `ref`
+                             ReportFar = 7,    // the player left the tether radius of anchor ref `ref`
                              Count_ };
 // Client-reported local action (at-most-once, in order, durable across reconnects).
 struct Intent { uint32_t session = 0; uint32_t epoch = 0; uint32_t id = 0; Cause cause; std::vector<Effect> effects;
@@ -80,6 +86,7 @@ struct BaselineDiffChunk {       // host -> client
 struct BaselineAck {             // phase 0: host acks summary chunks (next = first missing); phase 1: client acks diff chunks
     uint32_t session = 0, id = 0; uint8_t phase = 0; uint32_t next = 0;
 };
+constexpr size_t kMaxRewardsPerWelcome = 1u << 16;
 constexpr size_t kBaselineSummaryPerChunk = 256, kBaselineEffectsPerChunk = 128, kBaselineRevertsPerChunk = 512;
 
 // ---- runtime desync detection / self-heal ----

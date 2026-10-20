@@ -21,6 +21,7 @@
 #include "effect_json.h"
 #include "engine_hooks.h"
 #include "ui_hooks.h"
+#include "reload/reload_state.h"
 
 using nvcoop::json::Value;
 
@@ -259,6 +260,18 @@ bool MSwap(const std::string& params, std::string& out) {
     return true;
 }
 
+// ui.answer {button} -> {menu}: answer the message box our ops layer is showing (bot.menu.press / bot.consent use this)
+bool MAnswer(const std::string& params, std::string& out) {
+    Value p;
+    if (!Parse(params, p, out)) return false;
+    uint32_t menu = 0;
+    if (!nvui::ops::answerShowing(int(p.get("button").asInt(-1)), &menu)) { out = "no message box is being shown"; return false; }
+    Value o = Value::object();
+    o.set("menu", (int64_t)menu);
+    out = o.dump();
+    return true;
+}
+
 bool MForced(const std::string&, std::string& out) { out = g_forcedLog.dump(); return true; }
 bool MSlides(const std::string&, std::string& out) { out = g_slideLog.dump(); return true; }
 
@@ -278,6 +291,7 @@ void OnLoad(void*) {
     nvcoop::RegisterMethod("ui.open", MOpen, true);
     nvcoop::RegisterMethod("ui.closemenu", MCloseMenu, true);
     nvcoop::RegisterMethod("ui.slides", MSlides, true);
+    nvcoop::RegisterMethod("ui.answer", MAnswer, true);
 }
 void OnMessage(uint32_t type, void*, uint32_t) {
     if (type == NVSEMessagingInterface::kMessage_DeferredInit) InitUi();
@@ -290,3 +304,21 @@ void OnFrame() {
 }  // namespace
 
 NVCOOP_MODULE(l11_hooks_ui, "l11_hooks_ui", OnLoad, OnMessage, OnFrame);
+
+// Hot reload (T3b): see hooks/hooks_module.cpp. The UI hooks are reinstalled by InitUi in the new core.
+NVCOOP_RELOAD_STATE(l11_hooks_ui, "l11_hooks_ui", 1, 20,
+    /*canUnload*/ [] {
+        int n = nvui::auditTamperedHooks();
+        return n ? std::to_string(n) + " UI hook(s) were chained over by another mod" : std::string();
+    },
+    /*save*/ [](nvreload::Writer& w) {
+        w.boolean(g_inited);
+        return true;
+    },
+    /*restore*/ [](uint32_t, nvreload::Reader& r) {
+        if (r.boolean()) InitUi();
+        return true;
+    },
+    /*migrate*/ nullptr,
+    /*shutdown*/ [] { if (g_inited) nvui::Shutdown(); },
+    /*fresh*/ nullptr);

@@ -106,6 +106,13 @@ public:
         for (auto& [k, v] : enabled) en[k] = v ? 1 : 0;
         for (auto& [k, v] : objectives) obj2[k] = v;
         for (auto& [k, v] : reputation) rep[k] = static_cast<double>(v);
+        std::map<std::string, double> rv, comp, spawn, npc;
+        for (auto& [k, v] : refVars) rv[k] = v;
+        for (auto& [k, v] : companions) comp[k] = v;
+        for (auto& k : spawned) spawn[k.first] = 1;
+        for (auto& [k, v] : worldState) npc[k] = static_cast<double>(std::hash<std::string>()(v) % 1000003);
+        o.set("refVars", obj(rv)).set("companions", obj(comp)).set("spawned", obj(spawn)).set("npcState", obj(npc))
+            .set("slideEnds", (int64_t)slideEnds).set("forcedEvents", (int64_t)forcedEvents);
         o.set("stages", obj(st)).set("globals", obj(gl)).set("items", obj(items)).set("questRunning", obj(run))
             .set("enabled", obj(en)).set("objectives", obj(obj2)).set("reputation", obj(rep)).set("karma", (int64_t)karma)
             .set("xp", (int64_t)xp);
@@ -119,6 +126,23 @@ public:
     std::map<std::string, int> objectives;     // "quest#obj" -> flags
     std::map<std::string, int64_t> reputation; // "faction/fame|infamy"
     int64_t karma = 0, xp = 0;
+    // L12 / L8 / L11 effect surface: created refs (host ref -> this machine's own local ref), ref script vars, companions, events
+    std::map<std::string, uint32_t> spawned;       // host ref string -> local refID (differs per machine on purpose)
+    std::set<std::string> despawned;
+    std::map<std::string, double> refVars;         // "<ref>#<index>" -> value
+    std::map<std::string, int> companions;         // npc -> owner slot (absent = free)
+    std::map<std::string, std::string> worldState; // key -> lane-local world effect json (NPC AV, relations, ...)
+    uint64_t dupSpawns = 0, unresolvedRefOps = 0, worldApplied = 0, slideEnds = 0, forcedEvents = 0;
+    uint32_t nextLocalRef = 0x00100000;
+    // Lane-local world effect (WorldEffectApplier): same json twice must not be applied twice by the runtime.
+    std::string applyWorldJson(const std::string& json) {
+        nvcoop::json::Value v;
+        std::string err;
+        if (!nvcoop::json::parse(json, v, err)) return "BadWorldEffect";
+        ++worldApplied;
+        worldState[v.get("type").asString() + ":" + v.get("actor").asString() + ":" + v.get("a").asString() + v.get("b").asString() + ":" + v.get("av").dump()] = json;
+        return "Ok";
+    }
     std::vector<std::string> untaggedSnapshot;
     uint64_t effectsApplied = 0, unsupported = 0, baselineApplied = 0;
     int joinedSlot = -1;
@@ -147,6 +171,29 @@ private:
         if (auto* x = std::get_if<ModKarma>(&e)) { karma += x->delta; return true; }
         if (auto* x = std::get_if<StartQuest>(&e)) { questRunning[s(x->quest)] = true; return true; }
         if (auto* x = std::get_if<StopQuest>(&e)) { questRunning[s(x->quest)] = false; return true; }
+        if (auto* x = std::get_if<SpawnRef>(&e)) {
+            const std::string k = s(x->ref());
+            if (spawned.count(k) || despawned.count(k)) { ++dupSpawns; return true; }   // replayed / late-join: never create twice
+            spawned[k] = nextLocalRef++;
+            return true;
+        }
+        if (auto* x = std::get_if<DespawnRef>(&e)) {
+            const std::string k = s(x->ref());
+            spawned.erase(k);
+            despawned.insert(k);
+            return true;
+        }
+        if (auto* x = std::get_if<RefScriptVar>(&e)) {
+            if (isCreatedRef(x->ref) && !spawned.count(s(x->ref))) { ++unresolvedRefOps; return false; }
+            refVars[s(x->ref) + "#" + std::to_string(x->index)] = x->value;
+            return true;
+        }
+        if (auto* x = std::get_if<CompanionOwner>(&e)) {
+            if (x->active) companions[s(x->npc)] = x->owner; else companions.erase(s(x->npc));
+            return true;
+        }
+        if (std::get_if<ForcedDialogue>(&e)) { ++forcedEvents; return true; }
+        if (std::get_if<SlideshowEnd>(&e)) { ++slideEnds; return true; }
         return false;
     }
 };

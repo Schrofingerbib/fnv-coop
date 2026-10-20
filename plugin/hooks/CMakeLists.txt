@@ -21,13 +21,27 @@ function(nvh_flags tgt)
   target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS)
 endfunction()
 
+# ---- synccore, compiled for the tests only (rules_reducer.h drives a real RulesEngine); the plugin links its own copy elsewhere ----
+set(NVH_SC "${NVH_DIR}/../../synccore")
+if(NOT TARGET nvh_synccore)
+  add_library(nvh_synccore STATIC ${NVH_SC}/src/wire.cpp ${NVH_SC}/src/shadow.cpp ${NVH_SC}/src/policy.cpp ${NVH_SC}/src/storylog.cpp
+    ${NVH_SC}/src/protocol.cpp ${NVH_SC}/src/rules.cpp ${NVH_SC}/src/baseline.cpp ${NVH_SC}/src/replicator.cpp ${NVH_SC}/src/transport.cpp
+    ${NVH_SC}/src/transport_util.cpp ${NVH_SC}/src/session.cpp)
+  target_include_directories(nvh_synccore PUBLIC ${NVH_SYNCCORE_INC})
+  target_compile_features(nvh_synccore PUBLIC cxx_std_17)
+  if(MSVC)
+    target_compile_options(nvh_synccore PRIVATE /W3 /EHsc /permissive- /utf-8 /wd4456 /D_CRT_SECURE_NO_WARNINGS)
+  endif()
+endif()
+
 # ---- game-free core: prologue-checked patcher + capture hub (+ mutant twin) ----
 foreach(v "" _mutant)
-  add_library(nvcoop_hooks_core${v} STATIC ${NVH_DIR}/hook_patch.cpp ${NVH_DIR}/capture_hub.cpp ${NVH_DIR}/effect_json.cpp ${NVH_DIR}/suppress_policy.cpp ${NVH_DIR}/change_tracker.cpp ${NVH_DIR}/apply_lines.cpp ${NVH_DIR}/inventory_diff.cpp)
+  add_library(nvcoop_hooks_core${v} STATIC ${NVH_DIR}/hook_patch.cpp ${NVH_DIR}/capture_hub.cpp ${NVH_DIR}/effect_json.cpp ${NVH_DIR}/suppress_policy.cpp ${NVH_DIR}/change_tracker.cpp ${NVH_DIR}/apply_lines.cpp ${NVH_DIR}/inventory_diff.cpp ${NVH_DIR}/guest_local_run.cpp ${NVH_DIR}/party_cond.cpp)
   target_include_directories(nvcoop_hooks_core${v} PUBLIC ${NVH_DIR} ${NVH_DIR}/.. ${NVH_SYNCCORE_INC})
   nvh_flags(nvcoop_hooks_core${v})
   add_executable(nvcoop_hooks_tests${v} ${NVH_DIR}/tests/test_hooks.cpp)
-  target_link_libraries(nvcoop_hooks_tests${v} PRIVATE nvcoop_hooks_core${v})
+  target_link_libraries(nvcoop_hooks_tests${v} PRIVATE nvcoop_hooks_core${v} nvh_synccore)
+  target_compile_definitions(nvcoop_hooks_tests${v} PRIVATE NVH_DATA_DIR="${NVH_DIR}/data" NVH_RULES_JSON="${NVH_DIR}/../../docs/quest-policies/rules.json")
   nvh_flags(nvcoop_hooks_tests${v})
 endforeach()
 target_compile_definitions(nvcoop_hooks_core_mutant PUBLIC NVHOOKS_MUTANT=1)
@@ -61,6 +75,8 @@ if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 4 AND EXISTS "${NVH_DIR}/engine_hooks.cpp"
       target_link_libraries(nvcoop PRIVATE nvcoop_hooks_game)
       # bridge methods + role from nvcoop.ini; registered through NVCOOP_MODULE so it must be a direct source
       target_sources(nvcoop PRIVATE ${NVH_DIR}/hooks_module.cpp)
+      # GuestLocalRun allow-list data, deployed next to nvcoop.dll (deploy_instances.py copies nvcoop_*.json)
+      configure_file(${NVH_DIR}/data/guest_local_run.json ${NVCOOP_OUT_DIR}/nvcoop_guest_local_run.json COPYONLY)
     endif()
   endif()
 endif()

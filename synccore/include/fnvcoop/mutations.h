@@ -30,6 +30,20 @@ struct Mutations {
     bool disconnectKeepsLock = false;  // a disconnecting player keeps their control lock (rejoin comes back locked)
     bool guestLocalReplicated = false; // GuestLocalRun quests are captured and replicated like any other script
     bool departedHoldBarrier = false;  // players who left still count as present (a barrier waits for them forever)
+    bool objectiveOr = false;         // host objective writes OR into the flags again (a hide is lost on resync / late join)
+    bool noRewardIds = false;         // a baseline rejoin ignores delivered reward ids (the whole ledger is re-delivered)
+    bool paymentSharesAll = false;    // a RemoveItem in a topic result is charged to the whole party instead of the initiator
+    bool tetherIgnoresAnchor = false; // anchor+radius tethers are always satisfied (the party is never gathered outdoors)
+    bool stagesParamIgnored = false;  // a rule's per-stage `stages` list applies to every stage of the quest
+    bool sumAsAny = false;            // sum-over-party / max-over-party degrade to any-party-member (0 or 1)
+    bool exclusiveLastWins = false;   // ExclusiveStages: a later outcome replaces the first committed one
+    bool readyProceedsAlone = false;  // ReadyCheck / time-skip consent releases on the first confirmation
+    bool slideshowNoHold = false;     // the control lock after a slideshow barrier is released immediately
+    bool perPlayerSceneShared = false;// PerPlayerScene routes nothing to the acting player (rewards stay party-wide)
+    bool perPlayerVarsShared = false; // PerPlayerVars: every slot reads the last writer's value
+    bool originsIgnored = false;       // weather / time scale / ref var / map marker / lock pre-images are not used: a rebase cannot restore them
+    bool anglePreimageIgnored = false; // a rebase / diff cannot restore a ref axis the loaded save never rotated (the pre-image is not used)
+    bool angleKeepsFirst = false;     // RefAngle: a later committed angle for the same (ref, axis) is ignored (host order no longer wins)
     bool noGuestSuppression = false;  // guests keep script-originated effects (ghost-death double fire)
 };
 inline Mutations& mutations() {

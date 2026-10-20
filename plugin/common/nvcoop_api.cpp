@@ -55,7 +55,19 @@ void SetStateProvider(StateProvider fn) {
 void RegisterMethod(const char* name, MethodFn fn, bool mainThread) {
     if (!name || !fn) return;
     std::lock_guard<std::mutex> g(S().mu);
-    S().methods[name] = registry::MethodEntry{fn, mainThread};
+    S().methods[name] = registry::MethodEntry{fn, mainThread, 0};
+}
+
+void RegisterMethodClosure(const char* name, MethodClosure fn, bool mainThread, int owner) {
+    if (!name || !fn) return;
+    std::lock_guard<std::mutex> g(S().mu);
+    S().methods[name] = registry::MethodEntry{std::move(fn), mainThread, owner};
+}
+
+void UnregisterMethodsByOwner(int owner) {
+    std::lock_guard<std::mutex> g(S().mu);
+    for (auto it = S().methods.begin(); it != S().methods.end();)
+        it = (it->second.owner == owner) ? S().methods.erase(it) : std::next(it);
 }
 
 void RegisterModule(const Module& m) {

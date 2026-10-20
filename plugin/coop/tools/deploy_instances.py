@@ -36,6 +36,10 @@ def deploy(instances=(0, 1, 10, 11), root=None, handshake=False):
             if f.exists():
                 shutil.copy2(f, dst / f.name)
                 done.append((i, f.name))
+        consent = REPO / "plugin" / "dialogue" / "data" / "consent_messages.txt"   # L11 consent table, read by the host runtime
+        if consent.exists():
+            shutil.copy2(consent, dst / "nvcoop_consent_messages.txt")
+            done.append((i, "nvcoop_consent_messages.txt"))
     return done
 
 

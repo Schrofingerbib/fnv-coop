@@ -31,6 +31,7 @@ public:
     bool hostOf(uint32_t localRefID, fnvcoop::FormRef* out) const;
     bool forget(const fnvcoop::FormRef& host);                     // true if it was bound
     size_t size() const { return toLocal_.size(); }
+    const std::map<fnvcoop::FormRef, uint32_t>& all() const { return toLocal_; }
     void clear();
 
 private:
@@ -51,6 +52,53 @@ private:
     nvhooks::FormResolver& inner_;
     CreatedRefMap& map_;
     bool host_;
+};
+
+// ---------------------------------------------------------------------------------------------------------------------
+// 1b. Effects that target created refs, and the queue that holds them until the local object exists
+// ---------------------------------------------------------------------------------------------------------------------
+// The created (0xFF) ref an effect acts on, if any. SpawnRef/DespawnRef themselves are not "targets".
+bool createdTargetOf(const fnvcoop::Effect& e, fnvcoop::FormRef* out);
+bool createdTargetOf(const WorldEffect& e, fnvcoop::FormRef* out);
+
+struct HeldEffect {
+    bool world = false;       // true: wfx is meaningful, else fx
+    fnvcoop::Effect fx;
+    WorldEffect wfx;
+    fnvcoop::FormRef waitOn;  // created host ref (onCreated) or the missing form (retry)
+    bool onCreated = false;   // released when `waitOn` gets bound; otherwise released by the retry tick
+    int attempts = 0;
+};
+
+// What a client does with an effect before applying it: acting on a created ref that has no local object yet means "hold it".
+enum class Route { Apply, HoldForCreated };
+Route routeEffect(const fnvcoop::Effect& e, const CreatedRefMap& m, fnvcoop::FormRef* waitOn);
+Route routeEffect(const WorldEffect& e, const CreatedRefMap& m, fnvcoop::FormRef* waitOn);
+// After a failed apply: is it worth trying again later? (form not loaded yet, ref script instance not created yet)
+enum class Outcome { Ok, Missing, Rejected, Other };
+bool retriable(const fnvcoop::Effect& e, Outcome o);
+bool retriable(const WorldEffect& e, Outcome o);
+
+class DeferredQueue {
+public:
+    explicit DeferredQueue(size_t cap = 256) : cap_(cap) {}
+    void hold(HeldEffect h);  // arrival order; when full the OLDEST is dropped (counted)
+    // Created-ref waiters whose host ref is bound now, in arrival order (removed from the queue).
+    std::vector<HeldEffect> takeBound(const CreatedRefMap& m);
+    // Retry tick: every retry waiter (attempts++) is returned unless it has used up `maxAttempts` (then it expires). Created-ref
+    // waiters are aged by the same tick and expire after 4x as many (their spawn never arrived).
+    std::vector<HeldEffect> takeRetries(int maxAttempts);
+    // The created ref was despawned: its held follow-ups are moot.
+    size_t dropFor(const fnvcoop::FormRef& host);
+    size_t size() const { return q_.size(); }
+    size_t holds() const { return holds_; }  // total hold() calls; a flush uses it to tell "re-held" from "ran"
+    size_t dropped() const { return dropped_; }
+    size_t expired() const { return expired_; }
+    void clear() { q_.clear(); }
+
+private:
+    std::vector<HeldEffect> q_;
+    size_t cap_, dropped_ = 0, expired_ = 0, holds_ = 0;
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -75,12 +123,27 @@ public:
     // Queued spawns for which `ready(spawn)` is true, in arrival order; they are removed from the queue.
     std::vector<fnvcoop::SpawnRef> takeReady(const std::function<bool(const fnvcoop::SpawnRef&)>& ready);
     size_t pending() const { return pending_.size(); }
+    // A new world was loaded (save load / new game / back to menu): created refs of the old world no longer exist.
+    void clear() {
+        map_.clear();
+#if NVWORLD_MUT != 27
+        pending_.clear();  // MUTANT 27: queued spawns of the old world survive a load
+#endif
+        deferred_.clear();
+    }
     CreatedRefMap& map() { return map_; }
     const CreatedRefMap& map() const { return map_; }
+    // Effects held because they act on a created ref that is not bound yet (released by the glue after onCreated).
+    DeferredQueue& deferred() { return deferred_; }
+    const DeferredQueue& deferred() const { return deferred_; }
+    // Rejoin: `live` is the host's current set of spawns (WorldBaseline). Created refs this client still holds that the host no
+    // longer has (despawned while away) are forgotten and returned for deletion; queued spawns that are gone are cancelled.
+    std::vector<uint32_t> reconcile(const std::vector<fnvcoop::SpawnRef>& live);
 
 private:
     CreatedRefMap map_;
     std::vector<fnvcoop::SpawnRef> pending_;
+    DeferredQueue deferred_;
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -108,6 +171,7 @@ private:
 // ---------------------------------------------------------------------------------------------------------------------
 class WeatherTimeSync {
 public:
+    void reset() { weather_.reset(); scale_.reset(); }
     // Host poll. weatherRefID 0 = unknown (interior): no effect. Returns effects to record (host order).
     std::vector<fnvcoop::Effect> poll(const fnvcoop::FormRef& weather, bool haveWeather, float timeScale);
     // A SetWeather/SetTimeScale already went out through the capture hub (script-driven): do not re-send it on the next poll.
@@ -137,6 +201,8 @@ std::string setEssentialLine(const SetEssential& e, uint32_t baseOrRefID);  // r
 std::string setRestrainedLine(bool on);                              // on the ref
 std::string setRelationLine(Relation kind, uint32_t factionA, uint32_t factionB);
 std::string scriptPackageLine(bool add, uint32_t packageID);         // on the actor
+std::string ignoreCrimeLine(bool on);                                // on the actor
+std::string setPCEnemyOfFactionLine(uint32_t factionID, bool on);
 std::string avLine(const SetActorValueRef& e);                       // on the actor; empty if the AV has no console name
 std::string placeAtMeLine(uint32_t baseID, int count);               // on a reference in the target cell
 std::string setPosLine(char axis, float v);
@@ -152,6 +218,32 @@ public:
 
 private:
     std::vector<WorldEffect> q_;
+};
+
+// ---------------------------------------------------------------------------------------------------------------------
+// 8. WorldBaseline: host-side NET state of this lane's effects, for a client that joins or rejoins
+// ---------------------------------------------------------------------------------------------------------------------
+struct BaselineSnapshot {
+    std::vector<fnvcoop::Effect> effects;  // SpawnRef (creation order), then the last RefScriptVar of every ref/var seen
+    std::vector<WorldEffect> world;        // net NPC / faction state, folded (a Set replaces earlier deltas, deltas of one kind add up)
+};
+class WorldBaseline {
+public:
+    // Feed every effect the host emits (all txns); only SpawnRef / DespawnRef / RefScriptVar matter here.
+    void onEffect(const fnvcoop::Effect& e);
+    void onWorld(const WorldEffect& e);
+    BaselineSnapshot snapshot() const;
+    // Host ids of spawns that are alive (the host polls their script variables even when the player is elsewhere).
+    std::vector<fnvcoop::FormRef> liveSpawnRefs() const;
+    size_t spawns() const { return spawns_.size(); }
+    size_t worldEntries() const { return world_.size(); }
+    void clear();
+
+private:
+    void purge(const fnvcoop::FormRef& createdRef);
+    std::vector<fnvcoop::SpawnRef> spawns_;
+    std::map<std::pair<fnvcoop::FormRef, uint16_t>, double> vars_;
+    std::vector<WorldEffect> world_;
 };
 
 // JSON for WorldEffect: {"type":"SetEssential","actor":"falloutnv.esm:104C79","essential":true,"refOnly":false}

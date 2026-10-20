@@ -38,13 +38,13 @@ int seedCount(int dflt) {
 }
 
 // Whole-system twin: with the bug injected, at least one seed must violate an invariant, and the clean run must pass.
-void expectDetected(const Mutations& m, const char* label, const char* mustMention = nullptr) {
-    Agg clean = runSeeds(1, 60);
+void expectDetected(const Mutations& m, const char* label, const char* mustMention = nullptr, int seeds = 60) {
+    Agg clean = runSeeds(1, seeds);
     CHECK_MSG(clean.failed == 0, "clean run must pass before the twin means anything");
     Agg bad;
     {
         MutationScope s(m);
-        bad = runSeeds(1, 60);
+        bad = runSeeds(1, seeds);
     }
     std::printf("    twin %s: caught on %d/%d seeds", label, bad.failed, bad.seeds);
     if (!bad.firstViolations.empty()) std::printf("  e.g. %s", bad.firstViolations[0].c_str());
@@ -179,6 +179,9 @@ TEST(sim, desync_injection_is_healed_across_chaos_seeds) {
 
 TEST(twin, heal_disabled) { Mutations m; m.healDisabled = true; expectDetected(m, "heal_disabled"); }
 TEST(twin, no_epoch_bump) { Mutations m; m.noEpochBump = true; expectDetected(m, "no_epoch_bump"); }
+TEST(twin, angle_preimage_ignored) { Mutations m; m.anglePreimageIgnored = true; expectDetected(m, "angle_preimage_ignored", "angles"); }
+// The host-load pre-images (weather, time scale, ref vars, map markers, locks): without them a rebase cannot undo what the loaded save never held.
+TEST(twin, origins_ignored) { Mutations m; m.originsIgnored = true; expectDetected(m, "origins_ignored", nullptr, 400); }
 TEST(twin, baseline_skipped) { Mutations m; m.baselineSkipped = true; expectDetected(m, "baseline_skipped"); }
 TEST(twin, guest_runs_quest_scripts) { Mutations m; m.guestRunsQuestScripts = true; expectDetected(m, "guest_runs_quest_scripts"); }
 TEST(twin, no_guest_suppression) { Mutations m; m.noGuestSuppression = true; expectDetected(m, "no_guest_suppression", "ghost"); }

@@ -73,6 +73,13 @@ KV kvNote(const FormRef& t) { Fnv k; k.b(24); k.form(t); return kv(k, k); }
 KV kvMarker(const FormRef& m, uint8_t f) { Fnv k; k.b(25); k.form(m); Fnv v = k; v.b(f); return kv(k, v); }
 KV kvWeather(const FormRef& w, bool force) { Fnv k; k.b(26); Fnv v = k; v.form(w); v.b(force); return kv(k, v); }
 KV kvTimeScale(float s) { Fnv k; k.b(27); Fnv v = k; v.u32(fbits(s)); return kv(k, v); }
+KV kvRefItem(const FormRef& r, const FormRef& i, int64_t d) { Fnv k; k.b(29); k.form(r); k.form(i); Fnv v = k; v.u64(static_cast<uint64_t>(d)); return kv(k, v); }
+KV kvSpawn(const FormRef& r, const SpawnInfo& i) {
+    Fnv k; k.b(31); k.form(r); Fnv v = k; v.form(i.base); v.form(i.cell); v.u32(fbits(i.x)); v.u32(fbits(i.y)); v.u32(fbits(i.z)); v.b(i.leveled); return kv(k, v);
+}
+KV kvTombstone(const FormRef& r) { Fnv k; k.b(32); k.form(r); return kv(k, k); }
+KV kvRefClear(const FormRef& r) { Fnv k; k.b(30); k.form(r); return kv(k, k); }
+KV kvAngle(const FormRef& r, uint8_t axis, float deg) { Fnv k; k.b(28); k.form(r); k.b(axis); Fnv v = k; v.u32(fbits(deg)); return kv(k, v); }
 KV kvTravel(const FormRef& s) { Fnv k; k.b(19); k.form(s); Fnv v = k; v.b(1); return kv(k, v); }
 
 // Key/value hashes of an effect that is a baseline-style state entry.
@@ -103,6 +110,12 @@ bool kvOf(const Effect& e, KV& out) {
         else if constexpr (std::is_same_v<E, SetMapMarker>) out = kvMarker(x.marker, x.flags);
         else if constexpr (std::is_same_v<E, SetWeather>) out = kvWeather(x.weather, x.force);
         else if constexpr (std::is_same_v<E, SetTimeScale>) out = kvTimeScale(x.scale);
+        else if constexpr (std::is_same_v<E, RefAngle>) out = kvAngle(x.ref, x.axis, x.degrees);
+        else if constexpr (std::is_same_v<E, RefAddItem>) out = kvRefItem(x.ref, x.item, x.count);
+        else if constexpr (std::is_same_v<E, RefRemoveItem>) out = kvRefItem(x.ref, x.item, -static_cast<int64_t>(x.count));
+        else if constexpr (std::is_same_v<E, RemoveAllItems>) out = kvRefClear(x.ref);
+        else if constexpr (std::is_same_v<E, SpawnRef>) out = kvSpawn(x.ref(), SpawnInfo{x.base, x.cell, x.x, x.y, x.z, x.leveled});
+        else if constexpr (std::is_same_v<E, DespawnRef>) out = kvTombstone(x.ref());
         else if constexpr (std::is_same_v<E, PartyTether>) out = kvTether(x.cell, x.on);
         else if constexpr (std::is_same_v<E, SetFactionRank>) out = kvFaction(x.actor, x.faction, x.rank);
         else if constexpr (std::is_same_v<E, SayOnceFlag>) out = kvSayOnce(x.info);
@@ -138,7 +151,9 @@ bool isBaselineCovered(const Effect& e) {
            std::holds_alternative<SetFastTravelLock>(e) || std::holds_alternative<FailQuest>(e) ||
            std::holds_alternative<ObjectState>(e) || std::holds_alternative<RefScriptVar>(e) || std::holds_alternative<AddTopic>(e) ||
            std::holds_alternative<AddNote>(e) || std::holds_alternative<SetMapMarker>(e) || std::holds_alternative<SetWeather>(e) ||
-           std::holds_alternative<SetTimeScale>(e);
+           std::holds_alternative<SetTimeScale>(e) || std::holds_alternative<RefAngle>(e) ||
+           std::holds_alternative<RefAddItem>(e) || std::holds_alternative<RefRemoveItem>(e) || std::holds_alternative<RemoveAllItems>(e) ||
+           std::holds_alternative<SpawnRef>(e) || std::holds_alternative<DespawnRef>(e);
 }
 
 namespace {
@@ -180,41 +195,138 @@ std::vector<uint32_t> shardHashes(const std::vector<BaselineEntry>& entries) {
     return out;
 }
 
+namespace {
+// Visits every state entry exactly as baselineEntries() would (same volatile filtering), without building entry objects.
+template <class F>
+void walkSegment(const ShadowState& w, unsigned seg, F&& put) {
+    const bool vol = volatileKeys().size() != 0;
+    auto volEffect = [&](const Effect& e) { return vol && volatileKeys().isVolatile(e); };
+    switch (seg) {
+    case 0: for (auto& [q, on] : w.questRunning) if (!volEffect(StartQuest{q})) put(0, kvRunning(q, on)); break;
+    case 1: for (auto& q : w.questCompleted) if (!w.questFailed.count(q)) put(0, kvCompleted(q)); break;
+    case 2: for (auto& q : w.questFailed) put(0, kvFailed(q)); break;
+    case 3: for (auto& [q, st] : w.stages) if (!volEffect(SetStage{q, 0})) put(1, kvStage(q, st)); break;
+    case 4: for (auto& [k, f] : w.objectives) if (!volEffect(SetObjective{k.first, 0, 0})) put(2, kvObjective(k.first, k.second, f)); break;
+    case 5: for (auto& q : w.allObjectivesDone) put(2, kvAllObj(q)); break;
+    case 6: for (auto& [k, val] : w.scriptVars) if (!(vol && volatileKeys().isVolatileVar(k.first, k.second))) put(3, kvVar(k.first, k.second, val)); break;
+    case 7: for (auto& [g, val] : w.globals) if (!(vol && volatileKeys().isVolatileGlobal(g))) put(4, kvGlobal(g, double(val))); break;
+    case 8: for (auto& [r, on] : w.enabled) put(5, kvEnabled(r, on)); break;
+    case 9: for (auto& a : w.kills) put(5, kvKill(a)); break;
+    case 10: for (auto& [r, p] : w.placed) put(5, kvPlaced(r, p.cell, p.x, p.y, p.z)); break;
+    case 11: for (auto& [r, l] : w.locks) put(5, kvLock(r, l.first, l.second)); break;
+    case 12: for (auto& [k, t] : w.textures) put(5, kvTexture(k.first, k.second, t)); break;
+    case 13: for (auto& [n, o] : w.companionOwner) put(5, kvCompanion(n, o, w.companionKind.count(n) ? w.companionKind.at(n) : uint8_t(0))); break;
+    case 14: for (auto& [r, o] : w.objects) put(5, kvObj(r, o.open, o.destroyed, o.activated)); break;
+    case 15: for (auto& [k, val] : w.refVars) put(3, kvRefVar(k.first, k.second, val)); break;
+    case 16: for (auto& t : w.topics) put(7, kvTopic(t)); break;
+    case 17: for (auto& t : w.notes) put(7, kvNote(t)); break;
+    case 18: for (auto& [m, f] : w.mapMarkers) put(7, kvMarker(m, f)); break;
+    case 19: if (w.weatherSet) put(7, kvWeather(w.weather, w.weatherForced)); break;
+    case 20: if (w.timeScale != 0) put(7, kvTimeScale(w.timeScale)); break;
+    case 21: for (auto& [k, deg] : w.angles) put(5, kvAngle(k.first, k.second, deg)); break;
+    case 28: for (auto& [r, inv] : w.refInv) for (auto& [i, d] : inv.delta) put(5, kvRefItem(r, i, d)); break;
+    case 29: for (auto& [r, inv] : w.refInv) if (inv.cleared) put(5, kvRefClear(r)); break;
+    case 30: for (auto& [r, i] : w.spawned) put(5, kvSpawn(r, i)); break;
+    case 31: for (auto& r : w.despawned) put(5, kvTombstone(r)); break;
+    case 22: for (auto& [c, on] : w.tethers) put(5, kvTether(c, on)); break;
+    case 23: for (auto& [k, r] : w.factionRank) put(6, kvFaction(k.first, k.second, r)); break;
+    case 24: for (auto& [s, on] : w.fastTravelLock) if (on) put(7, kvTravel(s)); break;
+    case 25: for (auto& i : w.sayOnce) put(7, kvSayOnce(i)); break;
+    case 26: if (w.slideshowEnded) put(7, kvSlideshow()); break;
+    case 27: put(7, kvSave(w.saveSuppress)); break;
+    default: break;
+    }
+}
+template <class F>
+void walkEntries(const ShadowState& w, F&& put) {
+    for (unsigned seg = 0; seg < BucketCache::kSegments; ++seg) walkSegment(w, seg, put);
+}
+}  // namespace
+
 std::vector<uint32_t> shardHashesOf(const ShadowState& w) {
     if (mutations().slowHashing) return shardHashes(baselineEntries(w));   // TEST ONLY: the perf budget must catch this
     std::vector<uint64_t> acc(kSyncShards, 0);
-    const bool vol = volatileKeys().size() != 0;
-    auto put = [&](size_t cls, const KV& h) { acc[cls * 16 + static_cast<size_t>(h.key % 16)] += mix(h.key + (static_cast<uint64_t>(h.val) << 1) * 0x9E3779B97F4A7C15ull); };
-    auto volEffect = [&](const Effect& e) { return vol && volatileKeys().isVolatile(e); };
-    for (auto& [q, on] : w.questRunning) if (!volEffect(StartQuest{q})) put(0, kvRunning(q, on));
-    for (auto& q : w.questCompleted) if (!w.questFailed.count(q)) put(0, kvCompleted(q));
-    for (auto& q : w.questFailed) put(0, kvFailed(q));
-    for (auto& [q, st] : w.stages) if (!volEffect(SetStage{q, 0})) put(1, kvStage(q, st));
-    for (auto& [k, f] : w.objectives) if (!volEffect(SetObjective{k.first, 0, 0})) put(2, kvObjective(k.first, k.second, f));
-    for (auto& q : w.allObjectivesDone) put(2, kvAllObj(q));
-    for (auto& [k, val] : w.scriptVars) if (!(vol && volatileKeys().isVolatileVar(k.first, k.second))) put(3, kvVar(k.first, k.second, val));
-    for (auto& [g, val] : w.globals) if (!(vol && volatileKeys().isVolatileGlobal(g))) put(4, kvGlobal(g, double(val)));
-    for (auto& [r, on] : w.enabled) put(5, kvEnabled(r, on));
-    for (auto& a : w.kills) put(5, kvKill(a));
-    for (auto& [r, p] : w.placed) put(5, kvPlaced(r, p.cell, p.x, p.y, p.z));
-    for (auto& [r, l] : w.locks) put(5, kvLock(r, l.first, l.second));
-    for (auto& [k, t] : w.textures) put(5, kvTexture(k.first, k.second, t));
-    for (auto& [n, o] : w.companionOwner) put(5, kvCompanion(n, o, w.companionKind.count(n) ? w.companionKind.at(n) : uint8_t(0)));
-    for (auto& [r, o] : w.objects) put(5, kvObj(r, o.open, o.destroyed, o.activated));
-    for (auto& [k, val] : w.refVars) put(3, kvRefVar(k.first, k.second, val));
-    for (auto& t : w.topics) put(7, kvTopic(t));
-    for (auto& t : w.notes) put(7, kvNote(t));
-    for (auto& [m, f] : w.mapMarkers) put(7, kvMarker(m, f));
-    if (w.weatherSet) put(7, kvWeather(w.weather, w.weatherForced));
-    if (w.timeScale != 0) put(7, kvTimeScale(w.timeScale));
-    for (auto& [c, on] : w.tethers) put(5, kvTether(c, on));
-    for (auto& [k, r] : w.factionRank) put(6, kvFaction(k.first, k.second, r));
-    for (auto& [s, on] : w.fastTravelLock) if (on) put(7, kvTravel(s));
-    for (auto& i : w.sayOnce) put(7, kvSayOnce(i));
-    if (w.slideshowEnded) put(7, kvSlideshow());
-    put(7, kvSave(w.saveSuppress));
+    walkEntries(w, [&](size_t cls, const KV& h) { acc[cls * 16 + static_cast<size_t>(h.key % 16)] += mix(h.key + (static_cast<uint64_t>(h.val) << 1) * 0x9E3779B97F4A7C15ull); });
     std::vector<uint32_t> out(kSyncShards);
     for (size_t i = 0; i < kSyncShards; ++i) out[i] = static_cast<uint32_t>(acc[i] ^ (acc[i] >> 32));
+    return out;
+}
+
+uint32_t bucketMix(uint64_t key, uint32_t value) {
+    uint64_t z = key * 0x9E3779B97F4A7C15ull + value;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return static_cast<uint32_t>(z ^ (z >> 31));
+}
+
+std::vector<uint32_t> bucketHashesOf(const ShadowState& w, size_t* count) {
+    std::vector<uint32_t> out(256, 0);
+    size_t n = 0;
+    walkEntries(w, [&](size_t, const KV& h) { out[h.key & 0xFF] += bucketMix(h.key, h.val); ++n; });
+    if (count) *count = n;
+    return out;
+}
+
+namespace {
+// The current entry of one key in a keyed segment (3 stages, 7 globals, 8 enabled, 10 placed); false when the key is absent.
+bool entryAt(const ShadowState& w, unsigned seg, const FormRef& r, KV& out) {
+    switch (seg) {
+    case 3: { auto it = w.stages.find(r); if (it == w.stages.end()) return false; out = kvStage(r, it->second); return true; }
+    case 7: { auto it = w.globals.find(r); if (it == w.globals.end()) return false; out = kvGlobal(r, double(it->second)); return true; }
+    case 8: { auto it = w.enabled.find(r); if (it == w.enabled.end()) return false; out = kvEnabled(r, it->second); return true; }
+    case 10: { auto it = w.placed.find(r); if (it == w.placed.end()) return false; out = kvPlaced(r, it->second.cell, it->second.x, it->second.y, it->second.z); return true; }
+    }
+    return false;
+}
+}  // namespace
+
+std::vector<uint32_t> bucketHashesCached(const ShadowState& w, size_t* count) {
+    BucketCache& c = w.bucketCache;
+    constexpr unsigned N = BucketCache::kSegments;
+    const uint32_t vs = static_cast<uint32_t>(volatileKeys().size());
+    if (c.sums.size() != N * 256 || c.volSize != vs) { c.sums.assign(N * 256, 0); c.dirty = ~0ull; c.volSize = vs; c.termsMask = 0; c.pending.clear(); }
+    for (unsigned seg = 0; seg < N; ++seg) {
+        if (!(c.dirty >> seg & 1u)) continue;
+        uint32_t* sum = &c.sums[seg * 256];
+        std::fill(sum, sum + 256, 0u);
+        uint32_t n = 0;
+        const int slot = BucketCache::keyedSlot(seg);
+        if (slot >= 0 && vs == 0) {   // remember every entry's term so later single-key changes are O(1)
+            auto& terms = c.terms[slot];
+            terms.clear();
+            walkSegment(w, seg, [&](size_t, const KV& h) { uint32_t t = bucketMix(h.key, h.val); sum[h.key & 0xFF] += t; terms[h.key] = t; ++n; });
+            c.termsMask |= 1u << seg;
+        } else {
+            walkSegment(w, seg, [&](size_t, const KV& h) { sum[h.key & 0xFF] += bucketMix(h.key, h.val); ++n; });
+        }
+        c.counts[seg] = n;
+    }
+    c.dirty = 0;
+    for (const auto& [seg, ref] : c.pending) {   // single-key updates (a replay after a full recompute adds a zero delta)
+        KV now{};
+        if (!entryAt(w, seg, ref, now)) continue;   // these four maps never lose entries through applyEffect
+        const uint32_t t = bucketMix(now.key, now.val);
+        auto& terms = c.terms[BucketCache::keyedSlot(seg)];
+        uint32_t* sum = &c.sums[seg * 256];
+        auto it = terms.find(now.key);
+        if (it == terms.end()) { terms.emplace(now.key, t); ++c.counts[seg]; sum[now.key & 0xFF] += t; }
+        else { sum[now.key & 0xFF] += t - it->second; it->second = t; }
+    }
+    c.pending.clear();
+    std::vector<uint32_t> out(256, 0);
+    size_t n = 0;
+    for (unsigned seg = 0; seg < N; ++seg) {
+        const uint32_t* sum = &c.sums[seg * 256];
+        for (unsigned i = 0; i < 256; ++i) out[i] += sum[i];
+        n += c.counts[seg];
+    }
+    // Safety net: every 32nd digest is checked against a full walk; a disagreement (an unlisted mutation path) heals the cache.
+    if ((++c.calls & 31u) == 0) {
+        size_t fn = 0;
+        std::vector<uint32_t> full = bucketHashesOf(w, &fn);
+        if (full != out || fn != n) { ++c.verifyFailures; c.dirty = ~0ull; out = full; n = fn; }
+    }
+    if (count) *count = n;
     return out;
 }
 
@@ -269,6 +381,7 @@ std::string describeEntry(const Effect& e) {
         else if constexpr (std::is_same_v<T, SetMapMarker>) o << f(x.marker) << " flags " << int(x.flags);
         else if constexpr (std::is_same_v<T, SetWeather>) o << f(x.weather) << (x.force ? " forced" : "");
         else if constexpr (std::is_same_v<T, SetTimeScale>) o << x.scale;
+        else if constexpr (std::is_same_v<T, RefAngle>) o << f(x.ref) << " axis " << int(x.axis) << " " << x.degrees;
         else if constexpr (std::is_same_v<T, PartyTether>) o << f(x.cell) << (x.on ? " on" : " off");
         else if constexpr (std::is_same_v<T, SetFactionRank>) o << f(x.actor) << " in " << f(x.faction) << " rank " << x.rank;
         else if constexpr (std::is_same_v<T, SayOnceFlag>) o << f(x.info);
@@ -276,6 +389,11 @@ std::string describeEntry(const Effect& e) {
         else if constexpr (std::is_same_v<T, SetFastTravelLock>) o << f(x.scope) << (x.on ? " on" : " off");
     }, e);
     return o.str();
+}
+
+static const Origin* orgIn(const ShadowState& w, uint8_t kind, const FormRef& r, uint16_t idx) {
+    auto it = w.origins.find(OriginKey{kind, r, idx});
+    return it == w.origins.end() ? nullptr : &it->second;
 }
 
 std::vector<BaselineEntry> baselineEntries(const ShadowState& w) {
@@ -291,19 +409,52 @@ std::vector<BaselineEntry> baselineEntries(const ShadowState& w) {
     for (auto& [r, on] : w.enabled) add(v, 5, on ? Effect(EnableRef{r}) : Effect(DisableRef{r}));
     for (auto& a : w.kills) add(v, 5, KillActor{a});
     for (auto& [r, p] : w.placed) add(v, 5, MoveRef{r, p.cell, p.x, p.y, p.z, false});
-    for (auto& [r, l] : w.locks) add(v, 5, SetLock{r, l.first, l.second});
+    for (auto& [r, l] : w.locks) {
+        SetLock e{r, l.first, l.second};
+        if (const Origin* o = orgIn(w, kOrgLock, r, 0)) { e.hasBefore = true; e.beforeLocked = o->b; e.beforeLevel = o->n; }
+        add(v, 5, e);
+    }
     for (auto& [k, t] : w.textures) add(v, 5, SwapTexture{k.first, t, k.second});
     for (auto& [n, o] : w.companionOwner) add(v, 5, CompanionOwner{n, o, true, w.companionKind.count(n) ? w.companionKind.at(n) : uint8_t(0)});
     for (auto& [r, o] : w.objects) {
         ObjectState e; e.ref = r; e.mask = kObjOpen | kObjDestroyed | kObjActivated; e.open = o.open; e.destroyed = o.destroyed; e.activatedOnce = o.activated;
         add(v, 5, e);
     }
-    for (auto& [k, val] : w.refVars) add(v, 3, RefScriptVar{k.first, k.second, val});
+    for (auto& [k, val] : w.refVars) {
+        RefScriptVar e{k.first, k.second, val};
+        if (const Origin* o = orgIn(w, kOrgRefVar, k.first, k.second)) { e.hasBefore = true; e.before = o->d; }
+        add(v, 3, e);
+    }
     for (auto& t : w.topics) add(v, 7, AddTopic{t});
     for (auto& t : w.notes) add(v, 7, AddNote{t});
-    for (auto& [m, f] : w.mapMarkers) add(v, 7, SetMapMarker{m, f});
-    if (w.weatherSet) add(v, 7, SetWeather{w.weather, w.weatherForced});
-    if (w.timeScale != 0) add(v, 7, SetTimeScale{w.timeScale});
+    for (auto& [m, f] : w.mapMarkers) {
+        SetMapMarker e{m, f};
+        if (const Origin* o = orgIn(w, kOrgMarker, m, 0)) { e.hasBefore = true; e.before = static_cast<uint8_t>(o->n); }
+        add(v, 7, e);
+    }
+    if (w.weatherSet) {
+        SetWeather e{w.weather, w.weatherForced};
+        if (const Origin* o = orgIn(w, kOrgWeather, FormRef(), 0)) { e.hasBefore = true; e.before = o->f; e.beforeForce = o->b; }
+        add(v, 7, e);
+    }
+    if (w.timeScale != 0) {
+        SetTimeScale e{w.timeScale};
+        if (const Origin* o = orgIn(w, kOrgTimeScale, FormRef(), 0)) { e.hasBefore = true; e.before = static_cast<float>(o->d); }
+        add(v, 7, e);
+    }
+    for (auto& [k, deg] : w.angles) {
+        auto o = w.angleOrig.find(k);
+        add(v, 5, RefAngle{k.first, k.second, deg, o != w.angleOrig.end(), o != w.angleOrig.end() ? o->second : 0.f});
+    }
+    for (auto& [r, inv] : w.refInv) {
+        if (inv.cleared) add(v, 5, RemoveAllItems{r});
+        for (auto& [i, d] : inv.delta) {
+            const int32_t c = static_cast<int32_t>(std::clamp<int64_t>(d < 0 ? -d : d, 0, INT32_MAX));
+            if (d > 0) add(v, 5, RefAddItem{r, i, c}); else if (d < 0) add(v, 5, RefRemoveItem{r, i, c});
+        }
+    }
+    for (auto& [r, i] : w.spawned) add(v, 5, SpawnRef{r.localId, i.base, i.cell, i.x, i.y, i.z, i.leveled});
+    for (auto& r : w.despawned) add(v, 5, DespawnRef{r.localId});
     for (auto& [c, on] : w.tethers) add(v, 5, PartyTether{c, on});
     for (auto& [k, r] : w.factionRank) add(v, 6, SetFactionRank{k.first, k.second, r});
     for (auto& [s, on] : w.fastTravelLock) if (on) add(v, 7, SetFastTravelLock{s, true});
@@ -338,6 +489,8 @@ BaselineDiff diffBaseline(const ShadowState& host, const BaselineSummary& client
         hostKeys.insert(e.key);
         auto it = cl.find(e.key);
         if (it != cl.end() && it->second == e.value) { ++d.keptByClient; continue; }
+        // Additive entries (ref inventory deltas) differ by an amount the host cannot see: the client takes its own delta back first.
+        if (it != cl.end() && (std::holds_alternative<RefAddItem>(e.effect) || std::holds_alternative<RefRemoveItem>(e.effect))) d.revertKeys.push_back(e.key);
         t.effects.push_back(e.effect);
     }
     for (auto& [k, v] : cl) if (!hostKeys.count(k)) d.revertKeys.push_back(k);
@@ -380,6 +533,54 @@ bool revertEffectFor(const ShadowState& clientWorld, uint64_t key, Effect& out) 
         if (auto* l = std::get_if<SetFastTravelLock>(&e.effect)) { out = SetFastTravelLock{l->scope, false}; return true; }
         if (auto* c = std::get_if<CompanionOwner>(&e.effect)) { out = CompanionOwner{c->npc, c->owner, false, c->kind}; return true; }
         if (auto* n = std::get_if<AddNote>(&e.effect)) { out = RemoveNote{n->note}; return true; }
+        if (auto* g = std::get_if<RefAngle>(&e.effect)) {   // restore the axis's original (the pre-image the client recorded when it first rotated it)
+            auto o = clientWorld.angleOrig.find({g->ref, g->axis});
+            if (mutations().anglePreimageIgnored || o == clientWorld.angleOrig.end()) return false;
+            out = RefAngle{g->ref, g->axis, o->second, true, o->second};
+            return true;
+        }
+        if (!mutations().originsIgnored) {   // restore the value the client's world had before it first changed (pre-images kept in its shadow)
+            auto org = [&](uint8_t kind, const FormRef& r, uint16_t idx) -> const Origin* { return orgIn(clientWorld, kind, r, idx); };
+            if (auto* x = std::get_if<SpawnRef>(&e.effect)) { DespawnRef f{x->id}; f.forget = true; out = f; return true; }   // the host's timeline never had it
+            if (auto* x = std::get_if<DespawnRef>(&e.effect)) { DespawnRef f{x->id}; f.forget = true; out = f; return true; }  // drop the client-only tombstone
+            if (auto* x = std::get_if<RefAddItem>(&e.effect)) { out = RefRemoveItem{x->ref, x->item, x->count}; return true; }     // take back what the client added
+            if (auto* x = std::get_if<RefRemoveItem>(&e.effect)) { out = RefAddItem{x->ref, x->item, x->count}; return true; }
+            if (auto* x = std::get_if<RemoveAllItems>(&e.effect)) {
+                auto it = clientWorld.refInv.find(x->ref);
+                if (it == clientWorld.refInv.end() || !it->second.hasPre) return false;
+                RemoveAllItems u; u.ref = x->ref; u.undo = true;
+                for (auto& [f, c] : it->second.pre) u.items.emplace_back(f, static_cast<int32_t>(c));
+                out = u;
+                return true;
+            }
+            if (auto* x = std::get_if<SetLock>(&e.effect)) {
+                if (const Origin* o = org(kOrgLock, x->ref, 0)) { out = SetLock{x->ref, o->b, o->n, true, o->b, o->n}; return true; }
+                return false;
+            }
+            if (auto* x = std::get_if<RefScriptVar>(&e.effect)) {
+                if (const Origin* o = org(kOrgRefVar, x->ref, x->index)) { out = RefScriptVar{x->ref, x->index, o->d, true, o->d}; return true; }
+                return false;
+            }
+            if (auto* x = std::get_if<SetMapMarker>(&e.effect)) {
+                if (const Origin* o = org(kOrgMarker, x->marker, 0)) { out = SetMapMarker{x->marker, static_cast<uint8_t>(o->n), true, static_cast<uint8_t>(o->n)}; return true; }
+                return false;
+            }
+            if (std::holds_alternative<SetWeather>(e.effect)) {
+                if (const Origin* o = org(kOrgWeather, FormRef(), 0)) {
+                    const auto& x = std::get<SetWeather>(e.effect);
+                    out = SetWeather{o->f, o->b, true, o->f, o->b};
+                    return true;
+                }
+                return false;
+            }
+            if (std::holds_alternative<SetTimeScale>(e.effect)) {
+                if (const Origin* o = org(kOrgTimeScale, FormRef(), 0)) {
+                    out = SetTimeScale{static_cast<float>(o->d), true, static_cast<float>(o->d)};
+                    return true;
+                }
+                return false;
+            }
+        }
         if (auto* o = std::get_if<ObjectState>(&e.effect)) {   // sticky bits (destroyed / activated once) cannot be undone
             if (o->destroyed || o->activatedOnce) return false;
             ObjectState r; r.ref = o->ref; r.mask = kObjOpen; r.open = false; out = r; return true;

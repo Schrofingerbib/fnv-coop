@@ -8,11 +8,33 @@
 // Game-free so the exact text is pinned by unit tests.
 #pragma once
 #include <cstdint>
+#include <set>
 #include <string>
+
+#include "fnvcoop/types.h"
 
 namespace nvhooks {
 
 std::string killCmd();
+std::string enableFastTravelCmd(bool enable);
+// Party-wide fast-travel lock bookkeeping for SetFastTravelLock{scope,on}: travel is enabled only while NO scope holds a lock.
+class FastTravelLocks {
+public:
+    // Applies one lock/unlock; returns true if the effective travel state changed (then run enableFastTravelCmd(travelEnabled())).
+    bool set(const fnvcoop::FormRef& scope, bool on) {
+        bool before = travelEnabled();
+        if (on) locks_.insert(scope); else locks_.erase(scope);
+        return before != travelEnabled();
+    }
+    bool travelEnabled() const { return locks_.empty(); }
+    size_t size() const { return locks_.size(); }
+
+private:
+    std::set<fnvcoop::FormRef> locks_;
+};
+std::string setTeammateCmd(bool on);           // run ON the actor
+// CompanionOwner is applied only on the owner's machine (the engine's follower AI follows the LOCAL player); others see the NPC move.
+bool companionForMe(uint8_t owner, uint8_t localSlot);
 std::string resurrectCmd(bool resetInventory);
 std::string moveToMarkerCmd(uint32_t markerRefID, float ox, float oy, float oz);
 
@@ -39,6 +61,10 @@ std::string saveCmd(unsigned kind);
 
 // SetPos axis value (params: Axis, Float): same-cell absolute move, one command per axis.
 std::string setPosCmd(char axis /* 'X' 'Y' 'Z' */, float value);
+// SetAngle axis degrees (params: Axis, Float): rotation of one axis in degrees, run ON the reference.
+std::string setAngleCmd(char axis /* 'X' 'Y' 'Z' */, float degrees);
+// The Axis parameter as ExtractArgs hands it back ('X' 'Y' 'Z', either case) -> 0 / 1 / 2, or -1 when it is none of them.
+int axisIndexOf(unsigned axisChar);
 // Form types that can be a console calling reference / MoveTo marker: REFR 0x3A, ACHR 0x3B, ACRE 0x3C.
 bool isReferenceFormType(unsigned typeId);
 

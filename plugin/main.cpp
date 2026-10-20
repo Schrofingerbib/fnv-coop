@@ -13,6 +13,9 @@
 #include "common/nvcoop_api.h"
 #include "common/registry.h"
 #include "bridge/screenshot.h"
+#ifdef NVCOOP_LOADER
+#include "loader/loader_host.h"   // split build: this DLL is the permanent loader, the modules live in nvcoop_mod.dll
+#endif
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -40,6 +43,9 @@ NVSEMessagingInterface* g_msg = nullptr;
 NVSEConsoleInterface* g_console = nullptr;
 
 nvcoop::bridge::Bridge g_bridge;
+#ifdef NVCOOP_LOADER
+nvcoop::loader::CoreHost* g_coreHost = nullptr;
+#endif
 std::string g_gameDir;
 
 std::string IniPath() { return g_gameDir + "Data\\NVSE\\Plugins\\nvcoop.ini"; }
@@ -463,6 +469,9 @@ void OnMessage(NVSEMessagingInterface::Message* msg) {
         g_bridge.Pump(g_host);
         for (auto& m : nvcoop::registry::Modules())
             if (m.onFrame) m.onFrame();
+#ifdef NVCOOP_LOADER
+        if (g_coreHost) g_coreHost->OnFrame();   // also performs a pending dev.reload / file-watcher reload
+#endif
         return;  // do not forward the per-frame message to modules
     case NVSEMessagingInterface::kMessage_PostLoadGame:
         if (msg->data) g_bridge.NotifyGameLoaded();
@@ -488,6 +497,9 @@ void OnMessage(NVSEMessagingInterface::Message* msg) {
     }
     for (auto& m : nvcoop::registry::Modules())
         if (m.onMessage) m.onMessage(msg->type, msg->data, msg->dataLen);
+#ifdef NVCOOP_LOADER
+    if (g_coreHost) g_coreHost->OnMessage(msg->type, msg->data, msg->dataLen);
+#endif
 }
 
 }  // namespace
@@ -555,6 +567,27 @@ __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse) {
         Log("module %s", m.name ? m.name : "?");
         if (m.onLoad) m.onLoad(nvse);
     }
+#ifdef NVCOOP_LOADER
+    {
+        // The loader owns no modules; load the reloadable core (everything else) and optionally watch it.
+        HMODULE self = nullptr;
+        char me[MAX_PATH] = {0};
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&NVSEPlugin_Load), &self);
+        GetModuleFileNameA(self, me, MAX_PATH);
+        std::string dir = me;
+        dir = dir.substr(0, dir.find_last_of("\\/") + 1);
+        nvcoop::loader::HostEnv env;
+        env.gameDir = g_gameDir;
+        env.corePath = dir + ReadIni("loader", "core", "nvcoop_mod.dll");
+        env.nvse = nvse;
+        g_coreHost = new nvcoop::loader::CoreHost(env);   // lives for the whole process
+        std::string err;
+        if (!g_coreHost->Load(err)) Log("loader: core not loaded (%s); dev.reload can retry", err.c_str());
+        if (EnvOr("NVCOOP_WATCH", ReadIni("loader", "watch", "0")) == "1")
+            g_coreHost->StartWatcher(std::atoi(ReadIni("loader", "watchIntervalMs", "500").c_str()));
+    }
+#endif
     return true;
 }
 

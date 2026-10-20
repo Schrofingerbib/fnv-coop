@@ -45,6 +45,8 @@ struct WorldView {
     std::map<FormRef, uint8_t> markers, compKind;
     FormRef weather; bool weatherSet = false, weatherForced = false;
     float timeScale = 0;
+    std::map<std::pair<FormRef, uint8_t>, float> angles, angleOrig;
+    OriginMap origins;
     FormRef active; bool hasActive = false;   // per player
 
     bool operator==(const WorldView& o) const { return diff(o).empty(); }
@@ -81,13 +83,19 @@ struct WorldView {
         if (completed != o.completed) return "completed";
         if (failed != o.failed) return "failed";
         if (allObj != o.allObj) return "allObjectives";
-        if (locks != o.locks) return "locks";
+        if (locks != o.locks) {
+            std::string r = "locks mine:";
+            for (auto& [k, v] : locks) { auto it = o.locks.find(k); if (it == o.locks.end() || it->second != v) r += " " + std::to_string(k.localId) + "=" + (v.first ? "L" : "u") + std::to_string(v.second); }
+            r += " oracle:";
+            for (auto& [k, v] : o.locks) { auto it = locks.find(k); if (it == locks.end() || it->second != v) r += " " + std::to_string(k.localId) + "=" + (v.first ? "L" : "u") + std::to_string(v.second); }
+            return r;
+        }
         if (factionRank != o.factionRank) return "factionRank";
         if (textures != o.textures) return "textures";
         if (fastTravel != o.fastTravel) return "fastTravel";
         if (perks != o.perks) return "perks";
         if (controlsOff != o.controlsOff) return "controls";
-        if (spawned != o.spawned || despawned != o.despawned || createdCounter != o.createdCounter) return "spawned";
+        if (spawned != o.spawned || despawned != o.despawned) return "spawned";   // createdCounter is the host's allocation bookkeeping: a client that undid a spawn keeps the higher one
         if (objects != o.objects) return "objects";
         if (refVars != o.refVars) return "refVars";
         if (refInv != o.refInv) return "refInv";
@@ -115,6 +123,7 @@ struct WorldView {
         }
         if (weatherSet != o.weatherSet || (weatherSet && (!(weather == o.weather) || weatherForced != o.weatherForced))) return "weather";
         if (timeScale != o.timeScale) return "timeScale";
+        if (angles != o.angles || angleOrig != o.angleOrig) return "angles";
         if (hasActive != o.hasActive || (hasActive && !(active == o.active))) return "activeQuest mine " + std::to_string(hasActive) + ":" + std::to_string(active.localId) + " oracle " + std::to_string(o.hasActive) + ":" + std::to_string(o.active.localId);
         return "";
     }
@@ -134,7 +143,7 @@ void objState(WorldView& w, const ObjectState& e) {
     if ((e.mask & 4) && e.destroyed) o.destroyed = true;
     if ((e.mask & 8) && e.activatedOnce) o.activated = true;
     if (o.isDefault()) w.objects.erase(e.ref); else w.objects[e.ref] = o;
-    if (e.mask & 2) w.locks[e.ref] = {e.locked, e.locked ? e.level : 0};
+    if (e.mask & 2) foldLock(w.locks, w.origins, e.ref, e.locked, e.level, e.hasBefore, e.beforeLocked, e.beforeLevel);
 }
 void invAdd(WorldView& w, const FormRef& ref, const FormRef& item, int64_t d) {
     RefInv& inv = w.refInv[ref];
@@ -191,7 +200,7 @@ private:
         if (cap) cap->record(e);
     }
     void do_(const SetStage& e) { v.stages[e.quest] = e.stage; }
-    void do_(const SetObjective& e) { v.objectives[{e.quest, e.objective}] |= e.flags; }
+    void do_(const SetObjective& e) { v.objectives[{e.quest, e.objective}] = e.flags; }   // exact flag state (host-authoritative writer)
     void do_(const SetGlobal& e) { v.globals[e.global] = e.value; }
     void do_(const EnableRef& e) { v.enabled[e.ref] = true; }
     void do_(const DisableRef& e) { v.enabled[e.ref] = false; }
@@ -218,20 +227,21 @@ private:
         if (e.active) { v.companion[e.npc] = e.owner; v.compKind[e.npc] = e.kind; } else { v.companion.erase(e.npc); v.compKind.erase(e.npc); }
     }
     void do_(const SpawnRef& e) { spawn(v, e); }
-    void do_(const DespawnRef& e) { v.spawned.erase(e.ref()); v.despawned.insert(e.ref()); v.createdCounter = std::max(v.createdCounter, e.id & 0x00FFFFFFu); }
+    void do_(const DespawnRef& e) { v.spawned.erase(e.ref()); if (e.forget) { v.despawned.erase(e.ref()); return; } v.despawned.insert(e.ref()); v.createdCounter = std::max(v.createdCounter, e.id & 0x00FFFFFFu); }
     void do_(const ObjectState& e) { objState(v, e); }
-    void do_(const RefScriptVar& e) { v.refVars[{e.ref, e.index}] = e.value; }
+    void do_(const RefScriptVar& e) { foldRefVar(v.refVars, v.origins, e); }
     void do_(const RefAddItem& e) { if (e.count != 0) invAdd(v, e.ref, e.item, e.count); }
     void do_(const RefRemoveItem& e) { if (e.count != 0) invAdd(v, e.ref, e.item, -static_cast<int64_t>(e.count)); }
-    void do_(const RemoveAllItems& e) { RefInv& i = v.refInv[e.ref]; i.cleared = true; i.delta.clear(); }
+    void do_(const RemoveAllItems& e) { foldRefClear(v.refInv, e); }
     void do_(const AddTopic& e) { v.topics.insert(e.topic); }
     void do_(const AddNote& e) { v.notes.insert(e.note); }
     void do_(const RemoveNote& e) { v.notes.erase(e.note); }
-    void do_(const SetMapMarker& e) { v.markers[e.marker] = e.flags; }
+    void do_(const SetMapMarker& e) { foldMarker(v.markers, v.origins, e); }
     void do_(const ForceActiveQuest& e) { v.active = e.quest; v.hasActive = true; }
     void do_(const RequestSave&) { ++eventsSeen; }
-    void do_(const SetWeather& e) { v.weather = e.weather; v.weatherSet = true; v.weatherForced = e.force; }
-    void do_(const SetTimeScale& e) { v.timeScale = e.scale; }
+    void do_(const SetWeather& e) { foldWeather(v.weather, v.weatherSet, v.weatherForced, v.origins, e); }
+    void do_(const SetTimeScale& e) { foldTimeScale(v.timeScale, v.origins, e); }
+    void do_(const RefAngle& e) { foldAngle(v.angles, v.angleOrig, e); }
     void do_(const AdvanceTime&) { ++eventsSeen; }
     void do_(const ForcedDialogue&) { ++eventsSeen; }
     void do_(const BarrierArrive&) {}
@@ -240,7 +250,7 @@ private:
     void do_(const CompleteQuest& e) { v.completed.insert(e.quest); }
     void do_(const FailQuest& e) { v.completed.insert(e.quest); v.failed.insert(e.quest); }
     void do_(const CompleteAllObjectives& e) { v.allObj.insert(e.quest); }
-    void do_(const SetLock& e) { v.locks[e.ref] = {e.locked, e.locked ? e.level : 0}; }
+    void do_(const SetLock& e) { foldLock(v.locks, v.origins, e.ref, e.locked, e.level, e.hasBefore, e.beforeLocked, e.beforeLevel); }
     void do_(const SetFactionRank& e) { v.factionRank[{e.actor, e.faction}] = e.rank < 0 ? -1 : e.rank; }
     void do_(const SetPerk& e) { if (e.rank <= 0) v.perks.erase(e.perk); else v.perks[e.perk] = e.rank; }
     void do_(const SwapTexture& e) { v.textures[{e.ref, e.slot}] = e.texture; }
@@ -258,7 +268,8 @@ public:
                 if (it == shared.stages.end()) shared.stages[x->quest] = x->stage;
                 else it->second = std::max(it->second, x->stage);
             } else if (auto* x = std::get_if<SetObjective>(&e)) {
-                shared.objectives[{x->quest, x->objective}] |= x->flags;
+                auto& f = shared.objectives[{x->quest, x->objective}];   // host writes are the exact state, guest writes only add bits
+                if (t.origin == kHostPlayer) f = x->flags; else f |= x->flags;
             } else if (auto* x = std::get_if<SetGlobal>(&e)) {
                 shared.globals[x->global] = x->value;
             } else if (auto* x = std::get_if<EnableRef>(&e)) {
@@ -292,18 +303,20 @@ public:
             } else if (auto* x = std::get_if<SpawnRef>(&e)) {
                 spawn(shared, *x);
             } else if (auto* x = std::get_if<DespawnRef>(&e)) {
-                shared.spawned.erase(x->ref()); shared.despawned.insert(x->ref());
+                shared.spawned.erase(x->ref());
+                if (x->forget) { shared.despawned.erase(x->ref()); continue; }
+                shared.despawned.insert(x->ref());
                 shared.createdCounter = std::max(shared.createdCounter, x->id & 0x00FFFFFFu);
             } else if (auto* x = std::get_if<ObjectState>(&e)) {
                 objState(shared, *x);
             } else if (auto* x = std::get_if<RefScriptVar>(&e)) {
-                shared.refVars[{x->ref, x->index}] = x->value;
+                foldRefVar(shared.refVars, shared.origins, *x);
             } else if (auto* x = std::get_if<RefAddItem>(&e)) {
                 if (x->count != 0) invAdd(shared, x->ref, x->item, x->count);
             } else if (auto* x = std::get_if<RefRemoveItem>(&e)) {
                 if (x->count != 0) invAdd(shared, x->ref, x->item, -static_cast<int64_t>(x->count));
             } else if (auto* x = std::get_if<RemoveAllItems>(&e)) {
-                RefInv& i = shared.refInv[x->ref]; i.cleared = true; i.delta.clear();
+                foldRefClear(shared.refInv, *x);
             } else if (auto* x = std::get_if<AddTopic>(&e)) {
                 shared.topics.insert(x->topic);
             } else if (auto* x = std::get_if<AddNote>(&e)) {
@@ -311,13 +324,15 @@ public:
             } else if (auto* x = std::get_if<RemoveNote>(&e)) {
                 shared.notes.erase(x->note);
             } else if (auto* x = std::get_if<SetMapMarker>(&e)) {
-                shared.markers[x->marker] = x->flags;
+                foldMarker(shared.markers, shared.origins, *x);
             } else if (auto* x = std::get_if<ForceActiveQuest>(&e)) {
                 for (int s = 0; s < kMaxSlots; ++s) if (x->to.includes(PlayerId(s))) { per[s].active = x->quest; per[s].hasActive = true; }
             } else if (auto* x = std::get_if<SetWeather>(&e)) {
-                shared.weather = x->weather; shared.weatherSet = true; shared.weatherForced = x->force;
+                foldWeather(shared.weather, shared.weatherSet, shared.weatherForced, shared.origins, *x);
             } else if (auto* x = std::get_if<SetTimeScale>(&e)) {
-                shared.timeScale = x->scale;
+                foldTimeScale(shared.timeScale, shared.origins, *x);
+            } else if (auto* x = std::get_if<RefAngle>(&e)) {
+                foldAngle(shared.angles, shared.angleOrig, *x);
             } else if (auto* x = std::get_if<BarrierArrive>(&e)) {
                 auto& b = bar[x->barrier];
                 b.required |= x->required;
@@ -334,7 +349,7 @@ public:
             } else if (auto* x = std::get_if<CompleteAllObjectives>(&e)) {
                 shared.allObj.insert(x->quest);
             } else if (auto* x = std::get_if<SetLock>(&e)) {
-                shared.locks[x->ref] = {x->locked, x->locked ? x->level : 0};
+                foldLock(shared.locks, shared.origins, x->ref, x->locked, x->level, x->hasBefore, x->beforeLocked, x->beforeLevel);
             } else if (auto* x = std::get_if<SetFactionRank>(&e)) {
                 shared.factionRank[{x->actor, x->faction}] = x->rank < 0 ? -1 : x->rank;
             } else if (auto* x = std::get_if<SwapTexture>(&e)) {
@@ -407,7 +422,7 @@ WorldView viewOf(const ShadowState& s, int slot) {
     w.locks = s.locks; w.factionRank = s.factionRank; w.textures = s.textures;
     w.spawned = s.spawned; w.despawned = s.despawned; w.createdCounter = s.createdCounter; w.objects = s.objects; w.refVars = s.refVars;
     w.refInv = s.refInv; w.topics = s.topics; w.notes = s.notes; w.markers = s.mapMarkers; w.compKind = s.companionKind;
-    w.weather = s.weather; w.weatherSet = s.weatherSet; w.weatherForced = s.weatherForced; w.timeScale = s.timeScale;
+    w.weather = s.weather; w.weatherSet = s.weatherSet; w.weatherForced = s.weatherForced; w.timeScale = s.timeScale; w.angles = s.angles; w.angleOrig = s.angleOrig; w.origins = s.origins;
     w.active = s.ledger[slot].activeQuest; w.hasActive = s.ledger[slot].hasActive;
     for (auto& [k, on] : s.fastTravelLock) if (on) w.fastTravel.insert(k);
     for (auto& [k, b] : s.barriers) if (b.released) w.released.insert(k);
@@ -428,11 +443,15 @@ Recipient pickRecipient(Rng& r, int maxPlayers) {
     return Recipient::slots(uint8_t(r.range(1, (1u << maxPlayers) - 1)));
 }
 
+// Pristine values, a pure function of the key, as the engine would report them before any script touched it.
+void pristineLock(const FormRef& ref, bool& locked, int32_t& level) { locked = ref.localId % 3 == 0; level = locked ? int32_t((ref.localId * 11) % 100) : 0; }
+double pristineVar(const FormRef& ref, uint16_t idx) { return double((ref.localId * 5 + idx * 3) % 7) * 0.5; }
+
 Effect genEffect(Rng& r, int maxPlayers) {
     static const char* const plugins[] = {"falloutnv.esm", "deadmoney.esm"};
     auto form = [&](uint32_t base, uint32_t n) { return pick(r, plugins, 2, base, n); };
     auto created = [&] { return kCreatedRefPrefix | r.range(1, 8); };
-    switch (r.range(0, 56)) {
+    switch (r.range(0, 57)) {
         case 0: case 1: case 2: return SetStage{form(0x100, 6), r.range(0, 100)};
         case 3: case 4: return SetObjective{form(0x100, 6), r.range(0, 3), uint8_t(r.range(0, 3))};
         case 5: return SetGlobal{form(0x200, 4), float(r.range(0, 20)) * 0.5f};
@@ -460,7 +479,7 @@ Effect genEffect(Rng& r, int maxPlayers) {
         case 31: return SayOnceFlag{form(0xA00, 8)};
         case 32: return CompleteQuest{form(0x100, 6)};
         case 33: return CompleteAllObjectives{form(0x100, 6)};
-        case 34: return SetLock{form(0x300, 6), r.chance(0.5), int32_t(r.range(0, 100))};
+        case 34: { SetLock l{form(0x300, 6), r.chance(0.5), int32_t(r.range(0, 100))}; pristineLock(l.ref, l.beforeLocked, l.beforeLevel); l.hasBefore = true; return l; }
         case 35: return SetFactionRank{form(0x700, 6), form(0x500, 3), int32_t(r.range(0, 6)) - 1};
         case 36: return SetPerk{form(0xB00, 4), int32_t(r.range(0, 3)), pickRecipient(r, maxPlayers)};
         case 37: case 38: return SwapTexture{form(0x300, 6), form(0xC00, 3), uint8_t(r.range(0, 2))};
@@ -468,19 +487,30 @@ Effect genEffect(Rng& r, int maxPlayers) {
         case 41: return SpawnRef{created(), form(0x1000, 4), form(0x600, 2), float(r.range(0, 50)), float(r.range(0, 50)), 0.f, r.chance(0.3)};
         case 42: return DespawnRef{created()};
         case 43: { ObjectState o; o.ref = form(0x300, 6); o.mask = uint8_t(r.range(1, 15)); o.open = r.chance(0.5); o.locked = r.chance(0.5);
-                   o.level = int32_t(r.range(0, 100)); o.destroyed = r.chance(0.2); o.activatedOnce = r.chance(0.3); return o; }
-        case 44: return RefScriptVar{form(0x700, 6), uint16_t(r.range(0, 3)), double(r.range(0, 20)) * 0.5};
+                   o.level = int32_t(r.range(0, 100)); o.destroyed = r.chance(0.2); o.activatedOnce = r.chance(0.3);
+                   pristineLock(o.ref, o.beforeLocked, o.beforeLevel); o.hasBefore = true; return o; }
+        case 44: { RefScriptVar x{form(0x700, 6), uint16_t(r.range(0, 3)), double(r.range(0, 20)) * 0.5}; x.hasBefore = true; x.before = pristineVar(x.ref, x.index); return x; }
         case 45: return RefAddItem{form(0x1100, 4), form(0x400, 5), int32_t(r.range(1, 4))};
         case 46: return RefRemoveItem{form(0x1100, 4), form(0x400, 5), int32_t(r.range(1, 3))};
-        case 47: return r.chance(0.3) ? Effect(RemoveAllItems{form(0x1100, 4)}) : Effect(RefAddItem{form(0x1100, 4), form(0x400, 5), 1});
+        case 47: {
+            if (!r.chance(0.3)) return RefAddItem{form(0x1100, 4), form(0x400, 5), 1};
+            RemoveAllItems c; c.ref = form(0x1100, 4); c.hasBefore = true;   // the contents are a pure function of the ref, as the engine would report them
+            c.items = {{FormRef("falloutnv.esm", 0x400 + c.ref.localId % 5), int32_t(1 + c.ref.localId % 3)}, {FormRef("falloutnv.esm", 0x405), 2}};
+            return c;
+        }
         case 48: return AddTopic{form(0x1200, 6)};
         case 49: return AddNote{form(0x1300, 6)};
         case 50: return RemoveNote{form(0x1300, 6)};
-        case 51: return SetMapMarker{form(0x1400, 4), uint8_t(r.range(0, 3))};
+        case 51: { SetMapMarker m{form(0x1400, 4), uint8_t(r.range(0, 3))}; m.hasBefore = true; m.before = uint8_t(m.marker.localId % 4); return m; }
         case 52: return ForceActiveQuest{form(0x100, 6), pickRecipient(r, maxPlayers)};
         case 53: return RequestSave{uint8_t(r.range(0, 2))};
-        case 54: return SetWeather{form(0x1500, 3), r.chance(0.4)};
-        case 55: return SetTimeScale{float(r.range(1, 30))};
+        case 54: { SetWeather w{form(0x1500, 3), r.chance(0.4)}; w.hasBefore = true; w.before = FormRef("falloutnv.esm", 0x1500); w.beforeForce = false; return w; }
+        case 55: { SetTimeScale t{float(r.range(1, 30))}; t.hasBefore = true; t.before = 20.f; return t; }
+        case 56: {   // the pre-image is the ref axis's pristine angle, a pure function of (ref, axis), as the engine would report it
+            FormRef ref = form(0x300, 6);
+            uint8_t axis = uint8_t(r.range(0, 2));
+            return RefAngle{ref, axis, float(r.range(0, 36)) * 10.f, true, float((ref.localId * 7 + axis * 13) % 37) * 10.f};
+        }
         default: return AdvanceTime{r.range(1, 600)};
     }
 }
@@ -493,6 +523,34 @@ Cause genCause(Rng& r) {
     c.source = FormRef("falloutnv.esm", 0x100 + r.range(0, 5));
     c.aux = int32_t(r.range(0, 100));
     return c;
+}
+
+
+// Effects kept out of host-load scenarios (a load rewinds the host to an older save; clients must come back to that state), and why:
+//  - BarrierArrive / BarrierRelease: transient rendezvous state, not part of the baseline and never saved.
+//  - SayOnceFlag, CompleteQuest, FailQuest, CompleteAllObjectives, SlideshowEnd: one-way in the engine (no command un-sets them).
+//  - AddTopic: one-way in the engine (there is no RemoveTopic).
+//  - ObjectState destroyed / activated-once bits: sticky in the engine (the generator below strips them, the rest of ObjectState is kept).
+//  - Round-3 inventory and spawn effects (indices 33..34, 37..39): see hostLoadExcludedRound3.
+bool hostLoadExcluded(Effect& e) {
+    if (std::holds_alternative<BarrierArrive>(e) || std::holds_alternative<BarrierRelease>(e) || std::holds_alternative<SayOnceFlag>(e) ||
+        std::holds_alternative<CompleteQuest>(e) || std::holds_alternative<FailQuest>(e) || std::holds_alternative<CompleteAllObjectives>(e) ||
+        std::holds_alternative<SlideshowEnd>(e) || std::holds_alternative<AddTopic>(e))
+        return true;
+    if (auto* o = std::get_if<ObjectState>(&e)) {
+        o->mask &= uint8_t(~(kObjDestroyed | kObjActivated));
+        o->destroyed = o->activatedOnce = false;
+        if (o->mask == 0) return true;
+    }
+    const size_t i = e.index();
+    (void)i;
+    return false;
+}
+bool hasPreimage(const Effect& e) {
+    return std::holds_alternative<SetWeather>(e) || std::holds_alternative<SetTimeScale>(e) || std::holds_alternative<RefScriptVar>(e) ||
+           std::holds_alternative<SetMapMarker>(e) || std::holds_alternative<SetLock>(e) || std::holds_alternative<ObjectState>(e) ||
+           std::holds_alternative<RefAddItem>(e) || std::holds_alternative<RefRemoveItem>(e) || std::holds_alternative<RemoveAllItems>(e) ||
+           std::holds_alternative<SpawnRef>(e) || std::holds_alternative<DespawnRef>(e);
 }
 
 bool baselineKind(const Effect& e) {
@@ -585,7 +643,7 @@ ShadowState dumpOf(const WorldView& v) {
     s.textures = v.textures;
     s.companionKind = v.compKind; s.refVars = v.refVars; s.topics = v.topics; s.notes = v.notes; s.mapMarkers = v.markers;
     for (auto& [r, o] : v.objects) s.objects[r] = o;
-    s.weather = v.weather; s.weatherSet = v.weatherSet; s.weatherForced = v.weatherForced; s.timeScale = v.timeScale;
+    s.weather = v.weather; s.weatherSet = v.weatherSet; s.weatherForced = v.weatherForced; s.timeScale = v.timeScale; s.angles = v.angles; s.angleOrig = v.angleOrig; s.origins = v.origins; s.refInv = v.refInv; s.spawned = v.spawned; s.despawned = v.despawned; s.createdCounter = v.createdCounter;
     for (auto& k : v.fastTravel) s.fastTravelLock[k] = true;
     s.ledger[0].karma = v.karma;
     for (auto& [f, r] : v.rep) s.ledger[0].rep[f] = r;
@@ -813,11 +871,8 @@ SimResult runSim(const SimConfig& cfg) {
             std::vector<Effect> eff;
             for (uint32_t i = 0, n = rng.range(1, 6); i < n; ++i) {
                 Effect e = genEffect(rng, maxPlayers);
-                // barrier state is not part of the baseline, so it cannot be rewound with the world: keep it out of load scenarios
-                if (cfg.hostLoads && (std::holds_alternative<BarrierArrive>(e) || std::holds_alternative<BarrierRelease>(e) ||
-                                      std::holds_alternative<SayOnceFlag>(e) || std::holds_alternative<CompleteQuest>(e) || std::holds_alternative<FailQuest>(e) ||
-                                      (e.index() >= 33 && e.index() <= 48 && e.index() != 41 && e.index() != 42 && e.index() != 44 && e.index() != 45 && e.index() != 48) ||   // round 3 state that a rewind cannot undo (no revert effect)
-                                      std::holds_alternative<CompleteAllObjectives>(e) || std::holds_alternative<SlideshowEnd>(e))) continue;  // sticky flags cannot be un-set by a rewind
+                if (cfg.hostLoads && hostLoadExcluded(e)) continue;
+                if (cfg.hostLoads && hostSaves.empty() && hasPreimage(e)) continue;   // state that first appears after a save is the case a host load must undo
                 eff.push_back(std::move(e));
             }
             if (eff.empty()) eff.push_back(SetStage{FormRef("falloutnv.esm", 0x100), 1});

@@ -17,6 +17,7 @@
 //                     | (type 1 = fame/+0x44, else infamy/+0x48; Set also MarkModified's the form)
 //   ModKarma          | Player::RewardKarma 0x94FD30(int)                                                  | M
 //   StartQuest/Stop   | TESQuest::SetRunning 0x60C9C0(true/false)                                          | V
+//   RefAngle          | console `SetAngle <X|Y|Z> <degrees>` run ON <ref> via setExecLine | M
 //   MoveRef           | cell == marker REFR: console `MoveTo <marker> x y z` run ON <ref> via setExecLine (x/y/z = offsets) | M
 //   KillActor         | console `KillActor` run ON <actor>                                      | M
 //   ResurrectActor    | console `ResurrectActor 0` run ON <actor>                               | M
@@ -27,6 +28,7 @@
 #include <functional>
 #include <string>
 
+#include "apply_lines.h"
 #include "capture_hub.h"
 #include "engine_hooks.h"
 #include "fnvcoop/effect.h"
@@ -44,6 +46,8 @@ public:
     // Applies all effects in order. localSlot filters player-targeted effects by Recipient. Returns count applied.
     size_t applyTxn(const fnvcoop::EffectTxn& t, fnvcoop::PlayerId localSlot);
     std::string lastError() const { return err_; }
+    // This machine's party slot (applyTxn sets it from its argument); decides who applies CompanionOwner.
+    void setLocalSlot(fnvcoop::PlayerId s) { localSlot_ = s; }
     // Runs a console command with a calling reference (kill / resurrect / MoveTo). Injected by the plugin (NVSE console interface);
     // returns false on failure. Without it those effects stay Unsupported.
     void setExecLine(std::function<bool(const std::string&, uint32_t)> f) { exec_ = std::move(f); }
@@ -62,6 +66,8 @@ private:
     FormResolver& res_;
     std::string err_;
     bool useGate_ = true;
+    fnvcoop::PlayerId localSlot_ = 0;
+    FastTravelLocks travelLocks_;
     std::function<bool(const std::string&, uint32_t)> exec_;  // (console command, calling reference refID)
 };
 

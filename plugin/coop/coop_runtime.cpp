@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <random>
 #include <sstream>
 
 #include "common/minijson.h"
+#include "flight/flight.h"
 #include "effect_json.h"
 
 // Mutation twins (tests build the runtime with these to prove the integration tests can fail):
@@ -14,8 +16,17 @@
 //   COOP_MUTANT=2 : host capture hook not wired (captured txns are never committed)
 //   COOP_MUTANT=3 : host ignores guest actions (onAction never executes)
 //   COOP_MUTANT=4 : client skips setBaselineWorld (joins without a baseline transfer)
+//   COOP_MUTANT=5 : L11 wiring twin; env COOP_UI_MUTANT=n drops one wiring call (1 bridge config, 2 menu resume, 3 mux 0xE5 channel,
+//                   4 SlideshowEnd calls (host + guest), 5 INFO reader install)
 #ifndef COOP_MUTANT
 #define COOP_MUTANT 0
+#endif
+#if COOP_MUTANT == 5
+static bool leaveMut(int n) { const char* e = std::getenv("COOP_LEAVE_MUTANT"); return e && std::atoi(e) == n; }   // twins for leave()/join(): 1 leave keeps the session, 2 join ignores the saved session view
+static bool uiMut(int n) { const char* e = std::getenv("COOP_UI_MUTANT"); return e && std::atoi(e) == n; }
+#else
+static constexpr bool uiMut(int) { return false; }
+static constexpr bool leaveMut(int) { return false; }
 #endif
 
 namespace nvcoop::coop {
@@ -137,6 +148,11 @@ public:
         }
         if (r.ok) ++rt_.counters_.applied; else ++rt_.counters_.applyFailed;
         cur_.results.push_back(r.status);
+        if (auto* co = std::get_if<CompanionOwner>(&e)) rt_.noteCompanion(*co);   // L8 registry: per-owner follower views
+        if (rt_.uiEnabled_ && rt_.ui_.slideClient && !uiMut(4) && std::holds_alternative<SlideshowEnd>(e)) {   // L11: releases the slideshow control lock
+            rt_.ui_.slideClient().onSlideshowEndEffect();
+            ++rt_.uiStats_.slideEnds;
+        }
     }
     void onJoined(PlayerId slot, const SharePolicy& p) override {
         if (rt_.world_) rt_.world_->onJoined(slot, p);
@@ -215,7 +231,7 @@ bool Runtime::start(std::string* err) {
     startMs_ = now_();
     if (cfg_.role == Role::Host) {
         if (!makeTransport(true, &e)) { lastError_ = "host transport: " + e; if (err) *err = lastError_; return false; }
-        mux_.reset(new MuxTransport(*transport_));
+        mux_.reset(new MuxTransport(sessionTransport()));
         SharePolicy pol;
         pol.maxPlayers = static_cast<uint8_t>(cfg_.maxPlayers);
         if (cfg_.clientLoadBlock) pol.clientLoad = SharePolicy::ClientLoad::Block;
@@ -229,6 +245,11 @@ bool Runtime::start(std::string* err) {
             le.effects = t.effects;
             le.atMs = now_();
             pushLog(std::move(le));
+            if (flight_) flight_->captured(0, 0, t.seq, t.effects, t.cause.kind, host_ ? host_->epoch() : 0);
+            for (const Effect& e : t.effects)
+                if (auto* co = std::get_if<CompanionOwner>(&e)) noteCompanion(*co);
+            for (const Effect& e : t.effects)
+                if (!uiMut(4) && std::holds_alternative<SlideshowEnd>(e)) uiSlideEnded();   // L11: End packet to the guests
         };
         if (cfg_.baseline) {
             if (!dumper_) { lastError_ = "baseline=1 but no world dumper"; if (err) *err = lastError_; return false; }
@@ -300,9 +321,11 @@ bool Runtime::start(std::string* err) {
     } else if (cfg_.role == Role::Client) {
         if (!makeTransport(false, &e)) { lastError_ = "client transport: " + e; if (err) *err = lastError_; return false; }
         if (!cfg_.token) cfg_.token = randomToken();
-        mux_.reset(new MuxTransport(*transport_));
+        mux_.reset(new MuxTransport(sessionTransport()));
         sink_.reset(new Sink(*this));
-        client_.reset(new ClientSession(*mux_, 0, cfg_.token, *sink_, hub_ ? &hub_->echo() : nullptr));
+        IEffectSink* sessionSink = sink_.get();
+        if (flight_) { flightS_ = std::make_shared<fnvcoop::flight::RecordingSink>(*sink_, *flight_); sessionSink = flightS_.get(); }
+        client_.reset(new ClientSession(*mux_, 0, cfg_.token, *sessionSink, hub_ ? &hub_->echo() : nullptr));
 #if COOP_MUTANT != 4   // twin 4: client never hands its own world to the session -> no baseline transfer
         if (cfg_.baseline) {
             if (!dumper_) { lastError_ = "baseline=1 but no world dumper"; if (err) *err = lastError_; return false; }
@@ -316,7 +339,12 @@ bool Runtime::start(std::string* err) {
 #if COOP_MUTANT != 4
         if (dumper_) {   // Rebase / loading a save without a usable sidecar re-dumps the CURRENT world
             IWorldDumper* d = dumper_;
-            client_->setBaselineProvider([d](ShadowState& w, uint64_t& h) { std::string e; return d->dump(&w, &h, &e); });
+            client_->setBaselineProvider([this, d](ShadowState& w, uint64_t& h) {
+                std::string e;
+                bool ok = d->dump(&w, &h, &e);
+                if (ok && flight_) flightWorld_.reset(new ShadowState(w));   // T1a: the real world the desync digest was built from (pre-repair)
+                return ok;
+            });
         }
 #endif
         client_->setDigestInterval(cfg_.digestIntervalMs);
@@ -343,12 +371,29 @@ bool Runtime::start(std::string* err) {
             if (dlg_) dlg_->onPacket(from, d, static_cast<uint32_t>(now_()));
         });
     }
+    if (client_) client_->onApp = [this](PlayerId, uint16_t ch, const Bytes& d) { if (ch == kAppWorldChannel) onWorldPacket(d); };
+    if (uiEnabled_ && mux_) {
+        if (cfg_.role == Role::Client && ui_.slideClient && !uiMut(3)) {   // protocol.md section 2: slideshow channel 0xE5
+            mux_->registerChannel(nvui::kSlideChannel, [this](PeerId, Bytes&& d) {
+                if (!ui_.slideClient) return;
+                ++uiStats_.slidePackets;
+                ui_.slideClient().onPacket(d, now_());
+            });
+        }
+        if (ui_.installInfoReader && ui_.infoReader && !uiMut(5)) ui_.installInfoReader(ui_.infoReader);   // captured SayTo carries the INFO text
+    }
     running_ = true;
     return true;
 }
 
 void Runtime::stop() {
     if (!running_) return;
+    if (uiBridged_ && ui_.router) {
+        if (nvui::UiRouter* r = ui_.router()) r->bridge() = nvui::Bridge();   // the bridge captures the DialogueNode
+    }
+    uiBridged_ = false;
+    uiWasJoined_ = false;
+    uiJoined_.clear();
     if (enet_) enet_->disconnect();   // graceful: peers see Disconnected now instead of a timeout
     if (cfg_.role == Role::Host) captureOn_ = false;
     rules_.reset();
@@ -357,22 +402,63 @@ void Runtime::stop() {
     host_.reset();
     worker_.reset();   // joins the thread after queued jobs finished (sessions are gone: no result will be drained)
     dlg_.reset();
+    companionOwners_.clear();
+    worldState_.clear();
+    worldJoined_.clear();
+    worldQueue_.clear();
+    worldApplied_.clear();
     dlgJoined_.clear();
     dlgWasLive_ = false;
     client_.reset();
     sink_.reset();
     host_.reset();
     mux_.reset();
+    if (flight_) flight_->dumpToDir(fnvcoop::flight::kDumpShutdown);
+    flightS_.reset();
+    flightT_.reset();
     transport_.reset();
     udp_ = nullptr;
     enet_ = nullptr;
     running_ = false;
 }
 
+bool Runtime::leave(std::string* err) {
+    if (!running_) { if (err) *err = left_ ? "already left the session" : "coop not running"; return false; }
+    leaveView_.clear();
+    if (client_ && client_->canSaveState()) leaveView_ = client_->saveState();   // what this machine already received: join resumes from it
+    if (!leaveMut(1)) stop();
+    left_ = true;
+    LogEntry le;
+    le.dir = "leave";
+    le.atMs = now_();
+    pushLog(std::move(le));
+    return true;
+}
+
+bool Runtime::join(const std::string& host, uint16_t port, std::string* err) {
+    if (running_) { if (err) *err = "already in a session: coop.leave first"; return false; }
+    if (cfg_.role == Role::Client) {
+        if (!host.empty()) cfg_.host = host;
+        if (port) cfg_.port = port;
+    }
+    if (!start(err)) return false;
+    // A rejoin is a local save load of the view saved at leave: missed host txns arrive as a diff and the rewards already received are not
+    // granted again (a plain baseline join would send this slot's whole reward ledger on top of what the world already holds).
+    if (client_ && !leaveView_.empty() && !leaveMut(2)) client_->onLocalSaveLoaded(now_(), &leaveView_);
+    leaveView_.clear();
+    left_ = false;
+    LogEntry le;
+    le.dir = "join";
+    le.atMs = now_();
+    pushLog(std::move(le));
+    return true;
+}
+
 Bytes Runtime::saveSidecar() {
     Bytes b;
     if (host_) b = host_->saveSidecar();
     else if (client_ && client_->canSaveState()) b = client_->saveState();
+    else if (!client_ && left_) b = leaveView_;   // saved while out of the session: the save still records what this world already received
     if (!b.empty()) ++counters_.saves;
     LogEntry le;
     le.dir = "save";
@@ -382,7 +468,19 @@ Bytes Runtime::saveSidecar() {
     return b;
 }
 
+void Runtime::bindPlayerRefs(std::function<uint32_t(PlayerId)> ghostOf, std::function<bool(uint32_t, FormRef&)> idToRef) {
+    ghostOf_ = std::move(ghostOf);
+    idToRef_ = std::move(idToRef);
+    ++playerRefBinds_;
+    playerRef_ = [this](PlayerId slot, FormRef& out) {
+        uint32_t id = slot == kHostPlayer ? 0x14u : (ghostOf_ ? ghostOf_(slot) : 0u);
+        if (!id) return false;
+        return idToRef_ ? idToRef_(id, out) : false;
+    };
+}
+
 bool Runtime::onGameLoaded(const Bytes* sidecar, std::string* what) {
+    if (ghostOf_) bindPlayerRefs(ghostOf_, idToRef_);    // re-assert after a load / rebase (ghosts are respawned)
     std::string w;
     bool ok = false;
     if (!running_) { w = "runtime not running"; }
@@ -462,6 +560,7 @@ void Runtime::tickDialogue() {
                 return kNoPlayer;
             };
             dlg_.reset(new fnvcoop_dlg::DialogueNode(mux_.get(), c, dlgHooks_.run, dlgHooks_.sink));
+            syncCompanions();
         }
         std::set<PlayerId> joinedNow;
         for (auto& cv : host_->clients()) if (cv.joined) joinedNow.insert(cv.slot);
@@ -476,6 +575,7 @@ void Runtime::tickDialogue() {
             c.hostPeer = 0;
             c.appliedSeq = [this]() -> uint64_t { return client_ ? client_->applied() : 0; };
             dlg_.reset(new fnvcoop_dlg::DialogueNode(mux_.get(), c, nullptr, dlgHooks_.sink));
+            syncCompanions();
         }
     }
     if (dlg_ && client_) {   // the story session (re)joined or finished a (re)baseline: drop any stale conversation role
@@ -506,6 +606,226 @@ void Runtime::frame() {
         if (sink_) sink_->flush();
     }
     tickDialogue();
+    tickUi();
+    tickWorld();
+    if (flight_) tickFlight();
+}
+
+fnvcoop::ITransport& Runtime::sessionTransport() {
+    if (!flight_) return *transport_;
+    if (!flightT_) flightT_ = std::make_shared<fnvcoop::flight::RecordingTransport>(*transport_, *flight_);
+    return *flightT_;
+}
+
+// T1a: frame counter, a story digest every 2 s when the world moved, and desync detection -> dump.
+void Runtime::tickFlight() {
+    using namespace fnvcoop::flight;
+    constexpr uint8_t kNoFlightSlot = fnvcoop::flight::kNoSlot;
+    flight_->setFrame(static_cast<uint32_t>(counters_.frames));
+    uint64_t t = now_();
+    if (t - flightIdentAt_ >= 2000) {
+        flightIdentAt_ = t;
+        flight_->setIdentity(host_ ? kHostPlayer : client_ && client_->joined() ? client_->slot() : kNoFlightSlot, host_ ? kRoleHost : kRoleClient);
+    }
+    // Story digest at quiet points: the shared state is split into 256 key buckets (a one-level Merkle tree), so two machines'
+    // digests of the same seq differ in exactly the buckets whose entries differ. Both sides sample 400 ms after the seq last moved
+    // (the final seq of a burst), or every 5 s during constant activity. Idle cost: two integer compares per frame.
+    const ShadowState* st = host_ ? &host_->state() : client_ ? &client_->state() : nullptr;
+    if (st) {
+        if (st->seq != flightSeenSeq_) { flightSeenSeq_ = st->seq; flightSeenAt_ = t; }
+        if (st->seq != flightDigestSeq_ && (t - flightSeenAt_ >= 400 || t - flightDigestAt_ >= 5000)) {
+            flightDigestSeq_ = st->seq;
+            flightDigestAt_ = t;
+            flight_->digest(bucketedDigestOf(kCatStory, host_ ? host_->epoch() : client_->worldEpoch(), st->seq, *st));
+        }
+    }
+    if (host_ && host_->stats().digestsMismatch != flightHostMismatch_) {
+        flightHostMismatch_ = host_->stats().digestsMismatch;
+        flightDesync("host: a client digest did not match (mismatches=" + std::to_string(flightHostMismatch_) + ")");
+    }
+    if (client_ && client_->syncStats().repairsApplied != flightClientRepairs_) {
+        flightClientRepairs_ = client_->syncStats().repairsApplied;
+        flightDesync("client: host repaired our world (repairs=" + std::to_string(flightClientRepairs_) + ")");
+    }
+}
+
+// A desync: first record the REAL engine world (what the desync detector compares) as a bucketed digest plus every entry's
+// (key, value hash) and a text line per entry, then dump. Both machines do this, so the analyzer can name the exact key and value.
+void Runtime::flightDesync(const std::string& why) {
+    using namespace fnvcoop::flight;
+    uint64_t t = now_();
+    if (flightDetailAt_ == 0 || t - flightDetailAt_ >= 30000) {
+        // client: the engine world its last digest was built from (before the host's repair); host: its shadow, the reference the digest is compared with
+        const ShadowState* src = host_ ? &host_->state() : flightWorld_.get();
+        if (src) {
+            flightDetailAt_ = t;
+            std::vector<BaselineEntry> be = baselineEntries(*src);
+            std::vector<std::pair<uint64_t, uint32_t>> es;
+            es.reserve(be.size());
+            for (const BaselineEntry& e : be) es.emplace_back(e.key, e.value);
+            uint32_t epoch = host_ ? host_->epoch() : client_ ? client_->worldEpoch() : 0;
+            flight_->digest(bucketedDigest(kCatWorld, epoch, 0, es));
+            flight_->digestDetail(kCatWorld, epoch, 0, es);
+            size_t n = 0;
+            for (const BaselineEntry& e : be) {
+                if (++n > 20000) break;
+                char key[32];
+                std::snprintf(key, sizeof key, "%016llx", (unsigned long long)e.key);
+                flight_->marker(kMarkNote, std::string("entry ") + key + " " + std::to_string(e.value) + " " + describeEntry(e.effect));
+            }
+        } else {
+            flight_->marker(kMarkNote, "desync: no world snapshot available for key detail");
+        }
+    }
+    flight_->onDesync(why);
+}
+
+static Bytes worldPayload(uint64_t id, const std::string& key, const std::string& json) {
+    Value o = Value::object();
+    o.set("id", (int64_t)id).set("k", key).set("e", json);
+    std::string t = o.dump();
+    return Bytes(t.begin(), t.end());
+}
+
+void Runtime::noteCompanion(const CompanionOwner& c) {
+    if (c.active) companionOwners_[c.npc] = c.owner; else companionOwners_.erase(c.npc);
+    if (dlg_) dlg_->onCompanionOwner(c.npc, c.active ? c.owner : kNoPlayer);
+}
+
+void Runtime::syncCompanions() {
+    if (!dlg_) return;
+    for (auto& [npc, owner] : companionOwners_) dlg_->onCompanionOwner(npc, owner);
+}
+
+void Runtime::pushWorldEffect(const std::string& key, const std::string& json) {
+    if (!host_ || !running_) return;
+    ++worldStats_.pushed;
+    if (!worldId_) worldId_ = now_() << 12;   // a restarted host never reuses ids a long-lived guest already saw
+    const uint64_t id = ++worldId_;
+    const std::string k = key.empty() ? "#" + std::to_string(id) : key;
+    worldState_[k] = WorldEntry{id, json};
+    host_->sendApp(kNoPlayer, kAppWorldChannel, worldPayload(id, k, json));
+    ++worldStats_.sent;
+}
+
+void Runtime::tickWorld() {
+    if (host_) {
+        std::set<PlayerId> joinedNow;
+        for (auto& cv : host_->clients()) if (cv.joined) joinedNow.insert(cv.slot);
+        for (PlayerId p : joinedNow) {
+            if (worldJoined_.count(p)) continue;
+            std::vector<std::pair<uint64_t, const std::pair<const std::string, WorldEntry>*>> order;
+            for (auto& kv : worldState_) order.push_back({kv.second.id, &kv});
+            std::sort(order.begin(), order.end(), [](auto& a, auto& b) { return a.first < b.first; });
+            for (auto& o : order) { host_->sendApp(p, kAppWorldChannel, worldPayload(o.first, o.second->first, o.second->second.json)); ++worldStats_.replayed; }
+        }
+        worldJoined_ = joinedNow;
+    } else if (client_ && client_->joined() && !client_->baselineActive() && worldApplier_) {
+        while (!worldQueue_.empty()) {
+            auto e = std::move(worldQueue_.front());
+            worldQueue_.pop_front();
+            applyWorldEntry(e.second.id, e.first, e.second.json);
+        }
+    }
+}
+
+void Runtime::onWorldPacket(const Bytes& payload) {
+    Value v;
+    std::string err;
+    if (!nvcoop::json::parse(std::string(payload.begin(), payload.end()), v, err)) return;
+    ++worldStats_.received;
+    WorldEntry e{(uint64_t)v.get("id").asInt(), v.get("e").asString()};
+    const std::string key = v.get("k").asString();
+    if (!client_ || !client_->joined() || client_->baselineActive() || !worldApplier_) {
+        if (worldQueue_.size() < 4096) worldQueue_.emplace_back(key, std::move(e));
+        return;
+    }
+    applyWorldEntry(e.id, key, e.json);
+}
+
+void Runtime::applyWorldEntry(uint64_t id, const std::string& key, const std::string& json) {
+    auto it = worldApplied_.find(key);
+    if (it != worldApplied_.end() && it->second >= id) { ++worldStats_.stale; return; }   // replayed / reordered: never apply twice
+    worldApplied_[key] = id;
+    LogEntry le;
+    le.dir = "world";
+    le.seq = id;
+    le.atMs = now_();
+    std::string st = worldApplier_(json);
+    le.results.push_back(st);
+    if (st == "Ok") ++worldStats_.applied; else ++worldStats_.failed;
+    pushLog(std::move(le));
+}
+
+void Runtime::uiSlideEnded() {
+    if (!uiEnabled_ || !ui_.slideHost || cfg_.role != Role::Host) return;
+    if (nvui::SlideHost* sh = slideHost()) sh->end();
+    ++uiStats_.slideEnds;
+}
+
+// The host's slide broadcaster; its send fn goes out on the mux (first byte 0xE5 routes it on the guest).
+nvui::SlideHost* Runtime::slideHost() {
+    if (!slideHost_ && ui_.slideHost) {
+        std::weak_ptr<bool> alive = alive_;
+        slideHost_ = &ui_.slideHost([this, alive](PlayerId to, std::vector<uint8_t> bytes) {
+            if (alive.expired() || !mux_ || !host_) return;
+            for (auto& cv : host_->clients())
+                if (cv.slot == to && cv.joined) { mux_->send(cv.peer, std::move(bytes)); return; }
+        });
+    }
+    return slideHost_;
+}
+
+// Host: once the DialogueNode exists, point the router at it (boxes, consent, forced dialogue, condition views, slides).
+void Runtime::wireUiHost() {
+    if (uiBridged_ || !dlg_ || !host_ || !ui_.router) return;
+    nvui::UiRouter* router = ui_.router();
+    if (!router) return;
+    nvui::DialogueBridgeConfig c;
+    c.node = dlg_.get();
+    c.nowMs = [this]() { return static_cast<uint32_t>(now_()); };
+    if (!ui_.consentFile.empty()) {
+        std::ifstream in(ui_.consentFile);
+        if (in) c.consent = fnvcoop_dlg::loadConsentMessages(in);
+    }
+    uiStats_.consentRows = static_cast<uint32_t>(c.consent.size());
+    c.slotOfActor = [this](uint32_t ref) -> nvui::PlayerId {
+        if (ref == nvui::kPlayerRefID) return nvui::kHost;
+        if (!ghostOf_ || !host_) return nvui::kNoSlot;
+        for (auto& cv : host_->clients())
+            if (cv.joined && ghostOf_(cv.slot) == ref) return cv.slot;
+        return nvui::kNoSlot;
+    };
+    c.lastCommittedSeq = [this]() -> uint64_t { return host_ ? host_->log().head() : 0; };
+    c.slides = slideHost();
+    if (!uiMut(1)) router->bridge() = nvui::makeDialogueBridge(c);
+    if (!uiMut(2)) nvui::attachMenuResume(*dlg_, *router);
+    uiBridged_ = true;
+    ++uiStats_.bridges;
+}
+
+void Runtime::tickUi() {
+    if (!uiEnabled_) return;
+    uint64_t now = now_();
+    if (host_) {
+        nvui::SlideHost* sh = slideHost();
+        wireUiHost();
+        if (!sh) return;
+        std::set<PlayerId> joinedNow;
+        for (auto& cv : host_->clients()) if (cv.joined) joinedNow.insert(cv.slot);
+        for (PlayerId p : joinedNow) if (!uiJoined_.count(p)) sh->playerJoined(p, now);
+        for (PlayerId p : uiJoined_) if (!joinedNow.count(p)) sh->playerLeft(p);
+        uiJoined_ = joinedNow;
+        sh->tick(now);
+    } else if (client_ && ui_.slideClient) {
+        bool joined = client_->joined();
+        if (uiWasJoined_ && !joined) {
+            ui_.slideClient().onHostLost();
+            ++uiStats_.hostLost;
+        }
+        uiWasJoined_ = joined;
+        ui_.slideClient().tick(now);
+    }
 }
 
 bool Runtime::inject(const std::string& txnJson, std::string* resultJson, std::string* err) {
@@ -567,7 +887,7 @@ std::string Runtime::logJson(size_t maxEntries) const {
 
 std::string Runtime::statusJson() const {
     Value o = Value::object();
-    o.set("role", roleName(cfg_.role)).set("enabled", cfg_.enable).set("running", running_).set("mutant", (int64_t)COOP_MUTANT)
+    o.set("role", roleName(cfg_.role)).set("enabled", cfg_.enable).set("running", running_).set("left", left_).set("mutant", (int64_t)COOP_MUTANT)
         .set("port", (int64_t)boundPort()).set("error", lastError_);
     Value c = Value::object();
     c.set("frames", (int64_t)counters_.frames).set("captured", (int64_t)counters_.captured).set("committed", (int64_t)counters_.committed)
@@ -576,6 +896,31 @@ std::string Runtime::statusJson() const {
         .set("saves", (int64_t)counters_.saves).set("loads", (int64_t)counters_.loads).set("loadsBlocked", (int64_t)counters_.loadsBlocked)
         .set("actions", (int64_t)counters_.actions).set("baselineEffects", (int64_t)counters_.baselineEffects);
     o.set("counters", c);
+    if (uiEnabled_) {
+        Value u = Value::object();
+        u.set("bridged", uiBridged_).set("bridges", (int64_t)uiStats_.bridges).set("slidePackets", (int64_t)uiStats_.slidePackets)
+            .set("slideEnds", (int64_t)uiStats_.slideEnds).set("hostLost", (int64_t)uiStats_.hostLost).set("consentRows", (int64_t)uiStats_.consentRows);
+        o.set("ui", u);
+    }
+    if (worldStats_.pushed || worldStats_.received) {
+        Value w = Value::object();
+        w.set("pushed", (int64_t)worldStats_.pushed).set("sent", (int64_t)worldStats_.sent).set("replayed", (int64_t)worldStats_.replayed)
+            .set("received", (int64_t)worldStats_.received).set("applied", (int64_t)worldStats_.applied)
+            .set("failed", (int64_t)worldStats_.failed).set("stale", (int64_t)worldStats_.stale).set("state", (int64_t)worldState_.size());
+        o.set("world", w);
+    }
+    if (playerRefBinds_) {
+        Value pr = Value::object();
+        pr.set("binds", (int64_t)playerRefBinds_);
+        Value slots = Value::object();
+        for (unsigned s = 0; s < 4; ++s) {
+            FormRef r;
+            bool ok = playerRef_ && playerRef_(PlayerId(s), r);
+            slots.set(std::to_string(s), ok ? r.plugin + ":" + std::to_string(r.localId) : std::string());
+        }
+        pr.set("slots", slots);
+        o.set("playerRefs", pr);
+    }
     if (udp_) {
         const auto& s = udp_->stats();
         Value t = Value::object();

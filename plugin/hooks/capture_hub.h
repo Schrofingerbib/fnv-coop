@@ -39,6 +39,7 @@ public:
         uint64_t collapsed = 0;       // consecutive identical Enable/Disable/Start/Stop/CompleteQuest effects merged
         uint64_t weakTxns = 0;        // txns emitted by implicit script scopes
         uint64_t weakFlushes = 0;     // weak effects flushed because an explicit scope opened inside the script
+        uint64_t droppedLocal = 0;    // effects dropped because a GuestLocalRun script (per-machine) produced them
         uint64_t staleScopes = 0;     // scopes force-closed by reapStale() (their closing end() never ran)
     };
 
@@ -56,7 +57,12 @@ public:
     bool recordScriptVar(const ScriptVarChange& c);  // == record(SetScriptVar{...})
     // Only the host captures. Clients keep the hub disabled (hooks then cost one branch).
     void setEnabled(bool on) { enabled_ = on; }
-    bool enabled() const { return enabled_; }
+    bool enabled() const { return on(); }
+    // Local-only mute: while > 0 nothing is captured (no scopes, no records, no weak frames). Held around GuestLocalRun scripts, whose
+    // effects are per-machine by definition and must never reach the wire.
+    void pushMute() { ++muted_; }
+    void popMute() { if (muted_ > 0) --muted_; }
+    bool muted() const { return muted_ > 0; }
 
     // Implicit "weak" scope around a script execution that no explicit scope covers (quest GameMode blocks, object / effect scripts
     // running ambiently): opened only when NO frame is open, cause = Script / the script form, resolved lazily at emit time. Cheap: no
@@ -72,7 +78,10 @@ public:
     // still open lost its closing end() (an engine exception/longjmp skipped our destructor); it is closed here (its txn is emitted)
     // so later captures are not swallowed by a stuck scope. Returns the number of frames reaped.
     size_t reapStale();
-    bool active() const { return enabled_ && !frames_.empty(); }
+    // The source form (quest / script) of the outermost open scope: the natural "scope" for effects that need one (fast-travel lock).
+    // False when no scope is open or the cause has no source.
+    bool currentSource(fnvcoop::FormRef* out) const;
+    bool active() const { return on() && !frames_.empty(); }
     size_t depth() const { return frames_.size(); }
 
     // Returns true if the effect was captured.
@@ -91,7 +100,9 @@ private:
         uint32_t lazyId = 0;    // weak frames: script refID, turned into a Cause only if something was recorded
     };
     void emit(const fnvcoop::Cause& cause);
+    bool on() const { return enabled_ && muted_ == 0; }
     bool enabled_ = false;
+    int muted_ = 0;
     std::vector<Sink> sinks_;
     std::optional<fnvcoop::Effect> last_;
     std::function<void()> onBegin_, onEnd_;

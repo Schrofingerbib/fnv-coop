@@ -37,9 +37,14 @@ SpawnLedger& ledger();
 // Installs the new-handler detours. Idempotent; a hook whose prologue differs is skipped and reported.
 InitReport Init(nvhooks::CaptureHub& hub, nvhooks::Role role);
 void Shutdown();
+int auditTamperedHooks();  // hot reload preflight: our hooks that another patcher chained over (0 = safe to unload)
+// A different world is now loaded (PostLoadGame / NewGame / ExitToMainMenu): forget created refs, queued spawns, var and weather baselines.
+void resetSession();
 
 // Local (not-yet-L4) world effects recorded since the last drain, host order.
 std::vector<WorldEffect> drainWorldEffects();
+// Host: net spawn / ref-var / NPC state for a client that joins or rejoins (see WorldBaseline). Apply with WorldApplier::applyBaseline.
+BaselineSnapshot hostBaseline();
 // Called by the NPC AV hooks (here and L5's observer): decides + records.
 void recordNonPlayerAv(const fnvcoop::FormRef& actor, uint32_t av, AvCmdKind kind, float before, float after);
 void setWorldEffectSink(std::function<void(const WorldEffect&)> sink);
@@ -57,10 +62,20 @@ class WorldApplier {
 public:
     WorldApplier(nvhooks::CaptureHub& hub, nvhooks::FormResolver& res) : hub_(hub), res_(res) {}
     void setExecLine(std::function<bool(const std::string&, uint32_t)> f) { exec_ = std::move(f); }
-    nvhooks::ApplyStatus apply(const fnvcoop::Effect& e);
+    // Effects of every lane go through here: world-lane effects are applied by this class, all others by `fallback` (L10 sets it to
+    // L5's RemoteApplier::apply, which must share the world resolver so created-ref targets are translated). An effect on a
+    // created ref that does not exist locally yet is HELD and replayed once the spawn is created (dropped on despawn); one whose
+    // form / script instance is not there yet is retried by tick(true). A held effect reports Ok.
+    void setFallback(std::function<nvhooks::ApplyStatus(const fnvcoop::Effect&)> f) { fallback_ = std::move(f); }
+    nvhooks::ApplyStatus applyAny(const fnvcoop::Effect& e);
+    nvhooks::ApplyStatus apply(const fnvcoop::Effect& e);  // == applyAny
     nvhooks::ApplyStatus applyWorld(const WorldEffect& e);
-    // Queued spawns whose cell has loaded since. Returns how many were created.
-    size_t flushQueued();
+    // Join / rejoin: created refs the host no longer has are deleted, then every baseline effect is applied (idempotent).
+    size_t applyBaseline(const BaselineSnapshot& b);
+    // Create queued spawns whose cell has loaded, release held follow-ups of created refs; retry=true also retries the waiters for
+    // forms that were not loaded yet (call about every 2 s, and on cell load with retry=false). Returns how many were applied.
+    size_t tick(bool retry);
+    size_t flushQueued();  // == tick(false)
     std::string lastError() const { return err_; }
 
 private:
@@ -68,6 +83,7 @@ private:
     nvhooks::CaptureHub& hub_;
     nvhooks::FormResolver& res_;
     std::function<bool(const std::string&, uint32_t)> exec_;
+    std::function<nvhooks::ApplyStatus(const fnvcoop::Effect&)> fallback_;
     std::string err_;
 };
 
@@ -100,6 +116,7 @@ struct ActorRef {
     uint32_t refID = 0, baseID = 0;
     std::string ref;
 };
-std::vector<ActorRef> actorsInPlayerCell(size_t max);
+// formType 0x3B = characters (default), 0x1B containers, 0x1C doors.
+std::vector<ActorRef> actorsInPlayerCell(size_t max, uint32_t formType = 0x3B);
 
 }  // namespace nvworld

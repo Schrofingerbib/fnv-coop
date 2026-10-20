@@ -36,12 +36,13 @@ static FormRef created(uint32_t id) { return FormRef(fnvcoop::createdRefPlugin()
 
 // ---------------------------------------------------------------------------------------------- fake engine resolver
 struct FakeResolver : nvhooks::FormResolver {
+    std::set<uint32_t> unloaded;  // forms that exist in the esm but are not loaded right now
     bool toRef(uint32_t id, FormRef* out) override {
         if ((id >> 24) == 0xFF || (id >> 24) != 0) return false;  // engine resolver cannot name created refs
         *out = esm(id & 0xFFFFFF);
         return true;
     }
-    uint32_t fromRef(const FormRef& r) override { return r.plugin == "falloutnv.esm" ? r.localId : 0; }
+    uint32_t fromRef(const FormRef& r) override { return r.plugin == "falloutnv.esm" && !unloaded.count(r.localId) ? r.localId : 0; }
     void* lookup(uint32_t id) override { return id ? reinterpret_cast<void*>(uintptr_t(id)) : nullptr; }
 };
 
@@ -125,6 +126,17 @@ TEST(spawn_ledger_queue) {
     CHECK(l.pending() == 0);
     got = l.takeReady([](const fnvcoop::SpawnRef&) { return true; });
     CHECK(got.empty());
+}
+
+TEST(spawn_ledger_clear) {
+    SpawnLedger l;
+    l.onSpawn(spawn(1), true);
+    l.onCreated(created(1), 0xFF000A00u);
+    l.onSpawn(spawn(2, 0x99), false);
+    CHECK(l.map().size() == 1 && l.pending() == 1);
+    l.clear();  // new world: nothing of the old one survives
+    CHECK(l.map().size() == 0 && l.pending() == 0);
+    CHECK(l.onSpawn(spawn(1), true) == SpawnAction::Create);  // and the same host ref can be created again
 }
 
 TEST(ref_var_tracker) {
@@ -220,13 +232,13 @@ TEST(av_names_and_lines) {
     CHECK(std::strcmp(avName(45), "Unarmed") == 0);
     CHECK(std::strcmp(avName(999), "") == 0);
     SetActorValueRef x{esm(1), 16, 250, AvMode::Set};
-    CHECK(avLine(x) == "SetActorValue Health 250.0000");
+    CHECK(avLine(x) == "SetActorValue Health 250");
     x.mode = AvMode::Mod; x.value = -5;
-    CHECK(avLine(x) == "ModActorValue Health -5.0000");
+    CHECK(avLine(x) == "ModActorValue Health -5");
     x.mode = AvMode::Damage; x.value = 30;
-    CHECK(avLine(x) == "DamageActorValue Health 30.0000");
+    CHECK(avLine(x) == "DamageActorValue Health 30");
     x.mode = AvMode::Restore; x.value = 60;
-    CHECK(avLine(x) == "RestoreActorValue Health 60.0000");
+    CHECK(avLine(x) == "RestoreActorValue Health 60");
     x.av = 999;
     CHECK(avLine(x).empty());
 }
@@ -246,7 +258,7 @@ TEST(console_lines) {
     CHECK(scriptPackageLine(true, 0xAB) == "AddScriptPackage 000000AB");
     CHECK(scriptPackageLine(false, 0xAB) == "RemoveScriptPackage 000000AB");
     CHECK(placeAtMeLine(0x1234, 3) == "PlaceAtMe 00001234 3");
-    CHECK(setPosLine('X', 1.5f) == "SetPos X 1.5000");
+    CHECK(setPosLine('X', 1.5f) == "SetPos X 1.5");
 }
 
 TEST(world_log_coalesce) {
@@ -365,7 +377,7 @@ TEST(plan_ref_script_var) {
 TEST(plan_world_effects) {
     PlanFx f;
     auto p = planWorldEffect(SetActorValueRef{esm(0x100), 16, 50, AvMode::Damage}, f.env);
-    CHECK(p.status == PlanStatus::Ok && p.steps.size() == 1 && p.steps[0].refID == 0x100 && p.steps[0].line == "DamageActorValue Health 50.0000");
+    CHECK(p.status == PlanStatus::Ok && p.steps.size() == 1 && p.steps[0].refID == 0x100 && p.steps[0].line == "DamageActorValue Health 50");
     p = planWorldEffect(SetActorValueRef{esm(0x100), 9999, 1, AvMode::Set}, f.env);
     CHECK(p.status == PlanStatus::Unsupported);
     p = planWorldEffect(SetEssential{esm(0x200), true, true}, f.env);  // ref-only: on the ref
@@ -380,6 +392,392 @@ TEST(plan_world_effects) {
     CHECK(p.status == PlanStatus::FormMissing);
     p = planWorldEffect(SetScriptPackage{esm(0x300), esm(0x400), true}, f.env);
     CHECK(p.steps.size() == 1 && p.steps[0].refID == 0x300 && p.steps[0].line == "AddScriptPackage 00000400");
+}
+
+// ---------------------------------------------------------------------------------------------- IgnoreCrime / faction player-enemy
+TEST(new_world_effects_lines_json_log) {
+    CHECK(ignoreCrimeLine(true) == "IgnoreCrime 1");
+    CHECK(ignoreCrimeLine(false) == "IgnoreCrime 0");
+    CHECK(setPCEnemyOfFactionLine(0x1234, true) == "SetPCEnemyOfFaction 00001234 1");
+    CHECK(setPCEnemyOfFactionLine(0x1234, false) == "SetPCEnemyOfFaction 00001234 0");
+    for (WorldEffect e : {WorldEffect(SetIgnoreCrime{esm(0x104C79), true}), WorldEffect(SetFactionPlayerEnemy{esm(0x77), false})}) {
+        WorldEffect back;
+        std::string err;
+        CHECK(worldEffectFromJson(worldEffectToJson(e), &back, &err));
+        CHECK(back == e);
+    }
+    CHECK(std::string(worldEffectName(SetIgnoreCrime{})) == "SetIgnoreCrime");
+    CHECK(std::string(worldEffectName(SetFactionPlayerEnemy{})) == "SetFactionPlayerEnemy");
+    WorldLog l;
+    l.push(SetIgnoreCrime{esm(1), true});
+    l.push(SetIgnoreCrime{esm(1), false});
+    l.push(SetIgnoreCrime{esm(2), true});
+    l.push(SetFactionPlayerEnemy{esm(9), true});
+    l.push(SetFactionPlayerEnemy{esm(9), false});
+    auto v = l.drain();
+    CHECK(v.size() == 3);
+    if (v.size() == 3) {
+        CHECK(std::get<SetIgnoreCrime>(v[0]).on == false);
+        CHECK(std::get<SetFactionPlayerEnemy>(v[2]).on == false);
+    }
+}
+
+TEST(plan_new_world_effects) {
+    PlanFx f;
+    auto p = planWorldEffect(SetIgnoreCrime{esm(0x300), true}, f.env);
+    CHECK(p.status == PlanStatus::Ok && p.steps.size() == 1 && p.steps[0].kind == StepKind::ConsoleOnRef && p.steps[0].refID == 0x300 &&
+          p.steps[0].line == "IgnoreCrime 1");
+    p = planWorldEffect(SetFactionPlayerEnemy{esm(0x55), true}, f.env);
+    CHECK(p.steps.size() == 1 && p.steps[0].kind == StepKind::ConsoleGlobal && p.steps[0].line == "SetPCEnemyOfFaction 00000055 1");
+    p = planWorldEffect(SetFactionPlayerEnemy{esm(0x55), false}, f.env);
+    CHECK(p.steps.size() == 1 && p.steps[0].line == "SetPCEnemyOfFaction 00000055 0");
+    p = planWorldEffect(SetFactionPlayerEnemy{FormRef("nosuchmod.esp", 1), true}, f.env);
+    CHECK(p.status == PlanStatus::FormMissing);
+    p = planWorldEffect(SetIgnoreCrime{FormRef("nosuchmod.esp", 1), true}, f.env);
+    CHECK(p.status == PlanStatus::FormMissing);
+}
+
+// ---------------------------------------------------------------------------------------------- created-ref targets, routing, deferred queue
+TEST(created_targets) {
+    FormRef t;
+    CHECK(createdTargetOf(fnvcoop::RefScriptVar{created(3), 1, 2}, &t) && t == created(3));
+    CHECK(createdTargetOf(fnvcoop::DisableRef{created(3)}, &t));
+    CHECK(createdTargetOf(fnvcoop::KillActor{created(3)}, &t));
+    CHECK(createdTargetOf(fnvcoop::MoveRef{created(3), esm(1), 0, 0, 0, false}, &t));
+    CHECK(createdTargetOf(fnvcoop::SetScriptVar{created(3), 1, 2}, &t));
+    CHECK(createdTargetOf(fnvcoop::SetFactionRank{created(3), esm(4), 1}, &t));
+    CHECK(createdTargetOf(fnvcoop::RefAddItem{created(3), esm(4), 1}, &t));
+    CHECK(!createdTargetOf(fnvcoop::RefScriptVar{esm(3), 1, 2}, &t));  // an esm ref is not a created target
+    CHECK(!createdTargetOf(fnvcoop::SpawnRef{}, &t));                   // spawn / despawn are the lifecycle, not follow-ups
+    CHECK(!createdTargetOf(fnvcoop::DespawnRef{}, &t));
+    CHECK(!createdTargetOf(fnvcoop::SetStage{esm(1), 10}, &t));
+    CHECK(createdTargetOf(WorldEffect(SetRestrained{created(3), true}), &t));
+    CHECK(createdTargetOf(WorldEffect(SetIgnoreCrime{created(3), true}), &t));
+    CHECK(createdTargetOf(WorldEffect(SetActorValueRef{created(3), 16, 1, AvMode::Set}), &t));
+    CHECK(!createdTargetOf(WorldEffect(SetRelation{created(3), created(4), Relation::Ally}), &t));
+}
+
+TEST(route_and_retriable) {
+    CreatedRefMap m;
+    FormRef w;
+    CHECK(routeEffect(fnvcoop::RefScriptVar{created(3), 1, 2}, m, &w) == Route::HoldForCreated && w == created(3));
+    CHECK(routeEffect(fnvcoop::RefScriptVar{esm(3), 1, 2}, m, &w) == Route::Apply);
+    CHECK(routeEffect(fnvcoop::SpawnRef{}, m, &w) == Route::Apply);
+    CHECK(routeEffect(WorldEffect(SetRestrained{created(3), true}), m, &w) == Route::HoldForCreated);
+    m.bind(created(3), 0xFF000900u);
+    CHECK(routeEffect(fnvcoop::RefScriptVar{created(3), 1, 2}, m, &w) == Route::Apply);
+    CHECK(retriable(fnvcoop::SetStage{}, Outcome::Missing));
+    CHECK(!retriable(fnvcoop::SetStage{}, Outcome::Rejected));
+    CHECK(retriable(fnvcoop::RefScriptVar{}, Outcome::Rejected));
+    CHECK(!retriable(fnvcoop::RefScriptVar{}, Outcome::Other));
+    CHECK(!retriable(fnvcoop::RefScriptVar{}, Outcome::Ok));
+    CHECK(retriable(WorldEffect(SetRestrained{}), Outcome::Missing));
+    CHECK(!retriable(WorldEffect(SetRestrained{}), Outcome::Rejected));
+}
+
+static HeldEffect heldCreated(uint32_t id, double v) {
+    HeldEffect h;
+    h.fx = fnvcoop::RefScriptVar{created(id), 0, v};
+    h.waitOn = created(id);
+    h.onCreated = true;
+    return h;
+}
+static HeldEffect heldRetry(double v) {
+    HeldEffect h;
+    h.fx = fnvcoop::RefScriptVar{esm(0x10), 0, v};
+    return h;
+}
+
+TEST(deferred_queue_basic) {
+    DeferredQueue q;
+    CreatedRefMap m;
+    q.hold(heldCreated(1, 1));
+    q.hold(heldCreated(2, 2));
+    q.hold(heldCreated(1, 3));
+    CHECK(q.size() == 3);
+    CHECK(q.takeBound(m).empty());  // nothing bound yet: nothing released
+    m.bind(created(1), 0xFF000A00u);
+    auto r = q.takeBound(m);
+    CHECK(r.size() == 2);  // arrival order, only ref 1
+    if (r.size() == 2) CHECK(std::get<fnvcoop::RefScriptVar>(r[0].fx).value == 1 && std::get<fnvcoop::RefScriptVar>(r[1].fx).value == 3);
+    CHECK(q.size() == 1);
+    CHECK(q.takeBound(m).empty());  // released once
+    CHECK(q.dropFor(created(2)) == 1 && q.size() == 0);
+}
+
+TEST(deferred_queue_retry_and_expiry) {
+    DeferredQueue q;
+    q.hold(heldRetry(1));
+    q.hold(heldCreated(5, 2));
+    for (int i = 0; i < 3; ++i) {
+        auto r = q.takeRetries(3);
+        CHECK(r.size() == 1 && r[0].attempts == i + 1);  // the retry waiter comes back every tick
+        if (r.empty()) break;
+        q.hold(std::move(r[0]));                          // the apply failed again: held with its attempts
+    }
+    CHECK(q.takeRetries(3).empty());  // attempts 4 > 3: expired, not returned again
+    CHECK(q.expired() == 1);
+    CHECK(q.size() == 1);  // the created-ref waiter ages 4x slower and is still waiting for its spawn
+    for (int i = 0; i < 20; ++i) q.takeRetries(3);
+    CHECK(q.size() == 0 && q.expired() == 2);
+}
+
+TEST(deferred_queue_cap) {
+    DeferredQueue q(3);
+    for (int i = 1; i <= 5; ++i) q.hold(heldCreated(1, i));
+    CHECK(q.size() == 3 && q.dropped() == 2);
+    CreatedRefMap m;
+    m.bind(created(1), 1);
+    auto r = q.takeBound(m);
+    CHECK(r.size() == 3 && std::get<fnvcoop::RefScriptVar>(r[0].fx).value == 3);  // the OLDEST were dropped
+}
+
+// A fake executor: records plans, "creates" spawns with local ids 0xFF000A00+n, can fail var writes.
+struct FakeRun {
+    PlanFx& f;
+    std::vector<Step> ran;
+    uint32_t nextLocal = 0xFF000A00u;
+    bool varsReady = true;
+    Outcome operator()(const Plan& p) {
+        for (const Step& s : p.steps) {
+            if (s.kind == StepKind::CreateSpawn) f.ledger.onCreated(s.spawn.ref(), nextLocal++);
+            if (s.kind == StepKind::SetRefVar && !varsReady) return Outcome::Rejected;
+            ran.push_back(s);
+        }
+        return Outcome::Ok;
+    }
+};
+static FallbackApply noFallback() { return [](const fnvcoop::Effect&) { return Outcome::Other; }; }
+
+TEST(routed_follow_up_before_spawn) {
+    PlanFx f;
+    f.loadedCells.insert(0x10);
+    FakeRun run{f};
+    RunPlan rp = [&](const Plan& p) { return run(p); };
+    // the follow-up overtakes the spawn: held, nothing runs
+    CHECK(applyRouted(fnvcoop::RefScriptVar{created(1), 4, 7.5}, f.env, rp, noFallback()) == Outcome::Ok);
+    CHECK(applyWorldRouted(SetRestrained{created(1), true}, f.env, rp) == Outcome::Ok);
+    CHECK(run.ran.empty() && f.ledger.deferred().size() == 2);
+    // the spawn arrives: created, then the held follow-ups run against the LOCAL ref, in order
+    CHECK(applyRouted(spawn(1, 0x10), f.env, rp, noFallback()) == Outcome::Ok);
+    CHECK(f.ledger.deferred().size() == 0);
+    CHECK(run.ran.size() == 3);
+    if (run.ran.size() == 3) {
+        CHECK(run.ran[0].kind == StepKind::CreateSpawn);
+        CHECK(run.ran[1].kind == StepKind::SetRefVar && run.ran[1].refID == 0xFF000A00u && run.ran[1].varIndex == 4 && run.ran[1].varValue == 7.5);
+        CHECK(run.ran[2].kind == StepKind::ConsoleOnRef && run.ran[2].refID == 0xFF000A00u && run.ran[2].line == "SetRestrained 1");
+    }
+    // after that the target is bound: effects go straight through
+    run.ran.clear();
+    applyRouted(fnvcoop::RefScriptVar{created(1), 4, 8}, f.env, rp, noFallback());
+    CHECK(run.ran.size() == 1 && run.ran[0].refID == 0xFF000A00u);
+}
+
+TEST(routed_follow_up_on_queued_spawn) {
+    PlanFx f;  // cell 0x20 is not loaded: the spawn is queued, follow-ups wait for the creation
+    FakeRun run{f};
+    RunPlan rp = [&](const Plan& p) { return run(p); };
+    applyRouted(spawn(2, 0x20), f.env, rp, noFallback());
+    applyRouted(fnvcoop::RefScriptVar{created(2), 1, 3}, f.env, rp, noFallback());
+    CHECK(run.ran.empty() && f.ledger.pending() == 1 && f.ledger.deferred().size() == 1);
+    CHECK(flushDeferred(f.env, rp, noFallback(), false) == 0);  // spawn not created yet: still held
+    f.loadedCells.insert(0x20);
+    for (const Plan& p : planQueuedSpawns(f.env)) CHECK(run(p) == Outcome::Ok);
+    CHECK(flushDeferred(f.env, rp, noFallback(), false) == 1);
+    CHECK(run.ran.size() == 2 && run.ran[1].kind == StepKind::SetRefVar && run.ran[1].refID == 0xFF000A00u);
+}
+
+TEST(routed_despawn_drops_follow_ups) {
+    PlanFx f;
+    FakeRun run{f};
+    RunPlan rp = [&](const Plan& p) { return run(p); };
+    applyRouted(fnvcoop::RefScriptVar{created(3), 1, 3}, f.env, rp, noFallback());
+    applyWorldRouted(SetIgnoreCrime{created(3), true}, f.env, rp);
+    CHECK(f.ledger.deferred().size() == 2);
+    applyRouted(fnvcoop::DespawnRef{0xFF000003u}, f.env, rp, noFallback());
+    CHECK(f.ledger.deferred().size() == 0);
+    // the same id arriving later (a new spawn) must not inherit the dead ref's follow-ups
+    f.loadedCells.insert(0x10);
+    applyRouted(spawn(3, 0x10), f.env, rp, noFallback());
+    CHECK(run.ran.size() == 1 && run.ran[0].kind == StepKind::CreateSpawn);
+}
+
+TEST(routed_retry_unloaded_form) {
+    PlanFx f;
+    f.inner.unloaded.insert(0x500);
+    FakeRun run{f};
+    RunPlan rp = [&](const Plan& p) { return run(p); };
+    CHECK(applyWorldRouted(SetRestrained{esm(0x500), true}, f.env, rp) == Outcome::Ok);  // not loaded: held, not lost
+    CHECK(run.ran.empty() && f.ledger.deferred().size() == 1);
+    CHECK(flushDeferred(f.env, rp, noFallback(), true) == 0);  // still not loaded: held again
+    CHECK(f.ledger.deferred().size() == 1);
+    f.inner.unloaded.clear();
+    CHECK(flushDeferred(f.env, rp, noFallback(), true) == 1);
+    CHECK(run.ran.size() == 1 && run.ran[0].refID == 0x500 && f.ledger.deferred().size() == 0);
+    // a form that never shows up expires after maxAttempts
+    f.inner.unloaded.insert(0x600);
+    applyWorldRouted(SetRestrained{esm(0x600), true}, f.env, rp);
+    for (int i = 0; i < 5; ++i) flushDeferred(f.env, rp, noFallback(), true, 3);
+    CHECK(f.ledger.deferred().size() == 0 && f.ledger.deferred().expired() == 1);
+}
+
+TEST(routed_retry_ref_var_rejected_and_fallback) {
+    PlanFx f;
+    FakeRun run{f};
+    RunPlan rp = [&](const Plan& p) { return run(p); };
+    run.varsReady = false;  // the ref exists but its script instance has no variable list yet
+    CHECK(applyRouted(fnvcoop::RefScriptVar{esm(0x700), 2, 1}, f.env, rp, noFallback()) == Outcome::Ok);
+    CHECK(f.ledger.deferred().size() == 1);
+    run.varsReady = true;
+    CHECK(flushDeferred(f.env, rp, noFallback(), true) == 1);
+    CHECK(run.ran.size() == 1 && run.ran[0].varIndex == 2 && f.ledger.deferred().size() == 0);
+    // effects of other lanes go to the fallback; a rejection there is NOT retried (only RefScriptVar rejections are)
+    int calls = 0;
+    FallbackApply fb = [&](const fnvcoop::Effect&) { ++calls; return Outcome::Rejected; };
+    CHECK(applyRouted(fnvcoop::SetStage{esm(1), 10}, f.env, rp, fb) == Outcome::Rejected && calls == 1);
+    CHECK(f.ledger.deferred().size() == 0);
+    // a fallback effect on a created ref is also held until the spawn exists
+    fb = [&](const fnvcoop::Effect&) { ++calls; return Outcome::Ok; };
+    applyRouted(fnvcoop::KillActor{created(9)}, f.env, rp, fb);
+    CHECK(calls == 1 && f.ledger.deferred().size() == 1);
+    f.loadedCells.insert(0x10);
+    applyRouted(spawn(9, 0x10), f.env, rp, fb);
+    CHECK(calls == 2 && f.ledger.deferred().size() == 0);
+}
+
+// ---------------------------------------------------------------------------------------------- rejoin
+TEST(reconcile_and_plan) {
+    PlanFx f;
+    f.loadedCells.insert(0x10);
+    f.ledger.onCreated(created(1), 0xFF000B01u);
+    f.ledger.onCreated(created(2), 0xFF000B02u);
+    f.ledger.onCreated(created(3), 0xFF000B03u);
+    f.ledger.onSpawn(spawn(4, 0x99), false);  // queued
+    f.ledger.onSpawn(spawn(5, 0x99), false);  // queued
+    HeldEffect h = heldCreated(2, 1);
+    f.ledger.deferred().hold(h);
+    // the host still has 1, 5 and a new 6: 2 and 3 were despawned while this client was away; queued 4 is gone too
+    auto p = planReconcile({spawn(1), spawn(5, 0x99), spawn(6)}, f.env);
+    CHECK(p.steps.size() == 2);
+    if (p.steps.size() == 2) {
+        CHECK(p.steps[0].kind == StepKind::ConsoleOnRef && p.steps[0].line == "MarkForDelete");
+        CHECK((p.steps[0].refID == 0xFF000B02u && p.steps[1].refID == 0xFF000B03u));
+    }
+    CHECK(f.ledger.map().local(created(1)) == 0xFF000B01u && f.ledger.map().local(created(2)) == 0);
+    CHECK(f.ledger.pending() == 1);                 // only 5 remains queued
+    CHECK(f.ledger.deferred().size() == 0);         // the follow-up of the vanished ref is gone with it
+    CHECK(planReconcile({spawn(1), spawn(5, 0x99), spawn(6)}, f.env).steps.empty());  // idempotent
+}
+
+// ---------------------------------------------------------------------------------------------- host baseline
+TEST(world_baseline_spawns_and_vars) {
+    WorldBaseline b;
+    b.onEffect(spawn(1));
+    b.onEffect(spawn(2));
+    b.onEffect(spawn(1));  // replayed txn
+    b.onEffect(fnvcoop::RefScriptVar{created(1), 3, 1});
+    b.onEffect(fnvcoop::RefScriptVar{created(1), 3, 2});  // last write wins
+    b.onEffect(fnvcoop::RefScriptVar{esm(0x40), 0, 9});
+    b.onEffect(fnvcoop::SetStage{esm(1), 10});            // not this lane's business
+    auto s = b.snapshot();
+    CHECK(b.spawns() == 2);
+    CHECK(s.effects.size() == 4);  // 2 spawns first, then the 2 vars
+    if (s.effects.size() == 4) {
+        CHECK(std::holds_alternative<fnvcoop::SpawnRef>(s.effects[0]) && std::holds_alternative<fnvcoop::SpawnRef>(s.effects[1]));
+        CHECK(std::get<fnvcoop::SpawnRef>(s.effects[0]).id == 0xFF000001u);
+    }
+    int vars = 0;
+    for (auto& e : s.effects)
+        if (auto* v = std::get_if<fnvcoop::RefScriptVar>(&e))
+            if (v->ref == created(1)) { ++vars; CHECK(v->value == 2); }
+    CHECK(vars == 1);
+    CHECK(b.liveSpawnRefs().size() == 2);
+    // despawn: the ref, its vars and its NPC state leave the baseline; other state stays
+    b.onWorld(SetRestrained{created(1), true});
+    b.onWorld(SetRestrained{esm(0x40), true});
+    b.onEffect(fnvcoop::DespawnRef{0xFF000001u});
+    s = b.snapshot();
+    CHECK(b.spawns() == 1 && b.liveSpawnRefs()[0] == created(2));
+    CHECK(s.effects.size() == 2);  // spawn 2 and the esm var
+    CHECK(s.world.size() == 1 && std::get<SetRestrained>(s.world[0]).actor == esm(0x40));
+    b.clear();
+    CHECK(b.snapshot().effects.empty() && b.snapshot().world.empty());
+}
+
+TEST(world_baseline_folds_net_state) {
+    WorldBaseline b;
+    auto a = esm(0x100);
+    b.onWorld(SetActorValueRef{a, 16, 10, AvMode::Damage});
+    b.onWorld(SetActorValueRef{a, 16, 5, AvMode::Damage});
+    b.onWorld(SetActorValueRef{a, 5, 2, AvMode::Mod});
+    b.onWorld(SetActorValueRef{a, 5, 3, AvMode::Mod});
+    auto s = b.snapshot();
+    CHECK(s.world.size() == 2);
+    if (s.world.size() == 2) {
+        CHECK(std::get<SetActorValueRef>(s.world[0]).value == 15 && std::get<SetActorValueRef>(s.world[0]).mode == AvMode::Damage);  // deltas add up
+        CHECK(std::get<SetActorValueRef>(s.world[1]).value == 5);
+    }
+    b.onWorld(SetActorValueRef{a, 16, 200, AvMode::Set});  // a Set makes everything before it moot
+    s = b.snapshot();
+    CHECK(s.world.size() == 2);
+    b.onWorld(SetActorValueRef{a, 16, 30, AvMode::Damage});  // and later deltas stack on the Set
+    s = b.snapshot();
+    CHECK(s.world.size() == 3);
+    if (s.world.size() == 3) {
+        CHECK(std::get<SetActorValueRef>(s.world[1]).mode == AvMode::Set && std::get<SetActorValueRef>(s.world[1]).value == 200);
+        CHECK(std::get<SetActorValueRef>(s.world[2]).mode == AvMode::Damage && std::get<SetActorValueRef>(s.world[2]).value == 30);
+    }
+    b.onWorld(SetActorValueRef{a, 7, 4, AvMode::Mod});
+    b.onWorld(SetActorValueRef{a, 7, -4, AvMode::Mod});  // net zero disappears
+    CHECK(b.worldEntries() == 3);
+    // last write per key wins, in place
+    b.onWorld(SetEssential{a, true, false});
+    b.onWorld(SetEssential{a, false, false});
+    b.onWorld(SetEssential{a, true, true});  // ref-only is a separate key
+    b.onWorld(SetIgnoreCrime{a, true});
+    b.onWorld(SetIgnoreCrime{a, false});
+    b.onWorld(SetFactionPlayerEnemy{esm(9), true});
+    b.onWorld(SetFactionPlayerEnemy{esm(9), false});
+    b.onWorld(SetRelation{esm(1), esm(2), Relation::Enemy});
+    b.onWorld(SetRelation{esm(1), esm(2), Relation::Ally});
+    b.onWorld(SetScriptPackage{a, esm(0x20), true});
+    b.onWorld(SetScriptPackage{a, esm(0x20), false});
+    s = b.snapshot();
+    CHECK(s.world.size() == 3 + 2 + 1 + 1 + 1 + 1);
+    int ess = 0, ign = 0, rel = 0, pk = 0, pe = 0;
+    for (auto& w : s.world) {
+        if (auto* x = std::get_if<SetEssential>(&w)) { ++ess; if (!x->refOnly) CHECK(!x->essential); }
+        if (auto* x = std::get_if<SetIgnoreCrime>(&w)) { ++ign; CHECK(!x->on); }
+        if (auto* x = std::get_if<SetRelation>(&w)) { ++rel; CHECK(x->kind == Relation::Ally); }
+        if (auto* x = std::get_if<SetScriptPackage>(&w)) { ++pk; CHECK(!x->add); }
+        if (auto* x = std::get_if<SetFactionPlayerEnemy>(&w)) { ++pe; CHECK(!x->on); }
+    }
+    CHECK(ess == 2 && ign == 1 && rel == 1 && pk == 1 && pe == 1);
+}
+
+TEST(baseline_replay_on_client_is_idempotent) {
+    // host side builds a baseline; a client applies it twice: spawns are created once, vars/state converge
+    WorldBaseline b;
+    b.onEffect(spawn(1));
+    b.onEffect(fnvcoop::RefScriptVar{created(1), 0, 5});
+    b.onWorld(SetRestrained{created(1), true});
+    auto snap = b.snapshot();
+    PlanFx f;
+    f.loadedCells.insert(0x10);
+    FakeRun run{f};
+    RunPlan rp = [&](const Plan& p) { return run(p); };
+    for (int round = 0; round < 2; ++round) {
+        std::vector<fnvcoop::SpawnRef> live;
+        for (auto& e : snap.effects)
+            if (auto* sp = std::get_if<fnvcoop::SpawnRef>(&e)) live.push_back(*sp);
+        planReconcile(live, f.env);
+        for (auto& e : snap.effects) applyRouted(e, f.env, rp, noFallback());
+        for (auto& w : snap.world) applyWorldRouted(w, f.env, rp);
+    }
+    int creates = 0;
+    for (auto& s : run.ran) creates += s.kind == StepKind::CreateSpawn;
+    CHECK(creates == 1);
+    CHECK(f.ledger.map().size() == 1);
 }
 
 // ---------------------------------------------------------------------------------------------- engine hook specs
@@ -502,8 +900,56 @@ TEST(world_specs_match_dump) {
         CHECK(r->addr == c.addr);
         CHECK(std::memcmp(r->bytes.data(), c.bytes, 16) == 0);
     }
-    CHECK(world_addrs::kCount == 7);
+    CHECK(world_addrs::kCount == 10);
     CHECK(world_addrs::kCallCount == 3);
+}
+
+// Command table entries of the hooked commands (cmdinfo_*.bin): the execute pointer must be the hooked address, and the parameter
+// count must be what the detours' ExtractArgs calls assume.
+static std::vector<uint8_t> readFile(const std::string& path) {
+    std::vector<uint8_t> v;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return v;
+    uint8_t buf[512];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) v.insert(v.end(), buf, buf + n);
+    std::fclose(f);
+    return v;
+}
+static uint32_t le32(const std::vector<uint8_t>& v, size_t o) { return v[o] | (v[o + 1] << 8) | (v[o + 2] << 16) | ((uint32_t)v[o + 3] << 24); }
+static uint32_t le16(const std::vector<uint8_t>& v, size_t o) { return v[o] | (v[o + 1] << 8); }
+
+TEST(world_cmdinfo_match) {
+    std::string dir = NVW_DUMP_PATH;
+    dir = dir.substr(0, dir.find_last_of("/\\") + 1);
+    struct C { const nvhooks::HookSpec* spec; const char* info; uint32_t opcode; uint32_t needsParent, numParams; };
+    const C cs[] = {
+        {&world_addrs::Cmd_MarkForDelete, "MarkForDelete", 0x11bb, 1, 0},
+        {&world_addrs::Cmd_SetEssential, "SetEssential", 0x1003, 0, 2},
+        {&world_addrs::Cmd_SetActorRefEssential, "SetActorRefEssential", 0x1273, 0, 1},
+        {&world_addrs::Cmd_SetRestrained, "SetRestrained", 0x10f3, 0, 1},
+        {&world_addrs::Cmd_SetEnemy, "SetEnemy", 0x1078, 0, 4},
+        {&world_addrs::Cmd_SetAlly, "SetAlly", 0x1079, 0, 4},
+        {&world_addrs::Cmd_RestoreActorValue, "RestoreActorValue", 0x1182, 1, 2},
+        {&world_addrs::Cmd_IgnoreCrime, "IgnoreCrime", 0x10ab, 1, 1},
+        {&world_addrs::Cmd_SetPCEnemyOfFaction, "SetPCEnemyOfFaction", 0x10c6, 0, 2},
+        {&world_addrs::Cmd_ClearFactionPlayerEnemyFlag, "ClearFactionPlayerEnemyFlag", 0x11c9, 0, 1},
+    };
+    for (const C& c : cs) {
+        auto info = readFile(dir + "cmdinfo_" + c.info + ".bin");
+        CHECK(info.size() >= 0x24);
+        if (info.size() < 0x24) continue;
+        uint32_t params = c.numParams;
+#if NVWORLD_MUT == 41
+        params += 1;  // MUTANT: a spec table that disagrees with the engine's parameter count
+#endif
+        CHECK(le32(info, 8) == c.opcode);
+        CHECK(le32(info, 0x18) == c.spec->target);
+        CHECK(le16(info, 0x10) == c.needsParent);
+        CHECK(le16(info, 0x12) == params);
+        auto code = readFile(dir + c.spec->name + std::string(".bin"));
+        CHECK(code.size() >= 16 && std::memcmp(code.data(), c.spec->expected, 16) == 0);
+    }
 }
 
 int main() {
@@ -513,6 +959,7 @@ int main() {
     run("world_resolver_client", world_resolver_client);
     run("spawn_ledger_create_and_despawn", spawn_ledger_create_and_despawn);
     run("spawn_ledger_queue", spawn_ledger_queue);
+    run("spawn_ledger_clear", spawn_ledger_clear);
     run("ref_var_tracker", ref_var_tracker);
     run("ref_var_budget", ref_var_budget);
     run("ref_var_forget", ref_var_forget);
@@ -530,6 +977,23 @@ int main() {
     run("plan_world_effects", plan_world_effects);
     run("world_specs_pinned", world_specs_pinned);
     run("world_specs_match_dump", world_specs_match_dump);
+    run("world_cmdinfo_match", world_cmdinfo_match);
+    run("new_world_effects_lines_json_log", new_world_effects_lines_json_log);
+    run("plan_new_world_effects", plan_new_world_effects);
+    run("created_targets", created_targets);
+    run("route_and_retriable", route_and_retriable);
+    run("deferred_queue_basic", deferred_queue_basic);
+    run("deferred_queue_retry_and_expiry", deferred_queue_retry_and_expiry);
+    run("deferred_queue_cap", deferred_queue_cap);
+    run("routed_follow_up_before_spawn", routed_follow_up_before_spawn);
+    run("routed_follow_up_on_queued_spawn", routed_follow_up_on_queued_spawn);
+    run("routed_despawn_drops_follow_ups", routed_despawn_drops_follow_ups);
+    run("routed_retry_unloaded_form", routed_retry_unloaded_form);
+    run("routed_retry_ref_var_rejected_and_fallback", routed_retry_ref_var_rejected_and_fallback);
+    run("reconcile_and_plan", reconcile_and_plan);
+    run("world_baseline_spawns_and_vars", world_baseline_spawns_and_vars);
+    run("world_baseline_folds_net_state", world_baseline_folds_net_state);
+    run("baseline_replay_on_client_is_idempotent", baseline_replay_on_client_is_idempotent);
     std::printf("%d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

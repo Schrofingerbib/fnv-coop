@@ -56,9 +56,19 @@ target_include_directories(nvbridge_pngtest_mutant PRIVATE bridge)
 # ---- the xNVSE plugin ----
 # Other lanes: put `target_sources(nvcoop PRIVATE ...)` (and optional include dirs / libs) in
 # plugin/<hooks|snapshot|nvmp>/CMakeLists.txt; they are picked up automatically when present.
-add_library(nvcoop SHARED main.cpp)
-set_target_properties(nvcoop PROPERTIES PREFIX "" OUTPUT_NAME "nvcoop")
-target_link_libraries(nvcoop PRIVATE nvcoop_core)
+# Hot-reload split (T3a, opt-in): -DNVCOOP_SPLIT_LOADER=ON makes the `nvcoop` target the reloadable CORE
+# (out/L1/nvcoop_mod.dll, so every lane's target_sources(nvcoop ...) still works) and adds a tiny permanent
+# loader target `nvcoop_loader` that builds as nvcoop.dll. Default OFF = the monolithic nvcoop.dll as before.
+option(NVCOOP_SPLIT_LOADER "Build nvcoop.dll as a small loader + reloadable nvcoop_mod.dll (see docs/tools/T3a-loader.md)" OFF)
+if(NVCOOP_SPLIT_LOADER)
+  add_library(nvcoop SHARED loader/core_entry.cpp loader/core_thunks.cpp)
+  set_target_properties(nvcoop PROPERTIES PREFIX "" OUTPUT_NAME "nvcoop_mod")
+  target_include_directories(nvcoop PRIVATE ${CMAKE_CURRENT_LIST_DIR}/loader ${CMAKE_CURRENT_LIST_DIR}/common ${CMAKE_CURRENT_LIST_DIR}/bridge)
+else()
+  add_library(nvcoop SHARED main.cpp)
+  set_target_properties(nvcoop PROPERTIES PREFIX "" OUTPUT_NAME "nvcoop")
+  target_link_libraries(nvcoop PRIVATE nvcoop_core)
+endif()
 target_include_directories(nvcoop PUBLIC
   "${CMAKE_CURRENT_LIST_DIR}"
   "${FNVCOOP_NVSE_DIR}" "${FNVCOOP_NVSE_DIR}/nvse" "${FNVCOOP_NVSE_DIR}/nvse/nvse")
@@ -70,7 +80,7 @@ endif()
 # NOTE: xNVSE headers use max()/min(): do NOT define NOMINMAX for targets that include them.
 option(NVCOOP_LINK_SNAPSHOT "Link L7 fnvcoop_snapshot into nvcoop.dll (needs the xNVSE game-API sources; links in L7 snapshot)" ON)
 set(NVCOOP_SKIP_SUBDIRS "" CACHE STRING "semicolon list of plugin/<dir> to leave out (e.g. a lane whose code does not build yet)")
-foreach(sub hooks hooks_ui hooks_world snapshot nvmp coop)
+foreach(sub hooks hooks_ui hooks_world snapshot nvmp coop flight animprobe reload bots)
   if(sub IN_LIST NVCOOP_SKIP_SUBDIRS)
     continue()
   endif()
@@ -84,4 +94,8 @@ foreach(sub hooks hooks_ui hooks_world snapshot nvmp coop)
 endforeach()
 if(NVCOOP_LINK_SNAPSHOT AND TARGET fnvcoop_snapshot)
   target_compile_definitions(nvcoop PRIVATE NVCOOP_WITH_SNAPSHOT=1)
+endif()
+
+if(NVCOOP_SPLIT_LOADER)
+  add_subdirectory(loader)   # nvloader_host + the nvcoop_loader target (nvcoop.dll)
 endif()

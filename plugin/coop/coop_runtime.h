@@ -22,8 +22,11 @@
 #include "fnvcoop/transport_util.h"
 #include "fnvcoop/worker.h"
 #include "fnvcoop_dlg/adapter.h"
+#include "hooks_ui/ui_bridge.h"
 #include "fnvcoop/enet_transport.h"
 #include "udp_transport.h"
+
+namespace fnvcoop::flight { class FlightRecorder; }   // T1a flight recorder (synccore/flight/flight.h)
 
 namespace nvcoop::coop {
 
@@ -83,6 +86,23 @@ struct DialogueHooks {
     fnvcoop_dlg::DialogueNode::Sink sink;   // every node: engine glue (OpenMenu, ShowLines, ...)
 };
 
+// L11 hooks_ui wiring seams (production: nvui::router / nvui::slideHost / nvui::slideClient / nvui::setInfoReader; tests: fakes).
+struct UiWiring {
+    std::function<nvui::UiRouter*()> router;                             // host: its bridge is replaced by the DialogueNode bridge
+    std::function<nvui::SlideHost&(nvui::SlideHost::Send)> slideHost;    // host: the send fn rides the 0xE5 mux channel
+    std::function<nvui::SlideClient&()> slideClient;                     // guest: receives 0xE5, SlideshowEnd effect, host loss
+    std::string consentFile;                                             // plugin/dialogue/data/consent_messages.txt (empty/unreadable = no consent table)
+    std::function<void(std::function<std::vector<fnvcoop_dlg::Line>(uint32_t)>)> installInfoReader;   // nvui::setInfoReader
+    std::function<std::vector<fnvcoop_dlg::Line>(uint32_t)> infoReader;  // L8 fndlg::makeInfoReader(...)
+};
+
+// L12 lane-local world effects (NPC actor values, essential/restrained flags, faction relations, script packages): no synccore Effect type
+// exists, so the host ships them as JSON on the session's AppData channel. Entries are keyed: a later push with the same key replaces the
+// earlier one (state-like effects), an empty key accumulates (deltas). A guest that joins later gets the whole remembered state.
+constexpr uint16_t kAppWorldChannel = 0x0C12;
+// Guest side: apply one effect (the worldEffectToJson text); returns "Ok" or an error status.
+using WorldEffectApplier = std::function<std::string(const std::string& json)>;
+
 using EdidResolver = std::function<bool(const std::string& edid, fnvcoop::FormRef& out)>;
 using InfoQuestResolver = std::function<bool(const fnvcoop::FormRef& info, fnvcoop::FormRef& quest)>;
 // Host: perform the REAL engine SetStage (capture open) when the rules engine releases a deferral.
@@ -115,6 +135,14 @@ public:
     // Host with baseline=1: the exact dump handed to setWorldBaseline (null otherwise). Engine state drifts (timers),
     // so exports for tests must use THIS copy, not a fresh dump.
     const fnvcoop::ShadowState* usedBaseline(uint64_t* hash) const { if (hash) *hash = usedHash_; return usedBaseline_.get(); }
+    void enableUi(UiWiring w) { ui_ = std::move(w); uiEnabled_ = true; }   // before start()
+    struct UiStats { uint32_t bridges = 0, resumes = 0, slidePackets = 0, slideEnds = 0, hostLost = 0, consentRows = 0; };
+    const UiStats& uiStats() const { return uiStats_; }
+    // ---- world effects (L12). Host: pushWorldEffect from the engine glue (outside script scopes); guest: setWorldEffectApplier before start().
+    void setWorldEffectApplier(WorldEffectApplier f) { worldApplier_ = std::move(f); }
+    void pushWorldEffect(const std::string& key, const std::string& json);
+    struct WorldStats { uint64_t pushed = 0, sent = 0, replayed = 0, received = 0, applied = 0, failed = 0, stale = 0; };
+    const WorldStats& worldStats() const { return worldStats_; }
     fnvcoop_dlg::DialogueNode* dialogue() { return dlg_.get(); }  // null until the session is joined
     fnvcoop::MuxTransport* mux() { return mux_.get(); }
     // Client: ask the host to run an activation. Returns 0 (and does nothing) while syncing or not joined.
@@ -126,6 +154,10 @@ public:
     // PartyWarp (rules engine): slot -> that player's ref. Default: slot 0 = the host player (0x14 of falloutnv.esm), guests via the ghost
     // resolver below (none -> the slot is skipped). Evaluated lazily on every use, so it stays correct across loads / rebases.
     void setPlayerRefResolver(std::function<bool(fnvcoop::PlayerId, fnvcoop::FormRef&)> f) { playerRef_ = std::move(f); }
+    // Standard wiring used by the module: slot 0 -> the host player (engine refID 0x14), guest slots -> ghostOf(slot) (L6 GhostRefOfPlayer,
+    // 0 = no ghost known yet => slot skipped). `idToRef` converts an engine refID to a FormRef (false = unresolvable). Call at session start;
+    // onGameLoaded() re-asserts it (counted in status.playerRefs.binds) because ghosts are respawned by a load. Lazy on every use.
+    void bindPlayerRefs(std::function<uint32_t(fnvcoop::PlayerId)> ghostOf, std::function<bool(uint32_t, fnvcoop::FormRef&)> idToRef);
     void setRulesFile(const std::string& path) { cfg_.rulesFile = path; }
     void setEdidResolver(EdidResolver f) { edid_ = std::move(f); }
     void setInfoQuestResolver(InfoQuestResolver f) { infoQuest_ = std::move(f); }
@@ -159,6 +191,12 @@ public:
 
     bool start(std::string* err);  // opens the transport and builds the session
     void stop();
+    // coop.leave / coop.join: drop out of the session and back in without ending the game process. leave() is stop() plus a flag; the
+    // local world is left as it is. join() builds a fresh session (client: new ClientSession, baseline re-dump when baseline=1, so the host
+    // sends only the difference to what this machine already has: nothing earned before leaving is granted twice).
+    bool leave(std::string* err);
+    bool join(const std::string& host, uint16_t port, std::string* err);   // empty host / port 0 keep the configured ones
+    bool left() const { return left_; }
     bool running() const { return running_; }
     void frame();                  // one tick on the main thread
 
@@ -173,6 +211,8 @@ public:
     const Config& config() const { return cfg_; }
     fnvcoop::HostSession* host() { return host_.get(); }
     fnvcoop::ClientSession* client() { return client_.get(); }
+    // T1a flight recorder: call before start(). Every datagram and every applied/committed effect is then recorded (null = off).
+    void setFlight(fnvcoop::flight::FlightRecorder* r) { flight_ = r; }
     UdpTransport* transport() { return udp_; }            // null unless transport=udp
     fnvcoop::EnetTransport* enet() { return enet_; }      // null unless transport=enet
     uint16_t boundPort() const { return enet_ ? enet_->port() : udp_ ? udp_->localPort() : 0; }
@@ -187,9 +227,22 @@ public:
 private:
     class Sink;
     bool makeTransport(bool server, std::string* err);
+    fnvcoop::ITransport& sessionTransport();   // transport_, or the flight-recording wrapper around it
+    void tickFlight();
+    void flightDesync(const std::string& why);
     void pushLog(LogEntry e);
     void onCaptured(fnvcoop::EffectTxn&& t);
     void tickDialogue();
+    void tickUi();
+    void tickWorld();
+    void noteCompanion(const fnvcoop::CompanionOwner& c);
+    void syncCompanions();
+    void onWorldPacket(const fnvcoop::Bytes& payload);
+    void applyWorldEntry(uint64_t id, const std::string& key, const std::string& json);
+    void wireUiHost();
+    void uiSlideEnded();
+    nvui::SlideHost* slideHost();
+    nvui::SlideHost* slideHost_ = nullptr;
 
     Config cfg_;
     nvhooks::CaptureHub* hub_;
@@ -208,6 +261,9 @@ private:
     std::unique_ptr<fnvcoop::StateReplicator> replicator_;
     EdidResolver edid_;
     std::function<bool(fnvcoop::PlayerId, fnvcoop::FormRef&)> playerRef_;
+    std::function<uint32_t(fnvcoop::PlayerId)> ghostOf_;
+    std::function<bool(uint32_t, fnvcoop::FormRef&)> idToRef_;
+    uint32_t playerRefBinds_ = 0;
     InfoQuestResolver infoQuest_;
     StageApplier stageApplier_;
     bool applyingDeferred_ = false;
@@ -222,7 +278,20 @@ private:
     std::unique_ptr<fnvcoop_dlg::DialogueNode> dlg_;
     std::set<fnvcoop::PlayerId> dlgJoined_;
     bool dlgWasLive_ = false;
+    UiWiring ui_;
+    bool uiEnabled_ = false, uiBridged_ = false, uiWasJoined_ = false;
+    std::set<fnvcoop::PlayerId> uiJoined_;
+    UiStats uiStats_;
     fnvcoop::PlayerId actionOrigin_ = fnvcoop::kNoPlayer;
+    std::map<fnvcoop::FormRef, fnvcoop::PlayerId> companionOwners_;   // replicated CompanionOwner state (the dialogue node may not exist yet)
+    WorldEffectApplier worldApplier_;
+    struct WorldEntry { uint64_t id = 0; std::string json; };
+    std::map<std::string, WorldEntry> worldState_;   // host: latest entry per key (replayed to late joiners)
+    uint64_t worldId_ = 0;
+    std::set<fnvcoop::PlayerId> worldJoined_;
+    std::deque<std::pair<std::string, WorldEntry>> worldQueue_;   // guest: received before the baseline finished
+    std::map<std::string, uint64_t> worldApplied_;                // guest: newest id applied per key (duplicate / stale guard)
+    WorldStats worldStats_;
     std::unique_ptr<fnvcoop::HostSession> host_;
     std::unique_ptr<Sink> sink_;
     std::unique_ptr<fnvcoop::ClientSession> client_;
@@ -232,8 +301,15 @@ private:
     Counters counters_;
     std::string lastError_;
     bool running_ = false;
+    fnvcoop::Bytes leaveView_;   // client: saveState() taken by leave(), consumed by join()
+    bool left_ = false;   // leave() was called and join() has not rebuilt the session yet
     uint64_t startMs_ = 0;
     bool captureOn_ = false, sinkInstalled_ = false;
+    fnvcoop::flight::FlightRecorder* flight_ = nullptr;
+    std::shared_ptr<fnvcoop::ITransport> flightT_;     // RecordingTransport over transport_ (only with flight_)
+    std::unique_ptr<fnvcoop::ShadowState> flightWorld_;   // client: engine world of the last digest
+    std::shared_ptr<fnvcoop::IEffectSink> flightS_;    // RecordingSink over sink_
+    uint64_t flightIdentAt_ = 0, flightSeenSeq_ = ~0ull, flightSeenAt_ = 0, flightDetailAt_ = 0, flightDigestAt_ = 0, flightDigestSeq_ = ~0ull, flightHostMismatch_ = 0, flightClientRepairs_ = 0;
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
 };
 

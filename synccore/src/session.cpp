@@ -9,7 +9,7 @@ namespace fnvcoop {
 namespace {
 struct RepairItem {
     HostSession::DesyncEntry d;
-    bool clientOnly = false, race = false;
+    bool clientOnly = false, race = false, revertToo = false;   // revertToo: additive entry, the client takes its own amount back before the host's is added
     Effect fix;
     uint64_t key = 0;
 };
@@ -26,6 +26,7 @@ struct HostSession::Job {
     bool computing = false;
     uint32_t sentUpTo = 0, backoff = 0;
     uint32_t id = 0;
+    std::vector<RewardGrant> grantsAtH;   // the joiner slot's rewards as of snapAtH
     ShadowState snapAtH;   // frozen at Welcome time (baseline + session txns): the transfer is relative to THIS point
     std::map<uint32_t, BaselineSummaryChunk> got;
     uint32_t summaryTotal = 0;
@@ -115,6 +116,7 @@ uint64_t HostSession::commit(PlayerId origin, const Cause& cause, std::vector<Ef
     uint64_t seq = log_.append(std::move(t));
     if (opt_.autoCompactKeep && log_.size() > opt_.autoCompactKeep * 2) log_.compact(opt_.autoCompactKeep);
     const EffectTxn& stored = *log_.get(seq);
+    forEachReward(stored, epoch_, [&](PlayerId slot, uint64_t id, const Effect& e) { if (slot != kHostPlayer) grants_[slot].push_back({id, e}); });
     ++stats_.commits;
     if (onCommit) onCommit(stored);
     for (auto& [tok, c] : clients_) {
@@ -207,11 +209,13 @@ void HostSession::sendWelcome(Client& c, uint64_t lastSeq, bool fresh) {
         w.snapshot = c.job->snapAtH;
         w.baselineId = c.job->id;
         w.baselineAbs = static_cast<uint8_t>((policy_.karma ? 1 : 0) | (policy_.reputation ? 2 : 0));
+        w.rewards = c.job->grantsAtH;
         base = c.job->snapAtH.seq;
         ++stats_.snapshots;
     } else if (!replay) {
         w.hasSnapshot = true;
         w.snapshot = log_.headState();
+        w.rewards = grants_[c.slot];
         base = log_.head();
         ++stats_.snapshots;
     } else {
@@ -239,6 +243,7 @@ void HostSession::sendSnapshotWelcome(Client& c) {
     w.lastIntent = c.lastIntent;
     w.hasSnapshot = true;
     w.snapshot = log_.headState();
+    w.rewards = grants_[c.slot];
     ++stats_.snapshots;
     c.lastSend = now_;
     sendTo(c.peer, w);
@@ -290,6 +295,7 @@ void HostSession::handle(PeerId from, const Message& m) {
                 c.job = std::make_shared<Job>();
                 c.job->id = static_cast<uint32_t>(++baselineCounter_);
                 c.job->snapAtH = log_.headState();
+                c.job->grantsAtH = grants_[c.slot];
                 ++stats_.baselineJoins;
             }
         }
@@ -362,6 +368,7 @@ void HostSession::handle(PeerId from, const Message& m) {
                     if (it != clientE.end() && it->second.value == he.value) continue;
                     RepairItem r;
                     r.key = key; r.fix = he.effect;
+                    r.revertToo = it != clientE.end() && (std::holds_alternative<RefAddItem>(he.effect) || std::holds_alternative<RefRemoveItem>(he.effect));
                     r.d.key = describeEntry(he.effect); r.d.keyHash = key; r.d.host = r.d.key;
                     r.d.client = it == clientE.end() ? "(missing)" : describeEntry(it->second.effect);
                     r.race = touched.count(key) > 0;
@@ -407,7 +414,7 @@ void HostSession::handle(PeerId from, const Message& m) {
                     if (n++ < 64) it.d.lastSeqs = lastSeqs(it.key);
                     if (it.race) it.d.skippedRace = true;
                     else if (it.clientOnly) revert.push_back(it.key);
-                    else fix.push_back(it.fix);
+                    else { fix.push_back(it.fix); if (it.revertToo) revert.push_back(it.key); }
                     rep.entries.push_back(std::move(it.d));
                 }
                 rep.totalEntries = rep.entries.size();
@@ -574,6 +581,7 @@ bool HostSession::reloadWorld(const ShadowState& baseline, uint64_t contentHash)
     for (auto& r : baseRep_) r = b.ledger[0].rep;
     b.ledger[0] = Ledger();
     b.seq = 0;
+    for (auto& g : grants_) g.clear();
     log_ = StoryLog();
     log_.setInitialState(b);
     contentHash_ = contentHash;
@@ -648,6 +656,7 @@ bool HostSession::loadSidecar(const Bytes& bytes) {
         head.ledger[s] = Ledger();
     }
     head.seq = 0;
+    for (auto& g : grants_) g.clear();
     log_ = StoryLog();
     log_.setInitialState(head);
     haveBaseline_ = true;
@@ -917,18 +926,25 @@ void ClientSession::applyReadyDiffChunks() {
     for (;;) {
         auto it = diffGot_.find(diffNext_);
         if (it == diffGot_.end()) break;
-        for (auto& e : it->second.effects) applyBaselineEffect(e);
-        for (uint64_t key : it->second.revertKeys) {
-            Effect rev;
-            if (clientWorld_ && revertEffectFor(*clientWorld_, key, rev)) { applyBaselineEffect(rev); ++baselineResult_.reverted; }
-            else ++baselineResult_.unrevertable;
-        }
+        // Collected until the last chunk: reverts must all run before the host's effects (a revert is the inverse of what the client's own
+        // world holds; a host effect such as RemoveAllItems resets state a later revert would then subtract from).
+        for (auto& e : it->second.effects) diffEffects_.push_back(e);
+        for (uint64_t key : it->second.revertKeys) diffReverts_.push_back(key);
         diffGot_.erase(it);
         ++diffNext_;
         ++baselineResult_.chunks;
     }
     send(BaselineAck{session_, baselineId_, 1, diffNext_});
-    if (diffTotal_ != 0 && diffNext_ >= diffTotal_) finishBaseline();
+    if (diffTotal_ != 0 && diffNext_ >= diffTotal_) {
+        for (uint64_t key : diffReverts_) {
+            Effect rev;
+            if (clientWorld_ && revertEffectFor(*clientWorld_, key, rev)) { applyBaselineEffect(rev); ++baselineResult_.reverted; }
+            else ++baselineResult_.unrevertable;
+        }
+        for (auto& e : diffEffects_) applyBaselineEffect(e);
+        diffReverts_.clear(); diffEffects_.clear();
+        finishBaseline();
+    }
 }
 
 void ClientSession::finishBaseline() {
@@ -944,6 +960,8 @@ void ClientSession::finishBaseline() {
         sink_.apply(e, ctx);
     }
     heldDiff_.clear();
+    for (uint64_t id : heldRewardIds_) delivered_.insert(id);
+    heldRewardIds_.clear();
     baselineActive_ = false;
     baselineDone_ = true;
     clientWorld_.reset();
@@ -974,7 +992,7 @@ void ClientSession::connect(uint64_t nowMs, uint32_t session) {
     ++connGen_;
     digestOutstanding_ = false; digestWanted_ = false; touchedSince_.clear();
     lastDigest_ = nowMs;
-    diffGot_.clear(); diffNext_ = diffTotal_ = 0; summaryNext_ = 0;
+    diffGot_.clear(); diffEffects_.clear(); diffReverts_.clear(); diffNext_ = diffTotal_ = 0; summaryNext_ = 0;
     send(makeHello());
 }
 
@@ -988,7 +1006,7 @@ Hello ClientSession::makeHello() const {
 
 void ClientSession::doRebase() {
     ++stats_.rebases;
-    resetState();   // forgets shadow, queued intents, baseline progress (the world itself is whatever the engine has)
+    resetSession();   // forgets shadow, queued intents, baseline progress (the world itself is whatever the engine has)
     ShadowState w;
     uint64_t h = 0;
     if (provider_ && provider_(w, h)) {
@@ -1006,11 +1024,15 @@ constexpr uint32_t kClientStateMagic = 0x53434346;  // 'FCCS'
 Bytes ClientSession::saveState() const {
     Archive a = Archive::writer();
     uint32_t magic = kClientStateMagic; a.u32(magic);
-    uint8_t ver = 1; a.u8(ver);
+    uint8_t ver = 2; a.u8(ver);
     bool clean = joined_ && intents_.empty() && !baselineActive_ && pending_.empty();
     a.boolean(clean);
     uint8_t sl = slot_; a.u8(sl);
     uint32_t we = worldEpoch_; a.varu32(we);
+    // Which rewards this save's world already holds. Valid even when the rest of the sidecar is not (unclean / other epoch):
+    // the game save contains them regardless, so a baseline rejoin must not deliver them again.
+    size_t nd = delivered_.size(); a.count(nd, kMaxRewardsPerWelcome * 4);
+    for (uint64_t id : delivered_) { uint64_t x = id; a.varu(x); }
     ShadowState s = shadow_;
     io(a, s);
     return a.finish();
@@ -1023,9 +1045,15 @@ bool ClientSession::loadStateBytes(const Bytes& b) {
     bool clean = false; a.boolean(clean);
     uint8_t sl = 0; a.u8(sl);
     uint32_t we = 0; a.varu32(we);
+    std::set<uint64_t> ids;
+    size_t nd = 0;
+    if (a.count(nd, kMaxRewardsPerWelcome * 4))
+        for (size_t i = 0; i < nd && a.ok(); ++i) { uint64_t id = 0; a.varu(id); if (a.ok()) ids.insert(id); }
     ShadowState s;
     io(a, s);
-    if (!a.ok() || !a.atEnd() || magic != kClientStateMagic || ver != 1 || !clean || sl >= kMaxSlots || we == 0) return false;
+    if (!a.ok() || !a.atEnd() || magic != kClientStateMagic || ver != 2) return false;
+    delivered_ = std::move(ids);   // the save's reward record counts even if the shadow below is not resumable
+    if (!clean || sl >= kMaxSlots || we == 0) return false;
     if (mutations().sidecarLosesLedger) for (auto& l : s.ledger) l = Ledger();
     shadow_ = s;
     slot_ = sl;
@@ -1036,7 +1064,8 @@ bool ClientSession::loadStateBytes(const Bytes& b) {
 bool ClientSession::onLocalSaveLoaded(uint64_t nowMs, const Bytes* sidecar) {
     if (!clientLoadAllowed()) return false;
     now_ = nowMs;
-    resetState();
+    resetSession();
+    delivered_.clear();   // the loaded save's record replaces the running one (no sidecar: nothing is known to be delivered)
     bool restored = sidecar && loadStateBytes(*sidecar);
     if (!restored) {
         ShadowState w;
@@ -1113,6 +1142,11 @@ void ClientSession::disconnect() {
 }
 
 void ClientSession::resetState() {
+    resetSession();
+    delivered_.clear();
+}
+
+void ClientSession::resetSession() {
     disconnect();
     shadow_ = ShadowState();
     pending_.clear();
@@ -1120,7 +1154,7 @@ void ClientSession::resetState() {
     rebaseRequired_ = false;
     worldEpoch_ = 0;
     clientWorld_.reset(); ++sumGen_; summaryReady_ = false; ++connGen_; digestInFlight_ = false;
-    summaryChunks_.clear(); diffGot_.clear(); heldDiff_.clear();
+    summaryChunks_.clear(); diffGot_.clear(); diffEffects_.clear(); diffReverts_.clear(); heldDiff_.clear(); heldRewardIds_.clear();
     intents_.clear();
     nextIntent_ = 1;
     seenIntent_ = 0;
@@ -1200,12 +1234,22 @@ void ClientSession::handle(const Message& m) {
             // The baseline makes the shared world match the snapshot already; keep only what it does not carry (ledger deltas, barriers).
             if (!mutations().snapshotFloodAfterBaseline)
                 heldDiff_.erase(std::remove_if(heldDiff_.begin(), heldDiff_.end(), [](const Effect& e) { return isBaselineCovered(e); }), heldDiff_.end());
+            // Rewards: the snapshot's net ledger would hand over everything this slot ever received. Replace it by the rewards the save's
+            // world does not hold yet (ids persisted in the sidecar).
+            heldRewardIds_.clear();
+            if (!mutations().noRewardIds) {
+                heldDiff_.erase(std::remove_if(heldDiff_.begin(), heldDiff_.end(), [](const Effect& e) { return isRewardEffect(e); }), heldDiff_.end());
+                for (auto& g : w->rewards) {
+                    heldRewardIds_.push_back(g.id);
+                    if (!delivered_.count(g.id)) heldDiff_.push_back(g.effect);
+                }
+            }
             shadow_ = w->snapshot;
             baselineActive_ = true;
             baselineId_ = w->baselineId;
             baselineAbs_ = w->baselineAbs;
             baselineResult_ = BaselineResult();
-            diffGot_.clear(); diffNext_ = diffTotal_ = 0; summaryNext_ = 0;
+            diffGot_.clear(); diffEffects_.clear(); diffReverts_.clear(); diffNext_ = diffTotal_ = 0; summaryNext_ = 0;
             ++stats_.snapshots;
             summarySent_ = 0; summaryBackoff_ = 0;
             if (summaryReady_) { stampSummary(); sendSummaryWindow(false); }
@@ -1242,6 +1286,7 @@ void ClientSession::handle(const Message& m) {
                 for (auto& e : diff) sink_.apply(e, ctx);
             }
             shadow_ = w->snapshot;
+            for (auto& g : w->rewards) delivered_.insert(g.id);   // the diff above made the world hold every reward up to the snapshot
             ++stats_.snapshots;
         } else {
             ++stats_.replays;
@@ -1294,12 +1339,12 @@ void ClientSession::handle(const Message& m) {
     } else if (auto* rp = std::get_if<SyncRepair>(&m)) {
         if (rp->session != session_ || !digestOutstanding_ || rp->digestId != digestId_ || !joined_) return;
         ++syncStats_.repairsApplied;
-        for (auto& e : rp->effects) applyRepairEffect(e);
-        for (uint64_t key : rp->revertKeys) {
+        for (uint64_t key : rp->revertKeys) {   // reverts first: they undo what the client holds, the host's effects then build on that
             if (touchedSince_.count(key)) { ++syncStats_.repairEffectsSkipped; continue; }
             Effect rev;
             if (digestWorld_ && revertEffectFor(*digestWorld_, key, rev)) { applyRepairEffect(rev); }
         }
+        for (auto& e : rp->effects) applyRepairEffect(e);
         digestOutstanding_ = false;
         touchedSince_.clear();
     } else if (auto* b = std::get_if<TxnBatch>(&m)) {
@@ -1373,12 +1418,19 @@ void ClientSession::drain() {
     }
 }
 
+// Rewards addressed to this player in a txn the shadow just folded in are in the world (applied now, or by the player's own action).
+void ClientSession::noteDelivered(const EffectTxn& txn) {
+    if (slot_ >= kMaxSlots) return;
+    forEachReward(txn, worldEpoch_, [&](PlayerId slot, uint64_t id, const Effect&) { if (slot == slot_) delivered_.insert(id); });
+}
+
 void ClientSession::applyOne(const EffectTxn& txn) {
     uint64_t keep = shadow_.seq;
     std::vector<Effect> out;
     shadow_.applyTxn(txn, slot_, &out);
     shadow_.seq = std::max(keep, txn.seq);
     ++stats_.txnsApplied;
+    noteDelivered(txn);
     if (digestOutstanding_)
         for (auto& e : txn.effects) { BaselineEntry be; if (entryOf(e, be)) touchedSince_.insert(be.key); }
     if ((txn.flags & kTxnOriginApplied) && txn.origin == slot_ && txn.originEpoch == epoch_ && txn.originIntent > seenIntent_) {

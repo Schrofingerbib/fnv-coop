@@ -1,4 +1,6 @@
 #include "fnvcoop/rules.h"
+#include <tuple>
+#include "fnvcoop/wire.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -161,7 +163,83 @@ std::string lower(std::string s) {
 
 bool truthy(double v) { return v != 0.0; }
 
+bool parseUint(const std::string& s, uint32_t& out) {
+    if (s.empty() || s.size() > 10) return false;
+    uint64_t v = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') return false;
+        v = v * 10 + uint64_t(c - '0');
+    }
+    if (v > 0xFFFFFFFFull) return false;
+    out = uint32_t(v);
+    return true;
+}
+
+// "Plugin.esm:HEX" / "Plugin.esm HEX" form reference, as used by ReadyCheck `infos`.
+bool parseFormText(const std::string& s, FormRef& out) {
+    size_t sep = s.find_last_of(": ");
+    if (sep == std::string::npos || sep == 0 || sep + 1 >= s.size()) return false;
+    uint32_t id = 0;
+    for (size_t i = sep + 1; i < s.size(); ++i) {
+        char c = s[i];
+        uint32_t d = c >= '0' && c <= '9' ? uint32_t(c - '0') : c >= 'a' && c <= 'f' ? uint32_t(c - 'a' + 10) : c >= 'A' && c <= 'F' ? uint32_t(c - 'A' + 10) : 99u;
+        if (d == 99u || (id >> 28)) return false;
+        id = (id << 4) | d;
+    }
+    out = FormRef::make(s.substr(0, sep), id);
+    return true;
+}
+
+// Kind-specific load-time checks. Returns an empty string when the rule is fine.
+std::string validateRule(const std::string& edid, const Rule& r) {
+    const std::string who = edid + "/" + r.kind;
+    auto sl = r.lists.find("stages");
+    if (sl != r.lists.end()) {
+        for (auto& v : sl->second) { uint32_t n; if (!parseUint(v, n)) return who + ": stages must be whole numbers, got '" + v + "'"; }
+    }
+    if (r.scalars.count("stages")) return who + ": stages must be a list";
+    if (r.kind == "PartyTether") {
+        auto c = r.lists.find("cells");
+        const bool cells = c != r.lists.end() && !c->second.empty();
+        const std::string anchor = r.scalar("anchor", r.scalar("anchor_ref"));
+        if (!cells && anchor.empty()) return who + ": a tether needs a non-empty cells list or anchor + radius (an empty cell list tethers nothing)";
+        if (!anchor.empty() && !(r.number("radius", 0) > 0)) return who + ": anchor tethers need a radius > 0";
+    } else if (r.kind == "ExclusiveStages") {
+        if (sl == r.lists.end() || sl->second.size() < 2) return who + ": needs at least two stages";
+        if (r.scalar("resolution", "first-wins") != "first-wins") return who + ": only resolution first-wins exists";
+    } else if (r.kind == "ReadyCheck") {
+        auto i = r.lists.find("infos");
+        if (i == r.lists.end() || i->second.empty()) return who + ": needs infos";
+        const std::string oc = r.scalar("on_timeout", "cancel");
+        if (oc != "cancel" && oc != "proceed") return who + ": on_timeout must be cancel or proceed";
+        if (r.scalar("confirm", "all-players") != "all-players") return who + ": only confirm all-players exists";
+        if (r.scalars.count("timeout_s") && !(r.number("timeout_s", 0) > 0)) return who + ": timeout_s must be > 0";
+    } else if (r.kind == "PerPlayerVars") {
+        auto v = r.lists.find("vars");
+        if (v == r.lists.end() || v->second.empty()) return who + ": needs vars";
+    } else if (r.kind == "Barrier") {
+        const std::string b = r.scalar("before");
+        if (!b.empty() && b != "slideshow") return who + ": before may only be slideshow";
+    }
+    return std::string();
+}
+
 }  // namespace
+
+bool Rule::appliesToStage(uint32_t stage) const {
+    auto it = lists.find("stages");
+    if (it == lists.end() || it->second.empty() || mutations().stagesParamIgnored) return true;
+    for (auto& s : it->second) { uint32_t n; if (parseUint(s, n) && n == stage) return true; }
+    return false;
+}
+
+double Rule::number(const std::string& key, double dflt) const {
+    auto it = scalars.find(key);
+    if (it == scalars.end() || it->second.empty()) return dflt;
+    char* end = nullptr;
+    double v = std::strtod(it->second.c_str(), &end);
+    return end && *end == 0 ? v : dflt;
+}
 
 // ================================ RulesDb ======================================================================
 
@@ -209,6 +287,7 @@ bool RulesDb::load(const std::string& text, std::string* err) {
                     }
                 }
             }
+            if (std::string why = validateRule(edid, rule); !why.empty()) return bad(why);
             qr.rules.push_back(std::move(rule));
         }
         out.emplace(edid, std::move(qr));
@@ -245,24 +324,41 @@ RulesEngine::RulesEngine(HostSession& host, const RulesDb& db, Resolver resolve,
     : host_(host), db_(db), opt_(opt), resolve_(std::move(resolve)) {
     static const std::set<std::string> handled = {"Barrier", "PartyTether", "SetPlayerControls", "SaveSuppress", "RewardAll", "QuestItemDup",
                                                   "RemoveItemPerOwner", "ShareKarmaRep", "CompanionOwner", "SlideshowEnd", "PartyAwareCond",
-                                                  "ExcludeFromGate", "PerPlayerScene", "FastTravelLock", "InitiatorDialogue", "PartyWarp", "GuestLocalRun"};
+                                                  "ExcludeFromGate", "PerPlayerScene", "FastTravelLock", "InitiatorDialogue", "PartyWarp", "GuestLocalRun",
+                                                  "PerPlayerVars", "ExclusiveStages", "ReadyCheck"};
     for (auto& [edid, q] : db_.quests()) {
         FormRef f;
         if (resolve_ && resolve_(edid, f)) byForm_[f] = &q;
-        for (auto& r : q.rules) if (!handled.count(r.kind)) unsupported_.insert(r.kind);
+        for (auto& r : q.rules) {
+            if (!handled.count(r.kind)) unsupported_.insert(r.kind);
+            if (r.kind == "ReadyCheck") {
+                auto il = r.lists.find("infos");
+                if (il != r.lists.end()) for (auto& txt : il->second) { FormRef f; if (parseFormText(txt, f)) readyInfos_.insert(f); }
+            }
+        }
     }
     host_.txnFilter = [this](EffectTxn& t) { filter(t); };
 }
 
 RulesEngine::~RulesEngine() { host_.txnFilter = nullptr; }
 
+namespace {
+// PerPlayerScene with run=every-machine and scope=local-machine: the scene belongs to each machine's own player (achievements, local
+// fades, implant menus): it runs everywhere and nothing of it is replicated, exactly like GuestLocalRun.
+bool runsOnEveryMachine(const QuestRules& q) {
+    if (q.find("GuestLocalRun")) return true;
+    const Rule* p = q.find("PerPlayerScene");
+    return p && p->scalar("run") == "every-machine" && p->scalar("scope") == "local-machine";
+}
+}  // namespace
+
 bool RulesEngine::guestLocalRun(const FormRef& quest) const {
     const QuestRules* q = rulesFor(quest);
-    return q && q->find("GuestLocalRun");
+    return q && runsOnEveryMachine(*q);
 }
 std::vector<FormRef> RulesEngine::guestLocalQuests() const {
     std::vector<FormRef> v;
-    for (auto& [f, q] : byForm_) if (q->find("GuestLocalRun")) v.push_back(f);
+    for (auto& [f, q] : byForm_) if (runsOnEveryMachine(*q)) v.push_back(f);
     return v;
 }
 std::vector<std::string> RulesEngine::guestLocalScripts() const {
@@ -297,13 +393,17 @@ uint8_t RulesEngine::joinedMask() const {
     return m;
 }
 
-bool RulesEngine::tetherSatisfied(const std::set<FormRef>& cells) const {
-    if (cells.empty()) return true;
+bool RulesEngine::tetherSatisfied(const std::set<FormRef>& cells, const FormRef& anchor, bool hasAnchor) const {
+    if (cells.empty() && !hasAnchor) return true;
+    if (hasAnchor && cells.empty() && mutations().tetherIgnoresAnchor) return true;
     uint8_t m = joinedMask();
     for (unsigned s = 0; s < kMaxSlots; ++s) {
         if (!(m >> s & 1u)) continue;
         auto it = cellOf_.find(PlayerId(s));
-        if (it == cellOf_.end() || !cells.count(it->second)) return false;
+        if (it != cellOf_.end() && cells.count(it->second)) continue;
+        auto nr = nearOf_.find(PlayerId(s));
+        if (hasAnchor && !mutations().tetherIgnoresAnchor && nr != nearOf_.end() && nr->second.count(anchor)) continue;
+        return false;
     }
     return true;
 }
@@ -313,9 +413,10 @@ StageDecision RulesEngine::onStageRequested(const FormRef& quest, uint32_t stage
     const QuestRules* q = rulesFor(quest);
     if (!q) return StageDecision::Proceed;
     for (auto& p : pending_) if (p.quest == quest && p.stage == stage) return StageDecision::Deferred;   // already waiting
-    if (q->find("Barrier")) {
+    if (const Rule* br = q->findFor("Barrier", stage)) {
         Pending p;
         p.quest = quest; p.stage = stage; p.initiator = initiator; p.barrier = barrierId(quest, stage); p.since = now_;
+        p.slideshowAfter = br->scalar("before") == "slideshow";
         auto early = earlyPasses_.find(quest);
         pending_.push_back(std::move(p));
         ++stats_.stagesDeferred;
@@ -327,16 +428,21 @@ StageDecision RulesEngine::onStageRequested(const FormRef& quest, uint32_t stage
         }
         return StageDecision::Deferred;
     }
-    if (const Rule* tr = q->find("PartyTether")) {
+    if (const Rule* tr = q->findFor("PartyTether", stage)) {
         std::set<FormRef> cells;
         auto it = tr->lists.find("cells");
         if (it != tr->lists.end())
             for (auto& edid : it->second) { FormRef f; if (resolve_ && resolve_(edid, f)) cells.insert(f); }
-        if (tetherSatisfied(cells)) return StageDecision::Proceed;
+        FormRef anchor;
+        bool hasAnchor = false;
+        const std::string anchorEdid = tr->scalar("anchor", tr->scalar("anchor_ref"));
+        if (!anchorEdid.empty() && resolve_ && resolve_(anchorEdid, anchor)) hasAnchor = true;
+        if (tetherSatisfied(cells, anchor, hasAnchor)) return StageDecision::Proceed;
         Pending p;
         p.quest = quest; p.stage = stage; p.initiator = initiator; p.tether = true; p.since = now_; p.cells = cells;
+        p.anchor = anchor; p.hasAnchor = hasAnchor;
         Cause c; c.kind = CauseKind::Script; c.source = quest; c.aux = static_cast<int32_t>(stage);
-        host_.commit(kHostPlayer, c, {PartyTether{*cells.begin(), true}});   // clients gather / hold
+        host_.commit(kHostPlayer, c, {PartyTether{cells.empty() ? anchor : *cells.begin(), true}});   // clients gather / hold
         ++stats_.tetherGathers;
         pending_.push_back(std::move(p));
         ++stats_.stagesDeferred;
@@ -346,14 +452,24 @@ StageDecision RulesEngine::onStageRequested(const FormRef& quest, uint32_t stage
     return StageDecision::Proceed;
 }
 
-void RulesEngine::onPlayerPassed(PlayerId slot, const FormRef& quest) {
+FormRef RulesEngine::timeSkipId() { return FormRef("rules", 0x7157EEu); }
+
+void RulesEngine::onPlayerPassed(PlayerId slot, const FormRef& ref) {
     if (slot >= kMaxSlots) return;
     for (size_t i = 0; i < pending_.size(); ++i) {
         Pending& p = pending_[i];
-        if (p.quest != quest || p.tether) continue;
+        if (p.tether) continue;
+        if (p.kind != Pending::Stage) {   // a consent vote: keyed by the INFO (ReadyCheck) or by timeSkipId() (wait / sleep)
+            if ((p.kind == Pending::Ready ? p.info : timeSkipId()) != ref) continue;
+            if (!p.passed.insert(slot).second) { ++stats_.ignoredPasses; return; }
+            ++stats_.arrivals;
+            checkPending();
+            return;
+        }
+        if (p.quest != ref) continue;
         if (!p.passed.insert(slot).second) { ++stats_.ignoredPasses; return; }   // duplicate report
         ++stats_.arrivals;
-        Cause c; c.kind = CauseKind::Script; c.source = quest; c.aux = static_cast<int32_t>(p.stage);
+        Cause c; c.kind = CauseKind::Script; c.source = ref; c.aux = static_cast<int32_t>(p.stage);
         host_.commit(slot, c, {BarrierArrive{p.barrier, joinedMask()}});
         const BarrierState* b = nullptr;
         auto it = host_.state().barriers.find(p.barrier);
@@ -363,7 +479,8 @@ void RulesEngine::onPlayerPassed(PlayerId slot, const FormRef& quest) {
         if (done) release(i, false);
         return;
     }
-    earlyPasses_[quest].insert(slot);   // nobody asked for this barrier yet
+    if (ref == timeSkipId() || readyInfos_.count(ref)) return;   // a consent for a vote nobody asked for must not count for a later one
+    earlyPasses_[ref].insert(slot);   // nobody asked for this barrier yet
 }
 
 void RulesEngine::onCellReported(PlayerId slot, const FormRef& cell) {
@@ -371,24 +488,105 @@ void RulesEngine::onCellReported(PlayerId slot, const FormRef& cell) {
     checkPending();
 }
 
+void RulesEngine::onNearReported(PlayerId slot, const FormRef& anchor, bool near) {
+    if (slot >= kMaxSlots) return;
+    if (near) nearOf_[slot].insert(anchor); else nearOf_[slot].erase(anchor);
+    checkPending();
+}
+
 bool RulesEngine::handleAction(PlayerId slot, IntentKind kind, const FormRef& ref) {
     if (kind == IntentKind::ScenePass) { onPlayerPassed(slot, ref); return true; }
     if (kind == IntentKind::ReportCell) { onCellReported(slot, ref); return true; }
+    if (kind == IntentKind::ReportNear) { onNearReported(slot, ref, true); return true; }
+    if (kind == IntentKind::ReportFar) { onNearReported(slot, ref, false); return true; }
     return false;
+}
+
+void RulesEngine::startVote(Pending p) {
+    p.since = now_;
+    p.passed.insert(p.initiator);   // asking is agreeing
+    pending_.push_back(std::move(p));
+}
+
+// True when nobody but the asker is present: there is no one to ask, the caller just proceeds.
+bool RulesEngine::askerIsAlone(PlayerId asker) const {
+    return (joinedMask() & ~(1u << asker)) == 0;
+}
+
+StageDecision RulesEngine::onReadyRequested(const FormRef& quest, const FormRef& info, PlayerId initiator) {
+    if (mutations().rulesDisabled) return StageDecision::Proceed;
+    const QuestRules* q = rulesFor(quest);
+    if (!q) return StageDecision::Proceed;
+    for (auto& p : pending_) if (p.kind == Pending::Ready && p.info == info) return StageDecision::Deferred;   // already asking
+    for (auto& r : q->rules) {
+        if (r.kind != "ReadyCheck") continue;
+        auto il = r.lists.find("infos");
+        if (il == r.lists.end()) continue;
+        bool listed = false;
+        for (auto& txt : il->second) { FormRef f; listed |= parseFormText(txt, f) && f == info; }
+        if (!listed) continue;
+        Pending p;
+        p.kind = Pending::Ready; p.quest = quest; p.info = info; p.initiator = initiator;
+        p.timeoutMs = static_cast<uint32_t>(r.number("timeout_s", 120) * 1000.0);
+        p.proceedOnTimeout = r.scalar("on_timeout", "cancel") == "proceed";
+        ++stats_.readyChecks;
+        if (askerIsAlone(initiator) && !mutations().readyProceedsAlone) return StageDecision::Proceed;   // no one to ask
+        startVote(std::move(p));
+        return StageDecision::Deferred;
+    }
+    return StageDecision::Proceed;
+}
+
+StageDecision RulesEngine::onTimeSkipRequested(PlayerId initiator, uint32_t minutes) {
+    if (mutations().rulesDisabled) return StageDecision::Proceed;
+    for (auto& p : pending_) if (p.kind == Pending::TimeSkip) return StageDecision::Deferred;   // one wait / sleep question at a time
+    Pending p;
+    p.kind = Pending::TimeSkip; p.quest = timeSkipId(); p.initiator = initiator; p.minutes = minutes; p.timeoutMs = opt_.consentTimeoutMs;
+    ++stats_.timeSkipsAsked;
+    if (askerIsAlone(initiator) && !mutations().readyProceedsAlone) { ++stats_.timeSkipsGranted; return StageDecision::Proceed; }
+    startVote(std::move(p));
+    return StageDecision::Deferred;
+}
+
+void RulesEngine::holdForSlideshow(const FormRef& quest) {
+    if (mutations().slideshowNoHold || host_.state().slideshowEnded) return;
+    if (slideshowHold_.count(quest)) return;
+    slideshowHold_[quest] = now_;
+    ++stats_.slideshowHolds;
+    Cause c; c.kind = CauseKind::Script; c.source = quest;
+    host_.commit(kHostPlayer, c, {SetPlayerControls{kAllControls, false, Recipient::all()}});
 }
 
 void RulesEngine::release(size_t index, bool timedOut) {
     Pending p = std::move(pending_[index]);
     pending_.erase(pending_.begin() + static_cast<std::ptrdiff_t>(index));
+    if (p.kind == Pending::Ready) {
+        const bool ok = !timedOut || p.proceedOnTimeout;
+        if (timedOut) ++stats_.readyTimeouts;
+        ++stats_.stagesReleased;
+        if (onReadyResolved) onReadyResolved(p.quest, p.info, ok);
+        return;
+    }
+    if (p.kind == Pending::TimeSkip) {
+        if (timedOut) {
+            ++stats_.timeSkipsDenied;
+            if (timeSkipDenied) timeSkipDenied(p.minutes);
+        } else {
+            ++stats_.timeSkipsGranted;
+            if (applyTimeSkip) applyTimeSkip(p.minutes);
+        }
+        return;
+    }
     if (p.tether) {
         Cause c; c.kind = CauseKind::Script; c.source = p.quest; c.aux = static_cast<int32_t>(p.stage);
-        if (!p.cells.empty()) host_.commit(kHostPlayer, c, {PartyTether{*p.cells.begin(), false}});
+        if (!p.cells.empty() || p.hasAnchor) host_.commit(kHostPlayer, c, {PartyTether{p.cells.empty() ? p.anchor : *p.cells.begin(), false}});
     } else if (timedOut || !host_.state().barriers.count(p.barrier) || !host_.state().barriers.at(p.barrier).released) {
         Cause c; c.kind = CauseKind::Script; c.source = p.quest; c.aux = static_cast<int32_t>(p.stage);
         host_.commit(kHostPlayer, c, {BarrierRelease{p.barrier}});   // explicit release (timeout, or players left)
     }
     ++stats_.stagesReleased;
     syncTravelLock(p.quest);
+    if (p.slideshowAfter) holdForSlideshow(p.quest);   // the ending's controls stay locked until the slideshow itself ends
     host_.requestDigest();   // verify every client's world right after a barrier / scene
     if (applyStage) applyStage(p.quest, p.stage);
 }
@@ -415,11 +613,12 @@ void RulesEngine::checkPending() {
         Pending& p = pending_[i];
         bool go = false;
         if (p.tether) {
-            go = tetherSatisfied(p.cells);
+            go = tetherSatisfied(p.cells, p.anchor, p.hasAnchor);
         } else {
             uint8_t joined = joinedMask(), arrived = 0;
             for (PlayerId s : p.passed) arrived = static_cast<uint8_t>(arrived | (1u << s));
             go = (arrived & joined) == joined;   // everyone still present has passed (leavers do not hold the party)
+            if (p.kind != Pending::Stage && mutations().readyProceedsAlone) go = arrived != 0;
         }
         if (go) release(i, false); else ++i;
     }
@@ -429,7 +628,23 @@ void RulesEngine::tick(uint64_t nowMs) {
     now_ = nowMs;
     checkPending();
     for (size_t i = 0; i < pending_.size();) {
-        if (now_ >= pending_[i].since + opt_.barrierTimeoutMs) { ++stats_.barrierTimeouts; release(i, true); } else ++i;
+        const uint32_t limit = pending_[i].kind == Pending::Stage ? opt_.barrierTimeoutMs : pending_[i].timeoutMs;
+        if (now_ >= pending_[i].since + limit) {
+            if (pending_[i].kind == Pending::Stage) ++stats_.barrierTimeouts;
+            release(i, true);
+        } else {
+            ++i;
+        }
+    }
+    for (auto it = slideshowHold_.begin(); it != slideshowHold_.end();) {   // failsafe: a slideshow that never ends must not freeze the party forever
+        if (now_ >= it->second + opt_.slideshowHoldMs) {
+            FormRef quest = it->first;
+            it = slideshowHold_.erase(it);
+            Cause c; c.kind = CauseKind::Script; c.source = quest;
+            host_.commit(kHostPlayer, c, {SetPlayerControls{kAllControls, true, Recipient::all()}});
+        } else {
+            ++it;
+        }
     }
     for (auto it = locks_.begin(); it != locks_.end();) {
         if (now_ >= it->second.since + opt_.controlTimeoutMs) {
@@ -446,6 +661,74 @@ void RulesEngine::tick(uint64_t nowMs) {
             ++it;
         }
     }
+}
+
+// ---- PerPlayerVars -------------------------------------------------------------------------------------------------------------
+
+bool RulesEngine::isPerPlayerVar(const FormRef& quest, const std::string& var) const {
+    const QuestRules* q = rulesFor(quest);
+    if (!q) return false;
+    for (auto& r : q->rules) {
+        if (r.kind != "PerPlayerVars") continue;
+        auto it = r.lists.find("vars");
+        if (it != r.lists.end() && std::find(it->second.begin(), it->second.end(), var) != it->second.end()) return true;
+    }
+    return false;
+}
+
+void RulesEngine::writePlayerVar(const FormRef& quest, const std::string& var, PlayerId slot, double value) {
+    if (slot >= kMaxSlots || !isPerPlayerVar(quest, var)) return;
+    if (mutations().perPlayerVarsShared) { for (unsigned s = 0; s < kMaxSlots; ++s) playerVars_[{quest, var, PlayerId(s)}] = value; return; }
+    playerVars_[{quest, var, slot}] = value;
+}
+
+bool RulesEngine::readPlayerVar(const FormRef& quest, const std::string& var, PlayerId slot, double& out) const {
+    auto it = playerVars_.find({quest, var, slot});
+    if (it == playerVars_.end()) return false;
+    out = it->second;
+    return true;
+}
+
+std::vector<std::pair<std::string, double>> RulesEngine::playerVarsOf(const FormRef& quest, PlayerId slot) const {
+    std::vector<std::pair<std::string, double>> v;
+    for (auto& [k, val] : playerVars_)
+        if (std::get<0>(k) == quest && std::get<2>(k) == slot) v.emplace_back(std::get<1>(k), val);
+    return v;
+}
+
+// Host-side rules state worth keeping across a host restart: per-slot var copies and the ExclusiveStages winners.
+Bytes RulesEngine::saveState() const {
+    Archive a = Archive::writer();
+    uint32_t magic = 0x53525246; a.u32(magic);   // 'FRRS'
+    size_t n = playerVars_.size(); a.count(n, 1u << 20);
+    for (auto& [k, val] : playerVars_) {
+        FormRef q = std::get<0>(k); std::string var = std::get<1>(k); uint8_t sl = std::get<2>(k); double v = val;
+        io(a, q); a.str(var, 255); a.u8(sl); a.f64(v);
+    }
+    size_t m = exclusiveWinner_.size(); a.count(m, 1u << 20);
+    for (auto& [q, st] : exclusiveWinner_) { FormRef f = q; uint32_t s = st; io(a, f); a.varu32(s); }
+    return a.finish();
+}
+
+bool RulesEngine::loadState(const Bytes& b) {
+    Archive a = Archive::reader(b.data(), b.size());
+    uint32_t magic = 0; a.u32(magic);
+    std::map<std::tuple<FormRef, std::string, PlayerId>, double> vars;
+    std::map<FormRef, uint32_t> winners;
+    size_t n = 0;
+    if (!a.count(n, 1u << 20)) return false;
+    for (size_t i = 0; i < n && a.ok(); ++i) {
+        FormRef q; std::string var; uint8_t sl = 0; double v = 0;
+        io(a, q); a.str(var, 255); a.u8(sl); a.f64(v);
+        if (a.ok() && sl < kMaxSlots) vars[{q, var, sl}] = v;
+    }
+    size_t m = 0;
+    if (!a.count(m, 1u << 20)) return false;
+    for (size_t i = 0; i < m && a.ok(); ++i) { FormRef q; uint32_t s = 0; io(a, q); a.varu32(s); if (a.ok()) winners[q] = s; }
+    if (!a.ok() || !a.atEnd() || magic != 0x53525246) return false;
+    playerVars_ = std::move(vars);
+    exclusiveWinner_ = std::move(winners);
+    return true;
 }
 
 double RulesEngine::reduceCondition(const FormRef& quest, const std::string& func, const std::vector<PartyValue>& values,
@@ -473,6 +756,20 @@ double RulesEngine::reduceCondition(const FormRef& quest, const std::string& fun
         for (auto& v : values) m = std::min(m, v.value);
         return m;
     }
+    if (red == "max-over-party" || red == "sum-over-party") {
+        if (mutations().sumAsAny) {   // TEST ONLY: the old any-party-member stand-in (0 or 1, so a later >= 2 compare can never pass)
+            for (auto& v : values) if (truthy(v.value)) return 1.0;
+            return 0.0;
+        }
+        if (red == "max-over-party") {
+            double m = -std::numeric_limits<double>::infinity();
+            for (auto& v : values) m = std::max(m, v.value);
+            return m;
+        }
+        double sum = 0;
+        for (auto& v : values) sum += v.value;
+        return sum;
+    }
     if (red == "entry:all-in,exit:any-in") {
         if (phase == CondPhase::Entry) {
             for (auto& v : values) if (!truthy(v.value)) return 0.0;
@@ -487,9 +784,34 @@ double RulesEngine::reduceCondition(const FormRef& quest, const std::string& fun
 
 void RulesEngine::filter(EffectTxn& t) {
     if (mutations().rulesDisabled) return;
+    // ExclusiveStages: alternative outcomes (rescued / failed, three endings) are not progress. The first one committed wins in host order;
+    // a later outcome of the same set is dropped (stage merge alone would let the numerically highest win).
+    for (auto it = t.effects.begin(); it != t.effects.end();) {
+        auto* ss = std::get_if<SetStage>(&*it);
+        const QuestRules* sq = ss ? rulesFor(ss->quest) : nullptr;
+        const Rule* ex = sq ? sq->findFor("ExclusiveStages", ss->stage) : nullptr;
+        if (!ex || mutations().exclusiveLastWins) { ++it; continue; }
+        auto w = exclusiveWinner_.find(ss->quest);
+        if (w == exclusiveWinner_.end()) {
+            auto st = host_.state().stages.find(ss->quest);   // an outcome committed before this engine started counts
+            if (st != host_.state().stages.end() && ex->appliesToStage(st->second)) w = exclusiveWinner_.emplace(ss->quest, st->second).first;
+        }
+        if (w != exclusiveWinner_.end() && w->second != ss->stage) { it = t.effects.erase(it); ++stats_.exclusiveRejected; continue; }
+        if (w == exclusiveWinner_.end()) exclusiveWinner_[ss->quest] = ss->stage;
+        ++it;
+    }
+    // The ending slideshow releases the controls it held since the barrier.
+    if (!slideshowHold_.empty() && !host_.state().slideshowEnded) {
+        bool ends = false;
+        for (auto& e : t.effects) ends |= std::holds_alternative<SlideshowEnd>(e);
+        if (ends) {
+            slideshowHold_.clear();
+            t.effects.push_back(SetPlayerControls{kAllControls, true, Recipient::all()});
+        }
+    }
     const QuestRules* q = rulesFor(t.cause.source);
     if (!q) return;
-    if (q->find("GuestLocalRun") && !mutations().guestLocalReplicated) {
+    if (runsOnEveryMachine(*q) && !mutations().guestLocalReplicated) {
         // Per-machine scripts (achievements, rumble, DLC setup, fades) run locally on every machine: nothing of theirs is replicated.
         t.effects.clear();
         ++stats_.guestLocalDropped;
@@ -529,6 +851,7 @@ void RulesEngine::filter(EffectTxn& t) {
     const bool perOwner = q->find("RemoveItemPerOwner") != nullptr;
     const bool shareKR = q->find("ShareKarmaRep") != nullptr;
     const bool ctrlAll = q->find("SetPlayerControls") != nullptr;
+    const bool perScene = q->find("PerPlayerScene") != nullptr && !mutations().perPlayerSceneShared;   // the scene belongs to the acting player
     const bool saveRule = q->find("SaveSuppress") != nullptr;
     bool lockedNow = false, unlockedNow = false;
     for (auto& e : t.effects) {
@@ -537,15 +860,29 @@ void RulesEngine::filter(EffectTxn& t) {
             auto setTo = [&](Recipient& to, Recipient r) {
                 if (to.mode == Recipient::Default) { to = r; ++stats_.recipientRewrites; }
             };
+            auto scene = [&](Recipient& to) {
+                if (to.mode != Recipient::Default) return;
+                to = Recipient::origin();
+                ++stats_.recipientRewrites; ++stats_.perPlayerRouted;
+            };
+            // An explicit sharing rule of the quest (RewardAll, QuestItemDup, RemoveItemPerOwner, ShareKarmaRep) wins; otherwise a
+            // PerPlayerScene keeps the scene's effects with the acting player instead of the global quest-reward default.
             if constexpr (std::is_same_v<T, AddItem>) {
                 if (rewardAll || itemDup) setTo(x.to, Recipient::all());
+                else if (perScene) scene(x.to);
             } else if constexpr (std::is_same_v<T, ModActorValue>) {
                 if (rewardAll) setTo(x.to, Recipient::all());
+                else if (perScene) scene(x.to);
             } else if constexpr (std::is_same_v<T, RemoveItem>) {
                 if (perOwner) setTo(x.to, Recipient::origin());
                 else if (itemDup) setTo(x.to, Recipient::all());
+                else if (perScene) scene(x.to);
             } else if constexpr (std::is_same_v<T, ModKarma> || std::is_same_v<T, ModReputation>) {
                 if (shareKR) setTo(x.to, Recipient::all());
+                else if (perScene) scene(x.to);
+            } else if constexpr (std::is_same_v<T, SetPerk>) {
+                if (rewardAll) setTo(x.to, Recipient::all());
+                else if (perScene) scene(x.to);
             } else if constexpr (std::is_same_v<T, SetPlayerControls>) {
                 if (ctrlAll) {
                     setTo(x.to, Recipient::all());

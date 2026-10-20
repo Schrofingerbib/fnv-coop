@@ -133,6 +133,8 @@ def prepare_instance():
     dll = REPO / "out" / "L5" / "nvcoop.dll"
     if dll.exists():
         shutil.copy2(dll, d / "Data" / "NVSE" / "Plugins" / "nvcoop.dll")
+    for js in dll.parent.glob("nvcoop_*.json"):  # data files next to the dll (GuestLocalRun allow-list)
+        shutil.copy2(js, d / "Data" / "NVSE" / "Plugins" / js.name)
     sav = d / "Saves" / "autosave.fos"
     src = instances.instance_dir(0) / "Saves" / "autosave.fos"
     if not sav.exists() and src.exists():

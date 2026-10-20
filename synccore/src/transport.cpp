@@ -57,9 +57,10 @@ void InMemoryNetwork::setConnected(PeerId id, bool up) {
     if (it != eps_.end()) it->second->inbox.clear();
 }
 
-void InMemoryNetwork::enqueue(PeerId from, PeerId to, Bytes data) {
+void InMemoryNetwork::enqueue(PeerId from, PeerId to, Bytes data, int64_t forcedLatency) {
     uint64_t lat = link_.minLatencyMs;
-    if (link_.maxLatencyMs > link_.minLatencyMs) lat = rng_.range(link_.minLatencyMs, link_.maxLatencyMs);
+    if (forcedLatency >= 0) lat = static_cast<uint64_t>(forcedLatency);
+    else if (link_.maxLatencyMs > link_.minLatencyMs) lat = rng_.range(link_.minLatencyMs, link_.maxLatencyMs);
     uint64_t at = now_ + lat;
     if (bandwidth_) {   // serialization delay on a shared pipe: big messages block what is behind them
         uint64_t start = std::max<uint64_t>(now_, busyUntil_[{from, to}]);
@@ -76,6 +77,13 @@ void InMemoryNetwork::sendFrom(PeerId from, PeerId to, Bytes data) {
     stats_.bytesSent += data.size();
     if (!connected(from) || !connected(to)) { ++stats_.droppedDown; return; }
     sentBytes_[{from, to}] += data.size();   // offered load, before any loss
+    if (shaper_) {
+        std::vector<uint32_t> delays = shaper_(from, to, now_, data);
+        if (delays.empty()) { ++stats_.lost; return; }
+        for (size_t i = 1; i < delays.size(); ++i) { enqueue(from, to, data, delays[i]); ++stats_.duplicated; }
+        enqueue(from, to, std::move(data), delays[0]);
+        return;
+    }
     if (link_.loss > 0 && rng_.chance(link_.loss)) { ++stats_.lost; return; }
     if (link_.corrupt > 0 && !data.empty() && rng_.chance(link_.corrupt)) {
         data[rng_.u32() % data.size()] ^= static_cast<uint8_t>(1u << (rng_.u32() % 8));

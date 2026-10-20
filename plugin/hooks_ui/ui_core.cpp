@@ -182,6 +182,8 @@ ForcedOutcome UiRouter::onForced(const ForcedCall& c) {
     a.lines = c.lines;
     a.target = o.target;
     a.scene = c.scene || t.party || (c.kind == ForcedCall::Kind::Say && !origin_.scoped());
+    if (a.scene && br_.nextStamp)  // party scene (narrator, cutscene): everybody gets these, so they can be ordered against the slides
+        for (auto& ln : a.lines) ln.voice = withOrder(ln.voice, br_.nextStamp());
     br_.forcedSay(a);
     o.captured = true;
     ++stats_.forced;

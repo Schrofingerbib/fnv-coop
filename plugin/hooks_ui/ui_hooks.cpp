@@ -1,4 +1,4 @@
-// L11 hooks_ui x86 glue. Addresses/conventions: internal lane notes (prologues pinned in
+// L11 hooks_ui x86 glue. Addresses/conventions: internal lane notes (all verified in Ghidra on a reference exe, prologues pinned in
 // tests/test_ui.cpp). Every command-handler detour is cdecl (COMMAND_ARGS: paramInfo, scriptData, thisObj, containingObj, script,
 // eventList, double* result, UInt32* opcodeOffsetPtr); a static_assert ties each one to `ret` (retBytes == 0).
 #include "ui_hooks.h"
@@ -9,6 +9,7 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <unordered_map>
 
 #include "common/nvcoop_api.h"
 #include "engine_hooks.h"
@@ -96,6 +97,16 @@ using ExtractArgsFn = bool(__cdecl*)(void*, void*, uint32_t*, void*, void*, void
 ExtractArgsFn extractArgs() { return reinterpret_cast<ExtractArgsFn>(addr::ExtractArgs.addr); }
 
 bool toRef(uint32_t refID, FormRef& out) { return refID && nvhooks::resolver().toRef(refID, &out); }
+
+// runtime refID -> in-memory form (the engine's global form table: LookupFormByID 0x4839C0, cdecl, verified by L5 in docs/engine-addresses.md)
+uint32_t lookupForm(uint32_t refID) {
+    using Fn = void*(__cdecl*)(uint32_t);
+    __try {
+        return reinterpret_cast<uint32_t>(reinterpret_cast<Fn>(0x4839C0)(refID));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
 
 // ------------------------------------------------------------------ engine seam for the router
 struct GameEngine : IUiEngine {
@@ -204,8 +215,13 @@ int g_forcedDepth = 0;
 uint32_t g_lastInfo = 0;
 using Fn_GetTopicInfo = int(__cdecl*)(int, uint8_t*, void*, void*, char, int, int);
 Fn_GetTopicInfo o_GetTopicInfo;
+// info -> topic, learned from every resolution the engine does (the topic-list builder calls this for each offered topic). Vanilla
+// TESTopicInfo has no back pointer, so this is how L8's topicOf works. Installed on guests too: the initiator builds the lists.
+std::unordered_map<uint32_t, uint32_t> g_topicOfInfo;
+constexpr size_t kMaxTopicCache = 400000;
 int __cdecl h_GetTopicInfo(int topic, uint8_t* flag, void* speaker, void* target, char p5, int p6, int p7) {
     int info = o_GetTopicInfo(topic, flag, speaker, target, p5, p6, p7);
+    if (info && topic && g_topicOfInfo.size() < kMaxTopicCache) g_topicOfInfo[uint32_t(info)] = uint32_t(topic);
     if (g_forcedDepth > 0 && info) g_lastInfo = uint32_t(info);
     return info;
 }
@@ -344,7 +360,7 @@ const Entry kEntries[] = {
     E(CmdSayTo, h_SayTo, o_SayTo, true),
     E(CmdStartConversation, h_StartConversation, o_StartConv, true),
     E(CmdSwapTexture, h_SwapTexture, o_Swap, true),
-    E(GetTopicInfo, h_GetTopicInfo, o_GetTopicInfo, true),
+    E(GetTopicInfo, h_GetTopicInfo, o_GetTopicInfo, false),
     E(CmdShowBarterMenu, h_Barter, o_Barter, true),
     E(CmdShowRepairMenu, h_Repair, o_Repair, true),
     E(CmdShowRecipeMenu, h_Recipe, o_Recipe, true),
@@ -372,7 +388,7 @@ InitReport Init(UiRouter& router, bool host) {
     for (const Entry& e : kEntries) {
         if (e.hostOnly && !host) continue;
         nvhooks::Addr tramp = 0;
-        PatchStatus st = g_reg->acquire(*e.spec, reinterpret_cast<nvhooks::Addr>(e.detour), &tramp);
+        PatchStatus st = g_reg->acquire(*e.spec, reinterpret_cast<nvhooks::Addr>(e.detour), &tramp, reinterpret_cast<nvhooks::Addr*>(e.original));
         rep.hooks.push_back({e.spec->name, st});
         if (nvhooks::installed(st)) {
             *reinterpret_cast<nvhooks::Addr*>(e.original) = tramp;
@@ -385,6 +401,8 @@ InitReport Init(UiRouter& router, bool host) {
     }
     return rep;
 }
+
+int auditTamperedHooks() { return g_reg ? g_reg->auditTampered() : 0; }
 
 void Shutdown() {
     g_reg.reset();
@@ -502,6 +520,75 @@ bool swapTexture(const FormRef& ref, const std::string& oldTex, const std::strin
 }
 
 size_t queuedBoxes() { return g_queue.size() + (g_showing ? 1 : 0); }
+
+bool answerShowing(int button, uint32_t* menuId) {
+    if (!g_showing) return false;
+    const uint32_t id = g_showing;
+    g_showing = 0;
+    reinterpret_cast<void(__cdecl*)()>(addr::CloseAllMenusCore.addr)();
+    if (menuId) *menuId = id;
+    if (g_answer) g_answer(id, button);
+    return true;
+}
+
+uint32_t topicOfInfo(uint32_t infoAddr) {
+    auto it = g_topicOfInfo.find(infoAddr);
+    return it == g_topicOfInfo.end() ? 0 : it->second;
+}
+
+bool sayTopic(uint32_t npcRefID, const FormRef& topic) {
+    const uint32_t t = nvhooks::resolver().fromRef(topic);
+    if (!npcRefID || !t) return false;
+    char line[64];
+    std::snprintf(line, sizeof line, "Say %08X", t);
+    return nvhooks::execConsoleLineOn(line, npcRefID);
+}
+
+bool resumeTalk(uint32_t npcRefID) {
+    // the vanilla Activate was deferred by the activate observer; StartConversation opens the DialogMenu on the GREETING topic directly
+    return npcRefID && nvhooks::execConsoleLineOn("StartConversation player GREETING", npcRefID);
+}
+
+void setControlsLocked(bool locked) { nvhooks::SetPlayerControlsLocked(locked); }
+
+bool refPosition(uint32_t refID, uint32_t* cell, float xyz[3]) {
+    // TESObjectREFR: pos at 0x30..0x38, parentCell at 0x40 (xNVSE GameObjects.h); TESObjectCELL::worldSpace at 0xC0 (null = interior)
+    const uint32_t form = refID ? lookupForm(refID) : 0;
+    if (!form) return false;
+    uint8_t type = 0;
+    if (!safeRead(form + 0x04, &type, 1) || type < 0x3A || type > 0x3C) return false;  // REFR / ACHR / ACRE
+    float p[3] = {};
+    uint32_t c = 0;
+    if (!safeRead(form + 0x30, p, sizeof p) || !safeRead(form + 0x40, &c, 4)) return false;
+    if (cell) *cell = c;
+    if (xyz) std::memcpy(xyz, p, sizeof p);
+    return true;
+}
+bool cellIsInterior(uint32_t cell) { return cell && rd32(cell + 0xC0) == 0; }
+
+bool nearPlayer(uint32_t refID, float maxDist) {
+    uint32_t cn = 0, cp = 0;
+    float n[3], p[3];
+    if (!refPosition(refID, &cn, n) || !refPosition(0x14, &cp, p)) return false;
+    if (!cn || !cp) return false;
+    if (cn != cp && (cellIsInterior(cn) || cellIsInterior(cp))) return false;
+    const float dx = n[0] - p[0], dy = n[1] - p[1], dz = n[2] - p[2];
+    return dx * dx + dy * dy + dz * dz <= maxDist * maxDist;
+}
 }  // namespace ops
+
+// ------------------------------------------------------------------ ending slideshow (both roles)
+SlideClient& slideClient() {
+    static SlideClient c(SlideClient::Callbacks{
+        [](const FormRef& r, const std::string& o, const std::string& n) { return ops::swapTexture(r, o, n); },
+        [](bool locked) { nvhooks::SetPlayerControlsLocked(locked); },
+        [](const std::string& s) { nvcoop::Log("[ui] slideshow: %s", s.c_str()); }});
+    return c;
+}
+SlideHost& slideHost(SlideHost::Send send) {
+    static std::unique_ptr<SlideHost> h;
+    if (!h) h = std::make_unique<SlideHost>(send ? std::move(send) : SlideHost::Send([](fnvcoop::PlayerId, std::vector<uint8_t>) {}));
+    return *h;
+}
 
 }  // namespace nvui

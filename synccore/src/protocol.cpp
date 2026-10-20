@@ -35,6 +35,14 @@ void ioM(Archive& a, Welcome& m) {
     a.varu32(m.baselineId);
     a.u8(m.baselineAbs);
     a.varu32(m.worldEpoch);
+    size_t n = m.rewards.size();
+    if (!a.count(n, kMaxRewardsPerWelcome)) { m.rewards.clear(); return; }
+    if (a.reading()) {
+        m.rewards.clear();
+        for (size_t i = 0; i < n && a.ok(); ++i) { RewardGrant g; a.varu(g.id); io(a, g.effect); if (a.ok()) m.rewards.push_back(std::move(g)); }
+    } else {
+        for (auto& g : m.rewards) { uint64_t id = g.id; a.varu(id); io(a, g.effect); }
+    }
 }
 void ioM(Archive& a, Reject& m) { a.varu32(m.session); a.u8(m.reason); a.str(m.text, 255); }
 void ioM(Archive& a, TxnBatch& m) {

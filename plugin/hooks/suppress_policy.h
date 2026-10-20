@@ -41,9 +41,17 @@ public:
     // quest scripts running on guests.
     bool skipScript(uint16_t scriptType, uint32_t scriptRefID);
     void setGuestLocalRun(std::unordered_set<uint32_t> ids) { localRun_ = std::move(ids); }
+    // Quest script variables of a GuestLocalRun quest are per-machine state: never captured, polled or sent (and never shared divergence).
+    bool sharesQuestVars(uint32_t questScriptRefID) const;
     size_t guestLocalRunSize() const { return localRun_.size(); }
+    bool isGuestLocalRun(uint32_t scriptRefID) const { return scriptRefID && localRun_.count(scriptRefID); }
     void enterScript() { ++depth_; }
     void leaveScript() { if (depth_ > 0) --depth_; }
+    // A GuestLocalRun script is per-machine by definition: while one runs, its mutations (SetStage, StartQuest, AddItem, ...) are NOT
+    // blocked on a guest (the host drops the same script's txns, so each machine applies them itself).
+    void enterLocalScript() { ++depth_; ++localDepth_; }
+    void leaveLocalScript() { if (depth_ > 0) --depth_; if (localDepth_ > 0) --localDepth_; }
+    int localScriptDepth() const { return localDepth_; }
     int scriptDepth() const { return depth_; }
 
     bool blockMutation();      // shared-state mutator called from a running script
@@ -57,6 +65,7 @@ private:
     bool questGate_ = true;
     int applying_ = 0;
     int depth_ = 0;
+    int localDepth_ = 0;
     Suppressed stats_;
     std::unordered_set<uint32_t> localRun_;
 };
@@ -93,8 +102,22 @@ public:
 #endif
     void pop() { if (depth_) --depth_; }
     int depth() const { return depth_; }
+    // Party slot of the acting player: 0 for the host's own player, else the slot registered for that guest's ghost (unknown ghost -> 0).
+    void registerSlot(uint32_t ghostRefID, uint8_t slot) {
+        for (int i = 0; i < nSlots_; ++i) if (ghost_[i] == ghostRefID) { slot_[i] = slot; return; }
+        if (nSlots_ < 8) { ghost_[nSlots_] = ghostRefID; slot_[nSlots_++] = slot; }
+    }
+    void clearSlots() { nSlots_ = 0; }
+    uint8_t slot() const {
+        uint32_t c = current();
+        for (int i = 0; i < nSlots_; ++i) if (ghost_[i] == c) return slot_[i];
+        return 0;
+    }
 
 private:
+    uint32_t ghost_[8] = {};
+    uint8_t slot_[8] = {};
+    int nSlots_ = 0;
     uint32_t stack_[8] = {};
     int depth_ = 0;
 };

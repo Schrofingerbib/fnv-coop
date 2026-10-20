@@ -21,6 +21,7 @@
 
 #include "fnvcoop/types.h"
 #include "fnvcoop_dlg/messages.h"
+#include "showorder.h"
 
 #ifndef NVUI_MUTANT
 #define NVUI_MUTANT 0
@@ -139,6 +140,9 @@ struct Bridge {
 
     // --- ending slideshow (host capture -> everybody)
     std::function<void(const FormRef& ref, const std::string& oldTex, const std::string& newTex)> slideSwap;
+    // The host's ShowClock (shared with the slide host): every scene line gets the next stamp so receivers can order narration against
+    // slides (showorder.h). Absent = lines are sent unstamped.
+    std::function<ShowStamp()> nextStamp;
 };
 
 // ------------------------------------------------------------------ routing

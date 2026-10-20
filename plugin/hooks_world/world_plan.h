@@ -49,4 +49,18 @@ std::vector<Plan> planQueuedSpawns(PlanEnv& env);
 // True for effect types this lane applies.
 bool handlesEffect(const fnvcoop::Effect& e);
 
+// Rejoin: delete steps for created refs this client still has that the host no longer lists (see SpawnLedger::reconcile).
+Plan planReconcile(const std::vector<fnvcoop::SpawnRef>& live, PlanEnv& env);
+
+// ---- routed apply: ordering, remapping and retry around the plans (game-free; the glue supplies the executors) ----
+using RunPlan = std::function<Outcome(const Plan&)>;                  // execute the steps of a plan
+using FallbackApply = std::function<Outcome(const fnvcoop::Effect&)>;  // effects this lane does not own (L5's RemoteApplier)
+// Any effect from the host. An effect on a created ref that has no local object yet is HELD until the spawn is created (or
+// dropped when the ref is despawned); one that fails because a form / script instance is not there yet is held for the retry
+// tick. A held effect reports Ok. Applying a SpawnRef releases its held follow-ups.
+Outcome applyRouted(const fnvcoop::Effect& e, PlanEnv& env, const RunPlan& run, const FallbackApply& other, int attempts = 0);
+Outcome applyWorldRouted(const WorldEffect& e, PlanEnv& env, const RunPlan& run, int attempts = 0);
+// Release held effects: those whose created ref is bound now, plus (retryTick) the retry waiters. Returns how many were applied.
+size_t flushDeferred(PlanEnv& env, const RunPlan& run, const FallbackApply& other, bool retryTick, int maxAttempts = 30);
+
 }  // namespace nvworld

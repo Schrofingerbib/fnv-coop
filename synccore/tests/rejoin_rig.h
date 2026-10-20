@@ -35,8 +35,12 @@ struct Rec : IEffectSink {
     std::vector<uint8_t> tags;
     std::vector<std::string> trail;   // debugging: where each AddItem came from
     PlayerId slot = kNoPlayer;
+    struct Seen { Effect e; bool catchUp; };
+    std::vector<Seen> seen;            // every non-baseline effect the engine would perform, in order
+    int countSeen(size_t tag, bool live = true) const { int n = 0; for (auto& s : seen) n += s.e.index() == tag && (!live || !s.catchUp); return n; }
     void apply(const Effect& e, const Context& c) override {
         if (c.baseline) return;
+        seen.push_back({e, c.catchUp});
         tags.push_back(uint8_t(e.index()));
         if (auto* a = std::get_if<AddItem>(&e)) { items[a->item.localId] += a->count; trail.push_back(std::to_string(a->item.localId) + "@seq" + std::to_string(c.seq) + "/ep" + std::to_string(c.epoch) + (c.catchUp ? "/catchup" : "") + (c.fromSnapshot ? "/snap" : "")); }
     }
@@ -65,8 +69,8 @@ struct Rig {
     std::vector<std::pair<dlg::ConvId, dlg::Phase>> dlgRunKeys;
     bool withDialogue = false;
 
-    explicit Rig(uint64_t seed, bool dialogue = false, uint32_t dlgLatency = 40)
-        : story(seed * 7 + 1), dnet(seed * 7 + 2), host(*story.endpoint(0)), withDialogue(dialogue) {
+    explicit Rig(uint64_t seed, bool dialogue = false, uint32_t dlgLatency = 40, HostSession::Options hostOpt = HostSession::Options())
+        : story(seed * 7 + 1), dnet(seed * 7 + 2), host(*story.endpoint(0), SharePolicy(), hostOpt), withDialogue(dialogue) {
         LinkParams lp; lp.minLatencyMs = storyLatMin; lp.maxLatencyMs = storyLatMax; lp.loss = 0.03; lp.duplicate = 0.01;
         story.setLink(lp);
         LinkParams dp; dp.minLatencyMs = dp.maxLatencyMs = dlgLatency; dp.duplicate = 0.02;   // reliable + ordered, like ENet channel 0

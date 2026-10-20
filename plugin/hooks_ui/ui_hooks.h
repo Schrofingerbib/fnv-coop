@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "hook_patch.h"
+#include "slideshow.h"
 #include "ui_core.h"
 
 namespace nvui {
@@ -26,6 +27,7 @@ struct InitReport {
 UiRouter* MakeRouter(Bridge b);
 InitReport Init(UiRouter& router, bool host);
 void Shutdown();
+int auditTamperedHooks();  // hot reload preflight: our hooks that another patcher chained over (0 = safe to unload)
 UiRouter* router();
 
 // Reads the response chain of an INFO (L8's fndlg::readLines behind a lambda; wired by L10). Without it ForcedSay carries no text.
@@ -52,7 +54,19 @@ bool dialogOpen();
 // Ending slideshow playback on a client: the SwapTexture the host script ran (`SwapTexture <ref> "old" "new"` through the console executor).
 bool swapTexture(const FormRef& ref, const std::string& oldTex, const std::string& newTex);
 size_t queuedBoxes();
+// Bot/test: answer the message box we are showing as if the player clicked `button` (closes it, then runs the answer sink). false if none.
+bool answerShowing(int button, uint32_t* menuId);
+// L8 engine glue stubs (unproven in-game until internal lane notes says so):
+uint32_t topicOfInfo(uint32_t infoAddr);                    // TESTopicInfo* -> TESTopic* learned from GetTopicInfo (0 = never resolved)
+bool sayTopic(uint32_t npcRefID, const FormRef& topic);     // `<npc>.Say <topic>`: plays the NPC's line for that topic (voice + lip sync)
+bool resumeTalk(uint32_t npcRefID);                         // deferred vanilla talk -> `<npc>.StartConversation player GREETING`
+void setControlsLocked(bool locked);                        // player controls (all-or-nothing, L5's SetPlayerControlsLocked)
+bool nearPlayer(uint32_t refID, float maxDist);             // same cell (or both exterior) and within maxDist game units of the local player
 }  // namespace ops
+
+// Ending slideshow: the client side is the same on every machine; the host broadcasts through `send` (set once at session start).
+SlideClient& slideClient();
+SlideHost& slideHost(SlideHost::Send send = nullptr);
 
 // Test hooks (RPC ui.* in ui_module.cpp)
 bool installedByName(const std::string& n);

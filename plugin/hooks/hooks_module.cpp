@@ -17,6 +17,8 @@
 #include "common/nvcoop_api.h"
 #include "effect_json.h"
 #include "engine_hooks.h"
+#include "guest_local_run.h"
+#include "reload/reload_state.h"
 
 using nvcoop::json::Value;
 
@@ -28,6 +30,7 @@ nvhooks::InitReport g_report;
 NVSEConsoleInterface* g_console = nullptr;
 nvhooks::Role g_role = nvhooks::Role::Host;
 bool g_inited = false;
+size_t g_localRunListed = 0;
 std::vector<Value> g_txns, g_vars;
 
 int RunLineSEH(const char* line, void* thisObj) {
@@ -49,6 +52,26 @@ std::string IniPath() {
     return (s == std::string::npos ? std::string() : p.substr(0, s + 1)) + "nvcoop.ini";
 }
 
+// GuestLocalRun allow-list: nvcoop_guest_local_run.json next to the dll (generated from questlines types.json by
+// hooks/tools/gen_guest_local_run.py). Missing file = empty list (every quest script is gated on a guest, the old behaviour).
+void LoadGuestLocalRun() {
+    std::string path = IniPath();
+    path = path.substr(0, path.find_last_of("\\/") + 1) + "nvcoop_guest_local_run.json";
+    HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { nvcoop::Log("hooks: GuestLocalRun list not found (%s)", path.c_str()); return; }
+    std::string text;
+    char buf[8192];
+    DWORD n = 0;
+    while (ReadFile(f, buf, sizeof buf, &n, nullptr) && n) text.append(buf, n);
+    CloseHandle(f);
+    nvhooks::GuestLocalRunList list;
+    std::string err;
+    if (!nvhooks::parseGuestLocalRun(text, &list, &err)) { nvcoop::Log("hooks: GuestLocalRun list invalid: %s", err.c_str()); return; }
+    nvhooks::setGuestLocalRun(list.scripts);
+    g_localRunListed = list.scripts.size();
+    nvcoop::Log("hooks: GuestLocalRun allow-list: %d scripts (%d malformed)", static_cast<int>(list.scripts.size()), list.skipped);
+}
+
 const char* RoleName(nvhooks::Role r) {
     return r == nvhooks::Role::Host ? "host" : r == nvhooks::Role::Guest ? "guest" : "gateonly";
 }
@@ -62,6 +85,7 @@ void InitHooks() {
     g_role = (r == "client" || r == "guest") ? nvhooks::Role::Guest : r == "gateonly" ? nvhooks::Role::Client : nvhooks::Role::Host;
     g_hub.addSink([](fnvcoop::EffectTxn&& t) { g_txns.push_back(nvhooks::txnToJson(t)); });
     g_report = nvhooks::Init(g_hub, g_role);
+    LoadGuestLocalRun();
     g_applier.reset(new nvhooks::RemoteApplier(g_hub, nvhooks::resolver()));
     auto exec = [](const std::string& line, uint32_t refID) {
         void* ref = refID ? nvhooks::resolver().lookup(refID) : nullptr;
@@ -114,7 +138,7 @@ bool MEnd(const std::string&, std::string& out) {
     const auto& st = g_hub.stats();
     Value stats = Value::object();
     stats.set("recorded", (int64_t)st.recorded).set("droppedNoScope", (int64_t)st.droppedNoScope)
-        .set("staleScopes", (int64_t)st.staleScopes).set("weakTxns", (int64_t)st.weakTxns).set("weakFlushes", (int64_t)st.weakFlushes).set("collapsed", (int64_t)st.collapsed).set("droppedEcho", (int64_t)st.droppedEcho).set("txns", (int64_t)st.txns).set("emptyScopes", (int64_t)st.emptyScopes);
+        .set("staleScopes", (int64_t)st.staleScopes).set("weakTxns", (int64_t)st.weakTxns).set("weakFlushes", (int64_t)st.weakFlushes).set("collapsed", (int64_t)st.collapsed).set("droppedEcho", (int64_t)st.droppedEcho).set("droppedLocal", (int64_t)st.droppedLocal).set("txns", (int64_t)st.txns).set("emptyScopes", (int64_t)st.emptyScopes);
     const auto& um = nvhooks::unmapped();
     Value un = Value::object();
     un.set("questCompleted", (int64_t)um.questCompleted).set("itemOnNonPlayer", (int64_t)um.itemOnNonPlayer)
@@ -138,9 +162,23 @@ bool MExecRef(const std::string& params, std::string& out) {
     uint32_t id = nvhooks::resolver().fromRef(r);
     if (!id) { out = "plugin not loaded"; return false; }
     bool ok;
+    std::unique_ptr<nvhooks::ActingPlayerScope> acting;
+    if (p.find("acting")) {  // run as a guest's ghost: {ghost:"ref", slot:n} (CompanionOwner.owner etc. take the slot)
+        fnvcoop::FormRef gr;
+        if (!nvhooks::strToRef(p.get("acting").get("ghost").asString(""), &gr)) { out = "bad acting.ghost"; return false; }
+        uint32_t gid = nvhooks::resolver().fromRef(gr);
+        if (!gid) { out = "acting.ghost not loaded"; return false; }
+        nvhooks::registerPlayerSlot(gid, static_cast<uint8_t>(p.get("acting").get("slot").asInt(1)));
+        acting.reset(new nvhooks::ActingPlayerScope(gid));
+    }
     if (p.get("scope").asBool(false)) {  // run inside a capture scope so the mutation hooks record it (a bare console line is "ambient")
         fnvcoop::Cause c;
         c.kind = fnvcoop::CauseKind::Console;
+        fnvcoop::FormRef src;
+        if (p.find("source") && nvhooks::strToRef(p.get("source").asString(""), &src)) {  // pretend a quest stage runs the command (scope needs a source)
+            c.kind = fnvcoop::CauseKind::QuestResult;
+            c.source = src;
+        }
         nvhooks::ScopedCapture sc(g_hub, c);
         ok = nvhooks::execConsoleLineOn(p.get("cmd").asString(""), id);
     } else {
@@ -165,7 +203,8 @@ bool MRefInfo(const std::string& params, std::string& out) {
     Value o = Value::object();
     o.set("x", (double)ref->posX).set("y", (double)ref->posY).set("z", (double)ref->posZ)
         .set("lifeState", (int64_t)*reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(ref) + 0x108))
-        .set("flags", (int64_t)ref->flags).set("type", (int64_t)ref->typeID);
+        .set("flags", (int64_t)ref->flags).set("type", (int64_t)ref->typeID)
+        .set("cell", (int64_t)(ref->parentCell ? ref->parentCell->refID : 0));
     out = o.dump();
     return true;
 }
@@ -239,6 +278,229 @@ bool MApply(const std::string& params, std::string& out) {
     return true;
 }
 
+// observe.set {events:"off|count|suppress", activate:"off|count|suppress"}; observe.stats -> counts + last target. Observers only fire on a guest,
+// outside scripts, for the local player (see engine_hooks.cpp), so this is the live check for the guest event / activate observers.
+struct ObsState {
+    int64_t events = 0, activates = 0, lastMask = 0;
+    std::string lastEventTarget, lastActivateTarget;
+    std::string eventMode = "off", activateMode = "off";
+} g_obs;
+
+bool MObserveSet(const std::string& params, std::string& out) {
+    Value p;
+    std::string err;
+    if (!nvcoop::json::parse(params, p, err)) { out = "bad params: " + err; return false; }
+    if (p.find("events")) g_obs.eventMode = p.get("events").asString("off");
+    if (p.find("activate")) g_obs.activateMode = p.get("activate").asString("off");
+    if (p.get("reset").asBool(false)) { g_obs.events = g_obs.activates = g_obs.lastMask = 0; }
+    nvhooks::setEventObserver(g_obs.eventMode == "off" ? nvhooks::EventObserver() : nvhooks::EventObserver([](uint32_t mask, const fnvcoop::FormRef& t) {
+        ++g_obs.events;
+        g_obs.lastMask = mask;
+        g_obs.lastEventTarget = nvhooks::refToStr(t);
+        return g_obs.eventMode == "suppress" ? nvhooks::EventAction::Suppress : nvhooks::EventAction::Proceed;
+    }));
+    nvhooks::setActivateObserver(g_obs.activateMode == "off" ? nvhooks::ActivateObserver() : nvhooks::ActivateObserver([](const fnvcoop::FormRef& t) {
+        ++g_obs.activates;
+        g_obs.lastActivateTarget = nvhooks::refToStr(t);
+        return g_obs.activateMode == "suppress" ? nvhooks::ActivateAction::Suppress : nvhooks::ActivateAction::Proceed;
+    }));
+    Value o = Value::object();
+    o.set("events", g_obs.eventMode).set("activate", g_obs.activateMode);
+    out = o.dump();
+    return true;
+}
+
+bool MObserveStats(const std::string&, std::string& out) {
+    Value o = Value::object();
+    o.set("events", g_obs.events).set("lastMask", g_obs.lastMask).set("lastEventTarget", g_obs.lastEventTarget).set("activates", g_obs.activates)
+        .set("lastActivateTarget", g_obs.lastActivateTarget).set("scriptDepth", (int64_t)nvhooks::suppressStats().mutations);
+    out = o.dump();
+    return true;
+}
+
+// activate.ref {ref}: calls the ENGINE's TESObjectREFR::Activate (0x573170) with the local player as activator, outside any script - exactly
+// what a player key press does - so the guest activate observer is exercised. event.mark {ref, mask}: same for MarkBaseExtraListScriptEvent.
+using ActivateFn = UInt32(__thiscall*)(void*, void*, UInt8, UInt32, UInt32);
+using MarkFn = bool(__cdecl*)(void*, void*, UInt32);
+bool CallActivateSEH(void* ref, void* player, UInt32* ret) {
+    __try {
+        *ret = reinterpret_cast<ActivateFn>(0x573170)(ref, player, 0, 0, 0);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool CallMarkSEH(void* player, void* xlist, UInt32 mask, bool* ret) {
+    __try {
+        *ret = reinterpret_cast<MarkFn>(0x5AC750)(player, xlist, mask);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+void* RefFromParam(const Value& p, const char* key) {
+    fnvcoop::FormRef r;
+    if (!nvhooks::strToRef(p.get(key).asString(""), &r)) return nullptr;
+    uint32_t id = nvhooks::resolver().fromRef(r);
+    return id ? nvhooks::resolver().lookup(id) : nullptr;
+}
+bool MActivateRef(const std::string& params, std::string& out) {
+    Value p;
+    std::string err;
+    if (!nvcoop::json::parse(params, p, err)) { out = "bad params: " + err; return false; }
+    void* ref = RefFromParam(p, "ref");
+    void* player = nvhooks::resolver().lookup(nvhooks::kHostPlayerRef);
+    if (!ref || !player) { out = "ref or player not loaded"; return false; }
+    UInt32 ret = 0;
+    bool ok = CallActivateSEH(ref, player, &ret);
+    Value o = Value::object();
+    o.set("ok", ok).set("returned", (int64_t)ret);
+    out = o.dump();
+    return true;
+}
+bool MEventMark(const std::string& params, std::string& out) {
+    Value p;
+    std::string err;
+    if (!nvcoop::json::parse(params, p, err)) { out = "bad params: " + err; return false; }
+    TESObjectREFR* ref = static_cast<TESObjectREFR*>(RefFromParam(p, "ref"));
+    void* player = nvhooks::resolver().lookup(nvhooks::kHostPlayerRef);
+    if (!ref || !player) { out = "ref or player not loaded"; return false; }
+    bool ret = false;
+    bool ok = CallMarkSEH(player, &ref->extraDataList, static_cast<UInt32>(p.get("mask").asInt(1)), &ret);
+    Value o = Value::object();
+    o.set("ok", ok).set("returned", ret);
+    out = o.dump();
+    return true;
+}
+
+// perf.hooks {on:true|false}: QPC accounting of our code inside the Script::Execute detour. Reading it (on:false) returns the totals.
+bool MPerf(const std::string& params, std::string& out) {
+    Value p;
+    std::string err;
+    if (!nvcoop::json::parse(params, p, err)) { out = "bad params: " + err; return false; }
+    if (p.find("on") && p.get("on").asBool(false)) nvhooks::setHookPerf(true);
+    auto s = nvhooks::hookPerf();
+    if (p.find("on") && !p.get("on").asBool(false)) nvhooks::setHookPerf(false);
+    Value o = Value::object();
+    o.set("calls", (int64_t)s.calls).set("overheadUs", s.freq ? 1e6 * (double)s.overheadTicks / (double)s.freq : 0.0)
+        .set("usPerCall", s.calls ? 1e6 * (double)s.overheadTicks / (double)s.freq / (double)s.calls : 0.0);
+    out = o.dump();
+    return true;
+}
+
+// guest.stats: GuestLocalRun proof. allowListed = list size, localRan = allow-listed script executions since start, perScript = which ones,
+// questScriptsSkipped / mutationsBlocked = what the guest gate suppressed.
+bool MGuestStats(const std::string&, std::string& out) {
+    const auto& s = nvhooks::scriptStats();
+    const auto& sp = nvhooks::suppressStats();
+    Value o = Value::object(), per = Value::array();
+    for (auto& kv : nvhooks::localRunCounts()) {
+        fnvcoop::FormRef r;
+        Value e = Value::object();
+        e.set("script", nvhooks::resolver().toRef(kv.first, &r) ? nvhooks::refToStr(r) : std::string("?")).set("runs", (int64_t)kv.second);
+        per.push(e);
+    }
+    o.set("role", RoleName(g_role)).set("allowListed", (int64_t)g_localRunListed).set("localRan", (int64_t)s.localRan).set("ran", (int64_t)s.ran)
+        .set("questScriptsSkipped", (int64_t)sp.questScripts).set("mutationsBlocked", (int64_t)sp.mutations)
+        .set("resultScriptsBlocked", (int64_t)sp.resultScripts).set("perScript", per);
+    out = o.dump();
+    return true;
+}
+
+// party.set {members:[{slot,ref?}], reduce:"initiator"|"min"|"max"|"any"}: registers a test party (slot 0 = the local player; other members need
+// a loaded `ref`) and a simple reducer, so Condition evaluation can be proven live without the session. {members:[]} clears it.
+std::string g_testReduce = "initiator";
+bool MPartySet(const std::string& params, std::string& out) {
+    Value p;
+    std::string err;
+    if (!nvcoop::json::parse(params, p, err)) { out = "bad params: " + err; return false; }
+    std::vector<nvhooks::PartyMember> members;
+    for (const Value& m : p.get("members").items()) {
+        nvhooks::PartyMember pm;
+        pm.slot = static_cast<uint8_t>(m.get("slot").asInt(0));
+        fnvcoop::FormRef r;
+        if (m.find("ref") && nvhooks::strToRef(m.get("ref").asString(""), &r)) pm.refID = nvhooks::resolver().fromRef(r);
+        else pm.refID = nvhooks::kHostPlayerRef;
+        if (!pm.refID) { out = "member ref not loaded"; return false; }
+        members.push_back(pm);
+    }
+    g_testReduce = p.get("reduce").asString("initiator");
+    if (members.empty()) {
+        nvhooks::setPartyConditions(nullptr, nullptr);
+    } else {
+        nvhooks::setPartyConditions(
+            [members]() { return members; },
+            [](const fnvcoop::FormRef&, const std::string&, const std::vector<nvhooks::CondValue>& v, uint8_t init, fnvcoop::CondPhase) {
+                double best = v.front().value;
+                if (g_testReduce == "initiator") { for (auto& x : v) if (x.slot == init) return x.value; return v.front().value; }
+                for (auto& x : v) {
+                    if (g_testReduce == "min") best = x.value < best ? x.value : best;
+                    else if (g_testReduce == "max") best = x.value > best ? x.value : best;
+                    else if (g_testReduce == "any") { if (x.value != 0) return 1.0; best = 0; }
+                }
+                return best;
+            });
+    }
+    Value o = Value::object();
+    o.set("members", (int64_t)members.size()).set("reduce", g_testReduce);
+    out = o.dump();
+    return true;
+}
+
+// cond.eval {func:"GetDistance", subject:"ref", param1?:"ref", op:"<", value:500}: runs the ENGINE's Condition::Evaluate (0x681600) on a
+// synthetic condition, so the real condition path (and our evaluator hooks) is exercised. Returns {result, stats}.
+using CondEvalFn = bool(__thiscall*)(Condition*, void*, void*, bool*);
+bool EvalCondSEH(CondEvalFn eval, Condition* c, void* subject, bool* flag, bool* result) {
+    __try {
+        *result = eval(c, subject, nullptr, flag);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool MCondEval(const std::string& params, std::string& out) {
+    Value p;
+    std::string err;
+    if (!nvcoop::json::parse(params, p, err)) { out = "bad params: " + err; return false; }
+    static const struct { const char* n; UInt32 idx; } kFuncs[] = {{"GetDistance", 1}, {"GetInCell", 0x43}, {"GetInSameCell", 0x20}, {"IsInCombat", 0x121},
+                                                                      {"GetDetected", 0x2d}, {"GetHealthPercentage", 0x1af}};
+    UInt32 idx = 0xFFFFFFFF;
+    for (auto& f : kFuncs) if (p.get("func").asString("") == f.n) idx = f.idx;
+    if (idx == 0xFFFFFFFF) { out = "unknown func"; return false; }
+    auto refOf = [&](const char* key) -> void* {
+        fnvcoop::FormRef r;
+        if (!p.find(key)) return nullptr;
+        if (p.get(key).asString("") == "player") return nvhooks::resolver().lookup(nvhooks::kHostPlayerRef);
+        if (!nvhooks::strToRef(p.get(key).asString(""), &r)) return nullptr;
+        uint32_t id = nvhooks::resolver().fromRef(r);
+        return id ? nvhooks::resolver().lookup(id) : nullptr;
+    };
+    void* subject = refOf("subject");
+    void* param1 = refOf("param1");
+    if (!subject) { out = "subject not loaded"; return false; }
+    static const char* kOps[] = {"==", "!=", ">", ">=", "<", "<="};
+    UInt8 op = 0;
+    for (UInt8 i = 0; i < 6; ++i) if (p.get("op").asString("==") == kOps[i]) op = i;
+    Condition c = {};
+    c.type = static_cast<UInt8>(op << 5);
+    c.comparisonValue.value = static_cast<float>(p.get("value").asNumber(0));
+    c.function = idx;
+    c.parameter1.pointer = param1;
+    c.runOn = 0;  // Subject
+    bool flag = false;
+    CondEvalFn eval = reinterpret_cast<CondEvalFn>(0x681600);
+    auto before = nvhooks::condStats();
+    bool result = false;
+    bool crashed = !EvalCondSEH(eval, &c, subject, &flag, &result);
+    auto after = nvhooks::condStats();
+    Value o = Value::object();
+    o.set("result", result).set("crashed", crashed).set("evals", (int64_t)(after.evals - before.evals))
+        .set("partyEvals", (int64_t)(after.partyEvals - before.partyEvals)).set("reduced", (int64_t)(after.reduced - before.reduced));
+    out = o.dump();
+    return true;
+}
+
 void OnLoad(void* nvse) {
     if (nvse) g_console = static_cast<NVSEConsoleInterface*>(static_cast<NVSEInterface*>(nvse)->QueryInterface(kInterface_Console));
     nvcoop::RegisterMethod("hooks.status", MStatus, true);
@@ -249,6 +511,14 @@ void OnLoad(void* nvse) {
     nvcoop::RegisterMethod("exec.ref", MExecRef, true);
     nvcoop::RegisterMethod("ref.info", MRefInfo, true);
     nvcoop::RegisterMethod("vars.dump", MVarsDump, true);
+    nvcoop::RegisterMethod("guest.stats", MGuestStats, true);
+    nvcoop::RegisterMethod("observe.set", MObserveSet, true);
+    nvcoop::RegisterMethod("observe.stats", MObserveStats, true);
+    nvcoop::RegisterMethod("activate.ref", MActivateRef, true);
+    nvcoop::RegisterMethod("event.mark", MEventMark, true);
+    nvcoop::RegisterMethod("perf.hooks", MPerf, true);
+    nvcoop::RegisterMethod("party.set", MPartySet, true);
+    nvcoop::RegisterMethod("cond.eval", MCondEval, true);
 }
 void OnMessage(uint32_t type, void*, uint32_t) {
     if (type == NVSEMessagingInterface::kMessage_DeferredInit) InitHooks();
@@ -267,3 +537,25 @@ void OnFrame() {
 }
 
 NVCOOP_MODULE(l5_hooks, "l5_hooks", OnLoad, OnMessage, OnFrame);
+
+// Hot reload (T3b, docs/tools/T3b-state.md): hooks are uninstalled (bytes restored and read back) before the core is unloaded
+// and reinstalled by the new core. Nothing else here is worth carrying: the capture hub and the applier are rebuilt by InitHooks.
+NVCOOP_RELOAD_STATE(l5_hooks, "l5_hooks", 1, 10,
+    /*canUnload*/ [] {
+        int n = nvhooks::auditTamperedHooks();
+        return n ? std::to_string(n) + " engine hook(s) were chained over by another mod" : std::string();
+    },
+    /*save*/ [](nvreload::Writer& w) {
+        w.boolean(g_inited);
+        w.u8(static_cast<uint8_t>(g_role));
+        return true;
+    },
+    /*restore*/ [](uint32_t, nvreload::Reader& r) {
+        bool wasInited = r.boolean();
+        r.u8();
+        if (wasInited) InitHooks();  // idempotent; the module's DeferredInit handler would do the same
+        return true;
+    },
+    /*migrate*/ nullptr,
+    /*shutdown*/ [] { if (g_inited) nvhooks::Shutdown(); },
+    /*fresh*/ nullptr);

@@ -55,12 +55,39 @@ static void runVcg02(FakeWorld& w, nvhooks::CaptureHub& hub) {
     w.hostMutate(hub, ModKarma{2, Recipient::dflt()});
 }
 
+static std::string g_outDir;   // directory of the test exe (= <repo>/out/L10)
+
+// L11 rig: one router (host only), one slide host (host), one slide client (every node) per Node. A fake IUiEngine records the box answers
+// the real engine would get in ShowMessageBox_button.
+struct UiRig {
+    struct Eng : nvui::IUiEngine {
+        std::vector<std::pair<uint32_t, int32_t>> writes;
+        uint64_t nowMs() override { return ::nowMs(); }
+        void setMessageBoxResult(uint32_t s, int32_t b) override { writes.emplace_back(s, b); }
+        bool refOf(uint32_t id, fnvcoop::FormRef& out) override { if (!id) return false; out = fnvcoop::FormRef("falloutnv.esm", id); return true; }
+        void log(const std::string&) override {}
+        int32_t lastButton() const { return writes.empty() ? -2 : writes.back().second; }
+        // The router writes -1 ("box open": GetButtonPressed answers -1) when a box opens; only writes with a real button resume a script.
+        size_t resumed() const { size_t n = 0; for (auto& w : writes) n += w.second != nvui::kNoButton; return n; }
+        bool waiting() const { return resumed() == 0 && lastButton() == nvui::kNoButton; }
+    } eng;
+    std::unique_ptr<nvui::UiRouter> router;
+    std::unique_ptr<nvui::SlideHost> host;
+    std::unique_ptr<nvui::SlideClient> client;
+    std::vector<std::string> swaps;
+    std::vector<bool> locks;
+    int readerInstalls = 0;
+    std::function<std::vector<fnvcoop_dlg::Line>(uint32_t)> installedReader;
+};
+static std::string consentPath() { return g_outDir + "/../../plugin/dialogue/data/consent_messages.txt"; }
+
 struct Node {
-    struct Opt { const char* transport = "enet"; bool baseline = false; int seed = 0; bool dialogue = false; bool blockClientLoad = false; bool rules = false; bool handshake = false; bool partyWarp = false; bool noPlayerRef = false; uint64_t buildHash = 0; std::vector<std::string> plugins; };
+    struct Opt { const char* transport = "enet"; bool baseline = false; int seed = 0; bool dialogue = false; bool blockClientLoad = false; bool rules = false; bool handshake = false; bool partyWarp = false; bool noPlayerRef = false; int bindGhosts = 0; /*1: bindPlayerRefs with ghosts for slots 1,2; 2: ghost for slot 1 only*/ uint64_t buildHash = 0; std::vector<std::string> plugins; bool ui = false; };
     nvhooks::CaptureHub hub;
     FakeWorld world;
     std::unique_ptr<Runtime> rt;
     std::vector<fnvcoop_dlg::Event> dlgEvents;
+    UiRig ui;
     int dlgRuns = 0;
     Node(Role role, uint16_t port, uint64_t token = 0, const char* transport = "enet") : Node(role, port, token, Opt{transport}) {}
     Node(Role role, uint16_t port, uint64_t token, Opt o, const std::function<void(FakeWorld&)>& prep = nullptr) {
@@ -101,7 +128,10 @@ struct Node {
                 out = fnvcoop::FormRef("falloutnv.esm", h);
                 return true;
             });
-            if (!o.noPlayerRef)   // twin: with no resolver beyond the default (host only) a guest would be left behind -> still host-only
+            if (o.bindGhosts)
+                rt->bindPlayerRefs([n = o.bindGhosts](fnvcoop::PlayerId slot) -> uint32_t { return slot == 0 ? 0u : (n == 2 && slot > 1) ? 0u : 0x1000u + slot; },
+                                   [](uint32_t id, fnvcoop::FormRef& out) { out = fnvcoop::FormRef("falloutnv.esm", id); return true; });
+            else if (!o.noPlayerRef)   // twin: with no resolver beyond the default (host only) a guest would be left behind -> still host-only
                 rt->setPlayerRefResolver([](fnvcoop::PlayerId slot, fnvcoop::FormRef& out) {
                     out = fnvcoop::FormRef("falloutnv.esm", slot == 0 ? 0x14u : 0x1000u + slot);
                     return true;
@@ -122,9 +152,27 @@ struct Node {
             h.sink = [this](const fnvcoop_dlg::Event& e) { dlgEvents.push_back(e); };
             rt->enableDialogue(h);
         }
+        if (o.ui) {
+            const bool isHost = role == Role::Host;
+            ui.router.reset(new nvui::UiRouter(ui.eng, nvui::Bridge()));   // the runtime points the bridge at the DialogueNode
+            ui.router->setHost(isHost);
+            ui.client.reset(new nvui::SlideClient({[this](const fnvcoop::FormRef&, const std::string&, const std::string& nw) { ui.swaps.push_back(nw); return true; },
+                                                   [this](bool l) { ui.locks.push_back(l); }, nullptr}));
+            UiWiring w;
+            w.router = [this, isHost]() -> nvui::UiRouter* { return isHost ? ui.router.get() : nullptr; };
+            w.slideHost = [this](nvui::SlideHost::Send f) -> nvui::SlideHost& { ui.host.reset(new nvui::SlideHost(std::move(f))); return *ui.host; };
+            w.slideClient = [this]() -> nvui::SlideClient& { return *ui.client; };
+            w.consentFile = consentPath();
+            w.installInfoReader = [this](std::function<std::vector<fnvcoop_dlg::Line>(uint32_t)> f) { ++ui.readerInstalls; ui.installedReader = std::move(f); };
+            w.infoReader = [](uint32_t info) { return std::vector<fnvcoop_dlg::Line>{fnvcoop_dlg::Line{"info " + std::to_string(info), "", 0, 50}}; };
+            rt->enableUi(std::move(w));
+        }
+        rt->setWorldEffectApplier([this](const std::string& j) { return world.applyWorldJson(j); });
         std::string err;
         if (!rt->start(&err)) std::printf("  start failed: %s\n", err.c_str());
     }
+    // Host: NPC state of a lane-local world effect; the host applies it to its own fake world, guests get it through the runtime.
+    void pushWorld(const std::string& key, const std::string& json) { world.applyWorldJson(json); rt->pushWorldEffect(key, json); }
 };
 
 static void testConfig() {
@@ -567,8 +615,6 @@ public:
     bool dump(fnvcoop::ShadowState* o, uint64_t* h, std::string*) override { *o = st; *h = hash; return true; }
 };
 
-static std::string g_outDir;   // directory of the test exe (= <repo>/out/L10)
-
 static void testRealSidecar() {
     std::string base = g_outDir + "/ingame_baseline/host_baseline.bin", sc = g_outDir + "/ingame_saveload/sidecar.bin";
     StateDumper d;
@@ -642,14 +688,21 @@ static void testHandshake() {
 }
 
 
-static size_t partyWarpCount(bool withResolver) {
+static bool g_lastPlayerRefBinds = false;
+static size_t partyWarpCount(bool withResolver, int bindGhosts = 0, bool reload = false) {
     Node::Opt o;
     o.rules = true;
     o.noPlayerRef = !withResolver;
+    o.bindGhosts = bindGhosts;
     Node host(Role::Host, 0, 0, o);
     Node a(Role::Client, host.rt->boundPort(), 7301, o), b(Role::Client, host.rt->boundPort(), 7302, o);
     auto fr = [&] { host.rt->frame(); a.rt->frame(); b.rt->frame(); };
     pumpUntil(fr, [&] { return a.rt->client()->joined() && b.rt->client()->joined(); });
+    if (reload) {   // a load / rebase re-asserts the binding (module calls onGameLoaded after PostLoadGame)
+        std::string what;
+        host.rt->onGameLoaded(nullptr, &what);
+        g_lastPlayerRefBinds = host.rt->statusJson().find("\"binds\":2") != std::string::npos;
+    }
     uint32_t h = 2166136261u;
     for (char ch : std::string("WarpQ")) { h ^= (uint8_t)ch; h *= 16777619u; }
     fnvcoop::MoveRef m;
@@ -667,6 +720,308 @@ static void testPartyWarp() {
     std::printf("PartyWarp needs the rules engine's playerRef (set by the runtime)\n");
     CHECK(partyWarpCount(true) == 3);      // host + 2 guests moved together
     CHECK(partyWarpCount(false) == 1);     // twin: without a guest ref resolver only the host player is expanded (inert for guests)
+    CHECK(partyWarpCount(false, 1) == 3);  // module wiring (bindPlayerRefs: host 0x14 + L6 ghost refs) expands to host + 2 guests
+    CHECK(partyWarpCount(false, 2) == 2);  // a guest whose ghost is not spawned yet is skipped, the rest still move
+    CHECK(partyWarpCount(false, 1, true) == 3 && g_lastPlayerRefBinds);   // still bound after a load (binds == 2 in status)
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// L11 / L12 wiring: bridge config, menu resume, 0xE5 slideshow channel, SlideshowEnd calls, INFO reader, world effects, companions
+// ---------------------------------------------------------------------------------------------------------------------------------
+using fnvcoop_dlg::Event;
+static uint32_t menuIdOf(const Node& n) {
+    for (size_t i = n.dlgEvents.size(); i-- > 0;)
+        if (n.dlgEvents[i].kind == Event::MenuShow) return std::get<fnvcoop_dlg::MenuRequest>(n.dlgEvents[i].msg).menu;
+    return 0;
+}
+static int evCount(const Node& n, Event::Kind k) { int c = 0; for (auto& e : n.dlgEvents) c += e.kind == k; return c; }
+static nvui::MessageBoxCall endgameBox(uint32_t script, uint32_t msg = 0x161E8C) {
+    nvui::MessageBoxCall c;
+    c.scriptRefID = script;
+    c.thisObj = 0x300;
+    c.message = R("falloutnv.esm", msg);
+    c.text = "Are you ready for the battle of Hoover Dam?";
+    c.buttons = {"I'm not ready yet.", "Let's do this!"};
+    return c;
+}
+static nvui::Route boxFor(Node& host, fnvcoop::PlayerId origin, const nvui::MessageBoxCall& c) {
+    nvui::OriginScope sc(host.ui.router->origin(), nvui::OriginContext::Kind::Acting, origin);
+    return host.ui.router->onMessageBox(c);
+}
+static void slide(Node& host, int i) {
+    char b[64];
+    std::snprintf(b, sizeof b, "interface\\endgame\\endscrn_WN%02d", i);
+    host.ui.router->onSwapTexture(0x9000, "##GS01:0", b);
+}
+static void commitEnd(Node& host) {
+    nvhooks::ScopedCapture sc(host.hub, fnvcoop::Cause{fnvcoop::CauseKind::Script, R("FalloutNV.esm", 0x161E00), 0});
+    host.world.hostMutate(host.hub, fnvcoop::SlideshowEnd{});
+}
+static Node::Opt uiOpt() { Node::Opt o; o.dialogue = true; o.ui = true; return o; }
+
+static void testUiBridgeConsentResume() {
+    std::printf("L11 wiring: bridge config, consent prompt, menu resume, INFO reader\n");
+    Node host(Role::Host, 0, 0, uiOpt());
+    Node a(Role::Client, host.rt->boundPort(), 5001, uiOpt()), b(Role::Client, host.rt->boundPort(), 5002, uiOpt());
+    auto fr = [&] { host.rt->frame(); a.rt->frame(); b.rt->frame(); };
+    CHECK(pumpUntil(fr, [&] { return a.rt->client()->joined() && b.rt->client()->joined() && host.rt->host()->clients().size() == 2 && a.rt->dialogue() && b.rt->dialogue() && host.rt->uiStats().bridges == 1; }));
+    const auto sa = a.rt->client()->slot(), sb = b.rt->client()->slot();
+    CHECK(host.rt->uiStats().bridges == 1 && host.rt->uiStats().consentRows >= 5);          // (1) bridge config built from the consent table
+    CHECK(host.ui.readerInstalls == 1 && a.ui.readerInstalls == 1 && b.ui.readerInstalls == 1);   // (5) INFO reader installed on every node
+    CHECK(host.ui.installedReader && host.ui.installedReader(7).size() == 1 && host.ui.installedReader(7)[0].text == "info 7");
+    // point of no return, guest A pushes the button: the others are asked, the script resumes once with the confirm button
+    CHECK(boxFor(host, sa, endgameBox(91)) == nvui::Route::Suppressed);
+    CHECK(pumpUntil(fr, [&] { return menuIdOf(a) != 0; }));
+    const uint32_t id1 = menuIdOf(a);
+    CHECK(host.ui.eng.waiting() && host.ui.eng.resumed() == 0);
+    a.rt->dialogue()->menuReply(id1, 1, (uint32_t)nowMs());                                    // "Let's do this!"
+    CHECK(pumpUntil(fr, [&] { return menuIdOf(b) == id1 && menuIdOf(host) == id1; }));        // consent prompts on B and on the host
+    CHECK(host.ui.eng.waiting() && host.ui.eng.resumed() == 0);                                                         // still waiting for the party
+    b.rt->dialogue()->menuReply(id1, 0, (uint32_t)nowMs());                                    // "Ready"
+    pumpUntil(fr, [&] { return false; }, 100);
+    CHECK(host.ui.eng.waiting() && host.ui.eng.resumed() == 0);                                                         // the host has not answered yet
+    host.rt->dialogue()->menuReply(id1, 0, (uint32_t)nowMs());
+    CHECK(pumpUntil(fr, [&] { return host.ui.eng.resumed() == 1; }));                      // (2) menu resume reaches the script
+    CHECK(host.ui.eng.lastButton() == 1 && host.ui.router->pendingBoxes() == 0);
+    pumpUntil(fr, [&] { return false; }, 150);
+    CHECK(host.ui.eng.resumed() == 1);                                                     // exactly once
+    // a decline anywhere takes the table's decline button
+    CHECK(boxFor(host, sa, endgameBox(92)) == nvui::Route::Suppressed);
+    CHECK(pumpUntil(fr, [&] { return menuIdOf(a) != id1 && menuIdOf(a) != 0; }));
+    const uint32_t id2 = menuIdOf(a);
+    a.rt->dialogue()->menuReply(id2, 1, (uint32_t)nowMs());
+    CHECK(pumpUntil(fr, [&] { return menuIdOf(b) == id2; }));
+    b.rt->dialogue()->menuReply(id2, 1, (uint32_t)nowMs());                                    // "Not yet"
+    CHECK(pumpUntil(fr, [&] { return host.ui.eng.resumed() == 2; }));
+    CHECK(host.ui.eng.lastButton() == 0);
+    // a plain box has no consent round and a host-origin consent box stays local
+    CHECK(boxFor(host, sb, endgameBox(93, 0x123456)) == nvui::Route::Suppressed);
+    CHECK(pumpUntil(fr, [&] { return menuIdOf(b) != id2; }));
+    b.rt->dialogue()->menuReply(menuIdOf(b), 1, (uint32_t)nowMs());
+    CHECK(pumpUntil(fr, [&] { return host.ui.eng.resumed() == 3; }));
+    CHECK(host.ui.eng.lastButton() == 1 && menuIdOf(a) == id2);
+    CHECK(boxFor(host, nvui::kHost, endgameBox(94)) == nvui::Route::Local);
+    CHECK(host.rt->mux()->unroutable() == 0);
+}
+
+static void testUiSlideshowChannel() {
+    std::printf("L11 wiring: 0xE5 slideshow channel, SlideshowEnd on host and guest, late joiner\n");
+    Node host(Role::Host, 0, 0, uiOpt());
+    Node a(Role::Client, host.rt->boundPort(), 5101, uiOpt());
+    std::unique_ptr<Node> c;
+    auto fr = [&] { host.rt->frame(); a.rt->frame(); if (c) c->rt->frame(); };
+    CHECK(pumpUntil(fr, [&] { return a.rt->client()->joined() && host.rt->host()->clients().size() == 1 && host.rt->uiStats().bridges == 1; }));
+    slide(host, 1);
+    slide(host, 2);
+    CHECK(pumpUntil(fr, [&] { return a.ui.swaps.size() == 2; }));                              // (3) guest registered 0xE5 and plays in order
+    CHECK(a.ui.swaps[0] == "interface\\endgame\\endscrn_WN01" && a.ui.swaps[1] == "interface\\endgame\\endscrn_WN02");
+    CHECK(a.rt->uiStats().slidePackets >= 2 && a.ui.client->locked() && !a.ui.locks.empty() && a.ui.locks.back());
+    c.reset(new Node(Role::Client, host.rt->boundPort(), 5102, uiOpt()));                       // joins mid-show: replay
+    CHECK(pumpUntil(fr, [&] { return c->ui.swaps.size() == 2; }));
+    CHECK(c->ui.swaps == a.ui.swaps && c->ui.client->locked());
+    commitEnd(host);                                                                           // (4) SlideshowEnd: End packet + guest effect call
+    CHECK(pumpUntil(fr, [&] { return !a.ui.client->locked() && !c->ui.client->locked() && a.world.slideEnds == 1 && c->world.slideEnds == 1; }));
+    CHECK(a.ui.client->finished() && c->ui.client->finished() && a.ui.client->played() == 2 && c->ui.client->played() == 2);
+    CHECK(host.rt->uiStats().slideEnds == 1 && a.rt->uiStats().slideEnds >= 1 && !host.ui.host->active());
+    CHECK(a.ui.swaps.size() == 2 && c->ui.swaps.size() == 2);                                  // no replays after the end
+    CHECK(host.rt->mux()->unroutable() == 0 && a.rt->mux()->unroutable() == 0);
+}
+
+// Goodsprings mini story through host + 2 guests (+ a late joiner): every new effect type, convergence, no duplicates.
+static void testGoodspringsStory() {
+    std::printf("Goodsprings mini-story: stage, companion, consent, forced dialogue, spawn, ref var, world effects, slideshow end\n");
+    using namespace fnvcoop;
+    Node host(Role::Host, 0, 0, uiOpt());
+    Node a(Role::Client, host.rt->boundPort(), 5201, uiOpt()), b(Role::Client, host.rt->boundPort(), 5202, uiOpt());
+    std::unique_ptr<Node> late;
+    auto fr = [&] { host.rt->frame(); a.rt->frame(); b.rt->frame(); if (late) late->rt->frame(); };
+    CHECK(pumpUntil(fr, [&] { return a.rt->client()->joined() && b.rt->client()->joined() && host.rt->host()->clients().size() == 2 && a.rt->dialogue() && b.rt->dialogue() && host.rt->uiStats().bridges == 1; }));
+    const auto sa = a.rt->client()->slot(), sb = b.rt->client()->slot();
+    const FormRef quest = R("FalloutNV.esm", 0x10A214), sunny = R("FalloutNV.esm", 0x104C4B), follQuest = R("FalloutNV.esm", 0x104C00);
+    for (Node* n : {&host, &a, &b}) n->rt->dialogue()->companions().addVarRule(follQuest, 3, fnvcoop_dlg::VarKind::HasFollower);
+
+    // 1. stage + the spawn of a crate and script vars on it, in one result script
+    const FormRef crate = host.rt->host()->allocCreatedRef();
+    {
+        nvhooks::ScopedCapture sc(host.hub, Cause{CauseKind::QuestResult, quest, 10});
+        host.world.hostMutate(host.hub, SetStage{quest, 10});
+        SpawnRef sp;
+        sp.id = crate.localId;
+        sp.base = R("FalloutNV.esm", 0x7777);
+        sp.cell = R("FalloutNV.esm", 0x1A8AF);
+        sp.x = 1; sp.y = 2; sp.z = 3;
+        host.world.hostMutate(host.hub, sp);
+        host.world.hostMutate(host.hub, RefScriptVar{crate, 2, 5.0});                             // follow-up on the spawned (host) ref
+        host.world.hostMutate(host.hub, RefScriptVar{R("FalloutNV.esm", 0x104C50), 3, 7.0});      // an esm ref
+    }
+    // 2. companion recruit by guest A (Sunny Smiles), then the per-owner condition view
+    {
+        nvhooks::ScopedCapture sc(host.hub, Cause{CauseKind::DialogueResult, R("FalloutNV.esm", 0x105583), 0});
+        host.world.hostMutate(host.hub, CompanionOwner{sunny, (uint8_t)sa, true, 0});
+    }
+    CHECK(pumpUntil(fr, [&] { return a.world.companions.size() == 1 && b.world.companions.size() == 1 && b.rt->dialogue()->companions().ownerOf(sunny) == sa; }));
+    CHECK(host.rt->dialogue()->companions().ownerOf(sunny) == sa && a.rt->dialogue()->companions().ownerOf(sunny) == sa);
+    {
+        nvui::OriginScope s1(host.ui.router->origin(), nvui::OriginContext::Kind::Acting, sa);
+        CHECK(host.ui.router->viewQuestVar(0x104C00, 3, 0) == 1.0);
+    }
+    {
+        nvui::OriginScope s2(host.ui.router->origin(), nvui::OriginContext::Kind::Acting, sb);
+        CHECK(host.ui.router->viewQuestVar(0x104C00, 3, 1) == 0.0);                            // B has no follower
+    }
+    // 3. consent prompt (point of no return) answered by the whole party
+    CHECK(boxFor(host, sb, endgameBox(95)) == nvui::Route::Suppressed);
+    CHECK(pumpUntil(fr, [&] { return menuIdOf(b) != 0; }));
+    const uint32_t mid = menuIdOf(b);
+    b.rt->dialogue()->menuReply(mid, 1, (uint32_t)nowMs());
+    CHECK(pumpUntil(fr, [&] { return menuIdOf(a) == mid && menuIdOf(host) == mid; }));
+    a.rt->dialogue()->menuReply(mid, 0, (uint32_t)nowMs());
+    host.rt->dialogue()->menuReply(mid, 0, (uint32_t)nowMs());
+    CHECK(pumpUntil(fr, [&] { return host.ui.eng.resumed() == 1; }));
+    CHECK(host.ui.eng.lastButton() == 1);
+    // 4. forced dialogue: the capture record (ForcedDialogue effect) and the party scene through the node
+    {
+        nvhooks::ScopedCapture sc(host.hub, Cause{CauseKind::Script, R("FalloutNV.esm", 0x10A215), 0});
+        host.world.hostMutate(host.hub, ForcedDialogue{sunny, R("FalloutNV.esm", 0x6000), 0});
+        nvui::ForcedCall fc;
+        fc.kind = nvui::ForcedCall::Kind::SayTo;
+        fc.speaker = 0x5000;
+        fc.target = nvui::kPlayerRefID;   // outside an acting scope: the whole party
+        fc.topic = R("FalloutNV.esm", 0x6000);
+        fc.info = R("FalloutNV.esm", 0x6001);
+        fc.lines = {fnvcoop_dlg::Line{"Doc Mitchell's waiting for you.", "", 0, 50}};
+        CHECK(host.ui.router->onForced(fc).captured);
+    }
+    CHECK(pumpUntil(fr, [&] { return evCount(host, Event::ForcedSayShow) == 1 && evCount(a, Event::ForcedSayShow) == 1 && evCount(b, Event::ForcedSayShow) == 1; }));
+    // 5. lane-local world effects (NPC state): a replacing key and an accumulating delta
+    host.pushWorld("rel:NCRfaction:Powderganger", R"({"type":"SetRelation","a":"falloutnv.esm:000001","b":"falloutnv.esm:000002","kind":1})");
+    host.pushWorld("rel:NCRfaction:Powderganger", R"({"type":"SetRelation","a":"falloutnv.esm:000001","b":"falloutnv.esm:000002","kind":2})");
+    host.pushWorld("", R"({"type":"SetActorValueRef","actor":"falloutnv.esm:104C4B","av":16,"value":-10,"mode":2})");
+    // 6. ending slides then the SlideshowEnd effect
+    slide(host, 1);
+    slide(host, 2);
+    commitEnd(host);
+    auto synced = [&](Node& n) { return n.rt->client()->applied() == host.rt->host()->log().head(); };
+    CHECK(pumpUntil(fr, [&] { return synced(a) && synced(b) && a.world.worldApplied == 3 && b.world.worldApplied == 3 && !a.ui.client->locked() && !b.ui.client->locked() && a.ui.swaps.size() == 2; }));
+
+    const std::string hd = host.world.dump().dump();
+    CHECK(hd == a.world.dump().dump() && hd == b.world.dump().dump());                         // convergence
+    CHECK(host.world.stages.at("falloutnv.esm:10A214") == 10 && a.world.stages.at("falloutnv.esm:10A214") == 10);
+    for (Node* n : {&host, &a, &b}) CHECK(n->world.spawned.size() == 1 && n->world.dupSpawns == 0 && n->world.unresolvedRefOps == 0);
+    CHECK(a.world.refVars.at(nvhooks::refToStr(crate) + "#2") == 5.0 && a.world.refVars.at("falloutnv.esm:104C50#3") == 7.0);
+    CHECK(a.world.spawned.begin()->second != 0 && a.world.forcedEvents == 1 && b.world.forcedEvents == 1 && host.world.forcedEvents == 1);
+    CHECK(a.world.slideEnds == 1 && b.world.slideEnds == 1 && a.rt->uiStats().slideEnds >= 1);
+    CHECK(a.world.worldApplied == 3 && a.rt->worldStats().stale == 0 && host.rt->worldStats().pushed == 3);
+
+    // 7. a late joiner converges on the shared story state with every effect exactly once (events are not state)
+    late.reset(new Node(Role::Client, host.rt->boundPort(), 5203, uiOpt()));
+    CHECK(pumpUntil(fr, [&] { return late->rt->client()->joined() && !late->rt->syncing() && late->rt->client()->applied() == host.rt->host()->log().head() && late->world.worldApplied == 2 && late->rt->dialogue(); }));
+    CHECK(late->world.spawned.size() == 1 && late->world.dupSpawns == 0 && late->world.refVars.size() == 2);
+    CHECK(late->world.stages.at("falloutnv.esm:10A214") == 10 && late->world.companions.size() == 1 && late->world.slideEnds == 1);
+    CHECK(late->rt->dialogue()->companions().ownerOf(sunny) == sa);
+    CHECK(host.rt->worldStats().replayed == 2);   // latest relation + the delta, not the superseded push
+    CHECK(late->world.worldState == host.world.worldState);
+    CHECK(host.rt->mux()->unroutable() == 0);
+}
+
+static void testWorldEffectChannel() {
+    std::printf("L12 wiring: world effects on the app channel (replace, accumulate, stale guard, queued until the baseline is done)\n");
+    Node::Opt o;
+    o.baseline = true;
+    o.seed = 3;
+    Node host(Role::Host, 0, 0, o);
+    host.pushWorld("ess:a:base", R"({"type":"SetEssential","actor":"falloutnv.esm:000AAA","essential":true,"refOnly":false})");   // before anyone joined
+    Node a(Role::Client, host.rt->boundPort(), 5301, o);
+    a.rt->setWorldEffectApplier([&a](const std::string& j) { return a.world.applyWorldJson(j); });
+    auto fr = [&] { host.rt->frame(); a.rt->frame(); };
+    CHECK(pumpUntil(fr, [&] { return a.rt->client()->joined() && !a.rt->syncing() && a.world.worldApplied == 1; }));
+    CHECK(a.world.worldState.size() == 1 && host.rt->worldStats().replayed == 1);
+    host.pushWorld("ess:a:base", R"({"type":"SetEssential","actor":"falloutnv.esm:000AAA","essential":false,"refOnly":false})");
+    CHECK(pumpUntil(fr, [&] { return a.world.worldApplied == 2; }));
+    CHECK(a.world.worldState == host.world.worldState && a.world.worldState.size() == 1);
+    Value st;
+    std::string perr;
+    nvcoop::json::parse(a.rt->statusJson(), st, perr);
+    CHECK(st.get("world").get("applied").asInt() == 2 && st.get("world").get("failed").asInt() == 0);
+}
+
+// coop.leave / coop.join: a guest drops out (game keeps running, world untouched), the host plays on, the guest rejoins through the baseline path.
+// Rewards earned before leaving must not be granted a second time.
+static void testLeaveJoin() {
+    std::printf("leave / join (clean disconnect, rejoin resumes from the saved view, no duplicate rewards)\n");
+    Node::Opt o;
+    o.baseline = true;
+    o.seed = 3;
+    Node host(Role::Host, 0, 0, o);
+    Node c(Role::Client, host.rt->boundPort(), 5001, o);
+    auto fr = [&] { host.rt->frame(); c.rt->frame(); };
+    CHECK(pumpUntil(fr, [&] { return c.rt->client()->joined() && c.rt->client()->baselineDone(); }, 8000));
+    runVcg02(host.world, host.hub);                                   // caps 100 + karma 2 for everyone
+    CHECK(pumpUntil(fr, [&] { return c.rt->client()->applied() == host.rt->host()->log().head() && host.rt->host()->allSynced(); }));
+    const std::string caps = "falloutnv.esm:00000F";
+    CHECK(c.world.inventory[caps] == 100 && c.world.karma == 2);
+    std::string err;
+    CHECK(!c.rt->join("", 0, &err) && err.find("coop.leave") != std::string::npos);                 // already in a session
+    CHECK(c.rt->leave(&err) && c.rt->left() && !c.rt->running());
+    CHECK(!c.rt->leave(&err));                                                                      // leaving twice is an error, not a crash
+    c.rt->frame();                                                                                   // frame() on a left runtime is a no-op
+    CHECK(pumpUntil(fr, [&] { return host.rt->host()->clients().empty() || !host.rt->host()->clients()[0].joined; }, 8000));   // the host saw the disconnect
+    CHECK(c.world.inventory[caps] == 100 && c.world.karma == 2);                                    // leaving does not touch the local world
+    {   // the host earns another reward while the guest is away
+        nvhooks::ScopedCapture sc(host.hub, fnvcoop::Cause{fnvcoop::CauseKind::QuestResult, R("FalloutNV.esm", 0x10A215), 10});
+        host.world.hostMutate(host.hub, fnvcoop::AddItem{R("FalloutNV.esm", 0xF), 7, fnvcoop::Recipient::dflt()});
+    }
+    CHECK(c.rt->join("127.0.0.1", host.rt->boundPort(), &err));
+    CHECK(c.rt->running() && !c.rt->left());
+    CHECK(pumpUntil(fr, [&] { return c.rt->client() && c.rt->client()->joined() && c.rt->client()->applied() == host.rt->host()->log().head(); }, 8000));
+    CHECK(pumpUntil(fr, [&] { return host.rt->host()->allSynced(); }));
+    CHECK(c.world.inventory[caps] == host.world.inventory[caps]);                                 // 107 on both: the 100 was not granted again
+    CHECK(c.world.inventory[caps] == 107 && c.world.karma == 2 && host.world.karma == 2);
+}
+
+// A client whose game restarted loads its save; the sidecar stored with that save lists the rewards the saved world already holds, so the
+// plain baseline join delivers only the rewards it is missing. `useSidecar=false` is the twin: without it the whole ledger arrives again.
+static int64_t restartedCaps(bool useSidecar, bool saveWhileLeft) {
+    Node::Opt o;
+    o.baseline = true;
+    o.seed = 4;
+    Node host(Role::Host, 0, 0, o);
+    const std::string caps = "falloutnv.esm:00000F";
+    fnvcoop::Bytes sidecar;
+    int64_t capsInSave = 0, karmaInSave = 0;
+    {
+        Node c(Role::Client, host.rt->boundPort(), 5001, o);
+        auto fr = [&] { host.rt->frame(); c.rt->frame(); };
+        CHECK(pumpUntil(fr, [&] { return c.rt->client()->joined() && c.rt->client()->baselineDone(); }, 8000));
+        runVcg02(host.world, host.hub);
+        CHECK(pumpUntil(fr, [&] { return c.rt->client()->applied() == host.rt->host()->log().head() && host.rt->host()->allSynced(); }));
+        std::string err;
+        if (saveWhileLeft) CHECK(c.rt->leave(&err));
+        sidecar = c.rt->saveSidecar();                    // the game save is written together with this sidecar
+        capsInSave = c.world.inventory[caps];
+        karmaInSave = c.world.karma;
+        CHECK(!sidecar.empty() && capsInSave == 100);
+    }   // the game process ends
+    pumpUntil([&] { host.rt->frame(); }, [&] { return host.rt->host()->clients().empty() || !host.rt->host()->clients()[0].joined; }, 3000);
+    {   // the host earns more while the friend's game is down
+        nvhooks::ScopedCapture sc(host.hub, fnvcoop::Cause{fnvcoop::CauseKind::QuestResult, R("FalloutNV.esm", 0x10A215), 10});
+        host.world.hostMutate(host.hub, fnvcoop::AddItem{R("FalloutNV.esm", 0xF), 7, fnvcoop::Recipient::dflt()});
+    }
+    Node c2(Role::Client, host.rt->boundPort(), 5001, o, [&](FakeWorld& w) { w.inventory[caps] = capsInSave; w.karma = karmaInSave; });   // the loaded save
+    auto fr2 = [&] { host.rt->frame(); c2.rt->frame(); };
+    std::string what;
+    CHECK(c2.rt->onGameLoaded(useSidecar ? &sidecar : nullptr, &what));
+    pumpUntil(fr2, [&] { return c2.rt->client()->joined() && c2.rt->client()->applied() == host.rt->host()->log().head(); }, 8000);
+    pumpUntil(fr2, [&] { return false; }, 300);
+    return c2.world.inventory[caps];
+}
+
+static void testRestartedClientRejoin() {
+    std::printf("restarted client rejoins from its save (sidecar), no duplicate rewards\n");
+    CHECK(restartedCaps(true, false) == 107);
+    CHECK(restartedCaps(true, true) == 107);      // the save was written after coop.leave
+    CHECK(restartedCaps(false, false) != 107);    // twin: without the sidecar the host cannot know and re-delivers the ledger
 }
 
 static void testLossyHost() {
@@ -688,6 +1043,19 @@ static void testLossyHost() {
 
 int main(int argc, char** argv) {
     if (argc > 0) { g_outDir = argv[0]; size_t sl = g_outDir.find_last_of("\\/"); g_outDir = sl == std::string::npos ? "." : g_outDir.substr(0, sl); }
+    const bool uiOnly = argc > 1 && std::string(argv[1]) == "--ui";   // mutation-twin runs: only the wiring tests (COOP_UI_MUTANT=n must break them)
+    if (argc > 1 && std::string(argv[1]) == "--leave") {   // mutation-twin runs for leave()/join() (COOP_LEAVE_MUTANT=n must break them)
+        testLeaveJoin();
+        std::printf("%d checks, %d failed\n", g_checks, g_failed);
+        return g_failed ? 1 : 0;
+    }
+    if (uiOnly) {
+        testUiBridgeConsentResume();
+        testUiSlideshowChannel();
+        testGoodspringsStory();
+        std::printf("%d checks, %d failed\n", g_checks, g_failed);
+        return g_failed ? 1 : 0;
+    }
     testConfig();
     testTransport();
     testConvergence("enet");
@@ -702,6 +1070,12 @@ int main(int argc, char** argv) {
     testRealSidecar();
     testRealSelfDiff();
     testHandshake();
+    testUiBridgeConsentResume();
+    testUiSlideshowChannel();
+    testGoodspringsStory();
+    testWorldEffectChannel();
+    testLeaveJoin();
+    testRestartedClientRejoin();
     testLossyHost();
     std::printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;

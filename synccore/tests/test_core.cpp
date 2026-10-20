@@ -27,8 +27,33 @@ bool mergeRulesHold() {
     t2.seq = 2; s.applyTxn(t2);
     bool ok = true;
     ok &= s.stages[Q(1)] == 40;                                  // stage = max
-    ok &= s.objectives[{Q(1), 0}] == 3;                          // flags = OR
+    ok &= s.objectives[{Q(1), 0}] == 2;                          // host-origin flags = last writer (exact state)
+    EffectTxn t3 = txn(2, CauseKind::Intent, {SetObjective{Q(1), 0, 1}});
+    t3.seq = 3; s.applyTxn(t3);
+    ok &= s.objectives[{Q(1), 0}] == 3;                          // guest-origin flags only add bits
+    EffectTxn t4 = txn(0, CauseKind::QuestResult, {SetObjective{Q(1), 0, 0}});
+    t4.seq = 4; s.applyTxn(t4);
+    ok &= s.objectives[{Q(1), 0}] == 0;                          // the host's hide / reset survives
     ok &= s.kills.count(Q(10)) == 1 && s.kills.count(Q(11)) == 1; // kills = union
+    return ok;
+}
+
+// An objective the host hid (displayed bit cleared) stays hidden after a resync diff and for a late joiner.
+bool objectiveHideSurvives() {
+    ShadowState host;
+    EffectTxn a = txn(0, CauseKind::QuestResult, {SetObjective{Q(7), 2, 3}}); a.seq = 1; host.applyTxn(a);   // displayed | completed-ish
+    ShadowState client = host;                                                                                   // client in sync, then the host hides it
+    EffectTxn b = txn(0, CauseKind::QuestResult, {SetObjective{Q(7), 2, 2}}); b.seq = 2; host.applyTxn(b);
+    bool ok = host.objectives[{Q(7), 2}] == 2;
+    std::vector<Effect> d;                                                                                       // resync: client catches up by diff
+    ShadowState::diffEffects(client, host, 1, d);
+    EffectTxn r = txn(0, CauseKind::QuestResult, d); r.seq = 3; client.applyTxn(r);
+    ok &= client.objectives[{Q(7), 2}] == 2;
+    ShadowState late;                                                                                            // late join: diff from nothing
+    d.clear();
+    ShadowState::diffEffects(late, host, 2, d);
+    EffectTxn l = txn(0, CauseKind::QuestResult, d); l.seq = 1; late.applyTxn(l);
+    ok &= late.objectives[{Q(7), 2}] == 2;
     return ok;
 }
 }  // namespace
@@ -129,7 +154,12 @@ TEST(core, diff_effects_reconstruct_state) {
         ShadowState::diffEffects(early, late, me, d);
         // Applying the diff as a txn (self-addressed) to `early` must reproduce `late` for shared state and my ledger.
         ShadowState rebuilt = early;
-        EffectTxn dt = txn(me, CauseKind::Intent, d); dt.seq = late.seq;
+        // Objective flags in a diff are the exact host state, so they are applied host-origin; everything else is self-addressed.
+        std::vector<Effect> objs, rest;
+        for (auto& e : d) (std::holds_alternative<SetObjective>(e) ? objs : rest).push_back(e);
+        EffectTxn ho = txn(kHostPlayer, CauseKind::Intent, objs); ho.seq = late.seq;
+        rebuilt.applyTxn(ho);
+        EffectTxn dt = txn(me, CauseKind::Intent, rest); dt.seq = late.seq;
         rebuilt.applyTxn(dt);
         for (unsigned s2 = 0; s2 < kMaxSlots; ++s2) if (s2 != me) { rebuilt.ledger[s2] = late.ledger[s2]; }
         // Barrier arrival masks are not recoverable from a diff (only the release is world-visible).
@@ -227,7 +257,16 @@ TEST(twin, unit_merge) {
     { MutationScope s(m); CHECK(!mergeRulesHold()); }
     m = Mutations(); m.flagsAnd = true;
     { MutationScope s(m); CHECK(!mergeRulesHold()); }
+    m = Mutations(); m.objectiveOr = true;
+    { MutationScope s(m); CHECK(!mergeRulesHold()); }
     m = Mutations(); m.killsReplace = true;
     { MutationScope s(m); CHECK(!mergeRulesHold()); }
     CHECK(mergeRulesHold());  // and restored afterwards
+}
+
+TEST(core, host_objective_hide_survives_resync_and_late_join) { CHECK(objectiveHideSurvives()); }
+TEST(twin, unit_objective_or) {
+    Mutations m; m.objectiveOr = true;
+    { MutationScope s(m); CHECK(!objectiveHideSurvives()); }
+    CHECK(objectiveHideSurvives());
 }

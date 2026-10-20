@@ -62,6 +62,20 @@ bool RemoteApplier::forMe(const Recipient& r, PlayerId origin, PlayerId me) cons
     return false;
 }
 
+namespace {
+// First enabled, positioned reference in a loaded cell (a MoveTo anchor for cross-cell absolute moves).
+const TESObjectREFR* cellAnchor(TESObjectCELL* cell) {
+    int guard = 0;
+    for (auto* n = &cell->objectList.m_listHead; n && guard < 8192; n = n->next, ++guard) {
+        TESObjectREFR* r = n->data;
+        if (!r || !r->baseForm || r->typeID != kFormType_TESObjectREFR) continue;
+        if (r->flags & 0x800) continue;  // initially disabled
+        return r;
+    }
+    return nullptr;
+}
+}  // namespace
+
 ApplyStatus RemoteApplier::apply(const Effect& e) {
     EchoGuard echo(&hub_.echo());  // hooks must not re-capture what we apply
     ApplyScope applyScope;         // lifts the guest suppression for host-authored effects
@@ -282,6 +296,16 @@ ApplyStatus RemoteApplier::apply(const Effect& e) {
             uint32_t r;
             if (!idOf(x->ref, &r)) return ApplyStatus::FormMissing;
             gate.reset();
+            if (x->undo) {   // put back the contents the clear discarded (rebase after a host load)
+                ApplyStatus st = ApplyStatus::Ok;
+                for (auto& [f, c] : x->items) {
+                    uint32_t i;
+                    if (!idOf(f, &i)) return ApplyStatus::FormMissing;
+                    st = run(addItemCmd(i, c), r);
+                    if (st != ApplyStatus::Ok) return st;
+                }
+                return st;
+            }
             return run(removeAllItemsCmd(), r);
         }
         if (auto* x = std::get_if<AddNote>(&e)) { uint32_t n; if (!idOf(x->note, &n)) return ApplyStatus::FormMissing; gate.reset(); return run(addNoteCmd(n), 0); }
@@ -294,7 +318,26 @@ ApplyStatus RemoteApplier::apply(const Effect& e) {
             gate.reset();
             return run(showMapCmd(m, (x->flags & kMarkerTravel) != 0), 0);
         }
+        if (auto* x = std::get_if<SetFastTravelLock>(&e)) {
+            gate.reset();
+            if (!travelLocks_.set(x->scope, x->on)) return ApplyStatus::Ok;  // another scope still holds / already released: no engine change
+            return run(enableFastTravelCmd(travelLocks_.travelEnabled()), 0);
+        }
+        if (auto* x = std::get_if<CompanionOwner>(&e)) {
+            if (!companionForMe(x->owner, localSlot_)) return ApplyStatus::NotForMe;
+            uint32_t id;
+            if (!idOf(x->npc, &id)) return ApplyStatus::FormMissing;
+            gate.reset();
+            return run(setTeammateCmd(x->active), id);
+        }
         if (auto* x = std::get_if<SetTimeScale>(&e)) { gate.reset(); return run(setTimeScaleCmd(x->scale), 0); }
+        if (auto* x = std::get_if<RefAngle>(&e)) {
+            uint32_t id;
+            if (!idOf(x->ref, &id)) return ApplyStatus::FormMissing;
+            if (x->axis > kAxisZ) { err_ = "RefAngle: bad axis"; return ApplyStatus::Unsupported; }
+            gate.reset();
+            return run(setAngleCmd("XYZ"[x->axis], x->degrees), id);
+        }
         if (auto* x = std::get_if<MoveRef>(&e)) {
             uint32_t id = res_.fromRef(x->ref), cellOrMarker = res_.fromRef(x->cell);
             TESObjectREFR* r = id ? static_cast<TESObjectREFR*>(res_.lookup(id)) : nullptr;
@@ -303,10 +346,16 @@ ApplyStatus RemoteApplier::apply(const Effect& e) {
             gate.reset();
             if (m && isReferenceFormType(m->typeID))  // `cell` carries a marker reference: x/y/z are offsets from it
                 return run(moveToMarkerCmd(cellOrMarker, x->x, x->y, x->z), id);
-            // absolute position: only valid inside the cell the reference already is in
+            // absolute position: SetPos only works inside the cell the reference already is in. Cross-cell: use any loaded reference of the
+            // destination CELL as the MoveTo anchor and pass the absolute target as an offset from the anchor's position.
             if (!r->parentCell || r->parentCell->refID != cellOrMarker) {
-                err_ = "MoveRef: cross-cell move needs a marker reference as destination";
-                return ApplyStatus::Unsupported;
+                const TESObjectREFR* anchor = m && m->typeID == kFormType_TESObjectCELL ? cellAnchor(static_cast<TESObjectCELL*>(m)) : nullptr;
+                if (!anchor) {
+                    err_ = m && m->typeID == kFormType_TESObjectCELL ? "MoveRef: destination cell has no loaded reference to anchor on"
+                                                                     : "MoveRef: cross-cell move needs a loaded destination cell or a marker reference";
+                    return ApplyStatus::Unsupported;
+                }
+                return run(moveToMarkerCmd(anchor->refID, x->x - anchor->posX, x->y - anchor->posY, x->z - anchor->posZ), id);
             }
             const char axes[3] = {'X', 'Y', 'Z'};
             const float v[3] = {x->x, x->y, x->z};
@@ -364,6 +413,7 @@ ApplyStatus RemoteApplier::applyForce(const Effect& e) {
 
 size_t RemoteApplier::applyTxn(const EffectTxn& t, PlayerId me) {
     size_t n = 0;
+    localSlot_ = me;
     for (const Effect& e : t.effects) {
         // player-targeted effects honour Recipient; world effects (stage, refs, quests, globals) always apply
         const Recipient* r = nullptr;

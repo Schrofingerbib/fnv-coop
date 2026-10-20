@@ -14,6 +14,7 @@
 #include "GameExtraData.h"
 #include "GameForms.h"
 #include "GameObjects.h"
+#include "common/nvcoop_api.h"
 #include "effect_json.h"
 #include "engine_addrs.h"
 #include "world_addrs.h"
@@ -47,6 +48,7 @@ Win32Memory g_mem;
 std::unique_ptr<nvhooks::HookRegistry> g_reg;
 SpawnLedger g_ledger;
 WorldLog g_log;
+WorldBaseline g_base;
 WeatherTimeSync g_weather;
 RefVarTracker g_vars;
 std::function<void(const WorldEffect&)> g_sink;
@@ -61,9 +63,8 @@ inline bool capturing() { return g_hub && g_hub->active(); }
 inline uint32_t refIdOf(const void* f) { return f ? static_cast<const TESForm*>(f)->refID : 0; }
 inline bool isPlayer(const void* r) { return r && refIdOf(r) == kPlayerRefID; }
 
-// L5's exported suppression state is not available yet (requested: nvhooks::blockMutationNow). Until then guest suppression of
-// these commands is off and only host-side capture is live. Tracked in internal lane notes "open items".
-bool blockedNow() { return false; }
+// Guest suppression: L5's policy decides (script-driven shared-state mutators are dropped on a client; applier runs pass).
+bool blockedNow() { return nvhooks::blockMutationNow(); }
 
 bool formRef(const void* form, FormRef* out) {
     uint32_t id = refIdOf(form);
@@ -86,7 +87,8 @@ float getAV(void* actor, uint32_t av) {
 
 using Fn_Cmd = bool(__cdecl*)(void*, void*, void*, void*, void*, void*, double*, UInt32*);
 using Fn_Extract = bool(__cdecl*)(void*, void*, UInt32*, void*, void*, void*, void*, ...);
-Fn_Cmd o_MarkForDelete, o_SetEssential, o_SetActorRefEssential, o_SetRestrained, o_SetEnemy, o_SetAlly, o_RestoreAV;
+Fn_Cmd o_MarkForDelete, o_SetEssential, o_SetActorRefEssential, o_SetRestrained, o_SetEnemy, o_SetAlly, o_RestoreAV,
+    o_IgnoreCrime, o_SetPCEnemyOfFaction, o_ClearFactionPlayerEnemyFlag;
 
 #define CMD_ARGS void* pi, void* sd, void* thisObj, void* contObj, void* script, void* ev, double* res, UInt32* opc
 #define CMD_FWD(o) o(pi, sd, thisObj, contObj, script, ev, res, opc)
@@ -99,6 +101,7 @@ bool parseArgs(CMD_ARGS, Out*... outs) {
 
 void emitLocal(const WorldEffect& e) {
     g_log.push(e);
+    g_base.onWorld(e);
     if (g_sink) g_sink(e);
 }
 
@@ -176,6 +179,40 @@ bool __cdecl h_RestoreAV(CMD_ARGS) {
     return ok;
 }
 
+// IgnoreCrime <int> on an actor (opcode 0x10AB): ignore-crime flag = value > 0. The player is per machine, not shared.
+bool __cdecl h_IgnoreCrime(CMD_ARGS) {
+    if (blockedNow()) return true;
+    FormRef ar;
+    int v = 0;
+    bool track = capturing() && thisObj && !isPlayer(thisObj) && formRef(thisObj, &ar);
+    bool parsed = track && parseArgs(pi, sd, thisObj, contObj, script, ev, res, opc, &v);
+    bool ok = CMD_FWD(o_IgnoreCrime);
+    if (ok && parsed) emitLocal(SetIgnoreCrime{ar, v > 0});
+    return ok;
+}
+
+// SetPCEnemyOfFaction <faction> <int> (0x10C6): player-enemy flag = value != 0. ClearFactionPlayerEnemyFlag <faction> (0x11C9): flag = 0.
+bool __cdecl h_SetPCEnemyOfFaction(CMD_ARGS) {
+    if (blockedNow()) return true;
+    FormRef fr;
+    TESForm* f = nullptr;
+    int v = 0;
+    bool parsed = capturing() && parseArgs(pi, sd, thisObj, contObj, script, ev, res, opc, &f, &v);
+    bool ok = CMD_FWD(o_SetPCEnemyOfFaction);
+    if (ok && parsed && f && formRef(f, &fr)) emitLocal(SetFactionPlayerEnemy{fr, v != 0});
+    return ok;
+}
+
+bool __cdecl h_ClearFactionPlayerEnemyFlag(CMD_ARGS) {
+    if (blockedNow()) return true;
+    FormRef fr;
+    TESForm* f = nullptr;
+    bool parsed = capturing() && parseArgs(pi, sd, thisObj, contObj, script, ev, res, opc, &f);
+    bool ok = CMD_FWD(o_ClearFactionPlayerEnemyFlag);
+    if (ok && parsed && f && formRef(f, &fr)) emitLocal(SetFactionPlayerEnemy{fr, false});
+    return ok;
+}
+
 struct Entry {
     const nvhooks::HookSpec* spec;
     void* detour;
@@ -190,6 +227,9 @@ const Entry kEntries[] = {
     HK(Cmd_SetEnemy, h_SetEnemy, o_SetEnemy),
     HK(Cmd_SetAlly, h_SetAlly, o_SetAlly),
     HK(Cmd_RestoreActorValue, h_RestoreAV, o_RestoreAV),
+    HK(Cmd_IgnoreCrime, h_IgnoreCrime, o_IgnoreCrime),
+    HK(Cmd_SetPCEnemyOfFaction, h_SetPCEnemyOfFaction, o_SetPCEnemyOfFaction),
+    HK(Cmd_ClearFactionPlayerEnemyFlag, h_ClearFactionPlayerEnemyFlag, o_ClearFactionPlayerEnemyFlag),
 };
 
 // ------------------------------------------------------------------ polls
@@ -264,11 +304,13 @@ size_t scanRefVars(std::vector<RefScriptVar>* out, size_t budget) {
     };
     if (cell)
         for (auto it = cell->objectList.Begin(); !it.End(); ++it) visit(it.Get());
-    for (const FormRef& w : g_watched) {
+    auto visitOutside = [&](const FormRef& w) {
         uint32_t id = nvhooks::resolver().fromRef(w);
         TESObjectREFR* r = static_cast<TESObjectREFR*>(id ? nvhooks::resolver().lookup(id) : nullptr);
         if (r && r->parentCell != cell) visit(r);  // refs of the player's cell were already visited
-    }
+    };
+    for (const FormRef& w : g_watched) visitOutside(w);
+    for (const FormRef& w : g_base.liveSpawnRefs()) visitOutside(w);  // spawned refs keep being polled when the player is elsewhere
     return n;
 }
 
@@ -290,7 +332,7 @@ InitReport Init(nvhooks::CaptureHub& hub, nvhooks::Role role) {
     if (role == nvhooks::Role::Client) return rep;  // gate-only role: no capture hooks
     for (const Entry& e : kEntries) {
         nvhooks::Addr tramp = 0;
-        nvhooks::PatchStatus st = g_reg->acquire(*e.spec, reinterpret_cast<nvhooks::Addr>(e.detour), &tramp);
+        nvhooks::PatchStatus st = g_reg->acquire(*e.spec, reinterpret_cast<nvhooks::Addr>(e.detour), &tramp, reinterpret_cast<nvhooks::Addr*>(e.origOut));
         if (nvhooks::installed(st)) {
             *reinterpret_cast<void**>(e.origOut) = reinterpret_cast<void*>(tramp);
             ++rep.ok;
@@ -299,19 +341,42 @@ InitReport Init(nvhooks::CaptureHub& hub, nvhooks::Role role) {
         }
         rep.hooks.push_back({e.spec->name, st});
     }
+    // L5 detours these commands; it reports non-player AV changes and script packages through observers.
+    nvhooks::setNonPlayerAvObserver([](const FormRef& actor, uint32_t av, uint8_t kind, float before, float after) {
+        if (kind <= static_cast<uint8_t>(AvCmdKind::Damage)) recordNonPlayerAv(actor, av, static_cast<AvCmdKind>(kind), before, after);
+    });
+    nvhooks::setScriptPackageObserver([](const FormRef& actor, const FormRef& package, bool add) {
+        if (capturing()) emitLocal(SetScriptPackage{actor, package, add});
+    });
     // Script-driven SetWeather/SetTimeScale that already went out through a txn must not be re-sent by the next poll.
     hub.addSink([](EffectTxn&& t) {
-        for (const Effect& e : t.effects) g_weather.noteSent(e);
+        for (const Effect& e : t.effects) {
+            g_weather.noteSent(e);
+            g_base.onEffect(e);  // net spawn / ref var state for joiners and rejoiners
+        }
     });
     return rep;
 }
 
+int auditTamperedHooks() { return g_reg ? g_reg->auditTampered() : 0; }
+
 void Shutdown() {
+    nvhooks::setNonPlayerAvObserver(nullptr);
+    nvhooks::setScriptPackageObserver(nullptr);
     g_reg.reset();
     g_hub = nullptr;
 }
 
+void resetSession() {
+    g_ledger.clear();
+    g_base.clear();
+    g_vars.clear();
+    g_weather.reset();
+    g_log.drain();
+}
+
 std::vector<WorldEffect> drainWorldEffects() { return g_log.drain(); }
+BaselineSnapshot hostBaseline() { return g_base.snapshot(); }
 void setWorldEffectSink(std::function<void(const WorldEffect&)> sink) { g_sink = std::move(sink); }
 
 void recordNonPlayerAv(const FormRef& actor, uint32_t av, AvCmdKind kind, float before, float after) {
@@ -426,8 +491,13 @@ uint32_t playerCellID() { return refIdOf(playerCell()); }
 
 bool queryCondition(const std::string& fn, uint32_t refID, uint32_t p1, double* out) {
     // evaluator pointers: 4th field of the command table entry (0x118E8E0, stride 0x28); signature cdecl(thisObj, p1, p2, double* result)
-    struct Q { const char* name; uint32_t addr; };
-    static const Q kQ[] = {{"GetRestrained", 0x59FF90}, {"IsEssential", 0x5A3980}, {"GetActorValue", 0x59C4F0}, {"GetFactionRelation", 0x5A46D0}};
+    // formParam: p1 is a form id that must reach the evaluator as a TESForm*. Evaluator addresses: 4th field of the command table.
+    struct Q { const char* name; uint32_t addr; bool formParam; };
+    static const Q kQ[] = {{"GetRestrained", 0x59FF90, false}, {"IsEssential", 0x5A3980, false}, {"GetActorValue", 0x59C4F0, false},
+                           {"GetFactionRelation", 0x5A46D0, false}, {"GetLocked", 0x59D010, false}, {"GetLockLevel", 0x59D100, false},
+                           {"GetOpenState", 0x5A1C30, false}, {"GetDestroyed", 0x5A2330, false}, {"GetItemCount", 0x59D8E0, true},
+                           {"GetIgnoreCrime", 0x5A59A0, false}, {"GetPCEnemyofFaction", 0x5A21F0, false},
+                           {"GetActorFactionPlayerEnemy", 0x5A49F0, false}};
     for (const Q& q : kQ) {
         if (fn != q.name) continue;
         unsigned char pro[3] = {};
@@ -435,20 +505,25 @@ bool queryCondition(const std::string& fn, uint32_t refID, uint32_t p1, double* 
         void* ref = refID ? nvhooks::resolver().lookup(refID) : nullptr;
         if (!ref) return false;
         double r = 0;
-        bool ok = reinterpret_cast<bool(__cdecl*)(void*, void*, void*, double*)>(q.addr)(ref, reinterpret_cast<void*>(static_cast<uintptr_t>(p1)), nullptr, &r);
+        void* arg = reinterpret_cast<void*>(static_cast<uintptr_t>(p1));
+        if (q.formParam && !(arg = nvhooks::resolver().lookup(p1))) return false;
+        bool ok = reinterpret_cast<bool(__cdecl*)(void*, void*, void*, double*)>(q.addr)(ref, arg, nullptr, &r);
         *out = r;
         return ok;
     }
     return false;
 }
 
-std::vector<ActorRef> actorsInPlayerCell(size_t max) {
+std::vector<ActorRef> actorsInPlayerCell(size_t max, uint32_t formType) {
     std::vector<ActorRef> out;
     TESObjectCELL* cell = playerCell();
     if (!cell) return out;
     for (auto it = cell->objectList.Begin(); !it.End() && out.size() < max; ++it) {
         TESObjectREFR* r = it.Get();
-        if (!r || !r->refID || r->refID == kPlayerRefID || r->typeID != kFormType_Character) continue;
+        if (!r || !r->refID || r->refID == kPlayerRefID) continue;
+        // a placed object is a REFR whose BASE form has the object type (container, door); actors are their own ref type
+        uint32_t t = formType == kFormType_Character ? r->typeID : (r->baseForm ? r->baseForm->typeID : 0);
+        if (t != formType) continue;
         ActorRef a;
         a.refID = r->refID;
         a.baseID = refIdOf(r->baseForm);
@@ -484,6 +559,10 @@ nvhooks::ApplyStatus WorldApplier::run(const Plan& p) {
             case StepKind::ConsoleGlobal: {
                 if (!exec_) { err_ = "no console executor"; return ApplyStatus::Unsupported; }
                 nvhooks::ApplierExecScope scope;
+                {
+                    void* t = s.refID ? res_.lookup(s.refID) : nullptr;
+                    nvcoop::Log("world: apply '%s' on %08X (resolves=%d)", s.line.c_str(), s.refID, t ? 1 : 0);
+                }
                 if (!exec_(s.line, s.kind == StepKind::ConsoleOnRef ? s.refID : 0)) {
                     err_ = "console command failed: " + s.line;
                     return ApplyStatus::EngineRejected;
@@ -536,29 +615,78 @@ nvhooks::ApplyStatus WorldApplier::run(const Plan& p) {
     return ApplyStatus::Ok;
 }
 
-nvhooks::ApplyStatus WorldApplier::apply(const Effect& e) {
+namespace {
+using nvhooks::ApplyStatus;
+Outcome toOutcome(ApplyStatus s) {
+    switch (s) {
+        case ApplyStatus::Ok: return Outcome::Ok;
+        case ApplyStatus::FormMissing: return Outcome::Missing;
+        case ApplyStatus::EngineRejected: return Outcome::Rejected;
+        default: return Outcome::Other;
+    }
+}
+ApplyStatus toStatus(Outcome o) {
+    switch (o) {
+        case Outcome::Ok: return ApplyStatus::Ok;
+        case Outcome::Missing: return ApplyStatus::FormMissing;
+        case Outcome::Rejected: return ApplyStatus::EngineRejected;
+        default: return ApplyStatus::Unsupported;
+    }
+}
+}  // namespace
+
+ApplyStatus WorldApplier::applyAny(const Effect& e) {
     fnvcoop::EchoGuard echo(&hub_.echo());
     nvhooks::ApplyScope applyScope;
     nvhooks::ScriptGate gate;
     PlanEnv env{res_, g_ledger, cellIsReady};
-    return run(planEffect(e, env));
+    Outcome o = applyRouted(
+        e, env, [this](const Plan& p) { return toOutcome(run(p)); },
+        [this](const Effect& x) { return fallback_ ? toOutcome(fallback_(x)) : Outcome::Other; });
+    return toStatus(o);
 }
 
-nvhooks::ApplyStatus WorldApplier::applyWorld(const WorldEffect& e) {
+ApplyStatus WorldApplier::applyWorld(const WorldEffect& e) {
     fnvcoop::EchoGuard echo(&hub_.echo());
     nvhooks::ApplyScope applyScope;
     PlanEnv env{res_, g_ledger, cellIsReady};
-    return run(planWorldEffect(e, env));
+    return toStatus(applyWorldRouted(e, env, [this](const Plan& p) { return toOutcome(run(p)); }));
 }
 
-size_t WorldApplier::flushQueued() {
+ApplyStatus WorldApplier::apply(const Effect& e) { return applyAny(e); }
+
+size_t WorldApplier::tick(bool retry) {
     fnvcoop::EchoGuard echo(&hub_.echo());
     nvhooks::ApplyScope applyScope;
     nvhooks::ScriptGate gate;
     PlanEnv env{res_, g_ledger, cellIsReady};
+    RunPlan runner = [this](const Plan& p) { return toOutcome(run(p)); };
+    FallbackApply other = [this](const Effect& x) { return fallback_ ? toOutcome(fallback_(x)) : Outcome::Other; };
     size_t n = 0;
     for (const Plan& p : planQueuedSpawns(env))
-        if (run(p) == nvhooks::ApplyStatus::Ok) ++n;
+        if (run(p) == ApplyStatus::Ok) ++n;
+    n += flushDeferred(env, runner, other, retry);
+    return n;
+}
+
+size_t WorldApplier::flushQueued() { return tick(false); }
+
+size_t WorldApplier::applyBaseline(const BaselineSnapshot& b) {
+    size_t n = 0;
+    {
+        fnvcoop::EchoGuard echo(&hub_.echo());
+        nvhooks::ApplyScope applyScope;
+        nvhooks::ScriptGate gate;
+        PlanEnv env{res_, g_ledger, cellIsReady};
+        std::vector<fnvcoop::SpawnRef> live;
+        for (const Effect& e : b.effects)
+            if (auto* sp = std::get_if<fnvcoop::SpawnRef>(&e)) live.push_back(*sp);
+        run(planReconcile(live, env));  // spawns the host despawned while this client was away
+    }
+    for (const Effect& e : b.effects)
+        if (applyAny(e) == ApplyStatus::Ok) ++n;
+    for (const WorldEffect& w : b.world)
+        if (applyWorld(w) == ApplyStatus::Ok) ++n;
     return n;
 }
 

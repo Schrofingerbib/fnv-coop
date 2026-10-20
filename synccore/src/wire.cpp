@@ -312,10 +312,12 @@ void ioE(Archive& a, SayOnceFlag& e) { io(a, e.info); }
 void ioE(Archive& a, CompleteQuest& e) { io(a, e.quest); }
 void ioE(Archive& a, FailQuest& e) { io(a, e.quest); }
 void ioE(Archive& a, SpawnRef& e) { a.varu32(e.id); if (a.reading() && (e.id >> 24) != 0xFF) { a.fail(); return; } io(a, e.base); io(a, e.cell); a.f32(e.x); a.f32(e.y); a.f32(e.z); a.boolean(e.leveled); }
-void ioE(Archive& a, DespawnRef& e) { a.varu32(e.id); if (a.reading() && (e.id >> 24) != 0xFF) a.fail(); }
+void ioE(Archive& a, DespawnRef& e) { a.varu32(e.id); if (a.reading() && (e.id >> 24) != 0xFF) a.fail(); a.boolean(e.forget); }
 void ioE(Archive& a, ObjectState& e) {
     io(a, e.ref); a.u8(e.mask); a.boolean(e.open); a.boolean(e.locked); a.vari32(e.level); a.boolean(e.destroyed); a.boolean(e.activatedOnce);
     if (a.reading() && (e.mask & ~15u)) a.fail();
+    a.boolean(e.hasBefore);
+    if (e.hasBefore) { a.boolean(e.beforeLocked); a.vari32(e.beforeLevel); } else if (a.reading()) { e.beforeLocked = false; e.beforeLevel = 0; }
 }
 void ioE(Archive& a, RefScriptVar& e) {
     io(a, e.ref);
@@ -323,21 +325,56 @@ void ioE(Archive& a, RefScriptVar& e) {
     a.varu32(i);
     if (a.reading()) { if (i > 0xFFFF) { a.fail(); return; } e.index = static_cast<uint16_t>(i); }
     a.f64(e.value);
+    a.boolean(e.hasBefore);
+    if (e.hasBefore) a.f64(e.before); else if (a.reading()) e.before = 0;
 }
 void ioE(Archive& a, RefAddItem& e) { io(a, e.ref); io(a, e.item); a.vari32(e.count); }
 void ioE(Archive& a, RefRemoveItem& e) { io(a, e.ref); io(a, e.item); a.vari32(e.count); }
-void ioE(Archive& a, RemoveAllItems& e) { io(a, e.ref); }
+void ioE(Archive& a, RemoveAllItems& e) {
+    io(a, e.ref); a.boolean(e.undo); a.boolean(e.hasBefore);
+    if (!e.hasBefore && !e.undo) { if (a.reading()) e.items.clear(); return; }
+    size_t n = e.items.size();
+    if (!a.count(n, 1024)) { e.items.clear(); return; }
+    if (a.reading()) {
+        e.items.clear();
+        for (size_t i = 0; i < n && a.ok(); ++i) { FormRef f; int32_t c = 0; io(a, f); a.vari32(c); if (a.ok()) e.items.emplace_back(f, c); }
+    } else {
+        for (auto& [f, c] : e.items) { FormRef ff = f; int32_t cc = c; io(a, ff); a.vari32(cc); }
+    }
+}
 void ioE(Archive& a, AddTopic& e) { io(a, e.topic); }
 void ioE(Archive& a, AddNote& e) { io(a, e.note); }
 void ioE(Archive& a, RemoveNote& e) { io(a, e.note); }
-void ioE(Archive& a, SetMapMarker& e) { io(a, e.marker); a.u8(e.flags); if (a.reading() && e.flags > 3) a.fail(); }
+void ioE(Archive& a, SetMapMarker& e) {
+    io(a, e.marker); a.u8(e.flags); if (a.reading() && e.flags > 3) a.fail();
+    a.boolean(e.hasBefore);
+    if (e.hasBefore) { a.u8(e.before); if (a.reading() && e.before > 3) a.fail(); } else if (a.reading()) e.before = 0;
+}
 void ioE(Archive& a, ForceActiveQuest& e) { io(a, e.quest); io(a, e.to); }
 void ioE(Archive& a, RequestSave& e) { a.u8(e.kind); if (a.reading() && e.kind > kSaveForce) a.fail(); }
-void ioE(Archive& a, SetWeather& e) { io(a, e.weather); a.boolean(e.force); }
-void ioE(Archive& a, SetTimeScale& e) { a.f32(e.scale); }
+void ioE(Archive& a, SetWeather& e) {
+    io(a, e.weather); a.boolean(e.force);
+    a.boolean(e.hasBefore);
+    if (e.hasBefore) { io(a, e.before); a.boolean(e.beforeForce); } else if (a.reading()) { e.before = FormRef(); e.beforeForce = false; }
+}
+void ioE(Archive& a, SetTimeScale& e) {
+    a.f32(e.scale);
+    a.boolean(e.hasBefore);
+    if (e.hasBefore) a.f32(e.before); else if (a.reading()) e.before = 0;
+}
+void ioE(Archive& a, RefAngle& e) {
+    io(a, e.ref); a.u8(e.axis); a.f32(e.degrees);
+    if (a.reading() && e.axis > kAxisZ) a.fail();
+    a.boolean(e.hasBefore);
+    if (e.hasBefore) a.f32(e.before); else if (a.reading()) e.before = 0;
+}
 void ioE(Archive& a, AdvanceTime& e) { a.varu32(e.minutes); }
 void ioE(Archive& a, CompleteAllObjectives& e) { io(a, e.quest); }
-void ioE(Archive& a, SetLock& e) { io(a, e.ref); a.boolean(e.locked); a.vari32(e.level); }
+void ioE(Archive& a, SetLock& e) {
+    io(a, e.ref); a.boolean(e.locked); a.vari32(e.level);
+    a.boolean(e.hasBefore);
+    if (e.hasBefore) { a.boolean(e.beforeLocked); a.vari32(e.beforeLevel); } else if (a.reading()) { e.beforeLocked = false; e.beforeLevel = 0; }
+}
 void ioE(Archive& a, SetFactionRank& e) { io(a, e.actor); io(a, e.faction); a.vari32(e.rank); }
 void ioE(Archive& a, SetPerk& e) { io(a, e.perk); a.vari32(e.rank); io(a, e.to); }
 void ioE(Archive& a, SwapTexture& e) { io(a, e.ref); io(a, e.texture); a.u8(e.slot); }
@@ -373,7 +410,7 @@ const char* effectName(const Effect& e) {
                                   "StopQuest", "MoveRef", "KillActor", "ResurrectActor", "SetScriptVar",
                                   "SetPlayerControls", "PartyTether", "SlideshowEnd", "SaveSuppress", "CompanionOwner",
                                   "ForcedDialogue", "BarrierArrive", "BarrierRelease", "SayOnceFlag", "CompleteQuest",
-                                  "CompleteAllObjectives", "SetLock", "SetFactionRank", "SetPerk", "SwapTexture", "SetFastTravelLock", "FailQuest", "SpawnRef", "DespawnRef", "ObjectState", "RefScriptVar", "RefAddItem", "RefRemoveItem", "RemoveAllItems", "AddTopic", "AddNote", "RemoveNote", "SetMapMarker", "ForceActiveQuest", "RequestSave", "SetWeather", "SetTimeScale", "AdvanceTime"};
+                                  "CompleteAllObjectives", "SetLock", "SetFactionRank", "SetPerk", "SwapTexture", "SetFastTravelLock", "FailQuest", "SpawnRef", "DespawnRef", "ObjectState", "RefScriptVar", "RefAddItem", "RefRemoveItem", "RemoveAllItems", "AddTopic", "AddNote", "RemoveNote", "SetMapMarker", "ForceActiveQuest", "RequestSave", "SetWeather", "SetTimeScale", "AdvanceTime", "RefAngle"};
     return names[e.index()];
 }
 

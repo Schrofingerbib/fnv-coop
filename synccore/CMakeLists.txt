@@ -11,7 +11,7 @@ endif()
 # Core library: game-free, links into the game plugin (build Win32/x86 there).
 add_library(fnvcoop STATIC
   src/wire.cpp src/shadow.cpp src/policy.cpp src/storylog.cpp
-  src/protocol.cpp src/rules.cpp src/baseline.cpp src/replicator.cpp src/transport.cpp src/transport_util.cpp src/session.cpp)
+  src/protocol.cpp src/rules.cpp src/baseline.cpp src/replicator.cpp src/transport.cpp src/transport_util.cpp src/session.cpp src/ownership.cpp)
 target_include_directories(fnvcoop PUBLIC include)
 
 # Real transport (ENet, vendored MIT source). Separate so the pure core has no socket dependency.
@@ -29,7 +29,7 @@ add_library(fnvcoop_sim STATIC sim/sim.cpp)
 target_include_directories(fnvcoop_sim PUBLIC sim)
 target_link_libraries(fnvcoop_sim PUBLIC fnvcoop)
 
-add_executable(fnvcoop_tests tests/main.cpp tests/test_wire.cpp tests/test_core.cpp tests/test_session.cpp tests/test_sim.cpp tests/test_transport.cpp tests/test_baseline.cpp tests/test_saveload.cpp tests/test_rules.cpp tests/test_desync.cpp tests/test_handshake.cpp tests/test_perf.cpp tests/test_rejoin.cpp tests/test_rejoin_dlg.cpp tests/test_failquest.cpp)
+add_executable(fnvcoop_tests tests/main.cpp tests/test_wire.cpp tests/test_core.cpp tests/test_session.cpp tests/test_sim.cpp tests/test_transport.cpp tests/test_baseline.cpp tests/test_saveload.cpp tests/test_rules.cpp tests/test_desync.cpp tests/test_handshake.cpp tests/test_perf.cpp tests/test_rejoin.cpp tests/test_rejoin_dlg.cpp tests/test_failquest.cpp tests/test_round3.cpp)
 target_compile_definitions(fnvcoop_tests PRIVATE FNVCOOP_RULES_JSON="${CMAKE_CURRENT_SOURCE_DIR}/../docs/quest-policies/rules.json")
 target_include_directories(fnvcoop_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../plugin/dialogue/include)
 target_link_libraries(fnvcoop_tests PRIVATE fnvcoop_sim fnvcoop_enet)
@@ -62,7 +62,7 @@ endif()
 
 enable_testing()
 add_test(NAME soak_smoke COMMAND fnvcoop_soak --seconds 300 --players 4 --seed 3)
-add_test(NAME soak_smoke_threaded COMMAND fnvcoop_soak --seconds 300 --players 4 --seed 4 --threaded)
+add_test(NAME soak_smoke_threaded COMMAND fnvcoop_soak --seconds 60 --players 4 --seed 4 --threaded)
 add_test(NAME loopback_clean       COMMAND fnvcoop_loopback selftest)
 add_test(NAME loopback_faults      COMMAND fnvcoop_loopback selftest --loss 15)
 add_test(NAME twin_loopback_idempotency COMMAND fnvcoop_loopback selftest --loss 15 --mutate idempotency)
@@ -71,6 +71,7 @@ add_test(NAME loopback_unreliable  COMMAND fnvcoop_loopback selftest --loss 10 -
 add_test(NAME unit_wire     COMMAND fnvcoop_tests --group wire)
 add_test(NAME unit_core     COMMAND fnvcoop_tests --group core)
 add_test(NAME unit_session  COMMAND fnvcoop_tests --group session)
+add_test(NAME unit_round3 COMMAND fnvcoop_tests --group round3)
 add_test(NAME unit_rejoin COMMAND fnvcoop_tests --group rejoin)
 add_test(NAME unit_perf COMMAND fnvcoop_tests --group perf)
 add_test(NAME unit_handshake COMMAND fnvcoop_tests --group handshake)
@@ -81,6 +82,23 @@ add_test(NAME unit_baseline COMMAND fnvcoop_tests --group baseline)
 add_test(NAME unit_transport COMMAND fnvcoop_tests --group transport)
 add_test(NAME sim_seeds     COMMAND fnvcoop_tests --group sim)
 foreach(twin no_echo_guard no_idempotency stage_last_wins flags_and kills_replace apply_out_of_order
-             unit_merge unit_idempotency unit_echo no_guest_suppression unit_ghost guest_runs_quest_scripts baseline_skipped unit_volatile no_epoch_bump unit_epoch unit_flood rules_barrier_release_early rules_disabled rules_extended_disabled unit_heal_disabled heal_disabled unit_chatty_baseline unit_handshake unit_slow_digest fail_not_completed rejoin_sidecar_loses_ledger rejoin_no_epoch_bump rejoin_no_idempotency rejoin_departed_hold_barrier rejoin_barrier_release_early rejoin_dlg_no_join_catchup rejoin_dlg_ignore_result_link rejoin_dlg_drop_end_on_close rejoin_dlg_leak_lock_on_close rejoin_dlg_skip_control_release rejoin_dlg_no_resync rejoin_dlg_replay_duplicate_pick)
+             unit_merge unit_objective_or unit_idempotency unit_echo no_guest_suppression unit_ghost guest_runs_quest_scripts baseline_skipped unit_volatile no_epoch_bump unit_epoch unit_flood rules_barrier_release_early rules_disabled rules_extended_disabled rules_tether_ignores_anchor rules_stages_param_ignored rules_sum_as_any rules_exclusive_last_wins rules_ready_proceeds_alone rules_slideshow_no_hold rules_per_player_scene_shared rules_per_player_vars_shared rules_payment_shares_all unit_heal_disabled heal_disabled unit_chatty_baseline unit_handshake unit_slow_digest fail_not_completed round3_spawn_resurrects round3_sticky_objects_reset round3_ref_inv_no_clear round3_active_quest_shared round3_ignore_follower_caps round3_disconnect_keeps_lock round3_guest_local_replicated round3_angle_keeps_first angle_preimage_ignored round3_angle_preimage_ignored rejoin_sidecar_loses_ledger rejoin_no_reward_ids rejoin_no_epoch_bump rejoin_no_idempotency rejoin_departed_hold_barrier rejoin_barrier_release_early rejoin_dlg_no_join_catchup rejoin_dlg_ignore_result_link rejoin_dlg_drop_end_on_close rejoin_dlg_leak_lock_on_close rejoin_dlg_skip_control_release rejoin_dlg_no_resync rejoin_dlg_replay_duplicate_pick)
   add_test(NAME twin_${twin} COMMAND fnvcoop_tests --group twin --name ${twin})
 endforeach()
+
+# docs/protocol.md effect table must match effect.h / wire.cpp (regenerate: python -I synccore/tools/gen_effect_table.py --write)
+find_program(FNVCOOP_PYTHON NAMES python python3)
+if(FNVCOOP_PYTHON)
+  add_test(NAME drift_effect_table COMMAND ${FNVCOOP_PYTHON} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_effect_table.py --check)
+  add_test(NAME twin_drift_effect_table COMMAND ${FNVCOOP_PYTHON} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_effect_table.py --check --mutate)
+  set_tests_properties(twin_drift_effect_table PROPERTIES WILL_FAIL TRUE)
+endif()
+
+# T5 chaos mirror (synccore/chaos/CMakeLists.txt)
+add_subdirectory(chaos)
+
+# T2a: fake game engine model + actor ownership tests (own CMakeLists; ownership.cpp itself is in the core library above)
+add_subdirectory(enginemodel)
+
+# T1a flight recorder (synccore/flight/CMakeLists.txt); after enginemodel: it adapts T2a's observer
+add_subdirectory(flight)

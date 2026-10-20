@@ -16,6 +16,7 @@
 #include "nvse/GameForms.h"
 
 #include "glue.h"
+#include "voice_token.h"
 #include "ui_hooks.h"   // L11 hooks_ui: nvui::ops (real message boxes, vanilla menus, CloseAllMenus core, StartConversation)
 
 namespace fndlg {
@@ -79,13 +80,25 @@ public:
     }
     bool infoRefOf(Addr32 info, FormRef& out) override { return formRefOf(info, out); }
 
-    // [stub] TESTopicInfo -> parent TESTopic. Vanilla has no back pointer (JIP adds one at +0x50 only when its
-    // patch is active). Candidates: DialogMenu current topic via vtbl method, or the topic's info array search.
-    bool topicOf(Addr32, FormRef&, std::string&) override { unsupported("topicOf: TESTopicInfo->TESTopic lookup"); return false; }
+    // [live via L11, in-game proof pending] TESTopicInfo -> parent TESTopic. Vanilla has no back pointer, so L11's GetTopicInfo hook
+    // remembers the topic of every INFO the engine resolves (topic lists are built through it). No editor ids at runtime: edid stays empty.
+    bool topicOf(Addr32 info, FormRef& topic, std::string& edid) override {
+        edid.clear();
+        const uint32_t t = nvui::ops::topicOfInfo(info);
+        if (!t || !formRefOf(t, topic)) {
+            unsupported("topicOf: INFO never resolved through GetTopicInfo");
+            return false;
+        }
+        return true;
+    }
 
-    // [stub] voice file naming/locating (needs confirmation that "<topic>_<infoid>_<n>.ogg" is right and which
-    // BSA/loose path the engine resolves)
-    std::string voicePath(Addr32, uint32_t, Addr32) override { unsupported("voicePath"); return std::string(); }
+    // [live via L11] the "voice file" is a token naming topic + INFO (voice_token.h); playVoice turns it into `<npc>.Say <topic>`.
+    std::string voicePath(Addr32 info, uint32_t responseNumber, Addr32) override {
+        FormRef topic, inf;
+        std::string edid;
+        if (!topicOf(info, topic, edid) || !formRefOf(info, inf)) return std::string();
+        return nvui::makeVoiceToken(topic, inf, responseNumber);
+    }
 
     // [stub] facts: Actor::GetActorValue (0x66EF50, L5 verified) for the AVs the INFO conditions reference,
     // ContainerChanges item counts, perks. Needs the per-INFO form list (from L3 data / SCRO refs).
@@ -98,8 +111,11 @@ public:
         return CheckKind::None;
     }
 
-    // [stub] replay the deferred Activate: needs L5's RefActivate trampoline (TESObjectREFR::Activate 0x573170)
-    void resumeTalk(const FormRef&) override { unsupported("resumeTalk: call original RefActivate via trampoline"); }
+    // [live via L11, in-game proof pending] the vanilla Activate was suppressed by the activate observer; the grant opens the DialogMenu on
+    // GREETING with `<npc>.StartConversation player GREETING` (same mechanism as startForcedConversation, covered by proof_ui.py, not run yet).
+    void resumeTalk(const FormRef& npc) override {
+        if (!nvui::ops::resumeTalk(RuntimeRefId(npc))) unsupported("resumeTalk: npc ref not loaded");
+    }
 
     // [live] HUD message through xNVSE QueueUIMessage
     void talkDenied(DenyReason why, PlayerId owner) override {
@@ -114,8 +130,8 @@ public:
     // [stub] close the DialogMenu without local end scripts. Candidates: the CloseAllMenus routine near 0x715177
     // (JIP GameUI.h comment) or Menu::HandleClick on the goodbye tile; both unverified.
     void forceCloseDialog() override { if (!nvui::ops::forceCloseDialog()) unsupported("forceCloseDialog: no DialogMenu open"); }   // [live via L11] CloseAllMenus core, END script never runs locally
-    // [stub] EnablePlayerControls/DisablePlayerControls equivalents (OSGlobals control flags); L5 control capture
-    void setControls(uint8_t, bool) override { unsupported("setControls"); }
+    // [live via L5/L11] all-or-nothing: the mask is not honoured, any lock request locks every player control (nvhooks::SetPlayerControlsLocked)
+    void setControls(uint8_t, bool locked) override { nvui::ops::setControlsLocked(locked); }
 
     // [live] spectator banner/topics/subtitle through the HUD message queue
     void banner(const FormRef&, PlayerId initiator) override {
@@ -128,12 +144,22 @@ public:
         std::string t = text.substr(0, 0x1FF);
         QueueUIMessage(t.c_str(), 2, nullptr, nullptr, seconds, false);
     }
-    // [stub] play a voice file on the NPC puppet (Say-like, without touching conversation state)
-    void playVoice(const FormRef&, const std::string&) override { unsupported("playVoice"); }
+    // [live via L11, in-game proof pending] token from voicePath() -> `<npc>.Say <topic>`; the engine picks the INFO by the local conditions
+    void playVoice(const FormRef& npc, const std::string& token) override {
+        nvui::VoiceToken v;
+        if (!nvui::parseVoiceToken(token, v)) {
+            unsupported("playVoice: not a voice token");
+            return;
+        }
+        if (!nvui::ops::sayTopic(RuntimeRefId(npc), v.topic)) unsupported("playVoice: npc or topic not loaded");
+    }
     void hideOverlay() override {}
 
-    // [stub] hearing range / line of sight of the NPC from the local player (distance to the puppet ref); conservative: audible
-    bool npcAudible(const FormRef&) override { return true; }
+    // [live via L11, in-game proof pending] same cell (or both exterior) and within 2500 game units (about 36 m) of the local player
+    bool npcAudible(const FormRef& npc) override {
+        const uint32_t r = RuntimeRefId(npc);
+        return r && nvui::ops::nearPlayer(r, 2500.0f);
+    }
     // [stub] native StartConversation (NVSE Cmd_StartConversation) with the player as target, executed on THIS machine only; the
     // script command that triggered it on the host is vetoed there unless the host player is the actor
     void startForcedConversation(const FormRef& npc, const FormRef& topic) override {   // [live via L11] <npc>.StartConversation player <topic>
