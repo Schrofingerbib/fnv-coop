@@ -149,6 +149,11 @@ def apply(instance_dir: Path, grids: Optional[int] = None, audio_off: bool = Fal
     return n
 
 
+def prefs_startable(text: str) -> bool:
+    """True when FalloutPrefs.ini has sD3DDevice. Without it FalloutNV.exe opens its launcher instead of starting."""
+    return bool((instances.ini_get(text, "Display", "sD3DDevice") or "").strip())
+
+
 def restore(instance_dir: Path, check: bool = True) -> Dict[str, int]:
     """Undo apply(): write the instance's two INIs exactly as provisioning writes them (instances.render_inis()).
 
@@ -162,6 +167,13 @@ def restore(instance_dir: Path, check: bool = True) -> Dict[str, int]:
         raise UnsafeTarget(f"render_inis() returned {sorted(fresh)}, expected {[FO, PR]}")
     if instances.ini_get(fresh[FO], "General", "bUseMyGamesDirectory") != "0":
         raise UnsafeTarget("render_inis() Fallout.ini does not set bUseMyGamesDirectory=0")
+    # FalloutNV.exe starts FalloutNVLauncher.exe (a window on the owner's desktop) instead of the game when the prefs have
+    # no sD3DDevice. Seen in game on 2026-10-21: render_inis() could not find the owner's prefs (redirected Documents),
+    # wrote a 6-line FalloutPrefs.ini, and `pool up --no-lowcost` then failed with the launcher left open. Fail closed.
+    if not prefs_startable(fresh[PR]):
+        raise UnsafeTarget("render_inis() FalloutPrefs.ini has no sD3DDevice, so the game would open its launcher instead "
+                           "of starting: start Fallout: New Vegas once through Steam (the launcher writes it), check that "
+                           "the owner's My Games folder is found, then try again")
     if check:
         for name in (FO, PR):
             guard(d / name)
