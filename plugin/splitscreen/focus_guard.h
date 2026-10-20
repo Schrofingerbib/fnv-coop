@@ -12,7 +12,7 @@
 // for it), so the engine never sees the deactivation. Every other message goes to the engine unchanged.
 // It is the only deactivation path in that procedure: it does not handle WM_ACTIVATEAPP, WM_SETFOCUS or WM_KILLFOCUS
 // (they go to DefWindowProc), and WM_NCACTIVATE(FALSE) only writes a flag at 0x11DEEF4 that no code reads (one
-// reference in the whole .text section, the write at 0x86A26F). Checked against a Steamless-unpacked 1.4.0.525 image.
+// reference in the whole .text section, the write at 0x86A26F). Checked against the 1.4.0.525 exe.
 // The subclass must live in a DLL that is never unloaded (the monolithic nvcoop.dll or the split-mode loader), otherwise a
 // hot reload would leave the window procedure pointing into freed code.
 //
