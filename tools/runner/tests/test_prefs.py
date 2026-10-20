@@ -71,6 +71,27 @@ class DefaultPrefs(unittest.TestCase):
         self.assertIn('sD3DDevice="Owner GPU"', out)
         self.assertNotIn("Fake GPU 9000", out)
 
+    def check_verify_report_without_owner_prefs(self, owner_base=None):
+        """lowcost.verify() is a read-only report: no owner prefs and an unknown adapter must not make it raise."""
+        sys.path.insert(0, str(HERE.parents[1] / "pool"))
+        import lowcost
+        patches = [mock.patch.object(instances, "display_adapter_name", lambda: None)]
+        if owner_base:
+            patches.append(mock.patch.object(lowcost, "_owner_base", owner_base))
+        with patches[0], (patches[1] if len(patches) > 1 else mock.patch.dict(os.environ, {})):
+            try:
+                found = lowcost.verify()
+            except instances.PrefsUnavailable as e:
+                raise AssertionError(f"verify() raised for a read-only report: {e}")
+        self.assertTrue(found["absent"], found)  # the prefs keys are reported as absent instead
+
+    def test_verify_report_without_owner_prefs(self):
+        self.check_verify_report_without_owner_prefs()
+
+    def test_twin_verify_raises_without_owner_prefs(self):
+        with self.assertRaises(AssertionError):
+            self.check_verify_report_without_owner_prefs(owner_base=lambda name: instances._base_ini(name))
+
     @unittest.skipUnless(os.name == "nt", "Windows display API")
     def test_live_adapter_name(self):
         name = instances.display_adapter_name()

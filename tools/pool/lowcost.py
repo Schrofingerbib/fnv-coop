@@ -148,10 +148,19 @@ def apply(instance_dir: Path, grids: Optional[int] = None, audio_off: bool = Fal
     return n
 
 
+def _owner_base(name: str) -> str:
+    """The base INI for a read-only report. A missing owner FalloutPrefs.ini whose fallback cannot be built (unknown display
+    adapter) is an empty base here; only provisioning, which writes a file the game must start with, refuses it."""
+    try:
+        return instances._base_ini(name)
+    except getattr(instances, "PrefsUnavailable", ()):
+        return ""
+
+
 def verify() -> Dict[str, List[str]]:
     """Read-only: which profile keys exist in the owner's own INIs (the base the pool copies from)."""
     found: Dict[str, List[str]] = {"present": [], "absent": []}
-    base = {FO: instances._base_ini(FO), PR: instances._base_ini(PR)}
+    base = {FO: _owner_base(FO), PR: _owner_base(PR)}
     for r in PROFILE:
         has = instances.ini_get(base[r.file], r.section, r.key) is not None
         found["present" if has else "absent"].append(f"{r.file}:{r.section}:{r.key}")
