@@ -155,7 +155,27 @@ def objective_completed(bot, quest: str, obj: int) -> bool:
 
 
 def _eval_ref(bot, ref: str, fn: str) -> float:
-    return bot.nv.eval(f"{hexid(ref)}.{fn}")
+    """`fn` evaluated with `ref` as the calling reference (exec {cmd, ref}). The game's console does not accept
+    '<hexFormID>.Func' (in game, 2026-10-21). `ref` goes as it is: 'Plugin.esm:HEX' (the bridge adds the plugin's
+    load-order index) or a bare hex runtime id."""
+    return bot.nv.eval(fn, ref=ref)
+
+
+def _exec_ref(bot, ref: str, cmd: str) -> Result:
+    """Console line `cmd` with `ref` as the calling reference (see _eval_ref)."""
+    r = bot.nv.exec(cmd, ref=ref)
+    ok = r.get("ok", True)
+    return Result(bool(ok), "" if ok else str(r.get("output", "")))
+
+
+def seed_items(bot, holder: str, item: str, count: int) -> Result:
+    """Put `count` x `item` into the container/actor `holder` (console `additem` on the holder, UNVERIFIED)."""
+    return _exec_ref(bot, holder, f"additem {hexid(item)} {int(count)}")
+
+
+def set_teammate(bot, ref: str) -> Result:
+    """Make the NPC `ref` a teammate on this machine (console `SetPlayerTeammate 1` on the NPC)."""
+    return _exec_ref(bot, ref, "SetPlayerTeammate 1")
 
 
 def is_teammate(bot, ref: str) -> bool:
@@ -244,12 +264,10 @@ def holder_count(bot, item: str, holder: str) -> int:
 
 # ---- spawn, VATS timing, save/load, session ----------------------------------------------------
 def spawn(bot, base: str, at: str) -> Result:
-    """Place one `base` at the ref `at` (console `<at>.placeatme <base>`, UNVERIFIED)."""
+    """Place one `base` at the ref `at` (console `placeatme <base> 1` with `at` as the calling reference, UNVERIFIED)."""
     if _has(bot, "spawn"):
         return bot.spawn(base, at)
-    r = bot.nv.exec(f"{hexid(at)}.placeatme {hexid(base)} 1")
-    ok = r.get("ok", True)
-    return Result(bool(ok), "" if ok else str(r.get("output", "")))
+    return _exec_ref(bot, at, f"placeatme {hexid(base)} 1")
 
 
 def frames(bot) -> int:

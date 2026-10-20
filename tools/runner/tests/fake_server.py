@@ -1,7 +1,8 @@
 """A fake nvbridge server in pure Python, speaking the real protocol over a real Windows named pipe.
 
-Lets the client library be tested without the game or the C++ plugin. Console grammar mirrors
-plugin/bridge/fakehost_main.cpp (set / printc "NVCOOP_EVAL=%g" (name) / echo / event).
+Lets the client library be tested without the game or the C++ plugin. Console grammar, load order and forms mirror
+plugin/bridge/fakehost_main.cpp (set / printc "NVCOOP_EVAL=%g" (name|refid) / echo / event / getref / player.<line>;
+"<X>.<word>" fails like the game: Script command "<X>.<word>" not found). exec {cmd, ref} follows plugin/bridge/bridge.cpp.
 
 mutant= selects a deliberate defect the conformance suite must detect:
   wrong_id        replies carry id+1
@@ -10,15 +11,37 @@ mutant= selects a deliberate defect the conformance suite must detect:
   waitfor_no_timeout  waitFor claims satisfied when it timed out
   lock_ignore     lease is granted but never enforced
   save_guard      saveGame accepts reserved names / overwrites existing saves
+  exec_ref_ignored  exec {cmd, ref} checks the ref, then runs the line with no calling reference
 """
 from __future__ import annotations
 
 import ctypes
 import json
+import re
 import threading
 import time
 from ctypes import wintypes
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+PLUGINS = ["FalloutNV.esm", "DeadMoney.esm"]                  # load order of the fake game
+FORM_TYPES = {0x00000014: 0x3B, 0x00103E61: 0x3A, 0x01000ABC: 0x3C, 0x0000000F: 0x1F}   # player, door, creature, Caps001
+REFERENCE_TYPES = (0x3A, 0x3B, 0x3C)                           # REFR, ACHR, ACRE
+
+
+def parse_ref(text: str) -> Tuple[Optional[str], int]:
+    """The bridge's ParseRefSpec: 'Plugin.esm:HEX' -> (plugin, local id), 'HEX' / '0xHEX' -> (None, runtime id).
+    Raises ValueError for anything else."""
+    plugin, colon, hexpart = text.rpartition(":")
+    if colon and not plugin:
+        raise ValueError("the plugin name before ':' is empty")
+    if len(hexpart) > 2 and hexpart[:2] in ("0x", "0X"):
+        hexpart = hexpart[2:]
+    if not re.fullmatch(r"[0-9A-Fa-f]{1,8}", hexpart):
+        raise ValueError("the form id must have 1 to 8 hex digits")
+    v = int(hexpart, 16)
+    if colon and v > 0xFFFFFF:
+        raise ValueError("the id inside a plugin is at most FFFFFF")
+    return (plugin if colon else None), v
 
 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 k32.CreateNamedPipeW.restype = wintypes.HANDLE
@@ -103,16 +126,30 @@ class FakeServer:
     def _push(self, type_: str, data: Any = None) -> None:
         self.events.append({"seq": len(self.events) + 1, "tMs": int(time.monotonic() * 1000), "type": type_, "data": data})
 
-    def _exec(self, line: str) -> Dict[str, Any]:
+    def _exec(self, line: str, self_ref: int = 0) -> Dict[str, Any]:
+        """One console line; self_ref is the calling reference (0 = none)."""
         parts = line.split(None, 1)
         cmd = parts[0] if parts else ""
         rest = parts[1] if len(parts) > 1 else ""
+        if "." in cmd[1:]:
+            head, _, tail = cmd.partition(".")
+            if head.lower() == "player":
+                return self._exec(line[line.find(cmd) + len(head) + 1:], 0x14)
+            return {"ok": False, "output": 'Script command "%s" not found' % cmd}   # the game's reply to <hexFormID>.Command
+        if cmd == "getref":
+            if not self_ref:
+                return {"ok": False, "output": "getref: no calling reference"}
+            return {"ok": True, "output": "REF=%08X" % self_ref}
         if cmd == "set":
             n, v = rest.rsplit(None, 1)
             self.vars[n] = float(v)
             return {"ok": True, "output": ""}
         if cmd == "printc":
             name = rest[rest.find("(") + 1: rest.rfind(")")]
+            if name == "refid":
+                if not self_ref:
+                    return {"ok": False, "output": "refid: no calling reference"}
+                return {"ok": True, "output": "NVCOOP_EVAL=%g" % self_ref}
             return {"ok": True, "output": "NVCOOP_EVAL=%g" % self.vars.get(name, 0.0)}
         if cmd == "echo":
             return {"ok": True, "output": rest}
@@ -143,6 +180,8 @@ class FakeServer:
         if m == "exec":
             if not isinstance(p.get("cmd"), str):
                 return self._reply(rid, error={"code": -32602, "message": "exec requires string param 'cmd'"})
+            if "ref" in p:
+                return self._exec_ref(rid, p["cmd"], p["ref"])
             return self._reply(rid, self._exec(p["cmd"]))
         if m == "state":
             return self._reply(rid, {"todo": "L7"})
@@ -204,6 +243,28 @@ class FakeServer:
             self.quit_called.set()
             return self._reply(rid, {"quitting": True})
         return self._reply(rid, error={"code": -32601, "message": f"unknown method: {m}"})
+
+    def _exec_ref(self, rid, cmd: str, text: Any) -> Dict[str, Any]:
+        """exec {cmd, ref}, as plugin/bridge/bridge.cpp does it: parse, resolve the plugin, check the form type, run."""
+        if not isinstance(text, str):
+            return self._reply(rid, error={"code": -32602, "message": "exec: param 'ref' must be a string"})
+        try:
+            plugin, rid_ = parse_ref(text)
+        except ValueError as e:
+            return self._reply(rid, error={"code": -32602, "message": "exec: bad ref '%s': %s" % (text, e)})
+        if plugin is not None:
+            low = [x.lower() for x in PLUGINS]
+            if plugin.lower() not in low:
+                return self._reply(rid, error={"code": -32013, "message": "exec: ref '%s': plugin '%s' is not loaded" % (text, plugin)})
+            rid_ |= low.index(plugin.lower()) << 24
+        t = FORM_TYPES.get(rid_)
+        if t is None:
+            return self._reply(rid, error={"code": -32013, "message": "exec: ref '%s' (form %08X) is not a loaded form" % (text, rid_)})
+        if t not in REFERENCE_TYPES:
+            return self._reply(rid, error={"code": -32013, "message": "exec: ref '%s' (form %08X, form type 0x%02X) is not a reference"
+                                           % (text, rid_, t)})
+        out = self._exec(cmd, 0 if self.mutant == "exec_ref_ignored" else rid_)
+        return self._reply(rid, dict(out, ref="%08X" % rid_))
 
     def _lock(self, rid, m, p):
         now = time.monotonic()

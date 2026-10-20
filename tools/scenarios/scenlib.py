@@ -7,6 +7,10 @@ the EditorID and record type of each form), so an invented FormID, a wrong Edito
 without launching the game. Runtime hex ids (load-order index << 24 | local id) come from the same load order the
 questline sweep uses (tools/questdata/loadorder.json via plugin/snapshot/tools/sweep_config.py).
 
+Console lines for a reference other than the player are ("exec", cmd, ref) actions: the bridge runs `cmd` with `ref` as
+the console's calling reference (exec {cmd, ref}). In game (2026-10-21) the console rejected "<hexFormID>.Command"
+(Script command "00103E61.GetOpenState" not found); "player." lines work and stay ("exec", line).
+
 Pure functions only; the game-facing part is runner.py.
 """
 import gzip
@@ -22,9 +26,13 @@ SCEN_DIR = REPO / "scenarios"
 QDATA = REPO / "out" / "questdata"
 sys.path.insert(0, str(REPO / "plugin" / "snapshot" / "tools"))
 import sweep_config  # noqa: E402  (L7 helper: load order, hex8, split_ref, reset ids of a sweep config)
+sys.path.insert(0, str(REPO / "tools" / "runner"))
+from console_ref import RefLineError, split_ref_line  # noqa: E402  (pure: "<ref>.<Func> args" -> ("<Func> args", ref))
 
 SCHEMA = 1
-MUTANT = os.environ.get("SCEN_MUTANT", "")   # test-only twin: "noresolve" drops the FormID/EditorID/record-type checks
+# test-only twins: "noresolve" drops the FormID/EditorID/record-type checks; "hexprefix" builds the old "<hex>.Func"
+# console lines again; "refline" drops the check that a {alias}.Func call is the first word of a console line / expr
+MUTANT = os.environ.get("SCEN_MUTANT", "")
 REF_RE = re.compile(r"^[A-Za-z0-9_]+\.es[mp]:[0-9A-F]{6}$")
 ALIAS_RE = re.compile(r"^\$([A-Za-z][A-Za-z0-9_]*)$")
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z][A-Za-z0-9_]*)\}")
@@ -92,20 +100,23 @@ OPS = {
 }
 COMMON = {"id", "op", "on", "note", "needs", "parallel"}
 OP_NEEDS = {"pick": "dialogue", "message_click": "message_box", "consent": "party_consent", "vats_hit": "vats_hit", "fast_travel": "fast_travel", "leave": "session_leave", "join": "session_join"}
+# kind -> (required fields, the field that is the calling reference or None, expression template).
+# The calling reference is never written as "<hex>.Func": the expression runs with it as exec's ref ("player" keeps the
+# "player." prefix, a valid script reference).
 CHECK_KINDS = {
-    "stage": ({"quest"}, "GetStage {quest}"),
-    "stage_done": ({"quest", "stage"}, "GetStageDone {quest} {stage}"),
-    "item_count": ({"who", "item"}, "{who}.GetItemCount {item}"),
-    "dead": ({"ref"}, "{ref}.GetDead"),
-    "disabled": ({"ref"}, "{ref}.GetDisabled"),
-    "locked": ({"ref"}, "{ref}.GetLocked"),
-    "in_cell": ({"ref", "cell"}, "{ref}.GetInCell {cell}"),
-    "distance": ({"a", "b"}, "{a}.GetDistance {b}"),
-    "av": ({"ref", "av"}, "{ref}.GetAV {av}"),
-    "teammate": ({"ref"}, "{ref}.GetPlayerTeammate"),
-    "spawn_count": ({"base", "ref"}, None),   # call-based: dev.countRefs {base}
-    "owner": ({"ref"}, None),                                      # needs actor_owner (bridge method coop.owner); no NVSE expression
-    "expr": ({"expr"}, None),
+    "stage": ({"quest"}, None, "GetStage {quest}"),
+    "stage_done": ({"quest", "stage"}, None, "GetStageDone {quest} {stage}"),
+    "item_count": ({"who", "item"}, "who", "GetItemCount {item}"),
+    "dead": ({"ref"}, "ref", "GetDead"),
+    "disabled": ({"ref"}, "ref", "GetDisabled"),
+    "locked": ({"ref"}, "ref", "GetLocked"),
+    "in_cell": ({"ref", "cell"}, "ref", "GetInCell {cell}"),
+    "distance": ({"a", "b"}, "a", "GetDistance {b}"),
+    "av": ({"ref", "av"}, "ref", "GetAV {av}"),
+    "teammate": ({"ref"}, "ref", "GetPlayerTeammate"),
+    "spawn_count": ({"base", "ref"}, None, None),   # call-based: dev.countRefs {base}
+    "owner": ({"ref"}, None, None),                 # needs actor_owner (bridge method coop.owner); no NVSE expression
+    "expr": ({"expr"}, None, None),
 }
 CMPS = {"==", "!=", "<", "<=", ">", ">=", "same"}
 AGGS = {None, "sum", "min", "max"}
@@ -461,6 +472,7 @@ def validate(sc, name=None, root=QDATA, order=None):
                         e("%s: placeholder {%s} is not in forms" % (w, m.group(1)))
                 if re.search(r"(?<![A-Za-z0-9_.])(?:0x)?[0-9A-Fa-f]{8}(?![A-Za-z0-9_])", cmd):
                     e("%s: raw FormID in cmd; use a {alias} placeholder so it is validated" % w)
+                ref_line_error(w, cmd, e)
         elif op == "wait":
             if not isinstance(st.get("seconds"), (int, float)) or not 0 <= st["seconds"] <= 120:
                 e("%s: seconds must be 0..120" % w)
@@ -503,7 +515,7 @@ def _validate_check(w, st, e, need_form, glossary):
     if kind not in CHECK_KINDS:
         e("%s: unknown check kind %r" % (w, kind))
         return
-    req, _ = CHECK_KINDS[kind]
+    req = CHECK_KINDS[kind][0]
     for k in req:
         if k not in st:
             e("%s: check %s needs %r" % (w, kind, k))
@@ -540,6 +552,20 @@ def _validate_check(w, st, e, need_form, glossary):
         for m in PLACEHOLDER_RE.finditer(str(st.get("expr", ""))):
             if m.group(1) != "player" and m.group(1) not in glossary:
                 e("%s: placeholder {%s} is not in forms" % (w, m.group(1)))
+        ref_line_error(w, str(st.get("expr", "")), e)
+
+
+def ref_line_error(w, text, e):
+    """A console line / expression may name one reference, and only as its first word: '{alias}.Func args'. It then runs
+    with that reference as exec's calling reference. The console cannot run a '{alias}.Func' anywhere else."""
+    if MUTANT == "refline":   # test-only twin: the check is gone
+        return
+    probe = PLACEHOLDER_RE.sub(lambda m: "player" if m.group(1) == "player" else "0000ABC1", text)
+    try:
+        split_ref_line(probe)
+    except RefLineError:
+        e("%s: a {alias}.Func reference call must be the first word of the line (it becomes the calling reference of "
+          "exec {cmd, ref}), and a line can name only one" % w)
 
 
 def validate_file(path, root=QDATA):
@@ -574,9 +600,28 @@ def scenario_needs(sc):
     return out
 
 
+def on(who, text):
+    """The exec action that runs `text` on `who` (a runtime hex id or "player"). The player keeps the "player." prefix;
+    any other reference becomes exec's calling reference: ("exec", text, who). Never "<hex>.text"."""
+    if MUTANT == "hexprefix" and who != "player":   # test-only twin: the old "<hex>.text" line that failed in game
+        return ("exec", "%s.%s" % (who, text))
+    return ("exec", "player.%s" % text) if who == "player" else ("exec", text, who)
+
+
+def exec_line(line):
+    """An exec action for a whole console line: a leading "<hex>.Func" moves into exec's ref (console_ref.split_ref_line).
+    Raises StepError for a line that names a reference anywhere else."""
+    try:
+        cmd, ref = split_ref_line(line)
+    except RefLineError as ex:
+        raise StepError(str(ex)) from None
+    return ("exec", cmd) if ref is None else ("exec", cmd, ref)
+
+
 def step_actions(step, res):
     """Translate one non-check step to a list of actions:
-         ("exec", console line) | ("call", method, params) | ("wait", seconds) | ("stage", quest hex, stage) | ("load", name) | ("save", name)
+         ("exec", console line) | ("exec", console line, calling ref hex) | ("call", method, params) | ("wait", seconds)
+         | ("stage", quest hex, stage) | ("load", name) | ("save", name)
     """
     op = step["op"]
     h = res.hex
@@ -585,32 +630,32 @@ def step_actions(step, res):
     if op == "setvar":
         return [("call", "test.quest.setvar", {"quest": h(step["quest"]), "var": step["var"], "value": float(step["value"])})]
     if op == "moveto":
-        return [("exec", "%s.moveto %s" % (h(step["who"]), h(step["to"])))]
+        return [on(h(step["who"]), "moveto %s" % h(step["to"]))]
     if op == "spawn":
-        return [("exec", "%s.placeatme %s %d" % (h(step["at"]), h(step["base"]), step.get("count", 1)))]
+        return [on(h(step["at"]), "placeatme %s %d" % (h(step["base"]), step.get("count", 1)))]
     if op == "additem":
-        return [("exec", "%s.additem %s %d" % (h(step["who"]), h(step["item"]), step["count"]))]
+        return [on(h(step["who"]), "additem %s %d" % (h(step["item"]), step["count"]))]
     if op == "removeitem":
-        return [("exec", "%s.removeitem %s %d" % (h(step["who"]), h(step["item"]), step["count"]))]
+        return [on(h(step["who"]), "removeitem %s %d" % (h(step["item"]), step["count"]))]
     if op == "kill":
-        return [("exec", "%s.kill" % h(step["ref"]))]
+        return [on(h(step["ref"]), "kill")]
     if op == "resurrect":
-        return [("exec", "%s.resurrect" % h(step["ref"]))]
+        return [on(h(step["ref"]), "resurrect")]
     if op == "enable":
-        return [("exec", "%s.enable" % h(step["ref"]))]
+        return [on(h(step["ref"]), "enable")]
     if op == "disable":
-        return [("exec", "%s.disable" % h(step["ref"]))]
+        return [on(h(step["ref"]), "disable")]
     if op == "lock":
-        return [("exec", "%s.lock %d" % (h(step["ref"]), step["level"]))]
+        return [on(h(step["ref"]), "lock %d" % step["level"])]
     if op == "unlock":
-        return [("exec", "%s.unlock" % h(step["ref"]))]
+        return [on(h(step["ref"]), "unlock")]
     if op == "activate":
-        return [("exec", "%s.activate player 1" % h(step["ref"]))]
+        return [on(h(step["ref"]), "activate player 1")]
     if op == "recruit":
         r = h(step["ref"])
-        return [("exec", "%s.enable" % r), ("exec", "%s.moveto player" % r), ("exec", "%s.setplayerteammate 1" % r)]
+        return [on(r, "enable"), on(r, "moveto player"), on(r, "setplayerteammate 1")]
     if op == "console":
-        return [("exec", res.subst(step["cmd"]))]
+        return [exec_line(res.subst(step["cmd"]))]
     if op == "wait":
         return [("wait", float(step["seconds"]))]
     if op == "save":
@@ -618,7 +663,7 @@ def step_actions(step, res):
     if op == "load":
         return [("load", step["name"])]
     if op == "talk":
-        return [("exec", "%s.activate player 1" % h(step["npc"]))]   # opens the conversation; the greeting INFO is documentation + validated
+        return [on(h(step["npc"]), "activate player 1")]   # opens the conversation; the greeting INFO is documentation + validated
     if op == "pick":
         return [("call", CAPABILITIES["dialogue"]["method"], {"info": res.ref(step["info"])})]
     if op == "message_click":
@@ -637,14 +682,20 @@ def step_actions(step, res):
 
 
 def check_expr(step, res):
-    """-> (expression for nv.eval, cmp, value, agg, tol, timeout_s). The expression is None for kinds without one."""
+    """-> (expression for nv.eval, cmp, value, agg, tol, timeout_s, ref). The expression is None for kinds without one.
+    ref is the calling reference for nv.eval(expr, ref=ref) (a runtime hex id), or None: the console has no
+    "<hex>.Func" form, and the player stays the "player." prefix."""
     kind = step["kind"]
+    ref = None
     if kind == "expr":
-        expr = res.subst(step["expr"])
+        try:
+            expr, ref = split_ref_line(res.subst(step["expr"]))
+        except RefLineError as ex:
+            raise StepError(str(ex)) from None
     elif kind in ("owner", "spawn_count"):
         expr = None
     else:
-        _, tpl = CHECK_KINDS[kind]
+        _, on_field, tpl = CHECK_KINDS[kind]
         fields = {}
         for k in ("quest", "ref", "who", "cell", "a", "b", "item", "base"):
             if k in step:
@@ -653,7 +704,11 @@ def check_expr(step, res):
             if k in step:
                 fields[k] = step[k]
         expr = tpl.format(**fields)
-    return (expr, step.get("cmp", "=="), step.get("value"), step.get("agg"), step.get("tol", 0), float(step.get("timeout", 5)))
+        if on_field:
+            ref = fields[on_field]
+            if ref == "player" or MUTANT == "hexprefix":   # hexprefix: test-only twin, the old "<hex>.Func" expression
+                expr, ref = "%s.%s" % (ref, expr), None
+    return (expr, step.get("cmp", "=="), step.get("value"), step.get("agg"), step.get("tol", 0), float(step.get("timeout", 5)), ref)
 
 
 def compare(vals, cmp_, value, agg, tol):

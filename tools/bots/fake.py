@@ -18,6 +18,10 @@ It implements the console grammar and bridge methods in primitives.py over a tin
   crash             exec raises ConnectionLost
   drop_wrong_ref    the OnDrop event names a different ref than the one the engine created
   travel_ignored    bot.fasttravel is accepted but the player never moves
+  exec_ref_ignored  exec {cmd, ref} checks the ref, then runs the line with no calling reference
+
+Console lines follow the game (in game, 2026-10-21): "player.X" works, "<hex>.X" fails with
+Script command "<hex>.X" not found, and a line for another reference names it in exec's `ref` (calling reference).
 """
 from __future__ import annotations
 
@@ -28,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from .bot import PLAYER_REF, angle_diff, heading_deg
-from .bot import ConnectionLost, RpcError  # re-exported from nvbridge
+from .bot import BridgeError, ConnectionLost, RpcError  # re-exported from nvbridge
 from . import primitives as P
 
 PLAYER_ID = 0x14
@@ -66,6 +70,7 @@ class Thing:
     topics_text: List[str] = field(default_factory=list)   # terminal entry names
     base_id: int = 0                # base form id (0 = same as id); used by dev.countRefs
     topics: List[int] = field(default_factory=list)
+    teammate: bool = False          # SetPlayerTeammate
 
     @property
     def dead(self) -> bool:
@@ -178,22 +183,54 @@ class FakeBridge:
     def state_to_file(self, path: str, sections=None) -> Dict[str, Any]:
         return {"path": path, "sections": sections or []}
 
-    def eval(self, expr: str) -> float:
-        out = self.exec('printc "NVCOOP_EVAL=%g" (' + expr + ')')["output"]
+    def eval(self, expr: str, ref: Optional[str] = None) -> float:
+        line = 'printc "NVCOOP_EVAL=%g" (' + expr + ')'
+        out = (self.exec(line) if ref is None else self.exec(line, ref=ref))["output"]
+        if "NVCOOP_EVAL=" not in out:                       # same failure as nvbridge.NvBridge.eval
+            raise BridgeError(f"cannot evaluate {expr!r}: {out!r}")
         return float(out.rsplit("NVCOOP_EVAL=", 1)[1].split()[0])
 
-    def exec(self, cmd: str, timeout_ms: Optional[int] = None) -> Dict[str, Any]:
+    def exec(self, cmd: str, timeout_ms: Optional[int] = None, *, ref: Optional[str] = None) -> Dict[str, Any]:
+        """Like the game: a line runs with the calling reference `ref` (exec {cmd, ref}); "player.X" is the only
+        reference prefix the console accepts, and "<hex>.X" fails with: Script command "<hex>.X" not found."""
         if self.mutant == "crash":
             raise ConnectionLost("fake: pipe closed")
-        self.calls.append(("exec", cmd))
+        self.calls.append(("exec", cmd) if ref is None else ("exec", cmd, ref))
+        self_ref = None if ref is None else self._calling(ref)
+        if self.mutant == "exec_ref_ignored":
+            self_ref = None
         m = re.fullmatch(r'printc "NVCOOP_EVAL=%g" \((.*)\)', cmd)
+        text = m.group(1).strip() if m else cmd.strip()
+        bad = re.match(r"(\w+)\.\w+", text)
+        if bad and bad.group(1).lower() != "player":
+            return {"ok": False, "output": f'Script command "{text.split()[0]}" not found'}
         if m:
-            v = self._expr(m.group(1).strip())
+            v = self._expr(text, self_ref)
             if v is None:
                 return {"ok": False, "output": "unknown expression"}
             return {"ok": True, "output": f"NVCOOP_EVAL={v:g}"}
-        ok = self._stmt(cmd.strip())
+        ok = self._stmt(text, self_ref)
         return {"ok": ok, "output": "" if ok else "unknown command"}
+
+    def _calling(self, ref: str):
+        """exec's ref -> the Thing (or "player"), as the bridge resolves it: 'Plugin.esm:HEX' with the load order of
+        plugins(), or a runtime id 'HEX' / '0xHEX'. Anything else raises the bridge's errors (-32602 / -32013)."""
+        plugin, colon, hexpart = ref.rpartition(":")
+        hexpart = hexpart[2:] if hexpart[:2] in ("0x", "0X") and len(hexpart) > 2 else hexpart
+        if not re.fullmatch(r"[0-9A-Fa-f]{1,8}", hexpart) or (colon and (not plugin or int(hexpart, 16) > 0xFFFFFF)):
+            raise RpcError(-32602, f"exec: bad ref '{ref}'", "exec")
+        rid = int(hexpart, 16)
+        if colon:
+            low = [p.lower() for p in self.plugins()]
+            if plugin.lower() not in low:
+                raise RpcError(-32013, f"exec: ref '{ref}': plugin '{plugin}' is not loaded", "exec")
+            rid |= low.index(plugin.lower()) << 24
+        if rid == PLAYER_ID:
+            return "player"
+        t = self.world.things.get(rid)
+        if t is None:
+            raise RpcError(-32013, f"exec: ref '{ref}' (form {rid:08X}) is not a loaded form", "exec")
+        return t
 
     def call(self, method: str, params: Optional[Dict[str, Any]] = None, timeout_s: float = 35.0) -> Any:
         params = params or {}
@@ -475,11 +512,13 @@ class FakeBridge:
         if best:
             best[1].health -= 25
 
-    def _stmt(self, line: str) -> bool:
+    def _stmt(self, line: str, self_ref=None) -> bool:
+        """One statement. self_ref = the calling reference from exec's ref (a Thing, "player" or None)."""
         m = re.fullmatch(r"(?:(\w+)\.)?(\w+)(?:\s+(.*))?", line)
         if not m:
             return False
         tgt, cmd, rest = m.group(1), m.group(2).lower(), (m.group(3) or "").split()
+        who = "player" if (tgt or "").lower() == "player" else self_ref
         me = self.me
         mut = self.mutant
         if cmd == "setpos" and tgt == "player":
@@ -515,12 +554,12 @@ class FakeBridge:
                     self.drop_log[-1]["ref"] = "FalloutNV.esm:DEAD"
             return True
         if cmd == "activate":
-            t = self._target(tgt or "")
+            t = who
             if isinstance(t, Thing) and mut != "activate_noop":
                 self._activate(t)
             return isinstance(t, Thing)
         if cmd == "removeitemtarget":
-            src, dst = self._target(tgt or ""), self._target(rest[1])
+            src, dst = who, self._target(rest[1])
             si, di = self._holder_items(src), self._holder_items(dst)
             if si is None or di is None:
                 return False
@@ -531,15 +570,42 @@ class FakeBridge:
                 si[i] -= n
             di[i] = di.get(i, 0) + n
             return True
+        if cmd == "additem":
+            items = self._holder_items(who)
+            if items is None:
+                return False
+            items[_hex(rest[0])] = items.get(_hex(rest[0]), 0) + int(rest[1])
+            return True
+        if cmd in ("lock", "unlock"):
+            if not isinstance(who, Thing) or who.kind not in ("door", "container", "terminal"):
+                return False
+            who.locked = cmd == "lock"
+            return True
+        if cmd == "setplayerteammate":
+            if not isinstance(who, Thing) or who.kind != "actor":
+                return False
+            who.teammate = bool(int(rest[0]))
+            return True
+        if cmd == "placeatme":
+            at = me if who == "player" else who
+            if at is None:
+                return False
+            base = _hex(rest[0])
+            for _ in range(int(rest[1]) if len(rest) > 1 else 1):
+                self._next_ref += 1
+                self.world.add(Thing(self._next_ref, "actor", list(at.pos), at.cell, base_id=base))
+            return True
         if cmd == "fireweapon":
             return False  # the console fallback does not exist in the fake: tests the "unsupported" path
         return False
 
-    def _expr(self, e: str) -> Optional[float]:
+    def _expr(self, e: str, self_ref=None) -> Optional[float]:
+        """One expression. self_ref = the calling reference from exec's ref (a Thing, "player" or None)."""
         m = re.fullmatch(r"(?:(\w+)\.)?(\w+)(?:\s+(.*))?", e)
         if not m:
             return None
         tgt, fn, rest = m.group(1), m.group(2).lower(), (m.group(3) or "").split()
+        who = "player" if (tgt or "").lower() == "player" else self_ref
         me = self.me
         if fn == "getsneaking":
             return 1.0 if self.sneaking else 0.0
@@ -548,14 +614,16 @@ class FakeBridge:
         if fn == "getequipped":
             return 1.0 if _hex(rest[0]) in me.equipped else 0.0
         if fn == "getitemcount":
-            items = self._holder_items(self._target(tgt or ""))
+            items = self._holder_items(who)
             return float(items.get(_hex(rest[0]), 0)) if items is not None else None
         if fn == "getopenstate":
-            t = self._target(tgt or "")
-            return float(t.open_state) if isinstance(t, Thing) else None
+            return float(who.open_state) if isinstance(who, Thing) else None
         if fn == "getlocked":
-            t = self._target(tgt or "")
-            return float(t.locked) if isinstance(t, Thing) else None
+            return float(who.locked) if isinstance(who, Thing) else None
+        if fn == "getlocklevel":
+            return (50.0 if who.locked else 0.0) if isinstance(who, Thing) else None
+        if fn == "getplayerteammate":
+            return float(who.teammate) if isinstance(who, Thing) else None
         if fn == "getstage":
             return float(self.world.stages.get(_hex(rest[0]), 0))
         return None

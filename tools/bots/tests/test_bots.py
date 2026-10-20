@@ -2,13 +2,16 @@
 
 Run: python -I tools/bots/run_tests.py   (prints ALL OK)
 """
+import re
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from bots import ActionFailed, Bot, FakeBridge, World  # noqa: E402
-from bots.bot import ActionResult, ConnectionLost, heading_deg  # noqa: E402
+from bots import primitives as P  # noqa: E402
+from bots.bot import ActionResult, BridgeError, ConnectionLost, RpcError, heading_deg  # noqa: E402
+from nvbridge import join_ref_line  # noqa: E402  (bots.bot put tools/runner on sys.path)
 
 ITEM, AMMO, CHEST, DOOR, NPC, RAIDER, GROUND, TERM, QUEST = 0x500, 0x501, 0x600, 0x601, 0x602, 0x603, 0x604, 0x605, 0x700
 INFO = 0x800
@@ -395,6 +398,97 @@ class GenuineActions(unittest.TestCase):
         self.assertIn("speech_check", r.data)
 
 
+class LegacyBot(Bot):
+    """Twin of the old bot: it builds '<ref>.<Func>' console lines again (what failed in game on 2026-10-21)."""
+
+    def _old(self, line):
+        if not isinstance(line, P.Line) or line.ref is None:
+            return line
+        return join_ref_line(line.cmd, self._norm(line.ref)[1])     # "00000601.GetOpenState", as the old code sent it
+
+    def _exec(self, cmd, what=""):
+        return super()._exec(self._old(cmd), what)
+
+    def _eval(self, expr):
+        return super()._eval(self._old(expr))
+
+
+def no_activate_method(nv):
+    """The build has no activate.ref: Bot falls back to the console line 'Activate player 1' on the ref."""
+    orig = nv.call
+
+    def call(method, params=None, timeout_s=35.0):
+        if method == P.M_ACTIVATE:
+            raise RpcError(-32601, "unknown method: " + method, method)
+        return orig(method, params, timeout_s)
+    nv.call = call
+
+
+class ConsoleRefLines(unittest.TestCase):
+    """exec {cmd, ref}: the console has no '<hexFormID>.Command' form; a ref-targeted line names its reference in ref."""
+
+    def test_fake_console_behaves_like_the_game(self):
+        nv, _ = make()
+        r = nv.exec("00000600.RemoveItemTarget 00000500 player 1 1")
+        self.assertEqual(r, {"ok": False, "output": 'Script command "00000600.RemoveItemTarget" not found'})
+        with self.assertRaises(BridgeError):
+            nv.eval("00000601.GetOpenState")
+        self.assertEqual(nv.eval("GetOpenState", ref="FalloutNV.esm:601"), 3.0)
+        self.assertEqual(nv.eval("GetOpenState", ref="00000601"), 3.0)
+        self.assertEqual(nv.eval("GetItemCount 00000500", ref="0x600"), 5.0)
+        self.assertEqual(nv.eval("player.GetItemCount 00000501"), 30.0)       # player. lines need no ref
+        with self.assertRaises(BridgeError):
+            nv.eval("GetOpenState")                                            # no calling reference
+        with self.assertRaises(RpcError) as cm:
+            nv.eval("GetOpenState", ref="FalloutNV.esm:9999")
+        self.assertEqual(cm.exception.code, -32013)
+        with self.assertRaises(RpcError) as cm:
+            nv.eval("GetOpenState", ref="Nope.esm:601")
+        self.assertEqual(cm.exception.code, -32013)
+        with self.assertRaises(RpcError) as cm:
+            nv.eval("GetOpenState", ref="door")
+        self.assertEqual(cm.exception.code, -32602)
+
+    def test_bot_sends_ref_lines_never_hex_prefixes(self):
+        nv, b = make()
+        self.assertTrue(b.take(ref(CHEST), ITEM, 2).ok)
+        self.assertTrue(b.put(ref(CHEST), ITEM, 1).ok)
+        self.assertTrue(b.open(ref(DOOR)).ok)
+        self.assertTrue(b.close(ref(DOOR)).ok)
+        self.assertFalse(b.locked(ref(DOOR)))
+        self.assertEqual(b.inventory_count(ITEM, ref(CHEST)), 4)
+        lines = [c for c in nv.calls if c[0] == "exec"]
+        self.assertIn(("exec", "RemoveItemTarget 00000500 player 2 1", ref(CHEST)), lines)
+        self.assertIn(("exec", "player.RemoveItemTarget 00000500 00000600 1 1"), lines)
+        self.assertIn(("exec", 'printc "NVCOOP_EVAL=%g" (GetOpenState)', ref(DOOR)), lines)
+        self.assertIn(("exec", 'printc "NVCOOP_EVAL=%g" (GetLocked)', ref(DOOR)), lines)
+        bad = [c for c in lines if re.search(r"(^|[\s(])[0-9A-Fa-f]{8}\.\w", c[1])]
+        self.assertEqual(bad, [], "a console line still names a reference with '<hex>.'")
+
+    def test_console_activate_fallback_uses_the_ref(self):
+        nv, b = make()
+        no_activate_method(nv)
+        self.assertTrue(b.open(ref(DOOR)).ok)
+        self.assertIn(("exec", "Activate player 1", ref(DOOR)), nv.calls)
+
+    def test_legacy_hex_prefix_lines_fail_like_in_game(self):
+        """Twin: a bot that still builds '<hex>.Func' lines must fail on the fake, as it did in game."""
+        nv, b = make()
+        b = LegacyBot(nv, "legacy")
+        self.assertFalse(b.take(ref(CHEST), ITEM, 1).ok)
+        self.assertFalse(b.open(ref(DOOR)).ok)
+        with self.assertRaises(BridgeError):
+            b.door_state(ref(DOOR))
+        with self.assertRaises(BridgeError):
+            b.inventory_count(ITEM, ref(CHEST))
+        nv2, b2 = make()
+        no_activate_method(nv2)
+        r = LegacyBot(nv2, "legacy").activate(ref(DOOR))
+        self.assertFalse(r.ok)
+        self.assertIn("not found", r.data.get("output", ""))
+        self.assertEqual(nv2.world.things[DOOR].open_state, 3)
+
+
 # ---- mutation twins: a defective game must make the matching action FAIL, never report success ----
 def _scenario(name):
     """-> callable(bot) returning the ActionResult that must be a failure under mutant `name`."""
@@ -417,6 +511,7 @@ def _scenario(name):
         "drop_wrong_ref": lambda b: _drop_ref_check(b),
         "travel_ignored": lambda b: b.fast_travel(ref(CHEST), timeout_s=6.0),
         "ref_info_error": lambda b: b.pos(ref(NPC)) and None,
+        "exec_ref_ignored": lambda b: b.take(ref(CHEST), ITEM, 1),
     }[name]
 
 
@@ -430,7 +525,7 @@ def _drop_ref_check(b):
 
 
 MUTANTS = ["move_ignored", "look_ignored", "stop_ignored", "jump_noop", "fire_noop", "setpos_ignored", "angle_ignored", "activate_noop", "transfer_noop", "transfer_dup", "equip_noop",
-           "drop_noop", "fire_miss", "health_stuck", "dialog_never", "drop_wrong_ref", "travel_ignored"]
+           "drop_noop", "fire_miss", "health_stuck", "dialog_never", "drop_wrong_ref", "travel_ignored", "exec_ref_ignored"]
 
 
 class MutationTwins(unittest.TestCase):

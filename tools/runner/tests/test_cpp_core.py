@@ -22,6 +22,7 @@ GOOD = "nvbridge_fakehost"
 MUTANT = "nvbridge_fakehost_mutant"
 MUTANT_LOCK = "nvbridge_fakehost_mutant_lock"
 MUTANT_SAVE = "nvbridge_fakehost_mutant_save"
+MUTANT_EXECREF = "nvbridge_fakehost_mutant_execref"
 from uniq import unique_instance  # noqa: E402
 
 
@@ -86,6 +87,20 @@ class CppCore(unittest.TestCase):
             self.assertEqual(cm.exception.code, -32001)
             time.sleep(4.0)  # let the stall finish; the bridge must recover
             self.assertEqual(nv.exec("echo alive")["output"], "alive")
+
+    def test_exec_ref_runs_the_line_on_the_reference(self):
+        h = start(self)
+        with h.connect() as nv:
+            conformance.check_exec_ref(nv)
+            # the real core reports the plugin, the runtime id and the form type in its refusals
+            with self.assertRaises(nvbridge.RpcError) as cm:
+                nv.exec("getref", ref="FalloutNV.esm:F")
+            self.assertEqual(cm.exception.code, -32013)
+            self.assertIn("form 0000000F, form type 0x1F", cm.exception.message)
+            self.assertIn("only a REFR, ACHR or ACRE", cm.exception.message)
+            with self.assertRaises(nvbridge.RpcError) as cm:
+                nv.exec("getref", ref="FalloutNV.esm:1000000")
+            self.assertIn("at most FFFFFF", cm.exception.message)
 
     def test_custom_methods(self):
         h = start(self)
@@ -189,6 +204,14 @@ class CppMutationTwin(unittest.TestCase):
         with h.connect() as nv:
             with self.assertRaises((AssertionError, nvbridge.BridgeError), msg="save-guard mutant was NOT caught"):
                 conformance.run(nv, connect2=h.connect)
+
+    def test_exec_ref_ignored_mutant_is_rejected(self):
+        h = start(self, MUTANT_EXECREF)
+        with h.connect() as nv:
+            with self.assertRaises((AssertionError, nvbridge.BridgeError), msg="exec-ignores-ref mutant was NOT caught"):
+                conformance.run(nv, connect2=h.connect)
+            with self.assertRaises(AssertionError, msg="exec-ignores-ref mutant was NOT caught by check_exec_ref"):
+                conformance.check_exec_ref(nv)
 
 
 if __name__ == "__main__":

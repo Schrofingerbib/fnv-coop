@@ -38,8 +38,25 @@ Failure reasons: `timeout`, `not_found`, `dead`, `postcondition`, `unsupported`,
 
 Queries: pos, cell, alive, health, inventory_count(item, holder), quest_stage, dialogue_open, door_state, locked.
 
+## Lines for a reference: exec {cmd, ref} (VERIFIED in game, 2026-10-21)
+The game's console does not accept `<hexFormID>.Command`. On FalloutNV.exe 1.4.0.525 the line `00103E61.GetOpenState` got
+`Script command "00103E61.GetOpenState" not found`, and the EditorID of a non-persistent ref got `Invalid reference ...`.
+Only `player.` works as a prefix. So every line for another reference names it in the bridge's `ref` parameter, and the
+bridge runs the line with that reference as the console's calling reference (`RunScriptLine2(cmd, ref)`, see
+docs/CONTRACTS.md):
+- primitives.py returns a `Line(cmd, ref)` for these lines (`open_state`, `locked`, `item_count`, `transfer`,
+  `activate_console`). `P.on(holder, text)` keeps `player.` for the player and puts any other holder in `ref`.
+- `Bot._exec` / `Bot._eval` send a `Line` as `nv.exec(cmd, ref=ref)` / `nv.eval(expr, ref=ref)`. `Bot._exec_on(ref, cmd)`
+  does the same for a raw command. The ref is `Plugin.esm:HEX`, so the bridge resolves it with the game's own load order.
+- Argument refs (for example the destination of `RemoveItemTarget`, the marker of `player.MoveTo`) stay runtime hex ids
+  in the line: the console accepts hex FormID arguments.
+- fake.py behaves like the game: a `<hex>.Func` line fails with `Script command "<hex>.Func" not found`, and
+  `exec(cmd, ref=...)` runs the line on that reference. A bad ref raises the bridge's errors (-32602, -32013).
+- Twins: the fake mutant `exec_ref_ignored` (the host checks the ref, then drops it) and `LegacyBot` in
+  tests/test_bots.py (a bot that still builds `<hex>.Func` lines) must both fail.
+
 ## Unverified grammar (fix in tools/bots/primitives.py only)
-All of primitives.py except `GetStage`. In particular: `player.SetPos/SetAngle/GetAngle`, `EquipItem/UnequipItem/GetEquipped`, `RemoveItemTarget item target count silent` argument order, `Drop`, `GetOpenState` values (1 open, 3 closed), `GetLocked`, the FLAG_DISABLED bit 0x800, Health = actor value 16 for `world.query p1`, angle sign conventions in `heading_deg`, and whether hex refs work as `HEX.Cmd` prefixes and inside `printc` expressions. Update fake.py to the same grammar if you change a string.
+All of primitives.py except `GetStage`. In particular: `player.SetPos/SetAngle/GetAngle`, `EquipItem/UnequipItem/GetEquipped`, `RemoveItemTarget item target count silent` argument order, `Drop`, `GetOpenState` values (1 open, 3 closed), `GetLocked`, the FLAG_DISABLED bit 0x800, Health = actor value 16 for `world.query p1`, angle sign conventions in `heading_deg`, and whether an expression inside `printc` uses the calling reference that exec's `ref` gives it (`eval(expr, ref=...)`). Update fake.py to the same grammar if you change a string.
 Walking is a stepped SetPos: it does not path around walls, so use it inside open areas and teleport otherwise.
 
 ## In-process input driver and bridge methods (plugin/bots, ini `[dev] bots=1`) - BUILT, NOT RUN IN GAME
@@ -97,7 +114,7 @@ Its `--table` output is the source of the ~170 call sites of `GetControlState` g
 Known limits: terminal state only knows the bot's own picks; VATS limb choice; Reload control id; full inventory enumeration of base-container-only items.
 
 ## Tests
-`tools/bots/tests/test_bots.py`: 24 tests over the fake bridge (virtual clock, milliseconds). Mutation twins in fake.py (`setpos_ignored, angle_ignored, activate_noop, transfer_noop, transfer_dup, equip_noop, drop_noop, fire_miss, health_stuck, dialog_never, ref_info_error, crash`): each must make the matching action fail. The fake uses the same grammar as primitives.py, so it proves the Bot logic, not the real console.
+`tools/bots/tests/test_bots.py`: 24 tests over the fake bridge (virtual clock, milliseconds). Mutation twins in fake.py (`setpos_ignored, angle_ignored, activate_noop, transfer_noop, transfer_dup, equip_noop, drop_noop, fire_miss, health_stuck, dialog_never, ref_info_error, crash, exec_ref_ignored`): each must make the matching action fail. The fake uses the same grammar as primitives.py, so it proves the Bot logic, not the real console.
 `tools/bots/tests/test_proof.py` and `test_proof_cli.py`: the two proof scripts over the fake, and their command lines. A bad command line (an empty form value included) must make `main()` return 2 and name the argument before the bridge is opened, without `SystemExit`.
 A missing game, and a game lost in the middle of the run (`ConnectionLost` and `GameCrashed` from the fake), must give 2 without a traceback. `--other-info` in every accepted spelling must make the dialog check catch the fake mutant `dialog_lists_all`.
 `--info FalloutNV.esm:1800 --other-info FalloutNV.esm:800` must pass on a fake whose NPC offers 1800. A `form_key` table and the load-order refusals (exit 2 before the first check) check the runtime id rule.

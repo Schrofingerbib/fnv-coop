@@ -1,7 +1,11 @@
 """In-memory stand-in for the bridge of 1..N game instances sharing one world (test and dry-run use only).
 
 It models just enough of the console / eval / call surface for the shipped scenarios: quest stages, kills, locks, item counts,
-spawns, positions, health, loot pickup, teammates. Flags inject the bug classes the checks must catch.
+spawns, positions, health, loot pickup, teammates. Flags inject the bug classes the checks must catch
+(exec_ref_ignored: the host checks exec's ref, then runs the line with no calling reference).
+
+The console behaves like the game's (in game, 2026-10-21): "<hex>.Func" fails with Script command "<hex>.Func" not found,
+"player.Func" works, and a line for another reference runs as exec(cmd, ref=<hex>) / eval(expr, ref=<hex>).
 """
 import re
 
@@ -52,21 +56,36 @@ class FakeNv:
     def _log(self, kind, text):
         self.w.calls.append((self.i, kind, text))
 
-    # -- console
-    def exec(self, cmd):
+    # -- console. Like the game (2026-10-21): "player.X" works, "<hex>.X" fails with Script command "<hex>.X" not found,
+    # and a line for another reference names it in exec's ref (the console's calling reference).
+    def _who(self, text, ref):
+        """-> (who, verb, rest words) of a console line / expression, or None when it names no reference."""
+        if ref is not None and not self.w.flags.get("exec_ref_ignored"):   # twin flag: the host drops the ref
+            if not re.fullmatch(HEX, ref):
+                raise RuntimeError("exec: bad ref %r (the scenario runner passes runtime hex ids)" % ref)
+            m = re.match(r"^(\w+)\s*(.*)$", text)
+            return (ref.upper(), m.group(1).lower(), m.group(2).split()) if m else None
+        m = re.match(r"^player\.(\w+)\s*(.*)$", text, re.I)
+        return ("player", m.group(1).lower(), m.group(2).split()) if m else None
+
+    @staticmethod
+    def _hex_prefixed(text):
+        return re.match(r"^%s\.\w" % HEX, text) is not None
+
+    def exec(self, cmd, ref=None):
         w, i = self.w, self.i
-        self._log("exec", cmd)
+        self._log("exec", cmd if ref is None else "%s @%s" % (cmd, ref))
+        if self._hex_prefixed(cmd):
+            return {"ok": False, "output": 'Script command "%s" not found' % cmd.split()[0]}
         m = re.match(r"^setstage %s (\d+)$" % HEX, cmd, re.I)
         if m:
             w.stage[m.group(1).upper()] = int(m.group(2))
             w.stage_done.setdefault(m.group(1).upper(), set()).add(int(m.group(2)))
             return {"ok": True, "output": ""}
-        m = re.match(r"^(player|%s)\.(\w+)\s*(.*)$" % HEX, cmd, re.I)
-        if not m:
+        parsed = self._who(cmd, ref)
+        if not parsed:
             return {"ok": True, "output": "Could not parse"} if cmd.startswith("bogus") else {"ok": True, "output": ""}
-        # group layout: 1 = who, 2 = hex inside who, 3 = verb, 4 = rest
-        who = m.group(1).upper() if m.group(1).lower() != "player" else "player"
-        verb, rest = m.group(3).lower(), m.group(4).split()
+        who, verb, rest = parsed
         key = "player%d" % i if who == "player" else who
         if verb == "kill":
             w.dead.add(who)
@@ -105,9 +124,11 @@ class FakeNv:
         return {"ok": True, "output": ""}
 
     # -- eval
-    def eval(self, expr):
+    def eval(self, expr, ref=None):
         w, i = self.w, self.i
-        self._log("eval", expr)
+        self._log("eval", expr if ref is None else "%s @%s" % (expr, ref))
+        if self._hex_prefixed(expr):       # the old "<hex>.Func": the game's console cannot compile it (nvbridge.eval raises)
+            raise RuntimeError('cannot evaluate %r: Script command "%s" not found' % (expr, expr.split()[0]))
         guest_blind = w.flags.get("desync_guest") and i == 1
         m = re.match(r"^GetStage %s$" % HEX, expr)
         if m:
@@ -115,10 +136,11 @@ class FakeNv:
         m = re.match(r"^GetStageDone %s (\d+)$" % HEX, expr)
         if m:
             return 0.0 if guest_blind else float(int(m.group(2)) in w.stage_done.get(m.group(1).upper(), set()))
-        m = re.match(r"^(player|%s)\.(\w+)\s*(.*)$" % HEX, expr)
-        who = m.group(1).upper() if m.group(1).lower() != "player" else "player"
+        parsed = self._who(expr, ref)
+        if not parsed:
+            raise RuntimeError("cannot evaluate %r: no calling reference" % expr)
+        who, fn, rest = parsed
         key = "player%d" % i if who == "player" else who
-        fn, rest = m.group(3).lower(), m.group(4).split()
         if guest_blind and fn in ("getdead", "getlocked", "getav", "getitemcount", "getnumrefs", "getplayerteammate"):
             return 0.0
         if fn == "getdead":

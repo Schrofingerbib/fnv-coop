@@ -33,6 +33,24 @@ Checks: `kind` is one of `stage stage_done item_count dead disabled locked in_ce
 with `cmp` (`== != < <= > >= same`), `value`, `agg` (`sum min max` over the players), `tol`, `timeout` (seconds, polled until it
 holds). `cmp: same` means every player reports the same number (convergence without knowing the number).
 
+## Lines for a reference: exec {cmd, ref} (VERIFIED in game, 2026-10-21)
+The game's console does not accept `<hexFormID>.Command`. On FalloutNV.exe 1.4.0.525, `00103E61.GetOpenState` got
+`Script command "00103E61.GetOpenState" not found`, and the EditorID of a non-persistent ref got `Invalid reference ...`.
+Only `player.` works as a prefix. So the scenario tool never sends `<hex>.Func`:
+- `scenlib.step_actions` gives `("exec", line)` for a line with no reference or with `player.`, and
+  `("exec", line, ref)` for a line on another reference, for example `lock` gives `("exec", "lock 50", "00103E61")`. The
+  runner sends it as `nv.exec(line, ref=ref)`: the bridge runs the line with that reference as the console's calling
+  reference (docs/CONTRACTS.md, `exec{cmd, ref?}`).
+- `scenlib.check_expr` returns a seventh item, the calling reference: `dead` gives `("GetDead", ..., "00104C70")` and the
+  runner evaluates `nv.eval("GetDead", ref="00104C70")`. `player` stays the `player.` prefix.
+- A `console` step or an `expr` check may name one reference, and only as the first word: `{gang1}.setav Health 100` runs as
+  `exec("setav Health 100", ref=<gang1>)` (`console_ref.split_ref_line`). The validator refuses a `{alias}.Func` that is
+  not the first word, or a second one, because the console cannot run it.
+- fakegame.py behaves like the game: a `<hex>.Func` line fails (`Script command ... not found`), and `exec`/`eval` with
+  `ref` act on that reference.
+- Twins: `SCEN_MUTANT=hexprefix` (the tool builds `<hex>.Func` lines again), `SCEN_MUTANT=refline` (the validator accepts a
+  reference call that is not first), and the fake world flag `exec_ref_ignored` (the host drops the ref). Each must fail.
+
 ## Jump to scenario in seconds
 `runner.Runner.jump()` follows L7's reload-every rule. The save is reloaded only when: nothing is loaded on that instance yet
 (the state key names the game process, see "State keys" below, so a new game counts as empty); the loaded save differs from `start.save`; the
@@ -112,11 +130,12 @@ uses the capabilities marked `present` there unless you pass `capabilities=` to 
   present against this plugin, the owner check would report `error` (`KeyError: 'owner'`), not a pass.
 
 ## Unknowns (to settle with `proof.py probe`)
-- `ref.GetDead`, `ref.GetLocked`, `ref.GetItemCount`, `ref.GetAV`, `ref.GetDistance` and the other `hex.Function` forms through
-  `nv.eval` (the bridge's printc wrapper) are not verified in game; only `GetStage`-style forms are.
+- `GetDead`, `GetLocked`, `GetItemCount`, `GetAV`, `GetDistance` and the other reference functions through `nv.eval(expr, ref=...)`
+  (the bridge's printc wrapper, run with the reference as the calling reference) are not verified in game; only
+  `GetStage`-style forms are. The `<hex>.Function` form is verified NOT to work (see "Lines for a reference").
 - `GetNumRefs` as the spawn counter is unverified and may not exist with that signature. If it fails, `spawn_once` reports `error`.
-- Console forms used by actions (`.lock N`, `.unlock`, `.activate player 1`, `.placeatme`, `.setplayerteammate 1`, `.setav Health`)
-  are the usual console syntax but have not been run through the bridge here.
+- Console forms used by actions (`lock N`, `unlock`, `activate player 1`, `placeatme`, `setplayerteammate 1`, `setav Health`, each
+  with the reference in exec's `ref`) are the usual console syntax but have not been run through the bridge here.
 - Two-player scenarios assume the host and guest are already connected as one co-op session; the runner does not connect them.
   The format of the `coop.status` reply is unknown, so the runner does not gate on it.
 - The start save name `autosave` is the sweep's default; whether that save sits in Goodsprings in the pool instances is unknown.
@@ -128,10 +147,11 @@ and `scen.py jump` do this through `runner.for_lease`. The state key is `instanc
 process), stored in `out/scenarios/state.json`. See "State keys".
 
 ## Tests and twin
-63 tests: all 14 files valid; every form resolves with matching EditorID and type; load-order prefixes; validator rejections
-(20 tests in `ValidatorRejects`: invented id, wrong EditorID, wrong type, unnormalized ref, unknown alias, bad stage/variable,
+68 tests: all 14 files valid; every form resolves with matching EditorID and type; load-order prefixes; validator rejections
+(21 tests in `ValidatorRejects`: invented id, wrong EditorID, wrong type, unnormalized ref, unknown alias, bad stage/variable,
 wrong record type for a field, duplicate id, raw FormID in console, bad save name, no check, and a corrupted ref in each shipped
-file); translation of steps to exact console lines; comparison table; jump rules; runner against the fake world, including
+file); translation of steps to exact console lines and calling references (no shipped step or check sends `<hex>.Func`);
+the game-like fake console; the proof probes; comparison table; jump rules; runner against the fake world, including
 injected bugs (guest does not see changes, duplicated loot, double spawn, missing ownership handoff), steps landing on the named
 player, blocked steps, console parse errors, invalid scenarios never reaching the game, and in-place versus reload jumps.
 State keys (6 tests in `GameProcessKeys`, on the real pool policy `tools/pool/core.py` with its fake backend, the real
