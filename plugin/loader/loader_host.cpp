@@ -24,6 +24,10 @@
 //   NVLOADER_MUTANT_CONFIGONCE copy the config only at the first load (edits made before a reload are lost)
 //   NVLOADER_MUTANT_NOPRUNE   keep a cache copy whose source file was deleted (the core reads a removed file)
 //   NVLOADER_MUTANT_NOATTRS   leave a read-only cache copy read-only (the next copy over it fails)
+//   NVLOADER_MUTANT_NOVOLATILE leave nvcoop_volatile_keys.txt out of the config names (the snapshot filter finds no keys)
+//   NVLOADER_MUTANT_COREDIRCONFIG take the config from the core's folder also when gameDir is set (core= with a folder part)
+//   NVLOADER_MUTANT_RETRYALL  retry every config copy error but "not found", and wait after the last try (the old loop)
+//   NVLOADER_MUTANT_NORETRY   retry no config copy error (a file that an editor holds open for a moment is not copied)
 
 namespace nvcoop::loader {
 namespace {
@@ -98,6 +102,42 @@ void MakeWritable(const std::string& path) {
     SetFileAttributesA(path.c_str(), FILE_ATTRIBUTE_NORMAL);
 #else
     (void)path;
+#endif
+}
+
+// A config copy error that can clear by itself: an editor or a tool has the file open or locked at this moment.
+// Every other error (access denied, a folder in the way, a bad path) stays, so a retry only adds delay.
+[[maybe_unused]] bool CopyErrorIsTransient(DWORD e) {
+#ifdef NVLOADER_MUTANT_NORETRY
+    (void)e;
+    return false;
+#else
+    return e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION;
+#endif
+}
+constexpr int kConfigCopyTries = 10;        // at most 9 waits, so a transient error gets about 450 ms to clear
+constexpr DWORD kConfigCopyWaitMs = 50;
+
+// Copies one config file over its cache copy. On failure `err` is the last error of CopyFile.
+bool CopyConfigFile(const std::string& from, const std::string& to, DWORD& err) {
+    err = 0;
+#ifdef NVLOADER_MUTANT_RETRYALL
+    for (int i = 0; i < kConfigCopyTries; ++i) {
+        MakeWritable(to);
+        if (CopyFileA(from.c_str(), to.c_str(), FALSE)) return true;
+        err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND) return false;
+        Sleep(kConfigCopyWaitMs);
+    }
+    return false;
+#else
+    for (int i = 1;; ++i) {
+        MakeWritable(to);
+        if (CopyFileA(from.c_str(), to.c_str(), FALSE)) return true;
+        err = GetLastError();
+        if (!CopyErrorIsTransient(err) || i >= kConfigCopyTries) return false;   // no wait after the last try
+        Sleep(kConfigCopyWaitMs);
+    }
 #endif
 }
 
@@ -210,15 +250,29 @@ uint64_t g_seq = 0;   // cache file sequence, unique per process
 
 CoreHost* Current() { return g_current; }
 
+// Exact names: the ini (every module), the consent table (plugin/coop/coop_module.cpp) and the volatile keys
+// (plugin/snapshot/src/baseline_nvse.cpp). The pattern nvcoop_*.json covers the coop and hooks data files.
 bool IsCoreConfigFile(const std::string& fileName) {
     const std::string n = Lower(fileName);
     if (n == "nvcoop.ini" || n == "nvcoop_consent_messages.txt") return true;
+#ifndef NVLOADER_MUTANT_NOVOLATILE
+    if (n == "nvcoop_volatile_keys.txt") return true;
+#endif
     return n.size() >= 12 && n.compare(0, 7, "nvcoop_") == 0 && n.compare(n.size() - 5, 5, ".json") == 0;
 }
 
 CoreHost::CoreHost(HostEnv env) : env_(std::move(env)) {
     if (env_.cacheDir.empty()) env_.cacheDir = DirOf(env_.corePath) + "nvcoop_cache\\";
     if (!env_.cacheDir.empty() && env_.cacheDir.back() != '\\' && env_.cacheDir.back() != '/') env_.cacheDir += '\\';
+    // The config belongs to the loader's folder (main.cpp reads the loader's own nvcoop.ini there), not to the core's
+    // folder: the two differ when [loader] core= has a folder part. Without a game folder (tests) use the core's folder.
+#ifndef NVLOADER_MUTANT_COREDIRCONFIG
+    if (env_.configDir.empty() && !env_.gameDir.empty()) {
+        std::string game = env_.gameDir;
+        WithSlash(game);
+        env_.configDir = game + "Data\\NVSE\\Plugins\\";
+    }
+#endif
     if (env_.configDir.empty()) env_.configDir = DirOf(env_.corePath);
     if (env_.configDir.empty()) env_.configDir = ".\\";
     WithSlash(env_.configDir);
@@ -244,9 +298,10 @@ void CoreHost::CleanStaleCache() {
     FindClose(h);
 }
 
-// The core's modules find nvcoop.ini, nvcoop_*.json and the consent table beside their own module file, and that
-// file is the cache copy. Mirror the loader folder's current config files into the cache folder before each
-// LoadLibrary: copy (overwrite) every present file, delete cache copies whose source is gone, skip missing files.
+// The core's modules find nvcoop.ini, nvcoop_*.json, the consent table and the volatile keys beside their own module
+// file, and that file is the cache copy. Mirror the loader folder's current config files into the cache folder before
+// each LoadLibrary: copy (overwrite) every present file, delete cache copies whose source is gone, skip missing files.
+// Only a sharing or lock violation is retried (see CopyConfigFile); any other copy error is logged at once.
 #ifdef NVLOADER_MUTANT_NOCONFIG
 void CoreHost::SyncConfig() { configFiles_.clear(); }
 #else
@@ -278,20 +333,11 @@ void CoreHost::SyncConfig() {
     std::string list;
     for (const std::string& name : want) {
         const std::string from = src + name, to = dst + name;
-        bool copied = false;
         DWORD e = 0;
-        for (int i = 0; i < 10 && !copied; ++i) {   // an editor or tool may be writing the file right now
-            MakeWritable(to);
-            copied = CopyFileA(from.c_str(), to.c_str(), FALSE) != 0;
-            if (copied) break;
-            e = GetLastError();
-            if (e == ERROR_FILE_NOT_FOUND) break;   // deleted after the listing
-            Sleep(50);
-        }
-        if (copied) {
+        if (CopyConfigFile(from, to, e)) {
             configFiles_.push_back(name);
             list += " " + name;
-        } else if (e == ERROR_FILE_NOT_FOUND) {
+        } else if (e == ERROR_FILE_NOT_FOUND) {   // deleted after the listing
             MakeWritable(to);
             DeleteFileA(to.c_str());
         } else {

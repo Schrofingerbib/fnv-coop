@@ -30,12 +30,14 @@ struct HostEnv {
     std::string gameDir;     // with trailing backslash ("" in tests)
     std::string corePath;    // the DLL the build writes, e.g. ...\Data\NVSE\Plugins\nvcoop_mod.dll
     std::string cacheDir;    // "" = <dir of corePath>\nvcoop_cache
-    std::string configDir;   // where nvcoop.ini and nvcoop_*.json live; "" = dir of corePath (the loader's folder)
+    std::string configDir;   // where nvcoop.ini and nvcoop_*.json live; "" = <gameDir>Data\NVSE\Plugins\ (the loader's
+                             // folder), or the dir of corePath when gameDir is "" (tests)
     void* nvse = nullptr;    // NVSEInterface*, passed through to the core
 };
 
-// True for the file names the loader mirrors into the cache folder: nvcoop.ini, nvcoop_*.json and
-// nvcoop_consent_messages.txt (case-insensitive). These are the files the core's modules read beside their module.
+// True for the file names the loader mirrors into the cache folder: nvcoop.ini, nvcoop_*.json,
+// nvcoop_consent_messages.txt and nvcoop_volatile_keys.txt (case-insensitive). These are the files the core's modules
+// read beside their module.
 bool IsCoreConfigFile(const std::string& fileName);
 
 struct ReloadResult {

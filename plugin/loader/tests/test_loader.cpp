@@ -136,6 +136,8 @@ int main(int argc, char** argv) {
     CHECK(IsCoreConfigFile("nvcoop_rules.json") && IsCoreConfigFile("nvcoop_guest_local_run.json") && IsCoreConfigFile("Nvcoop_Edids.JSON"),
           "nvcoop_*.json is config");
     CHECK(IsCoreConfigFile("nvcoop_consent_messages.txt"), "the consent table is config");
+    CHECK(IsCoreConfigFile("nvcoop_volatile_keys.txt") && IsCoreConfigFile("NVCOOP_Volatile_Keys.TXT"),
+          "the snapshot's volatile keys file is config (baseline_nvse.cpp reads it beside its module)");
     CHECK(!IsCoreConfigFile("nvcoop.dll") && !IsCoreConfigFile("nvcoop_mod.dll") && !IsCoreConfigFile("nvcoop.log") &&
               !IsCoreConfigFile("nvcoop_rules.json.bak") && !IsCoreConfigFile("xnvcoop_rules.json") && !IsCoreConfigFile("nvcoop.json") &&
               !IsCoreConfigFile("nvcoop_notes.txt"),
@@ -143,10 +145,12 @@ int main(int argc, char** argv) {
 
     // config next to the core file (= next to the loader in the default layout); nothing left in the cache by an earlier run
     g_tag = std::to_string(GetCurrentProcessId());
-    for (const char* n : {"nvcoop.ini", "nvcoop_stub.json", "nvcoop_extra.json", "nvcoop.log", "nvcoop_mod.dll"}) RemoveFile(g_cache + n);
+    for (const char* n : {"nvcoop.ini", "nvcoop_stub.json", "nvcoop_extra.json", "nvcoop_volatile_keys.txt", "nvcoop.log", "nvcoop_mod.dll"})
+        RemoveFile(g_cache + n);
     SetIni("first-" + g_tag);
     SetJson("{\"v\":\"one-" + g_tag + "\"}");
     WriteText(g_run + "nvcoop_extra.json", "{}");
+    WriteText(g_run + "nvcoop_volatile_keys.txt", "# volatile keys " + g_tag + "\r\n");
     WriteText(g_run + "nvcoop.log", "not config");
 
     // stale cache file from a "dead" process must be cleaned at start
@@ -179,6 +183,7 @@ int main(int argc, char** argv) {
             const std::string want = Want("first-" + g_tag, "{\"v\":\"one-" + g_tag + "\"}");
             CHECK(Cfg() == want, ("core read nvcoop.ini (read-only) and nvcoop_stub.json beside its own module: " + Cfg()).c_str());
             CHECK(Exists(g_cache + "nvcoop_extra.json"), "every nvcoop_*.json is copied");
+            CHECK(Exists(g_cache + "nvcoop_volatile_keys.txt"), "nvcoop_volatile_keys.txt is copied");
             CHECK(!Exists(g_cache + "nvcoop.log") && !Exists(g_cache + "nvcoop_mod.dll"), "only config files are copied");
             std::string st;
             CHECK(Call("dev.status", "{}", st) && Contains(st, "\"configFiles\":[") && Contains(st, "\"nvcoop.ini\"") &&
@@ -364,7 +369,99 @@ int main(int argc, char** argv) {
         std::string e;
         CHECK(host.Unload(e), "unload (unlistable config folder)");
         RemoveFile(g_run + "nvcoop_extra.json");
+        RemoveFile(g_run + "nvcoop_volatile_keys.txt");
         RemoveFile(g_run + "nvcoop.log");
+    }
+
+    // ---- [loader] core= with a folder part: the config comes from the loader's folder, not from the core's folder ----
+    // The game layout under run\game\: the loader's folder Data\NVSE\Plugins\ and the core in its subfolder devcore\.
+    // Each folder has an nvcoop.ini with a different value. main.cpp reads the loader's own ini in the loader's folder,
+    // so the core must read that one too.
+    {
+        const std::string game = g_run + "game\\", data = game + "Data\\", nvse = data + "NVSE\\", plugins = nvse + "Plugins\\";
+        const std::string sub = plugins + "devcore\\", subCache = sub + "nvcoop_cache\\", core = sub + "nvcoop_mod.dll";
+        for (const std::string& d : {game, data, nvse, plugins, sub}) CreateDirectoryA(d.c_str(), nullptr);
+        CHECK(CopyFileA((g_dir + "nvstub_v1.dll").c_str(), core.c_str(), FALSE) != 0, "put v1 into a subfolder of the plugins folder");
+        WriteText(plugins + "nvcoop.ini", "[stub]\r\nvalue=loaderdir-" + g_tag + "\r\n");
+        WriteText(sub + "nvcoop.ini", "[stub]\r\nvalue=coredir-" + g_tag + "\r\n");
+        {
+            HostEnv env;
+            env.gameDir = game;
+            env.corePath = core;   // cacheDir and configDir: the defaults
+            CoreHost host(env);
+            std::string err, st;
+            CHECK(host.Load(err), ("load a core from a subfolder: " + err).c_str());
+            CHECK(Cfg() == Want("loaderdir-" + g_tag, "missing"),
+                  ("a core in a subfolder reads the nvcoop.ini of the loader's folder, not of its own folder: " + Cfg()).c_str());
+            CHECK(Call("dev.status", "{}", st) && Contains(st, "\\\\game\\\\Data\\\\NVSE\\\\Plugins\\\\\""),
+                  ("dev.status shows <game>\\Data\\NVSE\\Plugins\\ as configDir: " + st).c_str());
+            std::string e;
+            CHECK(host.Unload(e), "unload (core in a subfolder)");
+        }
+        RemoveFile(subCache + "nvcoop.ini");
+        RemoveDirectoryA(subCache.c_str());
+        RemoveFile(core);
+        RemoveFile(sub + "nvcoop.ini");
+        RemoveFile(plugins + "nvcoop.ini");
+        for (const std::string& d : {sub, plugins, nvse, data, game}) RemoveDirectoryA(d.c_str());
+    }
+
+    // ---- config copy errors: a persistent error fails at once, a sharing violation is retried until it clears ----
+    {
+        HostEnv env;
+        env.corePath = g_core;
+        env.cacheDir = g_cache;
+        CoreHost host(env);
+        std::string err;
+        CHECK(host.Load(err), ("load (copy errors): " + err).c_str());
+        bool allOk = true;
+        auto timedReload = [&]() {
+            auto t = std::chrono::steady_clock::now();
+            ReloadResult rr = host.Reload("copy errors");
+            if (!rr.ok) { allOk = false; std::printf("copy errors: reload failed: %s\n", rr.error.c_str()); }
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+        };
+        double base = 0;   // the slowest of 3 plain reloads
+        for (int i = 0; i < 3; ++i) {
+            const double t = timedReload();
+            if (t > base) base = t;
+        }
+        // A folder in the cache with the name of a config file: CopyFile over it fails with access denied, every time.
+        const char* blocked[] = {"nvcoop_blocked0.json", "nvcoop_blocked1.json", "nvcoop_blocked2.json"};
+        for (const char* b : blocked) {
+            WriteText(g_run + b, "{}");
+            CreateDirectoryA((g_cache + b).c_str(), nullptr);
+        }
+        // The fastest of 2 reloads with the blocked files. The old loop waited 10 x 50 ms per file: 1.5 s per reload here.
+        double slow = 1e9;
+        for (int i = 0; i < 2; ++i) {
+            const double t = timedReload();
+            if (t < slow) slow = t;
+        }
+        CHECK(allOk, "a reload with config files that cannot be copied still succeeds");
+        char msg[160];
+        std::snprintf(msg, sizeof msg, "a persistent copy error is not retried: reload %.0f ms with 3 blocked files, %.0f ms without", slow, base);
+        CHECK(slow < base + 300.0, msg);
+        std::string st;
+        CHECK(Call("dev.status", "{}", st) && !Contains(st, "nvcoop_blocked"), ("dev.status does not list a file that was not copied: " + st).c_str());
+        for (const char* b : blocked) {
+            RemoveDirectoryA((g_cache + b).c_str());
+            RemoveFile(g_run + b);
+        }
+
+        // An editor holds nvcoop_stub.json open with no sharing for 300 ms: the copy waits for it (the budget is ~450 ms).
+        SetJson("{\"v\":\"held-" + g_tag + "\"}");
+        HANDLE held = CreateFileA((g_run + "nvcoop_stub.json").c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        CHECK(held != INVALID_HANDLE_VALUE, "open nvcoop_stub.json with no sharing");
+        std::thread release([held] { Sleep(300); CloseHandle(held); });
+        ReloadResult r = host.Reload("sharing violation");
+        release.join();
+        CHECK(r.ok, ("reload while nvcoop_stub.json is held open: " + r.error).c_str());
+        CHECK(Cfg() == Want("missing", "{\"v\":\"held-" + g_tag + "\"}"),
+              ("a sharing violation is retried until the file is free: " + Cfg()).c_str());
+        std::string e;
+        CHECK(host.Unload(e), "unload (copy errors)");
+        RemoveFile(g_run + "nvcoop_stub.json");
     }
 
     std::printf("loader tests: %d checks, %d failed\n", g_checks, g_failed);
