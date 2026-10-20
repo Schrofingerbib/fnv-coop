@@ -6,6 +6,7 @@ test.fasttravel / dev.countRefs / dev.terminal). THE LEAD RUNS THIS, one game at
     python tools/bots/proof_glue.py --fake
 
 Needs nvcoop.ini [dev] bots=1 and the player next to the NPC (a living NPC with a plain greeting, e.g. Sunny Smiles).
+--dismiss-messages (opt-in, off by default): first clear stray message boxes with Bot.dismiss_messages (adds a "dismiss_messages" row).
 Each check prints measured numbers. Every engine call behind these methods is unverified at runtime, so the first failure is
 expected information, not a surprise: the printed 'reply' says which gate refused.
   menu       none -> dialogue after talking (kind and id), dialogReady flips true when the line has finished
@@ -40,6 +41,9 @@ def run(nv, a):
         print(f"SKIP  {name}  {why}")
 
     b = Bot(nv, "glue")
+    if getattr(a, "dismiss_messages", False):
+        d = b.dismiss_messages()
+        check("dismiss_messages", d.ok, reply=str(d))
     m0 = b.menu_info()
     check("menu_before", m0.get("kind") in ("none", "hud"), reply=m0)
     t = b.talk(a.npc)
@@ -104,6 +108,7 @@ def main():
     ap.add_argument("--instance", type=int, default=0)
     ap.add_argument("--npc"); ap.add_argument("--info"); ap.add_argument("--item"); ap.add_argument("--target")
     ap.add_argument("--terminal"); ap.add_argument("--entry", type=int, default=0); ap.add_argument("--marker"); ap.add_argument("--base"); ap.add_argument("--fake", action="store_true")
+    ap.add_argument("--dismiss-messages", action="store_true", help="clear stray message boxes (button 0) before the checks")
     ap.add_argument("--out", default=str(ROOT / "out" / "T6a" / "proof_glue.json"))
     a = ap.parse_args()
     if a.fake:

@@ -21,6 +21,17 @@ def run_with(mutant=None):
     return proof.run(FakeBridge(w, mutant=mutant), args)
 
 
+def run_with_boxes(dismiss, mutant=None):
+    """The proof over a fake that shows two engine message boxes; -> (report, bridge)."""
+    w = World()
+    w.add_actor(0x603, (0, 400, 0))
+    w.add_door(0x601, (50, 50, 0))
+    nv = FakeBridge(w, mutant=mutant)
+    nv.native_boxes = [1, 2]
+    args = argparse.Namespace(target="FalloutNV.esm:603", door="FalloutNV.esm:601", fake=True, dismiss_messages=dismiss)
+    return proof.run(nv, args), nv
+
+
 class Proof(unittest.TestCase):
     def test_passes_on_a_healthy_fake(self):
         rep = run_with()
@@ -35,6 +46,16 @@ class Proof(unittest.TestCase):
                 rep = run_with(mutant)
                 failed = {r["check"] for r in rep.rows if r["result"] == "FAIL"}
                 self.assertIn(check, failed, f"{mutant} should fail {check}; failed={failed}")
+
+    def test_dismiss_messages_is_opt_in(self):
+        rep, nv = run_with_boxes(dismiss=False)
+        self.assertEqual(nv.native_presses, [])                     # never called on its own
+        self.assertNotIn("dismiss_messages", {r["check"] for r in rep.rows})
+        rep, nv = run_with_boxes(dismiss=True)
+        self.assertEqual((rep.rows[0]["check"], rep.rows[0]["result"]), ("dismiss_messages", "PASS"))
+        self.assertEqual((nv.native_presses, nv.native_boxes), ([0, 0], []))
+        rep, nv = run_with_boxes(dismiss=True, mutant="msgbox_stuck")   # a box that never closes fails the row
+        self.assertEqual((rep.rows[0]["check"], rep.rows[0]["result"]), ("dismiss_messages", "FAIL"))
 
 
 

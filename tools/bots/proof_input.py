@@ -5,6 +5,8 @@ against a real game. It proves, with numbers, that forced controls reach the eng
     python tools/bots/proof_input.py --fake            # same script over the fake bridge (game-free self-test)
 
 Needs nvcoop.ini [dev] bots=1 on the instance. Writes out/T6a/proof_input.json and exits non-zero on any FAIL.
+--dismiss-messages (opt-in, off by default): first clear stray message boxes with Bot.dismiss_messages (button 0 while bot.menu says
+"message"), e.g. the DLC notices a fresh save shows about 5 s after load; it adds a "dismiss_messages" row.
 Checks (each prints measured values so a failure says what the game did):
   hook      bot.status reports hooked=true and the control-state query counter rises each frame
   forward   hold Forward+Run for 2 s: the player moves 300..700 units along the facing direction (real locomotion speed)
@@ -55,6 +57,9 @@ def rel_move(b, before, yaw_deg):
 def run(nv, args) -> Report:
     r = Report()
     b = Bot(nv, "proof")
+    if getattr(args, "dismiss_messages", False):
+        d = b.dismiss_messages()
+        r.check("dismiss_messages", d.ok, reply=str(d))
     st = nv.call("bot.status")
     q0 = st.get("frame", 0)
     b.wait(0.5)
@@ -134,6 +139,7 @@ def main() -> int:
     ap.add_argument("--target")
     ap.add_argument("--door")
     ap.add_argument("--fake", action="store_true")
+    ap.add_argument("--dismiss-messages", action="store_true", help="clear stray message boxes (button 0) before the checks")
     ap.add_argument("--out", default=str(ROOT / "out" / "T6a" / "proof_input.json"))
     args = ap.parse_args()
     if args.fake:

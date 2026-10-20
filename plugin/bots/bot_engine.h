@@ -5,6 +5,7 @@
 // Each method is defensive: it checks a state gate and refuses with a reason instead of poking the engine when a gate fails.
 #pragma once
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -23,6 +24,9 @@
 //  25 terminal pick is not recorded
 //  26 speech-check INFOs refused again   27 drop log ignores the base form    28 drop log ignores the time window    29 fast travel skips the may-travel gate
 //  30 fast travel skips the busy-menu gate  31 fast travel writes the marker at the wrong offset  32 refs list includes disabled refs
+// Native message box press (33..41; 33, 36 and 40 are in bot_rpc.h):
+//  34 MessageMenu vtable check skipped    35 button index off by one    37 null button tile not refused    38 top-menu gate skipped
+//  39 closing-box gate skipped (no current message)    41 main-thread gate skipped
 
 namespace nvbots {
 
@@ -38,6 +42,19 @@ constexpr uint32_t kVatsMode = 8, kVatsSelValid = 0x118, kVatsSelRef = 0x128;
 constexpr int kDlgReady = 2;
 constexpr Addr32 kTerminalMenuPtr = 0x11D9334;   // *(TerminalMenu**), set while the terminal menu (id 0x421) is open
 constexpr uint32_t kTermList = 0x68, kTermTerminal = 0xA8, kTermRef = 0xAC;
+// Native MessageMenu (id 0x3E9). The object comes from xNVSE InterfaceManager::GetMenuByType(0x3E9): g_TileMenuArray (NiTArray<TileMenu*>
+// 0x11F3508, data pointer at +4) [id - 0x3E9], then TileMenu::menu (+0x3C). The engine also keeps it in its MessageMenu singleton 0x11DA4F0.
+constexpr Addr32 kTileMenuArrayData = 0x11F350C;
+constexpr uint32_t kTileMenuMenu = 0x3C, kMenuIdMin = 0x3E9, kMenuIdMessage = 0x3E9;
+// MessageMenu+0x40 is a ListBox<int> (ctor 0x7642F0, vtable 0x107286C) of the buttons: its tList head node {item*, next*} is at +4, so at
+// menu+0x44. Each item is {Tile* @0, int value @4}. The builder 0x7A92E0 appends one item per non-empty button text in order, with
+// value = (signed char)entry[0x1C] + text index (ShowMessageBox passes 0, so the value is the button index scripts get).
+// The six tiles at menu+0x28..0x3C are the XML <id> 0..5 parts set by SetField (0x7A8AB0); they are NOT the buttons.
+constexpr uint32_t kMsgButtonHead = 0x44;
+constexpr int kMsgClickId = 7;   // HandleClick acts only on id 7 (a button tile)
+// The current message: FUN 0x7A92A0 = (*0x11DA4F4 < queue.count) ? queue.data[*0x11DA4F4] : 0; queue = BSSimpleArray at 0x11DA53C
+// (data @+4, count @+8). HandleClick runs the message callback only for a current message; none means the box is closing.
+constexpr Addr32 kMsgQueue = 0x11DA53C, kMsgQueueIdx = 0x11DA4F4;
 // Prologue pins for the engine functions the live engine calls (verified by tools/bots/re/verify_pins.py; thiscall unless noted)
 }  // namespace eng
 
@@ -66,6 +83,9 @@ struct IEngine {
     virtual bool canFastTravel(Addr32 player) = 0;                   // 0x93D660 (the engine's own may-travel check, shows its refusal message)
     virtual Addr32 newTravelObj() = 0;                               // heap 0x34 + ctor 0x456540, 0 on failure
     virtual void setPendingTravel(Addr32 player, Addr32 obj) = 0;    // 0x93BE30
+    // native message box
+    virtual bool onMainThread() = 0;                                 // the calling thread is the game main thread
+    virtual bool msgMenuHandleClick(Addr32 menu, int id, Addr32 tile) = 0;   // MessageMenu vtable slot 3 (0x7AA070); false = refused or faulted
     // references
     virtual bool resolveRef(const std::string& ref, Addr32* out) = 0;    // "" = the player
     virtual bool resolveForm(const std::string& form, Addr32* out) = 0;
@@ -116,6 +136,78 @@ inline bool menuInfo(IEngine& e, Value* out, std::string* err) {
         e.rd32(dlg + eng::kDlgState, &st);
         out->set("dialogState", (int64_t)st).set("dialogReady", st == (uint32_t)eng::kDlgReady);
     }
+    return true;
+}
+
+// ---- bot.menu.press, native path: press a button of the engine's own message box (MessageMenu, menu id 1001) ----
+// The caller uses it only when the UI layer (ui.answer) has no box. Gates, in this order: the game main thread; the interface manager is
+// ready and the message menu is the top menu (if not, *applies stays false and the caller reports the UI layer's error); GetMenuByType(1001)
+// gives an object with the MessageMenu vtable; a current message exists (none = the box is closing); `button` (0-based, in the order the
+// box lists its buttons) is in the button list and has a tile. Then HandleClick(7, tile): what the engine does for a mouse click and for its
+// own Enter / hotkey path, so the engine records the button value, runs the message callback and closes the box (or shows the next one).
+// On success `out` gets {menu, button, value, buttons}: value is what the engine records (GetButtonPressed), buttons is how many the box has.
+inline bool pressNativeMessageButton(IEngine& e, int button, Value* out, std::string* err, bool* applies) {
+    *applies = false;
+#if NVBOTS_MUTANT != 41
+    if (!e.onMainThread()) { *applies = true; *err = "the native message press must run on the game main thread"; return false; }
+#endif
+    uint32_t mgr = 0;
+    if (!e.rd32(eng::kInterfaceMgrPtr, &mgr) || !mgr) { *err = "interface manager not ready"; return false; }
+    const uint32_t top = e.topMenuId(mgr);
+#if NVBOTS_MUTANT != 38
+    if (top != eng::kMenuIdMessage) { *err = "the top menu is not the native message box (top menu id " + std::to_string(top) + ")"; return false; }
+#endif
+    *applies = true;
+    uint32_t arr = 0, tileMenu = 0, menu = 0, vt = 0;
+    if (!e.rd32(eng::kTileMenuArrayData, &arr) || !arr || !e.rd32(arr + 4 * (eng::kMenuIdMessage - eng::kMenuIdMin), &tileMenu) || !tileMenu ||
+        !e.rd32(tileMenu + eng::kTileMenuMenu, &menu) || !menu) {
+        *err = "message menu object missing (GetMenuByType(1001) is null)";
+        return false;
+    }
+    e.rd32(menu, &vt);
+#if NVBOTS_MUTANT != 34
+    if (vt != addr::MessageMenuVtbl) {
+        char b[96];
+        std::snprintf(b, sizeof b, "menu 1001 is not a MessageMenu (vtable %08X, want %08X): refused", vt, addr::MessageMenuVtbl);
+        *err = b;
+        return false;
+    }
+#endif
+    uint32_t idx = 0, count = 0;
+    const bool current = e.rd32(eng::kMsgQueueIdx, &idx) && e.rd32(eng::kMsgQueue + 8, &count) && idx < count;
+#if NVBOTS_MUTANT != 39
+    if (!current) { *err = "the message box has no current message (it is closing)"; return false; }
+#else
+    (void)current;
+#endif
+    struct Btn { Addr32 tile; int32_t value; };
+    std::vector<Btn> bs;
+    uint32_t node = menu + eng::kMsgButtonHead;
+    for (int i = 0; node && i < 64; ++i) {
+        uint32_t item = 0, next = 0;
+        if (!e.rd32(node, &item) || !e.rd32(node + 4, &next)) break;
+        if (item) {
+            uint32_t tile = 0, value = 0;
+            e.rd32(item, &tile);
+            e.rd32(item + 4, &value);
+            bs.push_back({tile, (int32_t)value});
+        }
+        node = next;
+    }
+    if (button < 0 || button >= (int)bs.size()) {
+        *err = "button " + std::to_string(button) + " is not shown (the box has " + std::to_string(bs.size()) + " buttons)";
+        return false;
+    }
+#if NVBOTS_MUTANT == 35
+    const Btn& pick = bs[(size_t)(button + 1 < (int)bs.size() ? button + 1 : button)];
+#else
+    const Btn& pick = bs[(size_t)button];
+#endif
+#if NVBOTS_MUTANT != 37
+    if (!pick.tile) { *err = "button " + std::to_string(button) + " has no tile"; return false; }
+#endif
+    if (!e.msgMenuHandleClick(menu, eng::kMsgClickId, pick.tile)) { *err = "the live glue refused the HandleClick call (pins or vtable did not match)"; return false; }
+    out->set("menu", (int64_t)eng::kMenuIdMessage).set("button", (int64_t)button).set("value", (int64_t)pick.value).set("buttons", (int64_t)bs.size());
     return true;
 }
 

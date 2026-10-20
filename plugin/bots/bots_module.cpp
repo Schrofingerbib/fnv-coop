@@ -76,6 +76,8 @@ std::string IniPath() {
 
 // ---- live IEngine: raw reads are SEH-guarded, every engine call first needs the pinned prologues to have matched at init ----
 bool g_callsOk = false;
+// The game main thread: written at DeferredInit and on every frame (both run on it). 0 until then, so the native press refuses.
+volatile DWORD g_mainThread = 0;
 
 template <class R, class... A>
 R CallThis(unsigned fn, void* self, A... a) {
@@ -166,6 +168,17 @@ struct LiveGame : nvbots::IEngine {
         unsigned r = 0;
         return g_callsOk && GuardedThis<unsigned>(&r, nvbots::addr::TopMenuId.addr, reinterpret_cast<void*>(mgr)) ? r : 0;
     }
+    bool onMainThread() override { return g_mainThread != 0 && GetCurrentThreadId() == g_mainThread; }
+    // MessageMenu vtable slot 3 = HandleClick(id, tile). The logic layer already checked the vtable; check it again here together with the
+    // slot content, so this call can only ever reach the pinned 0x7AA070 on a MessageMenu, on the main thread.
+    bool msgMenuHandleClick(nvbots::Addr32 menu, int id, nvbots::Addr32 tile) override {
+        if (!g_callsOk || !onMainThread() || !menu || !tile) return false;
+        uint32_t vt = 0, fn = 0;
+        if (!rd32(menu, &vt) || vt != nvbots::addr::MessageMenuVtbl) return false;
+        if (!rd32(vt + nvbots::addr::kMenuSlotHandleClick, &fn) || fn != nvbots::addr::MsgMenuHandleClick.addr) return false;
+        unsigned r = 0;
+        return GuardedThis<unsigned>(&r, fn, reinterpret_cast<void*>(menu), id, (unsigned)tile);
+    }
     nvbots::Addr32 containerData(nvbots::Addr32 ref) override {
         if (!g_callsOk) return 0;
         unsigned r = 0;
@@ -239,6 +252,13 @@ void CheckPins() {
         unsigned char got[16] = {};
         if (!g_mem.read(p->addr, got, 16) || std::memcmp(got, p->bytes, 16) != 0) {
             nvcoop::Log("bots: engine pin %s @%08X does not match this exe: dialogue/menu/inventory glue disabled", p->name, p->addr);
+            g_callsOk = false;
+        }
+    }
+    for (const nvbots::addr::DataPin* d : nvbots::addr::kAllData) {
+        uint32_t got = 0;
+        if (!g_mem.read(d->addr, &got, 4) || got != d->value) {
+            nvcoop::Log("bots: data pin %s @%08X holds %08X, want %08X: dialogue/menu/inventory glue disabled", d->name, d->addr, got, d->value);
             g_callsOk = false;
         }
     }
@@ -316,6 +336,7 @@ void Uninstall() {
 void Init() {
     if (g_inited) return;
     g_inited = true;
+    g_mainThread = GetCurrentThreadId();   // DeferredInit runs on the game main thread; OnFrame keeps this current
     g_enabled = GetPrivateProfileIntA("dev", "bots", 0, IniPath().c_str()) != 0;
     if (!g_enabled) return;
     CheckPins();
@@ -341,6 +362,7 @@ void OnMessage(uint32_t type, void*, uint32_t) {
     else if (type == NVSEMessagingInterface::kMessage_ExitGame || type == NVSEMessagingInterface::kMessage_ExitGame_Console) Uninstall();
 }
 void OnFrame() {
+    g_mainThread = GetCurrentThreadId();   // the main game loop
     if (g_rpc) g_rpc->tick();
 }
 

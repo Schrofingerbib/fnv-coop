@@ -324,6 +324,49 @@ class GlueActions(unittest.TestCase):
         self.assertFalse(b2.fast_travel(ref(CHEST)).ok)
 
 
+class MessageBoxes(unittest.TestCase):
+    def test_dismiss_clears_queued_engine_boxes_with_button_0(self):
+        nv, b = make()
+        r = b.dismiss_messages()
+        self.assertTrue(r.ok, r)
+        self.assertEqual(r.data, {"pressed": 0, "paths": []})          # nothing shown: nothing pressed
+        nv.native_boxes = [1, 2, 1]                                    # three queued engine boxes (the DLC notices after a load)
+        self.assertEqual(b.menu_info()["kind"], "message")
+        r = b.dismiss_messages()
+        self.assertTrue(r.ok, r)
+        self.assertEqual(r.data, {"pressed": 3, "paths": ["native"] * 3})
+        self.assertEqual(nv.native_presses, [0, 0, 0])
+        self.assertEqual(b.menu_info()["kind"], "none")
+
+    def test_dismiss_answers_the_ui_layers_box_first(self):
+        nv, b = make()
+        nv.box = 900
+        nv.native_boxes = [1]
+        r = b.dismiss_messages()
+        self.assertTrue(r.ok, r)
+        self.assertEqual(r.data["paths"], ["ui", "native"])
+        self.assertEqual(nv.box_answers, [0])
+
+    def test_dismiss_gives_up_after_max_n(self):
+        nv, b = make()
+        nv.native_boxes = [1] * 12
+        r = b.dismiss_messages(max_n=8)
+        self.assertEqual(r.reason, "postcondition")
+        self.assertEqual(r.data["pressed"], 8)
+        self.assertEqual(len(nv.native_boxes), 4)
+
+    def test_press_reply_names_the_path(self):
+        nv, b = make()
+        nv.native_boxes = [2]
+        r = b.press_box(1)
+        self.assertTrue(r.ok, r)
+        self.assertEqual((r.data["path"], r.data["value"]), ("native", 1))
+        nv.native_boxes = [2]
+        self.assertTrue(b.press_box(2).reason.startswith("rpc_error:native message box: button 2 is not shown"))
+        nv.box = 900
+        self.assertEqual(b.press_box(0).data["path"], "ui")
+
+
 class GenuineActions(unittest.TestCase):
     def test_drop_returns_the_dropped_world_ref_from_the_event(self):
         nv, b = make()
@@ -417,7 +460,15 @@ def _scenario(name):
         "drop_wrong_ref": lambda b: _drop_ref_check(b),
         "travel_ignored": lambda b: b.fast_travel(ref(CHEST), timeout_s=6.0),
         "ref_info_error": lambda b: b.pos(ref(NPC)) and None,
+        "msgbox_stuck": lambda b: _dismiss_two_boxes(b),
+        "msgbox_ui_only": lambda b: _dismiss_two_boxes(b),
     }[name]
+
+
+def _dismiss_two_boxes(b):
+    """Two engine message boxes are up: dismiss_messages must clear both, or fail."""
+    b.nv.native_boxes = [1, 2]
+    return b.dismiss_messages()
 
 
 def _drop_ref_check(b):
@@ -430,7 +481,7 @@ def _drop_ref_check(b):
 
 
 MUTANTS = ["move_ignored", "look_ignored", "stop_ignored", "jump_noop", "fire_noop", "setpos_ignored", "angle_ignored", "activate_noop", "transfer_noop", "transfer_dup", "equip_noop",
-           "drop_noop", "fire_miss", "health_stuck", "dialog_never", "drop_wrong_ref", "travel_ignored"]
+           "drop_noop", "fire_miss", "health_stuck", "dialog_never", "drop_wrong_ref", "travel_ignored", "msgbox_stuck", "msgbox_ui_only"]
 
 
 class MutationTwins(unittest.TestCase):
@@ -442,6 +493,13 @@ class MutationTwins(unittest.TestCase):
                 self.assertFalse(r.ok, f"mutant {m} slipped through: {r}")
                 nv0, b0 = make(None)
                 self.assertTrue(_scenario(m)(b0).ok, f"healthy scenario for {m} should pass")
+
+    def test_message_box_twins_fail_for_the_right_reason(self):
+        nv, b = make("msgbox_stuck")
+        r = _dismiss_two_boxes(b)
+        self.assertEqual((r.reason, r.data["pressed"]), ("postcondition", 8))   # pressed, re-checked, gave up: never looped forever
+        nv, b = make("msgbox_ui_only")
+        self.assertEqual(_dismiss_two_boxes(b).reason, "rpc_error:no message box is being shown")   # the bug seen in game
 
     def test_ref_info_error_reports_rpc_failure(self):
         nv, b = make("ref_info_error")

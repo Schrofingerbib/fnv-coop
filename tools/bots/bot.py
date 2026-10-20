@@ -598,8 +598,28 @@ class Bot:
         return {i["item"]: i["count"] for i in self._need(P.M_BOT_INVENTORY, p)["items"]}
 
     def press_box(self, button: int) -> ActionResult:
-        """Answer the message box our UI layer is showing (consent prompt, PNR confirm) with `button`."""
+        """Answer a message box with `button` (0-based, in the order the box lists its buttons). The UI layer's own box (consent prompt,
+        PNR confirm) answers first; when it shows none and the engine's own message box (MessageMenu, menu id 1001) is the top menu, the
+        plugin presses that box natively. data['path'] is 'ui' or 'native'; a native press also gives data['value'] (what the engine records)."""
         return self._act("press_box", lambda: dict(self._need(P.M_BOT_PRESS, {"button": button})))
+
+    def dismiss_messages(self, max_n: int = 8, button: int = 0, settle_s: float = 0.3) -> ActionResult:
+        """Clear stray message boxes, for example the DLC notices the engine shows about 5 s after a fresh save loads (MessageMenu,
+        menu id 1001), which keep a test copy in menu mode. While bot.menu reports kind 'message', press `button` with bot.menu.press
+        (UI layer's box first, else the engine's box natively), at most `max_n` presses, `settle_s` between them.
+        Post: bot.menu no longer reports 'message'. data: {pressed, paths}. No proof calls this on its own (proofs: --dismiss-messages)."""
+        def run():
+            paths: List[str] = []
+            while True:
+                kind = self.menu_info().get("kind")
+                if kind != "message":
+                    return {"pressed": len(paths), "paths": paths}
+                if len(paths) >= max_n:
+                    raise _Fail("postcondition", why="a message box is still shown", pressed=len(paths), paths=paths)
+                r = self._need(P.M_BOT_PRESS, {"button": button})
+                paths.append(str(r.get("path", "?")))
+                self.clock.sleep(settle_s)
+        return self._act("dismiss_messages", run)
 
     def consent(self, answer: str = "ready") -> ActionResult:
         """Answer the party-consent prompt: 'ready' or 'notyet'."""
