@@ -31,9 +31,12 @@ def shell_documents() -> Optional[Path]:
 
 
 def normalize_override(value: str) -> Path:
-    """An operator-supplied folder: expand ~ and %VARS%, then make it absolute (a relative path must not depend on
-    whatever the working directory is when a tool runs)."""
-    return Path(os.path.expandvars(os.path.expanduser(value.strip()))).resolve()
+    """An operator-supplied folder: expand ~ and %VARS%. It must then be absolute: a relative path would select a
+    different folder for each working directory a tool runs from, so it is refused instead of resolved."""
+    p = Path(os.path.expandvars(os.path.expanduser(value.strip())))
+    if not p.is_absolute():
+        raise ValueError(f"FNV_DOCUMENTS_DIR must be an absolute path (after ~ and %VAR% expansion), got {value!r}")
+    return p.resolve()
 
 
 def documents_dir(resolver: Callable[[], Optional[Path]] = shell_documents) -> Path:

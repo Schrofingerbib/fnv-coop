@@ -46,13 +46,20 @@ def override_errors(documents_fn) -> list:
     cases = {
         "~/OneDrive/Documents": Path.home() / "OneDrive" / "Documents",
         "%FNV_TEST_DOCS_ROOT%\\Docs": Path(tempfile.gettempdir()) / "Docs",
-        "rel_docs": Path.cwd() / "rel_docs",
     }
+    env = {"FNV_TEST_DOCS_ROOT": tempfile.gettempdir()}
     for value, want in cases.items():
-        with mock.patch.dict(os.environ, {"FNV_DOCUMENTS_DIR": value, "FNV_TEST_DOCS_ROOT": tempfile.gettempdir()}):
+        with mock.patch.dict(os.environ, dict(env, FNV_DOCUMENTS_DIR=value)):
             got = documents_fn(lambda: None)
         if got != want.resolve():
             errs.append(f"{value!r} -> {got}, want {want.resolve()}")
+    for value in ("rel_docs", "..\\Docs", "Documents"):  # relative: must be refused, never resolved against the cwd
+        with mock.patch.dict(os.environ, dict(env, FNV_DOCUMENTS_DIR=value)):
+            try:
+                got = documents_fn(lambda: None)
+                errs.append(f"relative {value!r} accepted as {got}")
+            except ValueError:
+                pass
     return errs
 
 
@@ -87,6 +94,12 @@ class MyGames(unittest.TestCase):
         def raw(resolver=mygames.shell_documents):  # the first version: Path(env) as given
             return Path(os.environ["FNV_DOCUMENTS_DIR"])
         self.assertNotEqual(override_errors(raw), [])
+
+    def test_twin_relative_resolved_against_cwd_is_caught(self):
+        def cwd_resolve(resolver=mygames.shell_documents):  # the second version: relative resolved against the cwd
+            return Path(os.path.expandvars(os.path.expanduser(os.environ["FNV_DOCUMENTS_DIR"]))).resolve()
+        errs = override_errors(cwd_resolve)
+        self.assertTrue(errs and all("relative" in e for e in errs), errs)
 
     def test_fallback_when_shell_has_no_answer(self):
         with mock.patch.dict(os.environ, {}, clear=False):
