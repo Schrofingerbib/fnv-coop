@@ -145,6 +145,34 @@ def check_reap_previous_only_recorded(m):
     assert pid not in b.procs
 
 
+class _VanishingState:
+    """A state file that the previous daemon deletes between our exists() and unlink() (the up-right-after-down race)."""
+    def __init__(self):
+        self.deleted = False
+
+    def exists(self):
+        return True
+
+    def read_text(self):
+        return json.dumps({"pids": {}})
+
+    def unlink(self, missing_ok=False):
+        if not missing_ok:
+            raise FileNotFoundError("state.json was deleted by the previous daemon")
+        self.deleted = True
+
+
+def check_reap_state_vanishes(m):
+    b, c = be.FakeBackend(), Clock()
+    st = _VanishingState()
+    p = core.Pool(b, be.FakeSlots(), size=1, sync=True, clock=c, state_path=st, mutant=m)
+    try:
+        killed = p.reap_previous()
+    except FileNotFoundError as e:
+        raise AssertionError(f"pool up crashed when the old daemon removed its state file first: {e}")
+    assert killed == [] and st.deleted, (killed, st.deleted)
+
+
 def check_crash_restart(m):
     p, b, *_ = mk(1, m)
     p.up()
@@ -474,7 +502,7 @@ def check_real_slots_cli(m):
 
 
 REAL = [check_exclusive, check_pair_lease_order, check_size_clamped, check_recycle_after_k, check_dirty_recycles,
-        check_expiry, check_renew, check_kill_only_own, check_reap_previous_only_recorded, check_crash_restart,
+        check_expiry, check_renew, check_kill_only_own, check_reap_previous_only_recorded, check_reap_state_vanishes, check_crash_restart,
         check_dead_instance_never_leased, check_unresponsive_restart, check_memory_growth, check_start_failure,
         check_failed_start_stops_lease, check_slot_renew, check_pids_registered, check_lowcost_applies,
         check_lowcost_guard_hardlink, check_lowcost_guard_mygames, check_owner_inis_untouched,
@@ -485,7 +513,8 @@ TWINS = [(check_exclusive, "double_lease"), (check_recycle_after_k, "no_recycle_
          (check_expiry, "no_expire"), (check_kill_only_own, "kill_foreign"), (check_lowcost_guard_hardlink, "no_guard"),
          (check_lowcost_guard_mygames, "no_guard"), (check_nolowcost_restores_provisioned_inis, "no_restore"),
          (check_restore_guard_hardlink, "no_guard"), (check_restore_guard_mygames, "no_guard"),
-         (check_doc_lists_every_key, "doc_missing"), (check_daemon_client, "no_dirty_recycle")]
+         (check_doc_lists_every_key, "doc_missing"), (check_daemon_client, "no_dirty_recycle"),
+         (check_reap_state_vanishes, "reap_unlink_strict")]
 
 
 def main() -> int:

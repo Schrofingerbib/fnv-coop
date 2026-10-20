@@ -82,7 +82,12 @@ class Pool:
                 if self.b.alive(int(pid)):
                     self.b.kill(int(pid))
                     killed.append(int(pid))
-            self.state_path.unlink()
+            # The previous daemon deletes this file in its own down() and may do so after the exists() above:
+            # `pool down` returns before that daemon has exited, so a quick `pool up` races it (seen on 2026-10-21).
+            if self.mutant == "reap_unlink_strict":
+                self.state_path.unlink()
+            else:
+                self.state_path.unlink(missing_ok=True)
         return killed
 
     # ------------------------------------------------------------ start / stop
