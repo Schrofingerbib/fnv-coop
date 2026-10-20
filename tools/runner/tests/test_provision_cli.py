@@ -11,6 +11,7 @@ from __future__ import annotations
 import codecs
 import contextlib
 import io
+import json
 import locale
 import os
 import sys
@@ -136,6 +137,7 @@ MUTANTS = {
     "merge_order_swapped": [(instances, "provision_ini", _provision_ini_swapped)],
     "run_space_separated": [(run, "provision_argv", _run_argv_space_separated)],
     "per_instance_keys_allowed": [(instances, "check_per_instance_ini", lambda *a, **k: None)],
+    "stale_plugins_kept": [(instances, "stale_plugin_dlls", lambda plugins, keep: [])],
 }
 
 
@@ -358,6 +360,27 @@ class ProvisionCli(unittest.TestCase):
     def test_twin_core_without_loader_key(self):
         with self.assertRaises(AssertionError):
             self.check_core_dll_installed_where_the_loader_looks("core_without_loader_key")
+
+    def check_stale_plugin_copies_removed(self, mut):
+        plugins = self.inst / "0" / PLUGINS
+        other = self.file("build2/nvcoop_focus.dll", b"other-build")
+        code, _, err = self.cli(instances.main, ["provision", "--n", "1", "--plugin-dll", str(other)])
+        self.assertEqual(code, 0, err)
+        (plugins / "jip_nvse.dll").write_bytes(b"third-party")  # not ours: must stay
+        with mutant(mut):
+            code, _, err = self.cli(instances.main, ["provision", "--n", "1", "--plugin-dll", str(self.dll)])
+        self.assertEqual(code, 0, err)
+        dlls = sorted(f.name for f in plugins.glob("*.dll"))
+        self.assertEqual(dlls, ["jip_nvse.dll", "nvcoop.dll"], "an old nvcoop copy under another name would load as a second plugin")
+        meta = json.loads((self.inst / "0" / "instance.json").read_text())
+        self.assertEqual(meta["removed"], ["Data/NVSE/Plugins/nvcoop_focus.dll"])
+
+    def test_stale_plugin_copies_removed(self):
+        self.check_stale_plugin_copies_removed(None)
+
+    def test_twin_stale_plugins_kept(self):
+        with self.assertRaises(AssertionError):
+            self.check_stale_plugin_copies_removed("stale_plugins_kept")
 
     def check_explicit_loader_core_entry_wins(self, mut):
         with mutant(mut):

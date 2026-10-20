@@ -234,6 +234,16 @@ def plugin_plan(plugin_dll: Optional[Path] = None, core_dll: Optional[Path] = No
     return files, ini
 
 
+def stale_plugin_dlls(plugins: Path, keep: List[Path]) -> List[Path]:
+    """nvcoop*.dll files in the instance Plugins folder that this provision does not install.
+
+    xNVSE loads every DLL in Data/NVSE/Plugins. A plugin installed earlier under another file name (nvcoop_focus.dll
+    next to nvcoop.dll) therefore runs as a second copy of the plugin: found in game on 2026-10-20, where three copies
+    were loaded and an old one answered the bridge. Other DLLs (third-party xNVSE plugins) are not touched."""
+    names = {Path(p).name.lower() for p in keep}
+    return [f for f in sorted(plugins.glob("*.dll")) if f.name.lower().startswith("nvcoop") and f.name.lower() not in names]
+
+
 def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
               plugin_dll: Optional[Path] = None, plugin_files: Optional[List[Path]] = None,
               autoload: str = "", autoload_delay_frames: int = 600, modes=LINK_MODES,
@@ -265,13 +275,17 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
             if f.is_file() and f.suffix.lower() in (".exe", ".dll") and f.name.lower().startswith(("nvse", "xnvse")):
                 _replace(f, d / f.name)
                 installed.append(f.name)
+    removed: List[str] = []
+    for f in stale_plugin_dlls(plugins, sources):
+        f.unlink()
+        removed.append("Data/NVSE/Plugins/" + f.name)
     for p in sources:
         _replace(p, plugins / p.name)
         installed.append("Data/NVSE/Plugins/" + p.name)
     cfg = write_plugin_ini(d, i, role, autoload, autoload_delay_frames, ini_extra)
     meta = {
         "instance": i, "role": role, "dir": str(d), "pipe": rf"\\.\pipe\nvcoop-{i}",
-        "exe": str(d / "FalloutNV.exe"), "link_counts": counts, "installed": installed,
+        "exe": str(d / "FalloutNV.exe"), "link_counts": counts, "installed": installed, "removed": removed,
         "ini": cfg, "game_dir": str(g),
         "pinned": {p: sha256_file(d / p) for p in PINNED_FILES if (d / p).exists()},
     }
