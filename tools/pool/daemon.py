@@ -136,7 +136,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--base-save", default="", help="save to load into each fresh instance")
     ap.add_argument("--grids", type=int, help="opt-in uGridsToLoad (see lowcost.py)")
     ap.add_argument("--audio-off", action="store_true")
-    ap.add_argument("--no-lowcost", action="store_true")
+    ap.add_argument("--no-lowcost", action="store_true",
+                    help="start each instance with the INIs that provisioning writes (removes an earlier low-cost profile)")
     ap.add_argument("--boot-timeout", type=float, default=300)
     ap.add_argument("--slot-ttl", type=int, default=3600)
     ap.add_argument("--tick-s", type=float, default=5.0)

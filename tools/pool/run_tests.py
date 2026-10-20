@@ -4,11 +4,12 @@
 
 A check takes a mutant name (or None) and raises AssertionError when an invariant is violated.
 Real run: every check must pass with mutant=None. Twin run: each (check, mutant) pair must FAIL.
-No game is launched; the only OS things touched are a loopback socket, a temp dir, the gameslot CLI under a
-temp GAMESLOT_DIR and (read only) the owner's INIs.
+No game is launched; the only OS things touched are a loopback socket, a temp dir (also holding a fake game dir and
+an instance provisioned from it), the gameslot CLI under a temp GAMESLOT_DIR and (read only) the owner's INIs.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -142,6 +143,51 @@ def check_reap_previous_only_recorded(m):
     p2 = core.Pool(b, be.FakeSlots(), size=1, sync=True, clock=c, state_path=tmp / "state.json", mutant=m)
     assert pid in p2.reap_previous() and 900001 in b.foreign
     assert pid not in b.procs
+
+
+class _VanishingState:
+    """A state file that the previous daemon deletes between our exists() and unlink() (the up-right-after-down race)."""
+    def __init__(self):
+        self.deleted = False
+
+    def exists(self):
+        return True
+
+    def read_text(self):
+        return json.dumps({"pids": {}})
+
+    def unlink(self, missing_ok=False):
+        if not missing_ok:
+            raise FileNotFoundError("state.json was deleted by the previous daemon")
+        self.deleted = True
+
+
+class _VanishingOnRead(_VanishingState):
+    """The previous daemon deletes the state file between our exists() and our read."""
+    def read_text(self):
+        raise FileNotFoundError("state.json was deleted before it could be read")
+
+
+def check_reap_state_vanishes_on_read(m):
+    b, c = be.FakeBackend(), Clock()
+    st = _VanishingOnRead()
+    p = core.Pool(b, be.FakeSlots(), size=1, sync=True, clock=c, state_path=st, mutant=m)
+    try:
+        killed = p.reap_previous()
+    except FileNotFoundError as e:
+        raise AssertionError(f"pool up crashed when the old daemon removed its state file before the read: {e}")
+    assert killed == [] and st.deleted, (killed, st.deleted)
+
+
+def check_reap_state_vanishes(m):
+    b, c = be.FakeBackend(), Clock()
+    st = _VanishingState()
+    p = core.Pool(b, be.FakeSlots(), size=1, sync=True, clock=c, state_path=st, mutant=m)
+    try:
+        killed = p.reap_previous()
+    except FileNotFoundError as e:
+        raise AssertionError(f"pool up crashed when the old daemon removed its state file first: {e}")
+    assert killed == [] and st.deleted, (killed, st.deleted)
 
 
 def check_crash_restart(m):
@@ -329,9 +375,143 @@ def check_owner_inis_untouched(m):
     before = h()
     d = _inst_dir()
     lowcost.apply(d)
+    with _owner_prefs():
+        lowcost.restore(d)
     lowcost.render_doc()
     lowcost.verify()
     assert h() == before, "owner INIs changed"
+
+
+# ------------------------------------------------------------------------------------------------ low-cost off: restore
+@contextlib.contextmanager
+def _env(**kv):
+    """Set environment variables for the block, then put back the old values (RealBackend() also sets FNV_LANE)."""
+    old = {k: os.environ.get(k) for k in set(kv) | {"FNV_LANE"}}
+    os.environ.update(kv)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+_TEST_PREFS = '[Display]\r\nsD3DDevice="Test GPU"\r\niShadowMapResolution=1024\r\n'
+
+
+@contextlib.contextmanager
+def _owner_prefs(text=_TEST_PREFS):
+    """The owner's FalloutPrefs.ini as provisioning would read it. A real one always has sD3DDevice (the launcher
+    writes it); without it the game opens its launcher instead of starting, and restore() refuses."""
+    import instances
+    real = instances._base_ini
+
+    def base(name):
+        return text if name.lower() == "falloutprefs.ini" else real(name)
+    old, instances._base_ini = instances._base_ini, base
+    try:
+        yield
+    finally:
+        instances._base_ini = old
+
+
+def check_restore_refuses_prefs_without_d3d(m):
+    """A FalloutPrefs.ini without sD3DDevice must not be written: the game would open FalloutNVLauncher.exe on the owner's
+    desktop instead of starting (seen in game on 2026-10-21)."""
+    d = _inst_dir()
+    before = _snapshot(d)
+    saved = lowcost.prefs_startable
+    if m == "no_d3d_check":
+        lowcost.prefs_startable = lambda text: True
+    try:
+        with _owner_prefs("[Display]\r\niSize W=640\r\n"):
+            try:
+                lowcost.restore(d)
+            except lowcost.UnsafeTarget as e:
+                assert "sD3DDevice" in str(e), e
+                assert _snapshot(d) == before, "a refused restore must write neither INI"
+                return
+    finally:
+        lowcost.prefs_startable = saved
+    assert False, "restore wrote a FalloutPrefs.ini without sD3DDevice (the game would open its launcher)"
+
+
+class _IniBackend(be.FakeBackend):
+    """Fake processes, but prepare() is RealBackend.prepare(): the real INI step of every pool start."""
+
+    def __init__(self, real):
+        super().__init__()
+        self.real = real
+
+    def prepare(self, i: int) -> None:
+        super().prepare(i)
+        self.real.prepare(i)
+
+
+def _snapshot(d: Path):
+    return {str(p.relative_to(d)): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()}
+
+
+def check_nolowcost_restores_provisioned_inis(m):
+    """`pool up` (low-cost), `down`, `pool up --no-lowcost`: the instance must be back to the provisioned INIs."""
+    import instances
+    tmp = Path(tempfile.mkdtemp(prefix="poolini-"))
+    g = tmp / "game"
+    (g / "Data").mkdir(parents=True)
+    (g / "FalloutNV.exe").write_bytes(b"MZ" + b"exe" * 100)
+    (g / "Fallout_default.ini").write_text("[General]\r\nuGridsToLoad=5\r\n[Display]\r\niFPSClamp=0\r\n", encoding="latin-1")
+    (g / "Data" / "FalloutNV.esm").write_bytes(b"TES4" + b"x" * 100)
+    with _env(FNV_GAME_DIR=str(g), FNV_INSTANCES_ROOT=str(tmp / "instances")), _owner_prefs():
+        instances.provision(0, appid=None)
+        d = instances.instance_dir(0)
+        fresh = _snapshot(d)
+        names = (lowcost.FO, lowcost.PR)
+        for lc_on, label in ((True, "lowcost"), (False, "normal")):
+            real = be.RealBackend(lowcost=lc_on, mutant=m)
+            p = core.Pool(_IniBackend(real), be.FakeSlots(available=(0,)), size=1, sync=True, clock=Clock(),
+                          state_path=tmp / f"state-{label}.json")
+            p.up()
+            now = _snapshot(d)
+            if lc_on:
+                assert all(now[n] != fresh[n] for n in names), "the low-cost start must change both INIs"
+                assert instances.ini_get(now[lowcost.FO].decode("latin-1"), "General", "iFPSClamp") == "30"
+            else:
+                changed = sorted(k for k in fresh if now.get(k) != fresh[k]) + sorted(set(now) - set(fresh))
+                assert not changed, f"`up --no-lowcost` left non-provisioned files after a low-cost run: {changed}"
+            p.down()
+
+
+def check_restore_guard_hardlink(m):
+    for name in (lowcost.FO, lowcost.PR):
+        d = _inst_dir()
+        src = Path(tempfile.mkdtemp(prefix="lowcost-src-")) / name
+        src.write_bytes(b"[General]\r\nlinked=1\r\n")
+        (d / name).unlink()
+        os.link(src, d / name)
+        before = _snapshot(d)
+        try:
+            with _owner_prefs():  # valid prefs, so only the link guard can refuse
+                lowcost.restore(d, check=(m != "no_guard"))
+        except lowcost.UnsafeTarget:
+            assert src.read_bytes() == b"[General]\r\nlinked=1\r\n", "refused restore wrote through the link"
+            assert _snapshot(d) == before, "refused restore must write neither INI"
+            continue
+        assert False, f"restore must refuse a hard-linked {name} (writing would change the file it is linked to)"
+
+
+def check_restore_guard_mygames(m):
+    root = Path(tempfile.mkdtemp(prefix="lowcost-")) / "Documents" / "My Games" / "FalloutNV"
+    root.mkdir(parents=True)
+    (root / "Fallout.ini").write_text("[General]\r\n", encoding="latin-1")
+    (root / "FalloutPrefs.ini").write_text("[Display]\r\n", encoding="latin-1")
+    try:
+        with _owner_prefs():  # valid prefs, so only the My Games guard can refuse
+            lowcost.restore(root, check=(m != "no_guard"))
+    except lowcost.UnsafeTarget:
+        return
+    assert False, "restore must refuse the owner's My Games folder"
 
 
 def check_doc_lists_every_key(m):
@@ -422,16 +602,22 @@ def check_real_slots_cli(m):
 
 
 REAL = [check_exclusive, check_pair_lease_order, check_size_clamped, check_recycle_after_k, check_dirty_recycles,
-        check_expiry, check_renew, check_kill_only_own, check_reap_previous_only_recorded, check_crash_restart,
-        check_boot_id_per_process, check_boot_refreshed_at_lease, check_dead_instance_never_leased,
-        check_unresponsive_restart, check_memory_growth, check_start_failure, check_failed_start_stops_lease, check_slot_renew, check_pids_registered, check_lowcost_applies,
+        check_expiry, check_renew, check_kill_only_own, check_reap_previous_only_recorded, check_reap_state_vanishes, check_reap_state_vanishes_on_read,
+        check_crash_restart, check_boot_id_per_process, check_boot_refreshed_at_lease, check_dead_instance_never_leased,
+        check_unresponsive_restart, check_memory_growth, check_start_failure, check_failed_start_stops_lease, check_slot_renew,
+        check_pids_registered, check_lowcost_applies,
         check_lowcost_guard_hardlink, check_lowcost_guard_mygames, check_owner_inis_untouched,
+        check_nolowcost_restores_provisioned_inis, check_restore_guard_hardlink, check_restore_guard_mygames,
+        check_restore_refuses_prefs_without_d3d,
         check_doc_lists_every_key, check_daemon_client, check_client_not_running, check_real_slots_cli]
 
 TWINS = [(check_exclusive, "double_lease"), (check_recycle_after_k, "no_recycle_k"), (check_dirty_recycles, "no_dirty_recycle"),
          (check_expiry, "no_expire"), (check_kill_only_own, "kill_foreign"), (check_lowcost_guard_hardlink, "no_guard"),
-         (check_lowcost_guard_mygames, "no_guard"), (check_doc_lists_every_key, "doc_missing"), (check_daemon_client, "no_dirty_recycle"),
-         (check_boot_id_per_process, "gen_boot"), (check_boot_refreshed_at_lease, "stale_boot")]
+         (check_lowcost_guard_mygames, "no_guard"), (check_nolowcost_restores_provisioned_inis, "no_restore"),
+         (check_restore_guard_hardlink, "no_guard"), (check_restore_guard_mygames, "no_guard"),
+         (check_doc_lists_every_key, "doc_missing"), (check_daemon_client, "no_dirty_recycle"),
+         (check_boot_id_per_process, "gen_boot"), (check_boot_refreshed_at_lease, "stale_boot"),
+         (check_reap_state_vanishes, "reap_unlink_strict"), (check_reap_state_vanishes_on_read, "reap_read_strict"), (check_restore_refuses_prefs_without_d3d, "no_d3d_check")]
 
 
 def main() -> int:

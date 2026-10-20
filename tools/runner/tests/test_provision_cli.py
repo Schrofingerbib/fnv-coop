@@ -14,6 +14,7 @@ import io
 import json
 import locale
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -138,6 +139,8 @@ MUTANTS = {
     "run_space_separated": [(run, "provision_argv", _run_argv_space_separated)],
     "per_instance_keys_allowed": [(instances, "check_per_instance_ini", lambda *a, **k: None)],
     "stale_plugins_kept": [(instances, "stale_plugin_dlls", lambda plugins, keep: [])],
+    "plugins_link_unchecked": [(instances, "check_plugins_inside", lambda d: None)],
+    "copied_onto_itself": [(instances, "same_file", lambda a, b: False)],
 }
 
 
@@ -374,6 +377,70 @@ class ProvisionCli(unittest.TestCase):
         self.assertEqual(dlls, ["jip_nvse.dll", "nvcoop.dll"], "an old nvcoop copy under another name would load as a second plugin")
         meta = json.loads((self.inst / "0" / "instance.json").read_text())
         self.assertEqual(meta["removed"], ["Data/NVSE/Plugins/nvcoop_focus.dll"])
+
+    def check_linked_data_refused(self, mut):
+        """An instance whose Data folder is a junction to the game's Data: provision must refuse and leave the game alone."""
+        game_plugins = self.game / PLUGINS
+        game_plugins.mkdir(parents=True)
+        game_dll = game_plugins / "nvcoop_game.dll"
+        game_dll.write_bytes(b"in the game install")
+        inst = self.inst / "0"
+        inst.mkdir(parents=True)
+        try:  # a Windows junction; off Windows there is no cmd and the test does not apply
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", str(inst / "Data"), str(self.game / "Data")],
+                               capture_output=True, text=True)
+        except OSError as e:
+            self.skipTest(f"cannot run cmd to create a junction: {e}")
+        if r.returncode != 0:
+            self.skipTest("cannot create a junction here: " + (r.stdout + r.stderr).strip())
+        with mutant(mut):
+            try:
+                code, _, err = self.cli(instances.main, ["provision", "--n", "1", "--plugin-dll", str(self.dll)])
+            except Exception as e:  # noqa: BLE001  a crash is not a clean refusal
+                raise AssertionError(f"provision crashed instead of refusing: {e!r}")
+        self.assertTrue(game_dll.exists(), "provision deleted a DLL from the game install through a linked Data folder")
+        self.assertFalse((game_plugins / "nvcoop.dll").exists(), "provision wrote into the game install")
+        self.assertNotEqual(code, 0, "a linked Data folder must be refused")
+
+    def test_linked_data_refused(self):
+        self.check_linked_data_refused(None)
+
+    def test_twin_plugins_link_unchecked(self):
+        with self.assertRaises(AssertionError):
+            self.check_linked_data_refused("plugins_link_unchecked")
+
+    def test_junction_tests_skip_without_cmd(self):
+        """Off Windows there is no cmd: the two junction tests must be skipped, not end in an error."""
+        def no_cmd(*a, **k):
+            raise FileNotFoundError("cmd")
+        names = [f"{__name__}.ProvisionCli.test_linked_data_refused", f"{__name__}.ProvisionCli.test_twin_plugins_link_unchecked"]
+        with mock.patch.object(subprocess, "run", no_cmd):
+            res = unittest.TestResult()
+            unittest.defaultTestLoader.loadTestsFromNames(names).run(res)
+        self.assertEqual((len(res.skipped), len(res.errors), len(res.failures)), (2, 0, 0), res.errors)
+
+    def check_installed_core_given_again(self, mut):
+        """--core-dll naming the core already installed in this instance must not delete it."""
+        code, _, err = self.cli(instances.main, ["provision", "--n", "1", "--plugin-dll", str(self.dll),
+                                                 "--core-dll", str(self.core)])
+        self.assertEqual(code, 0, err)
+        installed = self.inst / "0" / PLUGINS / self.core.name
+        with mutant(mut):
+            try:
+                code, _, err = self.cli(instances.main, ["provision", "--n", "1", "--plugin-dll", str(self.dll),
+                                                         "--core-dll", str(installed)])
+            except Exception as e:  # noqa: BLE001
+                raise AssertionError(f"provision failed on its own installed core: {e!r}")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(installed.exists(), "the installed core was deleted")
+        self.assertEqual(installed.read_bytes(), b"core-v1")
+
+    def test_installed_core_given_again(self):
+        self.check_installed_core_given_again(None)
+
+    def test_twin_copied_onto_itself(self):
+        with self.assertRaises(AssertionError):
+            self.check_installed_core_given_again("copied_onto_itself")
 
     def test_stale_plugin_copies_removed(self):
         self.check_stale_plugin_copies_removed(None)
