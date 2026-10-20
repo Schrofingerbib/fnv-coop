@@ -5,6 +5,7 @@ tools/runner/instances.py PER_INSTANCE). It refuses to touch anything under Docu
 game dir, or a file with more than one hard link (a link could write through into the owner's install).
 
     python -I tools/pool/lowcost.py apply --instance 0 [--grids 3] [--audio-off]
+    python -I tools/pool/lowcost.py restore --instance 0   # write both INIs as provisioning does (profile off)
     python -I tools/pool/lowcost.py doc            # markdown table of every key (pasted into docs/tools/T4a-pool.md)
 
 Every row is (file, section, key, value, why, status). status is
@@ -148,10 +149,51 @@ def apply(instance_dir: Path, grids: Optional[int] = None, audio_off: bool = Fal
     return n
 
 
+def _owner_base(name: str) -> str:
+    """The base INI for a read-only report. A missing owner FalloutPrefs.ini whose fallback cannot be built (unknown display
+    adapter) is an empty base here; only provisioning, which writes a file the game must start with, refuses it."""
+    try:
+        return instances._base_ini(name)
+    except getattr(instances, "PrefsUnavailable", ()):
+        return ""
+
+def prefs_startable(text: str) -> bool:
+    """True when FalloutPrefs.ini has sD3DDevice. Without it FalloutNV.exe opens its launcher instead of starting."""
+    return bool((instances.ini_get(text, "Display", "sD3DDevice") or "").strip())
+
+
+def restore(instance_dir: Path, check: bool = True) -> Dict[str, int]:
+    """Undo apply(): write the instance's two INIs exactly as provisioning writes them (instances.render_inis()).
+
+    apply() touches only Fallout.ini and FalloutPrefs.ini, so only these two files are written. The same guard as
+    apply() runs on both files before either is written: never the owner's My Games, the game dir, a hard link or a
+    symlink. Returns {file: bytes written}. Idempotent. The pool calls it on every start with the profile off.
+    """
+    d = Path(instance_dir)
+    fresh = instances.render_inis()
+    if set(fresh) != {FO, PR}:
+        raise UnsafeTarget(f"render_inis() returned {sorted(fresh)}, expected {[FO, PR]}")
+    if instances.ini_get(fresh[FO], "General", "bUseMyGamesDirectory") != "0":
+        raise UnsafeTarget("render_inis() Fallout.ini does not set bUseMyGamesDirectory=0")
+    # FalloutNV.exe starts FalloutNVLauncher.exe (a window on the owner's desktop) instead of the game when the prefs have
+    # no sD3DDevice. Seen in game on 2026-10-21: render_inis() could not find the owner's prefs (redirected Documents),
+    # wrote a 6-line FalloutPrefs.ini, and `pool up --no-lowcost` then failed with the launcher left open. Fail closed.
+    if not prefs_startable(fresh[PR]):
+        raise UnsafeTarget("render_inis() FalloutPrefs.ini has no sD3DDevice, so the game would open its launcher instead "
+                           "of starting: start Fallout: New Vegas once through Steam (the launcher writes it), check that "
+                           "the owner's My Games folder is found, then try again")
+    if check:
+        for name in (FO, PR):
+            guard(d / name)
+    for name in (FO, PR):
+        (d / name).write_text(fresh[name], encoding="latin-1", newline="")
+    return {name: len(fresh[name].encode("latin-1")) for name in (FO, PR)}
+
+
 def verify() -> Dict[str, List[str]]:
     """Read-only: which profile keys exist in the owner's own INIs (the base the pool copies from)."""
     found: Dict[str, List[str]] = {"present": [], "absent": []}
-    base = {FO: instances._base_ini(FO), PR: instances._base_ini(PR)}
+    base = {FO: _owner_base(FO), PR: _owner_base(PR)}
     for r in PROFILE:
         has = instances.ini_get(base[r.file], r.section, r.key) is not None
         found["present" if has else "absent"].append(f"{r.file}:{r.section}:{r.key}")
@@ -175,6 +217,8 @@ def main(argv=None) -> int:
     p.add_argument("--instance", type=int, required=True)
     p.add_argument("--grids", type=int)
     p.add_argument("--audio-off", action="store_true")
+    r = sub.add_parser("restore")
+    r.add_argument("--instance", type=int, required=True)
     sub.add_parser("doc")
     sub.add_parser("verify")
     a = ap.parse_args(argv)
@@ -184,6 +228,9 @@ def main(argv=None) -> int:
     if a.cmd == "verify":
         import json
         print(json.dumps(verify(), indent=1))
+        return 0
+    if a.cmd == "restore":
+        print(restore(instances.instance_dir(a.instance)))
         return 0
     print(apply(instances.instance_dir(a.instance), a.grids, a.audio_off))
     return 0

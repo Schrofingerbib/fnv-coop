@@ -58,7 +58,7 @@ inline constexpr CallPin TravelObjCtor = {"TravelObjCtor", 0x456540U, {0x55, 0x8
 // cdecl(size) -> game heap block
 inline constexpr CallPin HeapAlloc = {"HeapAlloc", 0x401000U, {0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x50, 0xe8, 0x14, 0x00, 0x00, 0x00, 0x8b, 0xc8, 0xe8, 0x2d}, 0};
 inline constexpr unsigned kPlayerPending = 0x1ECU, kTravelObjSize = 0x34U, kTravelObjMarker = 0x30U;   // player+0x1EC pending object; obj+0x30 = marker ref
-// ---- native message box press (bot.menu.press when the UI layer has no box). Static RE on the Steamless-unpacked 1.4.0.525 image.
+// ---- native message box press (bot.menu.press when the UI layer has no box). Static RE on the 1.4.0.525 exe.
 // MessageMenu (menu id 1001 = 0x3E9) vtable, from MSVC RTTI (COL 0x1119C24, base Menu 0x1095484). Slot 3 (+0x0C) is HandleClick 0x7AA070,
 // slot 12 (+0x30) is HandleKeyboardInput 0x7AA110, slot 13 (+0x34) returns 0x3E9. The press refuses every object whose vtable is not this one:
 // the button-list offsets and the slot-3 behaviour below are only known for MessageMenu.

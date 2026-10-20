@@ -83,11 +83,20 @@ class Pool:
                 old = json.loads(self.state_path.read_text()).get("pids", {})
             except ValueError:
                 old = {}
+            except FileNotFoundError:  # the same race as below, one step earlier: gone between exists() and the read
+                if self.mutant == "reap_read_strict":
+                    raise
+                old = {}
             for pid in old.values():
                 if self.b.alive(int(pid)):
                     self.b.kill(int(pid))
                     killed.append(int(pid))
-            self.state_path.unlink()
+            # The previous daemon deletes this file in its own down() and may do so after the exists() above:
+            # `pool down` returns before that daemon has exited, so a quick `pool up` races it (seen on 2026-10-21).
+            if self.mutant == "reap_unlink_strict":
+                self.state_path.unlink()
+            else:
+                self.state_path.unlink(missing_ok=True)
         return killed
 
     # ------------------------------------------------------------ start / stop

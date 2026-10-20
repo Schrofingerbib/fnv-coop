@@ -141,6 +141,60 @@ PREFS_EDITS = [
 ]
 
 
+class PrefsUnavailable(RuntimeError):
+    pass
+
+
+def display_adapter_name() -> Optional[str]:
+    """The primary display adapter's name (EnumDisplayDevicesW), which is what the game's launcher writes as sD3DDevice."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class DisplayDevice(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("DeviceName", wintypes.WCHAR * 32), ("DeviceString", wintypes.WCHAR * 128),
+                    ("StateFlags", wintypes.DWORD), ("DeviceID", wintypes.WCHAR * 128), ("DeviceKey", wintypes.WCHAR * 128)]
+
+    first, i = None, 0
+    while True:
+        dd = DisplayDevice()
+        dd.cb = ctypes.sizeof(dd)
+        if not ctypes.windll.user32.EnumDisplayDevicesW(None, i, ctypes.byref(dd), 0):
+            break
+        if dd.DeviceString and first is None:
+            first = dd.DeviceString
+        if dd.StateFlags & 0x4:  # DISPLAY_DEVICE_PRIMARY_DEVICE
+            return dd.DeviceString
+        i += 1
+    return first
+
+
+def default_prefs(adapter=None) -> str:
+    """FalloutPrefs.ini for an owner who has none (the game never ran here): Fallout_default.ini, the game's own low.ini
+    preset over it, and sD3DDevice. FalloutNV.exe 1.4.0.525 starts FalloutNVLauncher.exe instead of the game when the
+    prefs have no sD3DDevice (checked in game on 2026-10-21: a 6-line prefs file and a defaults-only one both opened the
+    launcher on the owner's desktop; the same defaults plus sD3DDevice started the game)."""
+    g = game_dir()
+    d = g / "Fallout_default.ini"
+    text = d.read_text(encoding="latin-1") if d.exists() else ""
+    low = g / "low.ini"
+    if low.exists():
+        sec = None
+        for line in low.read_text(encoding="latin-1").splitlines():
+            s = line.strip()
+            if s.startswith("[") and s.endswith("]"):
+                sec = s[1:-1]
+            elif "=" in s and sec and not s.startswith(";"):
+                k, v = s.split("=", 1)
+                text = ini_set(text, sec, k.strip(), v.strip())
+    name = (adapter or display_adapter_name)()
+    if not name:
+        raise PrefsUnavailable("no FalloutPrefs.ini in My Games and the display adapter name is unknown: start Fallout: New "
+                               "Vegas once through Steam so its launcher writes FalloutPrefs.ini, then provision again")
+    return ini_set(text, "Display", "sD3DDevice", f'"{name}"')
+
+
 def _base_ini(name: str) -> str:
     """Start from the user's My Games ini (has the DLC archive list etc.), else the game default."""
     mg = mygames.my_games_dir() / name
@@ -150,6 +204,8 @@ def _base_ini(name: str) -> str:
         d = game_dir() / "Fallout_default.ini"
         if d.exists():
             return d.read_text(encoding="latin-1")
+    if name.lower() == "falloutprefs.ini":
+        return default_prefs()
     return ""
 
 
@@ -237,6 +293,31 @@ def plugin_plan(plugin_dll: Optional[Path] = None, core_dll: Optional[Path] = No
     return files, ini
 
 
+class UnsafeInstance(RuntimeError):
+    """The instance layout would make provisioning write or delete outside the instance."""
+
+
+def check_plugins_inside(d: Path) -> None:
+    """Refuse when Data, Data/NVSE or Data/NVSE/Plugins of an instance is a symlink or junction, or resolves outside the
+    instance. Provisioning deletes stale DLLs and writes nvcoop.ini there; through a linked Data folder that would change
+    the game install itself."""
+    base = Path(os.path.realpath(d))
+    for p in (d / "Data", d / "Data" / "NVSE", d / "Data" / "NVSE" / "Plugins"):
+        if not (p.exists() or p.is_symlink()):
+            continue
+        is_junction = getattr(p, "is_junction", lambda: False)()
+        real = Path(os.path.realpath(p))
+        if p.is_symlink() or is_junction or not real.is_relative_to(base):
+            raise UnsafeInstance(f"{p} is a link (resolves to {real}); refusing to write plugins outside the instance")
+
+
+def same_file(a: Path, b: Path) -> bool:
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def stale_plugin_dlls(plugins: Path, keep: List[Path]) -> List[Path]:
     """nvcoop*.dll files in the instance Plugins folder that this provision does not install.
 
@@ -261,13 +342,12 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
         raise FileNotFoundError(f"game not found at {g}")
     d = instance_dir(i, root)
     d.mkdir(parents=True, exist_ok=True)
+    plugins = d / "Data" / "NVSE" / "Plugins"
+    check_plugins_inside(d)  # before mirror_tree: it must not write through a linked Data folder either
     counts = mirror_tree(g, d, modes)
     (d / "Saves").mkdir(exist_ok=True)
-    plugins = d / "Data" / "NVSE" / "Plugins"
-    for p in (d / "Data" / "NVSE", plugins):
-        if p.is_symlink():
-            raise RuntimeError(f"{p} is a symlink; refusing to write plugins into the game install")
     plugins.mkdir(parents=True, exist_ok=True)
+    check_plugins_inside(d)  # and again before anything is deleted from or written into Plugins
     for name, text in render_inis().items():
         (d / name).write_text(text, encoding="latin-1", newline="")
     if appid:
@@ -283,7 +363,8 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
         f.unlink()
         removed.append("Data/NVSE/Plugins/" + f.name)
     for p in sources:
-        _replace(p, plugins / p.name)
+        if not same_file(p, plugins / p.name):  # a source that is already the installed file must not be deleted
+            _replace(p, plugins / p.name)
         installed.append("Data/NVSE/Plugins/" + p.name)
     cfg = write_plugin_ini(d, i, role, autoload, autoload_delay_frames, ini_extra)
     meta = {
@@ -521,11 +602,15 @@ def main(argv=None) -> int:
             print("refusing: <2 GiB free", file=sys.stderr)
             return 2
         for i in range(a.n):
-            m = provision(i, role="host" if i == 0 else "client",
-                          nvse_dir=Path(a.nvse_dir) if a.nvse_dir else None,
-                          plugin_dll=dll, core_dll=core, extra_ini=extra_ini,
-                          autoload=a.autoload, modes=tuple(a.modes.split(",")),
-                          appid=None if a.no_appid else STEAM_APPID)
+            try:
+                m = provision(i, role="host" if i == 0 else "client",
+                              nvse_dir=Path(a.nvse_dir) if a.nvse_dir else None,
+                              plugin_dll=dll, core_dll=core, extra_ini=extra_ini,
+                              autoload=a.autoload, modes=tuple(a.modes.split(",")),
+                              appid=None if a.no_appid else STEAM_APPID)
+            except UnsafeInstance as e:
+                print(f"error: instance {i}: {e}", file=sys.stderr)
+                return 2
             print(f"instance {i}: {m['dir']} links={m['link_counts']}")
     elif a.cmd == "show":
         for i in range(a.n):

@@ -15,10 +15,10 @@ to match.
 Exit codes: 0 every check passed, 1 a check failed, 2 the proof could not run: a bad command line (refused before the
 bridge is opened), no game on the instance, the game lost during the run (crash or pipe loss), or --info / --other-info
 that the load order cannot resolve or that name the same INFO (refused before the proof drives anything).
+
 --dismiss-messages (opt-in, off by default): first clear stray message boxes with Bot.dismiss_messages. It presses until no box has
 been shown for --dismiss-quiet-s seconds (default 20, the boxes come in waves), at most --dismiss-max-s (default 120). It adds a
-"dismiss_messages" row with the press count and the seconds it waited. It runs after the --info / --other-info load-order check,
-so a form that the load order cannot resolve still stops the proof before any box is pressed.
+"dismiss_messages" row with the press count and the seconds it waited.
 Each check prints measured numbers. Every engine call behind these methods is unverified at runtime, so the first failure is
 expected information, not a surprise: the printed 'reply' says which gate refused.
   menu       none -> dialogue after talking (kind and id), dialogReady flips true when the line has finished
