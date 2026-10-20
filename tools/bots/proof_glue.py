@@ -15,6 +15,10 @@ to match.
 Exit codes: 0 every check passed, 1 a check failed, 2 the proof could not run: a bad command line (refused before the
 bridge is opened), no game on the instance, the game lost during the run (crash or pipe loss), or --info / --other-info
 that the load order cannot resolve or that name the same INFO (refused before the proof drives anything).
+
+--dismiss-messages (opt-in, off by default): first clear stray message boxes with Bot.dismiss_messages. It presses until no box has
+been shown for --dismiss-quiet-s seconds (default 20, the boxes come in waves), at most --dismiss-max-s (default 120). It adds a
+"dismiss_messages" row with the press count and the seconds it waited.
 Each check prints measured numbers. Every engine call behind these methods is unverified at runtime, so the first failure is
 expected information, not a surprise: the printed 'reply' says which gate refused.
   menu       none -> dialogue after talking (kind and id), dialogReady flips true when the line has finished
@@ -96,6 +100,9 @@ def run(nv, a):
     plugins = list(nv.plugins())
     want, other_key = dialog_keys(a, plugins)   # CannotRun here: nothing has been driven yet
     b = Bot(nv, "glue")
+    if getattr(a, "dismiss_messages", False):
+        d = b.dismiss_messages(quiet_s=getattr(a, "dismiss_quiet_s", 20.0), max_s=getattr(a, "dismiss_max_s", 120.0))
+        check("dismiss_messages", d.ok, pressed=d.data.get("pressed"), waited_s=d.data.get("waited_s"), reply=str(d))
     m0 = b.menu_info()
     check("menu_before", m0.get("kind") in ("none", "hud"), reply=m0)
     t = b.talk(a.npc)
@@ -167,6 +174,9 @@ def parser():
     ap.add_argument("--other-info", help="INFO the NPC does NOT offer now: the dialog check fails if bot.dialog lists it")
     ap.add_argument("--item"); ap.add_argument("--target")
     ap.add_argument("--terminal"); ap.add_argument("--entry", type=int, default=0); ap.add_argument("--marker"); ap.add_argument("--base"); ap.add_argument("--fake", action="store_true")
+    ap.add_argument("--dismiss-messages", action="store_true", help="clear stray message boxes (button 0) before the checks")
+    ap.add_argument("--dismiss-quiet-s", type=float, default=20.0, help="done when no box has been shown for this many seconds")
+    ap.add_argument("--dismiss-max-s", type=float, default=120.0, help="give up (FAIL) after this many seconds")
     ap.add_argument("--out", default=str(ROOT / "out" / "T6a" / "proof_glue.json"))
     return ap
 

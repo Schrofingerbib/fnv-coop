@@ -23,7 +23,7 @@ M_BOT_SAY = "bot.say"          # {info: "plugin:HEX"} -> {said}
 M_BOT_MENU = "bot.menu"        # {} -> {kind: "none|dialogue|container|terminal|pipboy|...", ref?}
 M_BOT_INVENTORY = "bot.inventory"  # {ref?} -> {items:[{item, count}]}
 # in-process input driver (plugin/bots/bot_rpc.h)
-M_BOT_MENU_PRESS = "bot.menu.press"   # {button}
+M_BOT_MENU_PRESS = "bot.menu.press"   # {button} -> {menu, button, path: ui|native, value?, buttons?}
 M_BOT_PRESS = M_BOT_MENU_PRESS
 M_BOT_CONSENT = "bot.consent"          # {answer: ready|notyet}
 M_BOT_DIALOG = "bot.dialog"            # -> {choices:[{idx,formId,info}]}

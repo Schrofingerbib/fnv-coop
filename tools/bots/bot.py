@@ -21,6 +21,9 @@ from . import primitives as P  # noqa: E402
 
 METHOD_NOT_FOUND = -32601
 PLAYER_REF = "FalloutNV.esm:14"
+# The refusal of the native message-box press while menu 1001 is still the top menu but its current message is gone
+# (pressNativeMessageButton in plugin/bots/bot_engine.h). dismiss_messages waits and retries on this text only.
+MSGBOX_CLOSING = "the message box has no current message (it is closing)"
 
 
 class Pos(Tuple[float, float, float]):
@@ -598,8 +601,70 @@ class Bot:
         return {i["item"]: i["count"] for i in self._need(P.M_BOT_INVENTORY, p)["items"]}
 
     def press_box(self, button: int) -> ActionResult:
-        """Answer the message box our UI layer is showing (consent prompt, PNR confirm) with `button`."""
+        """Answer a message box with `button` (0-based, in the order the box lists its buttons). The UI layer's own box (consent prompt,
+        PNR confirm) answers first; when it shows none and the engine's own message box (MessageMenu, menu id 1001) is the top menu, the
+        plugin presses that box natively. data['path'] is 'ui' or 'native'; a native press also gives data['value'] (what the engine records)."""
         return self._act("press_box", lambda: dict(self._need(P.M_BOT_PRESS, {"button": button})))
+
+    def dismiss_messages(self, quiet_s: float = 20.0, max_s: float = 120.0, max_n: int = 8, button: int = 0, settle_s: float = 0.3,
+                         poll_s: float = 0.5, max_closing: int = 10) -> ActionResult:
+        """Clear the message boxes the engine shows after a load (MessageMenu, menu id 1001), for example the DLC notices, which keep a
+        test copy in menu mode. They come in waves: with all DLC, 6 boxes about 5 s after a fresh save loads, then 2, then 2 more about
+        16 s later (first in-game run, 2026-10-21). So this keeps watching. While bot.menu reports kind 'message', it presses `button`
+        with bot.menu.press (the UI layer's box first, else the engine's box natively) and waits `settle_s`. Otherwise it polls every
+        `poll_s`. Done when no box has been shown for `quiet_s` seconds (quiet_s=0: only the boxes shown now).
+        A box that is closing (menu 1001 is still the top menu but its current message is gone) refuses the press with MSGBOX_CLOSING.
+        Then it waits `settle_s` and tries again. That retry is not a press. At most `max_closing` retries in a row, and the count starts
+        again after each press. Any other refusal ends the dismissal (reason 'rpc_error:...').
+        Fails with 'timeout' when `max_s` passes first (boxes keep coming), and with 'postcondition' when a box is still shown after
+        `max_n` presses in a row (a box that does not close) or stays closing for more than `max_closing` retries.
+        data: {pressed, paths, waited_s, quiet_s, closing}: waited_s = seconds from the call to the end of the quiet window (or to the
+        failure), closing = the closing refusals retried. No proof calls this on its own (proofs: --dismiss-messages)."""
+        def run():
+            paths: List[str] = []
+            t0 = self.clock.monotonic()
+            last = t0        # the last time a box was shown; the quiet window starts at the call
+            in_row = 0       # presses since a poll last saw no box
+            closing = 0      # closing refusals since the last press
+            retried = 0      # closing refusals in all
+            while True:
+                kind = self.menu_info().get("kind")
+                now = self.clock.monotonic()
+                waited = round(now - t0, 2)
+                if kind == "message":
+                    if in_row >= max_n:
+                        raise _Fail("postcondition", why="a message box is still shown", pressed=len(paths), paths=paths, waited_s=waited,
+                                    closing=retried)
+                    if now - t0 >= max_s:
+                        raise _Fail("timeout", why=f"message boxes still shown after {max_s:g} s", pressed=len(paths), paths=paths,
+                                    waited_s=waited, closing=retried)
+                    try:
+                        r = self._need(P.M_BOT_PRESS, {"button": button})
+                    except RpcError as e:
+                        if MSGBOX_CLOSING not in e.message:
+                            raise
+                        closing += 1
+                        retried += 1
+                        if closing > max_closing:
+                            raise _Fail("postcondition", why=f"a message box stayed closing for {closing} tries", pressed=len(paths),
+                                        paths=paths, waited_s=waited, closing=retried)
+                        self.clock.sleep(settle_s)
+                        last = self.clock.monotonic()
+                        continue
+                    closing = 0
+                    paths.append(str(r.get("path", "?")))
+                    in_row += 1
+                    self.clock.sleep(settle_s)
+                    last = self.clock.monotonic()
+                    continue
+                in_row = 0
+                if now - last >= quiet_s:
+                    return {"pressed": len(paths), "paths": paths, "waited_s": waited, "quiet_s": quiet_s, "closing": retried}
+                if now - t0 >= max_s:
+                    raise _Fail("timeout", why=f"no {quiet_s:g} s without a message box within {max_s:g} s", pressed=len(paths), paths=paths,
+                                waited_s=waited, closing=retried)
+                self.clock.sleep(min(poll_s, quiet_s - (now - last), max_s - (now - t0)))
+        return self._act("dismiss_messages", run)
 
     def consent(self, answer: str = "ready") -> ActionResult:
         """Answer the party-consent prompt: 'ready' or 'notyet'."""
