@@ -83,6 +83,10 @@ class Pool:
                 old = json.loads(self.state_path.read_text()).get("pids", {})
             except ValueError:
                 old = {}
+            except FileNotFoundError:  # the same race as below, one step earlier: gone between exists() and the read
+                if self.mutant == "reap_read_strict":
+                    raise
+                old = {}
             for pid in old.values():
                 if self.b.alive(int(pid)):
                     self.b.kill(int(pid))

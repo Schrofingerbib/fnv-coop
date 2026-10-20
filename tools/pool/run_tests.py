@@ -162,6 +162,23 @@ class _VanishingState:
         self.deleted = True
 
 
+class _VanishingOnRead(_VanishingState):
+    """The previous daemon deletes the state file between our exists() and our read."""
+    def read_text(self):
+        raise FileNotFoundError("state.json was deleted before it could be read")
+
+
+def check_reap_state_vanishes_on_read(m):
+    b, c = be.FakeBackend(), Clock()
+    st = _VanishingOnRead()
+    p = core.Pool(b, be.FakeSlots(), size=1, sync=True, clock=c, state_path=st, mutant=m)
+    try:
+        killed = p.reap_previous()
+    except FileNotFoundError as e:
+        raise AssertionError(f"pool up crashed when the old daemon removed its state file before the read: {e}")
+    assert killed == [] and st.deleted, (killed, st.deleted)
+
+
 def check_reap_state_vanishes(m):
     b, c = be.FakeBackend(), Clock()
     st = _VanishingState()
@@ -585,7 +602,7 @@ def check_real_slots_cli(m):
 
 
 REAL = [check_exclusive, check_pair_lease_order, check_size_clamped, check_recycle_after_k, check_dirty_recycles,
-        check_expiry, check_renew, check_kill_only_own, check_reap_previous_only_recorded, check_reap_state_vanishes,
+        check_expiry, check_renew, check_kill_only_own, check_reap_previous_only_recorded, check_reap_state_vanishes, check_reap_state_vanishes_on_read,
         check_crash_restart, check_boot_id_per_process, check_boot_refreshed_at_lease, check_dead_instance_never_leased,
         check_unresponsive_restart, check_memory_growth, check_start_failure, check_failed_start_stops_lease, check_slot_renew,
         check_pids_registered, check_lowcost_applies,
@@ -600,7 +617,7 @@ TWINS = [(check_exclusive, "double_lease"), (check_recycle_after_k, "no_recycle_
          (check_restore_guard_hardlink, "no_guard"), (check_restore_guard_mygames, "no_guard"),
          (check_doc_lists_every_key, "doc_missing"), (check_daemon_client, "no_dirty_recycle"),
          (check_boot_id_per_process, "gen_boot"), (check_boot_refreshed_at_lease, "stale_boot"),
-         (check_reap_state_vanishes, "reap_unlink_strict"), (check_restore_refuses_prefs_without_d3d, "no_d3d_check")]
+         (check_reap_state_vanishes, "reap_unlink_strict"), (check_reap_state_vanishes_on_read, "reap_read_strict"), (check_restore_refuses_prefs_without_d3d, "no_d3d_check")]
 
 
 def main() -> int:
