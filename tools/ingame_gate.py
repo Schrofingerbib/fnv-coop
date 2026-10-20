@@ -124,7 +124,8 @@ def provision_gate(dll: Path) -> Path:
     instances.provision(0, role="host", plugin_dll=dll, autoload="autosave", autoload_delay_frames=600,
                         extra_ini={"coop": {"enable": "0"}})
     saves = instances.instance_dir(0) / "Saves"
-    src = Path.home() / "Documents" / "My Games" / "FalloutNV" / "Saves" / "autosave.fos"
+    import mygames
+    src = mygames.saves_dir() / "autosave.fos"
     if not src.exists():
         raise FileNotFoundError(f"no autosave to load: {src}")
     shutil.copy2(src, saves / "autosave.fos")
