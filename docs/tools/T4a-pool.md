@@ -1,7 +1,7 @@
 # T4a-pool: warm game pool and low-cost mode
 
-Status: code complete, game-free tests green (`python -I tools/pool/run_tests.py` prints `ALL OK`). Nothing here has
-been run against a real game. The lead's first in-game steps are at the end.
+Status: code complete, game-free tests green (`python -I tools/pool/run_tests.py` prints `ALL OK`). The RAM and CPU
+table below was measured with the pool and a real game on 2026-10-20. The lead's first in-game steps are at the end.
 
 ## What it does
 
@@ -56,7 +56,12 @@ with lease("scn-goodsprings", n=2, ttl_s=900, timeout_s=600) as L:
 `tools/pool/lowcost.py` edits only the instance-local `Fallout.ini` and `FalloutPrefs.ini` under the instances root.
 It refuses (and tests prove it) the owner's `Documents\My Games`, the Steam game dir, hard-linked files and symlinks.
 A test also hashes the owner's INIs before and after. The pool applies it on every instance start (idempotent).
-Disable with `--no-lowcost`. `python -I tools/pool/lowcost.py verify` lists which keys exist in the owner's own INIs.
+Disable with `--no-lowcost`. With `--no-lowcost`, every instance start writes back the two INIs that provisioning
+writes (`lowcost.restore`, the output of `instances.render_inis()`). A profile from an earlier `up` therefore does not
+stay in force. The restore uses the same guard: it refuses the owner's `Documents\My Games`, the Steam game dir,
+hard-linked files and symlinks, and it writes neither INI when one of them fails the guard. It also removes manual
+edits to these two instance INIs. `python -I tools/pool/lowcost.py restore --instance 0` does the same by hand.
+`python -I tools/pool/lowcost.py verify` lists which keys exist in the owner's own INIs.
 
 Column "Status": `present in owner INI` means the key exists in the owner's INI, so the name is right.
 `not in owner INI (added)` means the name is a guess from other Bethesda games; the engine ignores unknown keys, so
@@ -111,8 +116,30 @@ made at 3).
 
 ## RAM and CPU estimate
 
-Unknown. Nothing has been measured. Expect a 32-bit game process to use roughly 1 to 2 GB of RAM per instance, but this
-is a guess, not a measurement. To measure, with the pool up and idle:
+Measured on 2026-10-20, one idle warm instance per profile:
+
+| Profile | RAM per instance (MB) | CPU idle (% of one core) | CPU during a test | Free system RAM |
+|---|---|---|---|---|
+| low-cost | 254-699 (min-max working set) | 12.5 avg (max 56.8) | not measured | not measured |
+| normal | 272-710 (min-max working set) | 13.2 avg (max 57.2) | not measured | not measured |
+
+Conditions:
+
+- 1 instance, window minimized, 640x480 (provisioning sets 640x480 for both profiles).
+- `FalloutNV.exe` 1.4.0.525 (Steam) with all DLC, xNVSE 6.4.9.
+- A Goodsprings save, loaded by the nvcoop autoload.
+- `nvcoop.dll` with the focus guard from PR cranebeaker/fnv-coop#3, so the game world was not paused while minimized.
+- 5 minutes of samples with `tools/pool/measure.py`.
+- Other heavy programs ran on the PC. Free system RAM is therefore not meaningful.
+
+In this setup the low-cost profile saves little: about 10-20 MB of working set and about 0.7 % of one core. The
+saving is small because the window is minimized.
+
+The "normal" row comes from a re-provisioned instance. Before this fix (`lowcost.restore`), `up --no-lowcost` did not
+undo the INI edits of an earlier low-cost run. A first "normal" run therefore measured the low-cost profile again
+(254-688 MB, 12.7 % avg). It is not used.
+
+To measure again, with the pool idle:
 
 ```
 python -I tools/pool/pool.py up --size 1
@@ -123,13 +150,9 @@ python -I tools/pool/measure.py --label normal --minutes 5
 python -I tools/pool/pool.py down
 ```
 
-Results go to `out/T4a-pool/measure-<label>.json` (working set MB, CPU percent of one core, free system RAM). Paste
-the two summaries here:
-
-| Profile | RAM per instance (MB) | CPU idle (% of one core) | CPU during a test | Free system RAM |
-|---|---|---|---|---|
-| low-cost | unknown | unknown | unknown | unknown |
-| normal | unknown | unknown | unknown | unknown |
+`up --no-lowcost` writes the provisioned INIs back on each instance start, so no re-provision is necessary between the
+two runs. (Pool code from before this fix does not do this. With that code, re-provision before the "normal" run.)
+Results go to `out/T4a-pool/measure-<label>.json` (working set MB, CPU percent of one core, free system RAM).
 
 Also unknown: whether the fps cap of 30 changes any timing-based test; whether the 640x480 window keeps the HUD
 usable for screenshots.

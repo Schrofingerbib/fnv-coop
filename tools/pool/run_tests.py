@@ -4,11 +4,12 @@
 
 A check takes a mutant name (or None) and raises AssertionError when an invariant is violated.
 Real run: every check must pass with mutant=None. Twin run: each (check, mutant) pair must FAIL.
-No game is launched; the only OS things touched are a loopback socket, a temp dir, the gameslot CLI under a
-temp GAMESLOT_DIR and (read only) the owner's INIs.
+No game is launched; the only OS things touched are a loopback socket, a temp dir (also holding a fake game dir and
+an instance provisioned from it), the gameslot CLI under a temp GAMESLOT_DIR and (read only) the owner's INIs.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -290,9 +291,100 @@ def check_owner_inis_untouched(m):
     before = h()
     d = _inst_dir()
     lowcost.apply(d)
+    lowcost.restore(d)
     lowcost.render_doc()
     lowcost.verify()
     assert h() == before, "owner INIs changed"
+
+
+# ------------------------------------------------------------------------------------------------ low-cost off: restore
+@contextlib.contextmanager
+def _env(**kv):
+    """Set environment variables for the block, then put back the old values (RealBackend() also sets FNV_LANE)."""
+    old = {k: os.environ.get(k) for k in set(kv) | {"FNV_LANE"}}
+    os.environ.update(kv)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+class _IniBackend(be.FakeBackend):
+    """Fake processes, but prepare() is RealBackend.prepare(): the real INI step of every pool start."""
+
+    def __init__(self, real):
+        super().__init__()
+        self.real = real
+
+    def prepare(self, i: int) -> None:
+        super().prepare(i)
+        self.real.prepare(i)
+
+
+def _snapshot(d: Path):
+    return {str(p.relative_to(d)): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()}
+
+
+def check_nolowcost_restores_provisioned_inis(m):
+    """`pool up` (low-cost), `down`, `pool up --no-lowcost`: the instance must be back to the provisioned INIs."""
+    import instances
+    tmp = Path(tempfile.mkdtemp(prefix="poolini-"))
+    g = tmp / "game"
+    (g / "Data").mkdir(parents=True)
+    (g / "FalloutNV.exe").write_bytes(b"MZ" + b"exe" * 100)
+    (g / "Fallout_default.ini").write_text("[General]\r\nuGridsToLoad=5\r\n[Display]\r\niFPSClamp=0\r\n", encoding="latin-1")
+    (g / "Data" / "FalloutNV.esm").write_bytes(b"TES4" + b"x" * 100)
+    with _env(FNV_GAME_DIR=str(g), FNV_INSTANCES_ROOT=str(tmp / "instances")):
+        instances.provision(0, appid=None)
+        d = instances.instance_dir(0)
+        fresh = _snapshot(d)
+        names = (lowcost.FO, lowcost.PR)
+        for lc_on, label in ((True, "lowcost"), (False, "normal")):
+            real = be.RealBackend(lowcost=lc_on, mutant=m)
+            p = core.Pool(_IniBackend(real), be.FakeSlots(available=(0,)), size=1, sync=True, clock=Clock(),
+                          state_path=tmp / f"state-{label}.json")
+            p.up()
+            now = _snapshot(d)
+            if lc_on:
+                assert all(now[n] != fresh[n] for n in names), "the low-cost start must change both INIs"
+                assert instances.ini_get(now[lowcost.FO].decode("latin-1"), "General", "iFPSClamp") == "30"
+            else:
+                changed = sorted(k for k in fresh if now.get(k) != fresh[k]) + sorted(set(now) - set(fresh))
+                assert not changed, f"`up --no-lowcost` left non-provisioned files after a low-cost run: {changed}"
+            p.down()
+
+
+def check_restore_guard_hardlink(m):
+    for name in (lowcost.FO, lowcost.PR):
+        d = _inst_dir()
+        src = Path(tempfile.mkdtemp(prefix="lowcost-src-")) / name
+        src.write_bytes(b"[General]\r\nlinked=1\r\n")
+        (d / name).unlink()
+        os.link(src, d / name)
+        before = _snapshot(d)
+        try:
+            lowcost.restore(d, check=(m != "no_guard"))
+        except lowcost.UnsafeTarget:
+            assert src.read_bytes() == b"[General]\r\nlinked=1\r\n", "refused restore wrote through the link"
+            assert _snapshot(d) == before, "refused restore must write neither INI"
+            continue
+        assert False, f"restore must refuse a hard-linked {name} (writing would change the file it is linked to)"
+
+
+def check_restore_guard_mygames(m):
+    root = Path(tempfile.mkdtemp(prefix="lowcost-")) / "Documents" / "My Games" / "FalloutNV"
+    root.mkdir(parents=True)
+    (root / "Fallout.ini").write_text("[General]\r\n", encoding="latin-1")
+    (root / "FalloutPrefs.ini").write_text("[Display]\r\n", encoding="latin-1")
+    try:
+        lowcost.restore(root, check=(m != "no_guard"))
+    except lowcost.UnsafeTarget:
+        return
+    assert False, "restore must refuse the owner's My Games folder"
 
 
 def check_doc_lists_every_key(m):
@@ -386,11 +478,14 @@ REAL = [check_exclusive, check_pair_lease_order, check_size_clamped, check_recyc
         check_dead_instance_never_leased, check_unresponsive_restart, check_memory_growth, check_start_failure,
         check_failed_start_stops_lease, check_slot_renew, check_pids_registered, check_lowcost_applies,
         check_lowcost_guard_hardlink, check_lowcost_guard_mygames, check_owner_inis_untouched,
+        check_nolowcost_restores_provisioned_inis, check_restore_guard_hardlink, check_restore_guard_mygames,
         check_doc_lists_every_key, check_daemon_client, check_client_not_running, check_real_slots_cli]
 
 TWINS = [(check_exclusive, "double_lease"), (check_recycle_after_k, "no_recycle_k"), (check_dirty_recycles, "no_dirty_recycle"),
          (check_expiry, "no_expire"), (check_kill_only_own, "kill_foreign"), (check_lowcost_guard_hardlink, "no_guard"),
-         (check_lowcost_guard_mygames, "no_guard"), (check_doc_lists_every_key, "doc_missing"), (check_daemon_client, "no_dirty_recycle")]
+         (check_lowcost_guard_mygames, "no_guard"), (check_nolowcost_restores_provisioned_inis, "no_restore"),
+         (check_restore_guard_hardlink, "no_guard"), (check_restore_guard_mygames, "no_guard"),
+         (check_doc_lists_every_key, "doc_missing"), (check_daemon_client, "no_dirty_recycle")]
 
 
 def main() -> int:

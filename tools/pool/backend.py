@@ -68,7 +68,7 @@ class FakeSlots:
 # ---------------------------------------------------------------------------------------------- backends
 class RealBackend:
     def __init__(self, *, boot_timeout_s: float = 300, base_save: str = "", grids: Optional[int] = None,
-                 audio_off: bool = False, lowcost: bool = True):
+                 audio_off: bool = False, lowcost: bool = True, mutant: Optional[str] = None):
         os.environ["FNV_LANE"] = OWNER           # run.register_pid() records pids under our gameslot owner
         for p in (str(RUNNER), str(Path(__file__).resolve().parent)):
             if p not in sys.path:
@@ -76,14 +76,19 @@ class RealBackend:
         import instances, lowcost as lc, nvbridge, run, winproc  # noqa: E401
         self.instances, self.lc, self.nv, self.run, self.wp = instances, lc, nvbridge, run, winproc
         self.boot_timeout_s, self.base_save, self.grids, self.audio_off, self.lowcost = boot_timeout_s, base_save, grids, audio_off, lowcost
+        self.mutant = mutant                      # test twins only (tools/pool/run_tests.py)
         self._mine: set = set()
 
     def prepare(self, i: int) -> None:
+        """Set the instance INIs for this start. Low-cost on: apply the profile. Low-cost off: write the INIs that
+        provisioning writes, so a profile applied by an earlier `pool up` does not stay in force."""
         d = self.instances.instance_dir(i)
         if not (d / "instance.json").exists():
             raise RuntimeError(f"instance {i} not provisioned: run `python -I tools/runner/run.py provision --n N`")
         if self.lowcost:
             self.lc.apply(d, self.grids, self.audio_off)
+        elif self.mutant != "no_restore":
+            self.lc.restore(d)
 
     def start(self, i: int) -> int:
         pid = self.run.launch_instance(i)
