@@ -5,12 +5,15 @@ Status 2026-10-20: code and tests done, game-free. Nothing was run in a game. Ru
 
 ## Files
 - `tools/scenarios/scenlib.py`: format, validator, command/expression builders, jump planner.
-- `tools/scenarios/runner.py`: runs a scenario over bridge objects (duck-typed), keeps a per-instance state store.
+- `tools/scenarios/runner.py`: runs a scenario over bridge objects (duck-typed), keeps a state store keyed by game process.
 - `tools/scenarios/scen.py`: CLI (`list`, `validate`, `plan`, `run`, `jump`).
 - `tools/scenarios/fakegame.py`: in-memory fake of N instances sharing one world, with bug flags (tests only).
-- `tools/scenarios/run_tests.py`: 48 unit tests plus the mutation twin.
-- `tools/scenarios/proof.py`: in-game proof for the lead (not run by tests): `probe`, `jump`, `suite`.
-- `scenarios/*.json`: the 10 starters.
+- `tools/scenarios/run_tests.py`: 63 unit tests plus the mutation twin.
+- `tools/scenarios/proof.py`: in-game proof for the lead (not run by tests in a game; the tests drive its `jump` and `suite`
+  modes on the fake pool and fake game only to check the state keys): `probe`, `jump`, `suite`.
+- `scenarios/*.json`: 14 scenario files, the 10 starters plus 4 added for the playbooks (table below). The files in
+  `scenarios/simfuzz/` are T2b's saved simfuzz repros (docs/tools/T2b-fuzz.md); the scenario tool reads only
+  `scenarios/*.json`.
 
 ## The scenario format (schema 1)
 One JSON file per scenario, file name = `name`. Keys: `schema`, `name`, `title`, `description`, `players` (1 to 4), `tags`,
@@ -32,7 +35,7 @@ holds). `cmp: same` means every player reports the same number (convergence with
 
 ## Jump to scenario in seconds
 `runner.Runner.jump()` follows L7's reload-every rule. The save is reloaded only when: nothing is loaded on that instance yet
-(the key is instance plus pool generation, so a restarted game counts as empty); the loaded save differs from `start.save`; the
+(the state key names the game process, see "State keys" below, so a new game counts as empty); the loaded save differs from `start.save`; the
 previous scenario failed or errored; the scenario sets `start.reload`; or the previous scenario changed a world object this one
 uses. Otherwise it is in place: `test.quest.reset` over the scenario's quests plus everything the previous scenario touched, then
 the `setup` steps. What a scenario "dirties" is computed from its steps (kill, enable/disable, lock, item changes, spawns,
@@ -41,8 +44,37 @@ raw console line counts as "unnameable" and forces a reload next). `scen.py plan
 Expected cost: in place is a few bridge calls and console lines (the test measures that it stays under 20 calls on the fake);
 the real time is unknown until `proof.py jump` is run. A reload is a save load, which L7 measured at the sweep's usual load time.
 
-## The 10 starters plus 3 playbook scenarios (13 files; INFO and DIAL aliases resolve against dials/infos.jsonl.gz; the API for playbooks is `tools/scenarios/__init__.py`) (all `players: 2`; `start.save` is `autosave`)
-| name | what it checks | needs (not in the bridge yet) |
+## State keys
+The runner remembers, per game process, which save is loaded and what the last scenario dirtied. `scen.py run` and
+`scen.py jump` keep this in `out/scenarios/state.json`; `proof.py` keeps it in `out/scenarios/proof_state.json`.
+- The key is `instance@boot`. `boot` is the id that the pool gives each game process at each successful start: the game
+  pid plus a random token (`L.boot(i)` in `tools/pool/client.py`, `boot` in `pool.py status`). A new game process always
+  gets a new id, also after `pool down` and `pool up`.
+- Earlier keys were wrong. `scen.py` and `proof.py suite` used `instance@generation`, and the generation starts again at
+  1 on every pool start. `proof.py jump` used the fixed key `0@proof`. So a run after a pool restart found the state of
+  the earlier game, skipped the save load, and ran the checks against the main menu or a different world.
+- The same live game keeps its key from lease to lease, so a second `scen.py run` in the same pool still jumps in place.
+  For `proof.py jump` this means that the first jump of a second run in the same pool is in place too. To time a
+  reload again, restart the pool or delete `out/scenarios/proof_state.json`.
+- A lease without a boot id (a pool older than this change) gets keys that are new for that run, so its first jump
+  reloads. A `Runner` made without `keys` keeps its state private to that `Runner` object.
+- `runner.for_lease(L, path)` builds the runner for a pool lease with these keys; `StateStore.lease_keys(L)` builds the
+  keys alone.
+- Limit: the store assumes that nothing else changed the world of that game process between two of your leases (another
+  lessee of the same warm instance, or a person at the console). If that can have happened, use `scen.py run --force-reload`
+  (or `jump --force-reload`); for `proof.py`, delete `out/scenarios/proof_state.json`.
+
+Locking: two `scen.py` (or two `proof.py`) processes can use the same state file at the same time, with leases on
+different instances. Every read and every write of the file holds an exclusive lock on the sidecar file `<file>.lock`
+(`msvcrt.locking` on Windows, `fcntl.flock` elsewhere). A write reads the file, changes only its own keys, writes a
+temporary file in the same folder and replaces the state file with `os.replace`, so the state file is never partial.
+Each plan reads the file again, so it sees what the other process wrote. A lock that stays held for 30 s stops the run
+with `runner.StateLockTimeout`, which names the lock file. The `.lock` file stays in the folder; it is empty.
+
+## The 10 starters plus 4 playbook scenarios (14 files; INFO and DIAL aliases resolve against dials/infos.jsonl.gz; the API for playbooks is `tools/scenarios/__init__.py`) (all `players: 2`; `start.save` is `autosave`)
+The 4 added for the playbooks are dialogue_spectator, pnr_vote, pnr_vote_guest_declines and goodsprings_opening.
+
+| name | what it checks | needs (capability, bridge method; status below) |
 |---|---|---|
 | goodsprings_fight | 3 Powder Gangers, kills by host and guest, dead state agrees | none |
 | loot_race | both grab one world item at once, total copies stay 1 | none |
@@ -60,10 +92,24 @@ the real time is unknown until `proof.py jump` is run. A reload is a save load, 
 | fast_travel_tether | host fast travels, guest is pulled | `fast_travel` (`test.fasttravel`) |
 
 A step whose capability is missing is reported `blocked` (never a pass), and every later step is blocked too, so the scenario
-ends as `partial`. The method names above are proposals; they do not exist in the bridge. Capabilities live in
-`scenlib.CAPABILITIES`; pass `capabilities=` to `Runner` once a method exists.
+ends as `partial`. Capabilities and their method names live in `scenlib.CAPABILITIES` (one place to change); the runner
+uses the capabilities marked `present` there unless you pass `capabilities=` to `Runner`.
 
-## Final names (from T6a, all behind nvcoop.ini [dev] bots=1, implemented but never run in game): `bot.say {info}`, `bot.vats {ref}` (limb unsupported, so not sent), `bot.menu.press {button}`, `bot.consent {answer}`, `test.fasttravel {marker}` (a teleport across cells, reply `genuine:false`, not the real fast-travel call), `dev.countRefs {base}` (spawn_once; counts the base over the loaded world). These count as present. Still proposed, not in the bridge: `coop.owner`, `coop.leave`, `coop.join` (ownership_handoff and save_load_rejoin stay `partial`). Older note: vats and dialogue follow T6a's docs/tools/T6a-actions.md; the message-box press and the consent answer do not exist in T6a's spec yet, so their names are provisional and were requested from T6a-actions (all method names live in `scenlib.CAPABILITIES`, one place to change).
+## Capability status (checked 2026-10-20 against `scenlib.CAPABILITIES` and `plugin/coop/coop_module.cpp`)
+- Present, from T6a, all behind nvcoop.ini [dev] bots=1, implemented but never run in game: `bot.say {info}`,
+  `bot.vats {ref}` (limb unsupported, so not sent), `bot.menu.press {button}`, `bot.consent {answer}`,
+  `test.fasttravel {marker}` (a teleport across cells, reply `genuine:false`, not the real fast-travel call),
+  `dev.countRefs {base}` (spawn_once; counts the base over the loaded world).
+- `coop.leave` and `coop.join` are built. `plugin/coop/coop_module.cpp` registers both in `OnLoad`. `coop.leave {}`
+  drops this player out of the session and replies `{"ok":true}`. `coop.join {host?, port?}` builds a new session with the
+  configured or the given address and replies `{"ok":true}`. Both fail with `coop not running` when the co-op runtime is
+  not running. Neither was run through the scenario runner in a game. `scenlib.CAPABILITIES` still marks `session_leave`
+  and `session_join` as `proposed`, so `save_load_rejoin` stays `partial` until an in-game run proves them and they are
+  changed to `present`.
+- `coop.owner` is registered but not implemented. It always replies
+  `{"unsupported":true,"reason":"actor-ownership service is not in the plugin yet"}`, with no `owner` field.
+  `actor_owner` stays `proposed`, so `ownership_handoff` stays `partial`. By code reading, if `actor_owner` were marked
+  present against this plugin, the owner check would report `error` (`KeyError: 'owner'`), not a pass.
 
 ## Unknowns (to settle with `proof.py probe`)
 - `ref.GetDead`, `ref.GetLocked`, `ref.GetItemCount`, `ref.GetAV`, `ref.GetDistance` and the other `hex.Function` forms through
@@ -78,14 +124,28 @@ ends as `partial`. The method names above are proposals; they do not exist in th
 
 ## Lease API (agreed with T4a-pool)
 Uses `tools/pool/client.py`: `with lease("scenarios", n=players) as L:` then `L.bridge(i)` for each `L.instances`; `scen.py run`
-and `scen.py jump` do this. State key is `instance@generation` (generation from the lease), stored in `out/scenarios/state.json`.
+and `scen.py jump` do this through `runner.for_lease`. The state key is `instance@boot` (`L.boot(i)`, the id of the game
+process), stored in `out/scenarios/state.json`. See "State keys".
 
 ## Tests and twin
-48 tests: all 10 files valid; every form resolves with matching EditorID and type; load-order prefixes; 20 validator rejections
-(invented id, wrong EditorID, wrong type, unnormalized ref, unknown alias, bad stage/variable, wrong record type for a field,
-duplicate id, raw FormID in console, bad save name, no check, and a corrupted ref in each shipped file); translation of
-steps to exact console lines; comparison table; jump rules; runner against the fake world, including injected bugs (guest does
-not see changes, duplicated loot, double spawn, missing ownership handoff), steps landing on the named player, blocked steps,
-console parse errors, invalid scenarios never reaching the game, and in-place versus reload jumps.
-Twin: the suite is re-run under five mutants (`SCEN_MUTANT=` `noresolve`, `noreload`, `nodirty`, `passall`, `firsthost`); each must
-make the suite fail, and the run prints `caught` for each.
+63 tests: all 14 files valid; every form resolves with matching EditorID and type; load-order prefixes; validator rejections
+(20 tests in `ValidatorRejects`: invented id, wrong EditorID, wrong type, unnormalized ref, unknown alias, bad stage/variable,
+wrong record type for a field, duplicate id, raw FormID in console, bad save name, no check, and a corrupted ref in each shipped
+file); translation of steps to exact console lines; comparison table; jump rules; runner against the fake world, including
+injected bugs (guest does not see changes, duplicated loot, double spawn, missing ownership handoff), steps landing on the named
+player, blocked steps, console parse errors, invalid scenarios never reaching the game, and in-place versus reload jumps.
+State keys (6 tests in `GameProcessKeys`, on the real pool policy `tools/pool/core.py` with its fake backend, the real
+`client.Lease` and the fake game): after a pool restart, where the old `instance@generation` key repeats, a new game reloads
+the save; the same live game still jumps in place on the next lease; `proof.py jump`, `proof.py suite` and `scen.py jump` use
+these keys; a lease without a boot id and a `Runner` without keys never reuse old state.
+Shared state file (5 tests in `SharedStateFile`): two stores loaded before each other's put keep both keys, and the older
+copy of a key in one store does not replace the newer key on disk; a plan sees a dirty state that another store wrote
+after this store was made, and reloads; a failure between the write and the replace leaves the old valid file and no
+temporary file; a held lock gives `StateLockTimeout`; two Python processes that each put 200 different keys end with all
+400 keys.
+Twin: the suite is re-run under nine mutants (`SCEN_MUTANT=` `noresolve`, `noreload`, `nodirty`, `passall`, `firsthost`,
+`oldkey`, `wholedict`, `noreread`, `inplace`); each must make the suite fail, and the run prints `caught` for each.
+`oldkey` brings back the `instance@generation` key; all 6 `GameProcessKeys` tests fail under it. `wholedict` brings back
+the write of the whole in-memory dict (lost update), `noreread` plans from the state read at start, and `inplace` writes
+into the state file itself; each fails its `SharedStateFile` test. The pool suite has its own twins for the boot id
+(`gen_boot`, `stale_boot`, see docs/tools/T4a-pool.md).

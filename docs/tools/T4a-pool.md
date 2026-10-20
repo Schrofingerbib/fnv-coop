@@ -41,12 +41,19 @@ sys.path.insert(0, "tools/pool"); from client import lease
 with lease("scn-goodsprings", n=2, ttl_s=900, timeout_s=600) as L:
     L.instances      # [0, 1], host first
     nv = L.bridge(0) # NvBridge that already holds the bridge lock.* lease for L.owner
+    L.boot(0)        # id of that game process: "<pid>-<random token>"
     L.dirty(0, "why")  # instance is recycled on release
     L.renew()
 ```
 
 - Leaving the block releases the lease; an exception inside marks every instance dirty.
 - If an instance was restarted under you, `L.bridge()` raises `PoolError` (generation changed).
+- `L.boot(i)` (`boots` in the lease JSON, `boot` per instance in `status`) names the game process. The pool draws a new
+  one at every successful start, so it never repeats, also not after `down` and `up`. The generation (`gen`) starts again
+  at 1 on every pool start, so do not key state that must die with the game by `gen`. T4b keys its scenario state by
+  `boot` (docs/tools/T4b-scenarios.md, "State keys"). A health-check restart at lease time updates `boots` as it updates
+  `gens`. Tests: `check_boot_id_per_process` (twin `gen_boot`: the boot id is the generation alone) and
+  `check_boot_refreshed_at_lease` (twin `stale_boot`: the lease keeps the boot id of the replaced process).
 - `PoolBusy` means no free warm instance within `timeout_s`. `PoolNotRunning` means no daemon.
 - The pool does not reset game state between leases. Resetting in place is the scenario runner's job (T4b); it
   calls `L.dirty()` when it could not reset cleanly. `--base-save` loads a save once into each freshly booted instance.
