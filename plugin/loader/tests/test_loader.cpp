@@ -86,6 +86,33 @@ static std::string Info() {
     return o;
 }
 
+// ---- config files beside the core (nvcoop.ini, nvcoop_*.json): the stub reads them beside ITS module (the cache copy) ----
+static std::string g_tag;   // unique per process, so a cache copy left by an earlier run can never match
+static bool Exists(const std::string& p) { return GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
+static void RemoveFile(const std::string& p) {
+    SetFileAttributesA(p.c_str(), FILE_ATTRIBUTE_NORMAL);
+    DeleteFileA(p.c_str());
+}
+static void WriteText(const std::string& p, const std::string& text, bool readOnly = false) {
+    SetFileAttributesA(p.c_str(), FILE_ATTRIBUTE_NORMAL);
+    HANDLE h = CreateFileA(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD n = 0;
+        WriteFile(h, text.data(), static_cast<DWORD>(text.size()), &n, nullptr);
+        CloseHandle(h);
+    }
+    if (readOnly) SetFileAttributesA(p.c_str(), FILE_ATTRIBUTE_READONLY);
+}
+// Users often make game ini files read-only; the copy of a read-only file is read-only too.
+static void SetIni(const std::string& value) { WriteText(g_run + "nvcoop.ini", "[stub]\r\nvalue=" + value + "\r\n", true); }
+static void SetJson(const std::string& text) { WriteText(g_run + "nvcoop_stub.json", text); }
+static std::string Cfg() {
+    std::string o;
+    Call("stub.cfg", "{}", o);
+    return o;
+}
+static std::string Want(const std::string& ini, const std::string& json) { return "ini=" + ini + ";json=" + json; }
+
 int main(int argc, char** argv) {
     if (argc > 2) {   // smoke mode: nvloader_test <dir> <real core dll>: only maps the DLL and checks its export
         HMODULE m = LoadLibraryExA(argv[2], nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -103,6 +130,24 @@ int main(int argc, char** argv) {
     nvcoop::registry::SetLogFile(g_run + "loader_test.log");
     std::remove((g_run + "loader_test.log").c_str());
     SetEnvironmentVariableA("NVSTUB_VETO", nullptr);
+
+    // ---- which file names the loader mirrors into the cache ----
+    CHECK(IsCoreConfigFile("nvcoop.ini") && IsCoreConfigFile("NVCOOP.INI"), "nvcoop.ini is config (any case)");
+    CHECK(IsCoreConfigFile("nvcoop_rules.json") && IsCoreConfigFile("nvcoop_guest_local_run.json") && IsCoreConfigFile("Nvcoop_Edids.JSON"),
+          "nvcoop_*.json is config");
+    CHECK(IsCoreConfigFile("nvcoop_consent_messages.txt"), "the consent table is config");
+    CHECK(!IsCoreConfigFile("nvcoop.dll") && !IsCoreConfigFile("nvcoop_mod.dll") && !IsCoreConfigFile("nvcoop.log") &&
+              !IsCoreConfigFile("nvcoop_rules.json.bak") && !IsCoreConfigFile("xnvcoop_rules.json") && !IsCoreConfigFile("nvcoop.json") &&
+              !IsCoreConfigFile("nvcoop_notes.txt"),
+          "other files are not config");
+
+    // config next to the core file (= next to the loader in the default layout); nothing left in the cache by an earlier run
+    g_tag = std::to_string(GetCurrentProcessId());
+    for (const char* n : {"nvcoop.ini", "nvcoop_stub.json", "nvcoop_extra.json", "nvcoop.log", "nvcoop_mod.dll"}) RemoveFile(g_cache + n);
+    SetIni("first-" + g_tag);
+    SetJson("{\"v\":\"one-" + g_tag + "\"}");
+    WriteText(g_run + "nvcoop_extra.json", "{}");
+    WriteText(g_run + "nvcoop.log", "not config");
 
     // stale cache file from a "dead" process must be cleaned at start
     { HANDLE f = CreateFileA((g_cache + "nvcoop_mod.1.1.dll").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr); if (f != INVALID_HANDLE_VALUE) CloseHandle(f); }
@@ -129,12 +174,28 @@ int main(int argc, char** argv) {
         CHECK(Has("dev.reload") && Has("dev.status"), "dev methods registered");
         CHECK(CacheFiles() == 1, "exactly one cache copy while loaded");
 
+        // ---- the core finds its config beside its own module (the cache copy) ----
+        {
+            const std::string want = Want("first-" + g_tag, "{\"v\":\"one-" + g_tag + "\"}");
+            CHECK(Cfg() == want, ("core read nvcoop.ini (read-only) and nvcoop_stub.json beside its own module: " + Cfg()).c_str());
+            CHECK(Exists(g_cache + "nvcoop_extra.json"), "every nvcoop_*.json is copied");
+            CHECK(!Exists(g_cache + "nvcoop.log") && !Exists(g_cache + "nvcoop_mod.dll"), "only config files are copied");
+            std::string st;
+            CHECK(Call("dev.status", "{}", st) && Contains(st, "\"configFiles\":[") && Contains(st, "\"nvcoop.ini\"") &&
+                      Contains(st, "\"nvcoop_stub.json\""),
+                  ("dev.status lists the copied config files: " + st).c_str());
+        }
+
         // ---- the build can overwrite the original while the game runs (needs the private copy) ----
         CHECK(Put("nvstub_v2"), "overwrite core file while loaded");
+        SetIni("second-changed-" + g_tag);   // config edited between reloads
+        SetJson("{\"v\":\"two-" + g_tag + "\"}");
+        const std::string cfg2 = Want("second-changed-" + g_tag, "{\"v\":\"two-" + g_tag + "\"}");
         ReloadResult r = host.Reload("test");
         CHECK(r.ok, ("reload to v2: " + r.error).c_str());
         CHECK(host.generation() == 2, "generation 2");
         CHECK(Contains(Info(), "v2:frames=3"), "v2 running, frames blob preserved");
+        CHECK(Cfg() == cfg2, ("an ini and a json edited before the reload reach the new core: " + Cfg()).c_str());
         CHECK(!Has("stub.only_v1"), "old core's methods are gone");
         CHECK(Has("stub.only_v2"), "new core's methods are registered");
         CHECK(sp = nvcoop::registry::GetStateProvider(), "state provider re-registered");
@@ -165,22 +226,28 @@ int main(int argc, char** argv) {
             CHECK(host.generation() == 2 && host.loaded(), "generation unchanged after failed reload");
             CHECK(Contains(Info(), "v2:frames=4"), "previous core running again with its state");
             CHECK(Has("stub.only_v2"), "previous core's methods back");
+            CHECK(Cfg() == cfg2, ("the rolled-back core reads the current config: " + Cfg()).c_str());
             CHECK(ThreadCount() == threadsBefore, "no leaked thread after a failed reload");
         }
         CHECK(CacheFiles() == 1, "no cache files leaked by failures");
 
-        // ---- recover to a good build ----
+        // ---- recover to a good build; a data file deleted next to the loader must not live on in the cache ----
         CHECK(Put("nvstub_v1"), "put v1 again");
+        RemoveFile(g_run + "nvcoop_stub.json");
         r = host.Reload("recover");
         CHECK(r.ok && host.generation() == 3 && Contains(Info(), "v1:frames=4"), "reload back to v1 keeps state");
+        CHECK(Cfg() == Want("second-changed-" + g_tag, "missing"), ("a deleted nvcoop_stub.json is gone for the new core: " + Cfg()).c_str());
+        CHECK(!Exists(g_cache + "nvcoop_stub.json"), "the stale cache copy of the deleted json was removed");
 
         // ---- 100 reloads: state kept, no leaked threads, handles or files ----
         {
             int th = ThreadCount(), hd = HandleCount();
-            bool allOk = true;
+            bool allOk = true, cfgOk = true;
             for (int i = 0; i < 100; ++i) {
                 host.OnFrame();
                 CHECK(Put((i & 1) ? "nvstub_v1" : "nvstub_v2"), "put alternating build");
+                const std::string v = "loop" + std::to_string(i) + "-" + g_tag;
+                SetIni(v);
                 r = host.Reload("loop");
                 if (!r.ok) { allOk = false; std::printf("loop %d: %s\n", i, r.error.c_str()); break; }
                 if (!Contains(Info(), (std::string((i & 1) ? "v1" : "v2") + ":frames=" + std::to_string(5 + i)).c_str())) {
@@ -188,8 +255,13 @@ int main(int argc, char** argv) {
                     std::printf("loop %d: unexpected info %s\n", i, Info().c_str());
                     break;
                 }
+                if (cfgOk && Cfg() != Want(v, "missing")) {
+                    cfgOk = false;
+                    std::printf("loop %d: unexpected config %s\n", i, Cfg().c_str());
+                }
             }
             CHECK(allOk, "100 reloads succeeded with frame counter preserved");
+            CHECK(cfgOk, "each of the 100 reloads saw the ini written just before it");
             CHECK(host.generation() == 103, "generation 103 after 100 reloads");
             CHECK(ThreadCount() == th, "thread count unchanged after 100 reloads");
             CHECK(HandleCount() <= hd + 4, "no handle leak across 100 reloads");
@@ -256,8 +328,10 @@ int main(int argc, char** argv) {
     }
 
     // ---- core not built yet at game start, then built: dev.reload recovers ----
+    // No nvcoop.ini beside the loader this time: a missing config file is skipped, and its old cache copy goes.
     {
         DeleteFileA(g_core.c_str());
+        RemoveFile(g_run + "nvcoop.ini");
         HostEnv env;
         env.corePath = g_core;
         env.cacheDir = g_cache;
@@ -268,8 +342,29 @@ int main(int argc, char** argv) {
         CHECK(Put("nvstub_v1"), "put v1 (late)");
         std::string o;
         CHECK(Call("dev.reload", "{}", o) && host.loaded() && host.generation() == 1, "dev.reload loads a core that appeared later");
+        CHECK(Cfg() == Want("missing", "missing"), ("with no config beside the loader the core loads and reads none: " + Cfg()).c_str());
+        CHECK(!Exists(g_cache + "nvcoop.ini"), "the stale cache copy of the deleted nvcoop.ini was removed");
+        CHECK(Exists(g_cache + "nvcoop_extra.json"), "the remaining config file is still copied");
         std::string e;
         CHECK(host.Unload(e), "unload (late-loaded core)");
+    }
+
+    // ---- a config folder that cannot be listed: the load goes on, and the cache keeps its older copies ----
+    {
+        HostEnv env;
+        env.corePath = g_core;
+        env.cacheDir = g_cache;
+        env.configDir = g_run + "no_such_folder";
+        CoreHost host(env);
+        std::string err, st;
+        CHECK(host.Load(err), ("load with an unlistable config folder: " + err).c_str());
+        CHECK(Exists(g_cache + "nvcoop_extra.json"), "an unlistable config folder does not delete the cached copies");
+        CHECK(Call("dev.status", "{}", st) && Contains(st, "no_such_folder\\\\\"") && Contains(st, "\"configFiles\":[]"),
+              ("dev.status shows the configured folder and no copied files: " + st).c_str());
+        std::string e;
+        CHECK(host.Unload(e), "unload (unlistable config folder)");
+        RemoveFile(g_run + "nvcoop_extra.json");
+        RemoveFile(g_run + "nvcoop.log");
     }
 
     std::printf("loader tests: %d checks, %d failed\n", g_checks, g_failed);

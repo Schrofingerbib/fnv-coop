@@ -5,7 +5,9 @@
 //   hooks     a REAL nvhooks::HookRegistry patch on a function inside the host process (uninstalled and read back on shutdown)
 //   thread    a ManagedThread ticker whose count must keep growing across reloads
 //   socket    a UDP socket handed over as a raw SOCKET (not closed by shutdown, adopted by the next core)
-// Built once clean and once per TESTCORE_MUTANT=1..6; the host test must fail against every mutant.
+// Not carried, read fresh by every core at init: [testcore] value= from nvcoop.ini beside this module's own file, the
+// same lookup as IniPath() in the real modules (the loader must have copied the ini into its cache folder).
+// Built once clean and once per TESTCORE_MUTANT=1..9; the host test must fail against every mutant.
 #ifndef _M_IX86
 #error "testcore must be built for x86 (the hook patcher writes rel32 jumps)"
 #endif
@@ -122,6 +124,20 @@ bool g_adopted = false;
 nvreload::ManagedThread g_ticker;
 std::thread g_raw;                   // mutant 2 only
 std::atomic<bool> g_rawStop{false};
+std::string g_cfg = "unread";        // [testcore] value= read at init from nvcoop.ini beside this module
+
+void readConfig() {
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCSTR>(&readConfig), &self);
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(self, path, MAX_PATH);
+    std::string ini = path;
+    ini = ini.substr(0, ini.find_last_of("\\/") + 1) + "nvcoop.ini";
+    char v[64] = {};
+    GetPrivateProfileStringA("testcore", "value", "missing", v, sizeof v, ini.c_str());
+    g_cfg = v;
+}
 
 int processThreads() {
     int n = 0;
@@ -266,6 +282,7 @@ NVCOOP_RELOAD_STATE(tc_socket, "tc_socket", 1, 70, nullptr,
 namespace {
 int CoreInit() {
     g_threadsAtInit = processThreads();
+    readConfig();   // where the real core's modules read nvcoop.ini: onLoad, before AfterLoad
     g_label = "gen" + std::to_string(g_api->generation);
     return nvcoop::reload::AfterLoad(g_api) ? 1 : 0;
 }
@@ -291,9 +308,9 @@ extern "C" __declspec(dllexport) void NvCoreTest_Hold(int on) { g_hold = on; }
 
 // Everything the host test inspects, as "key=value;" text.
 extern "C" __declspec(dllexport) int NvCoreTest_Info(char* buf, int cap) {
-    int n = std::snprintf(buf, cap, "counter=%llu;label=%s;port=%u;adopted=%d;bg=%llu;hookcalls=%u;pristine=%d;threadsAtInit=%d;gen=%u;livehooks=%d;guardcalls=%u",
+    int n = std::snprintf(buf, cap, "counter=%llu;label=%s;port=%u;adopted=%d;bg=%llu;hookcalls=%u;pristine=%d;threadsAtInit=%d;gen=%u;livehooks=%d;guardcalls=%u;cfg=%s",
                           static_cast<unsigned long long>(g_counter), g_label.c_str(), static_cast<unsigned>(g_port), g_adopted ? 1 : 0,
                           static_cast<unsigned long long>(g_bgBase + g_bg.load()), g_hookCallsBase + g_hookCalls.load(), g_pristineAtInit,
-                          g_threadsAtInit, g_api ? g_api->generation : 0, nvhooks::liveHookCount(), nvreload::guardCalls());
+                          g_threadsAtInit, g_api ? g_api->generation : 0, nvhooks::liveHookCount(), nvreload::guardCalls(), g_cfg.c_str());
     return n;
 }

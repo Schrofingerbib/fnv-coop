@@ -5,7 +5,10 @@
 //   threads   the process thread count returns to the baseline after every reload (polled, not trusted from the core)
 //   handles   the process handle count does not creep; at most one cached core DLL file; only one core module mapped
 //   refusal   a hook chained over by "another mod" vetoes the reload and the old core keeps running
-// Usage: test_reload_host <core dll> <work dir>.   Exit 0 = every check passed. Built against mutant cores, which must fail.
+//   config    nvcoop.ini beside the core file is rewritten before every reload; each new core reads the new value beside
+//             its own module (the loader's cache copy), as the real modules do
+// Usage: test_reload_host <core dll> <work dir>.   Exit 0 = every check passed. Built against mutant cores, which must fail,
+// and as nvreload_host_test_<twin> against a mutant loader (NVLOADER_MUTANT_NOCONFIG / CONFIGONCE), which must fail too.
 #include <winsock2.h>
 #include <windows.h>
 #include <psapi.h>
@@ -138,6 +141,20 @@ static unsigned long long U(const std::map<std::string, std::string>& m, const c
     return it == m.end() ? ~0ull : std::strtoull(it->second.c_str(), nullptr, 10);
 }
 
+// nvcoop.ini next to the core file (= next to the loader dll in the game). The value is unique per process and per
+// write, so a cache copy left by an earlier run or an earlier load can never match.
+static std::string g_tag;
+static std::string IniValue(int cycle) { return "c" + std::to_string(cycle) + "x" + g_tag; }
+static void WriteIni(const std::string& value) {
+    const std::string p = g_run + "nvcoop.ini";
+    SetFileAttributesA(p.c_str(), FILE_ATTRIBUTE_NORMAL);
+    if (FILE* f = std::fopen(p.c_str(), "wb")) {
+        const std::string text = "[testcore]\r\nvalue=" + value + "\r\n";
+        std::fwrite(text.data(), 1, text.size(), f);
+        std::fclose(f);
+    }
+}
+
 // The host function the core hooks: int __cdecl f(int x) { return x + 1; }
 static uint8_t* g_target2 = nullptr;
 static void MakeTarget() {
@@ -202,6 +219,10 @@ int main(int argc, char** argv) {
     nvcoop::registry::SetLogFile(g_run + "reload_host.log");
     std::remove((g_run + "reload_host.log").c_str());
     CHECK(CopyFileA(coreSrc.c_str(), g_core.c_str(), FALSE) != 0, "copy test core into place");
+    g_tag = std::to_string(GetCurrentProcessId());
+    SetFileAttributesA((g_cache + "nvcoop.ini").c_str(), FILE_ATTRIBUTE_NORMAL);
+    DeleteFileA((g_cache + "nvcoop.ini").c_str());   // nothing left in the cache by an earlier run
+    WriteIni(IniValue(0));
 
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -221,6 +242,7 @@ int main(int argc, char** argv) {
         std::string err;
         CHECK(host.Load(err), "first load: " + err);
         auto info = Info();
+        CHECK(info["cfg"] == IniValue(0), "first core read nvcoop.ini beside its own module: cfg=" + info["cfg"]);
         CHECK(U(info, "pristine") == 1, "first core saw the original function bytes");
         CHECK(f(1) == 102, "first core hooked the host function");
         CHECK(std::memcmp(g_target, pristine, 6) != 0, "hook bytes are in place");
@@ -243,6 +265,7 @@ int main(int argc, char** argv) {
             Sleep(3);
             CHECK(f(2) == 103, "hook active before reload");
             ++hookCalls;
+            WriteIni(IniValue(i));   // the ini is edited while the old core runs; only the next core may see it
             ReloadResult r = host.Reload("test");
             if (!r.ok) {
                 CHECK(false, "reload " + std::to_string(i) + " failed: " + r.error);
@@ -251,6 +274,7 @@ int main(int argc, char** argv) {
             info = Info();
             std::string tag = " (cycle " + std::to_string(i) + ")";
             CHECK(host.generation() == static_cast<uint32_t>(i + 1), "generation advances" + tag);
+            CHECK(info["cfg"] == IniValue(i), "the new core read the ini edited before this reload: cfg=" + info["cfg"] + tag);
             CHECK(U(info, "counter") == frames, "frame counter survived: " + std::to_string(U(info, "counter")) + " != " + std::to_string(frames) + tag);
             CHECK(info["label"] == "gen1", "label saved by the first core is restored by every later one" + tag);
             CHECK(U(info, "gen") == static_cast<unsigned long long>(i + 1), "the core running is the new generation" + tag);

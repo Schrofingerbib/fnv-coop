@@ -1,6 +1,7 @@
 #include "loader_host.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -19,6 +20,10 @@
 //   NVLOADER_MUTANT_NOPURGE   leave the old core's bridge methods registered after unload
 //   NVLOADER_MUTANT_NOVETO    unload even when the core vetoes
 //   NVLOADER_MUTANT_NOROLLBACK stay dead when the new core fails to load
+//   NVLOADER_MUTANT_NOCONFIG  do not copy nvcoop.ini / nvcoop_*.json into the cache (the core finds no config)
+//   NVLOADER_MUTANT_CONFIGONCE copy the config only at the first load (edits made before a reload are lost)
+//   NVLOADER_MUTANT_NOPRUNE   keep a cache copy whose source file was deleted (the core reads a removed file)
+//   NVLOADER_MUTANT_NOATTRS   leave a read-only cache copy read-only (the next copy over it fails)
 
 namespace nvcoop::loader {
 namespace {
@@ -59,6 +64,41 @@ std::string StemOf(const std::string& path) {
     std::string f = p == std::string::npos ? path : path.substr(p + 1);
     size_t d = f.find_last_of('.');
     return d == std::string::npos ? f : f.substr(0, d);
+}
+std::string Lower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+void WithSlash(std::string& dir) {
+    if (!dir.empty() && dir.back() != '\\' && dir.back() != '/') dir += '\\';
+}
+// Absolute, lower-case, with a trailing backslash: two spellings of one folder give the same key.
+std::string DirKey(const std::string& dir) {
+    char b[1024];
+    DWORD n = GetFullPathNameA(dir.c_str(), sizeof b, b, nullptr);
+    std::string s = (n > 0 && n < sizeof b) ? std::string(b, n) : dir;
+    WithSlash(s);
+    return Lower(s);
+}
+// Config files directly in `dir` (long names, no folders). False if the folder cannot be listed (no match is fine).
+bool ConfigNamesIn(const std::string& dir, std::vector<std::string>& out) {
+    out.clear();
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dir + "nvcoop*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && IsCoreConfigFile(fd.cFileName)) out.push_back(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return true;
+}
+// CopyFile and DeleteFile both fail on a read-only file; a copy of a read-only source is read-only too.
+void MakeWritable(const std::string& path) {
+#ifndef NVLOADER_MUTANT_NOATTRS
+    SetFileAttributesA(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+#else
+    (void)path;
+#endif
 }
 
 void SetStr(void* h, const char* text) { *static_cast<std::string*>(h) = text ? text : ""; }
@@ -170,9 +210,18 @@ uint64_t g_seq = 0;   // cache file sequence, unique per process
 
 CoreHost* Current() { return g_current; }
 
+bool IsCoreConfigFile(const std::string& fileName) {
+    const std::string n = Lower(fileName);
+    if (n == "nvcoop.ini" || n == "nvcoop_consent_messages.txt") return true;
+    return n.size() >= 12 && n.compare(0, 7, "nvcoop_") == 0 && n.compare(n.size() - 5, 5, ".json") == 0;
+}
+
 CoreHost::CoreHost(HostEnv env) : env_(std::move(env)) {
     if (env_.cacheDir.empty()) env_.cacheDir = DirOf(env_.corePath) + "nvcoop_cache\\";
     if (!env_.cacheDir.empty() && env_.cacheDir.back() != '\\' && env_.cacheDir.back() != '/') env_.cacheDir += '\\';
+    if (env_.configDir.empty()) env_.configDir = DirOf(env_.corePath);
+    if (env_.configDir.empty()) env_.configDir = ".\\";
+    WithSlash(env_.configDir);
     g_current = this;
     gate_ = std::make_shared<Gate>();
     CleanStaleCache();
@@ -194,6 +243,64 @@ void CoreHost::CleanStaleCache() {
     do { DeleteFileA((env_.cacheDir + fd.cFileName).c_str()); } while (FindNextFileA(h, &fd));
     FindClose(h);
 }
+
+// The core's modules find nvcoop.ini, nvcoop_*.json and the consent table beside their own module file, and that
+// file is the cache copy. Mirror the loader folder's current config files into the cache folder before each
+// LoadLibrary: copy (overwrite) every present file, delete cache copies whose source is gone, skip missing files.
+#ifdef NVLOADER_MUTANT_NOCONFIG
+void CoreHost::SyncConfig() { configFiles_.clear(); }
+#else
+void CoreHost::SyncConfig() {
+#ifdef NVLOADER_MUTANT_CONFIGONCE
+    static bool once = false;
+    if (once) return;
+    once = true;
+#endif
+    const std::string& src = env_.configDir;
+    const std::string& dst = env_.cacheDir;
+    configFiles_.clear();
+    if (DirKey(src) == DirKey(dst)) return;   // the core already runs beside its config
+    std::vector<std::string> want, have;
+    if (!ConfigNamesIn(src, want)) {   // keep the older copies rather than delete them all
+        nvcoop::Log("loader: cannot list config files in %s (error %lu); the cache keeps its older copies", src.c_str(), GetLastError());
+        return;
+    }
+#ifndef NVLOADER_MUTANT_NOPRUNE
+    ConfigNamesIn(dst, have);
+    for (const std::string& h : have) {
+        const std::string key = Lower(h);
+        if (std::none_of(want.begin(), want.end(), [&](const std::string& w) { return Lower(w) == key; })) {
+            MakeWritable(dst + h);
+            DeleteFileA((dst + h).c_str());
+        }
+    }
+#endif
+    std::string list;
+    for (const std::string& name : want) {
+        const std::string from = src + name, to = dst + name;
+        bool copied = false;
+        DWORD e = 0;
+        for (int i = 0; i < 10 && !copied; ++i) {   // an editor or tool may be writing the file right now
+            MakeWritable(to);
+            copied = CopyFileA(from.c_str(), to.c_str(), FALSE) != 0;
+            if (copied) break;
+            e = GetLastError();
+            if (e == ERROR_FILE_NOT_FOUND) break;   // deleted after the listing
+            Sleep(50);
+        }
+        if (copied) {
+            configFiles_.push_back(name);
+            list += " " + name;
+        } else if (e == ERROR_FILE_NOT_FOUND) {
+            MakeWritable(to);
+            DeleteFileA(to.c_str());
+        } else {
+            nvcoop::Log("loader: cannot copy config %s to the cache (error %lu); the core reads the older copy, if any", name.c_str(), e);
+        }
+    }
+    nvcoop::Log("loader: %u config file(s) copied to the cache:%s", static_cast<unsigned>(configFiles_.size()), list.c_str());
+}
+#endif
 
 std::string CoreHost::MakeCachePath(uint32_t seq) const {
     char b[64];
@@ -236,6 +343,7 @@ bool CoreHost::LoadCoreFrom(const std::string& sourcePath, bool isReload, uint32
     }
     if (!copied) { err = "cannot copy core '" + sourcePath + "' to cache (error " + std::to_string(GetLastError()) + ")"; return false; }
 #endif
+    SyncConfig();   // every load, reload and rollback: the core's modules read their config at onLoad
     HMODULE m = LoadLibraryExA(cache.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!m) {
         err = "LoadLibrary failed for core (error " + std::to_string(GetLastError()) + ")";
@@ -505,9 +613,12 @@ void CoreHost::StopWatcher() {
 }
 
 std::string CoreHost::StatusJson() const {
+    std::string files;
+    for (const std::string& f : configFiles_) files += (files.empty() ? "\"" : ",\"") + JsonEsc(f) + "\"";
     std::string s = "{\"loaded\":" + std::string(loaded_ ? "true" : "false") + ",\"generation\":" + std::to_string(generation_) +
                     ",\"reloadCount\":" + std::to_string(reloadCount_) + ",\"corePath\":\"" + JsonEsc(env_.corePath) +
-                    "\",\"cachePath\":\"" + JsonEsc(cachePath_) + "\",\"watching\":" + (watcher_.joinable() ? "true" : "false") +
+                    "\",\"cachePath\":\"" + JsonEsc(cachePath_) + "\",\"configDir\":\"" + JsonEsc(env_.configDir) +
+                    "\",\"configFiles\":[" + files + "],\"watching\":" + (watcher_.joinable() ? "true" : "false") +
                     ",\"pending\":" + (reloadPending.load() ? "true" : "false") + ",\"last\":{\"ok\":" + (last_.ok ? "true" : "false") +
                     ",\"rolledBack\":" + (last_.rolledBack ? "true" : "false") + ",\"coreDead\":" + (last_.coreDead ? "true" : "false") +
                     ",\"error\":\"" + JsonEsc(last_.error) + "\",\"msUnload\":" + std::to_string(last_.msUnload) +

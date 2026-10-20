@@ -35,7 +35,7 @@ function(loader_flags tgt)
 endfunction()
 
 # nvloader_host = CoreHost; the _m* twins each break one safety rule (see loader_host.cpp)
-set(LOADER_MUTANTS NOCOPY NOPURGE NOVETO NOROLLBACK)
+set(LOADER_MUTANTS NOCOPY NOPURGE NOVETO NOROLLBACK NOCONFIG CONFIGONCE NOPRUNE NOATTRS)
 function(loader_host_lib name)
   add_library(${name} STATIC ${LOADER_DIR}/loader_host.cpp)
   target_include_directories(${name} PUBLIC ${LOADER_DIR} ${LOADER_DIR}/..)
