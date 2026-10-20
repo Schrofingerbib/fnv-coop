@@ -23,7 +23,8 @@
 //
 // Threads: Install and Uninstall hold one mutex for their whole body, so calls from different threads run one at a time.
 // Without it, two Install calls on the same window could both subclass it, and the guard would then chain to itself.
-// The guard's window procedure does not take the mutex. It reads only atomics, and on WM_NCDESTROY it clears them.
+// The guard's window procedure reads only atomics. It takes the mutex only for its WM_NCDESTROY cleanup, so an Uninstall
+// plus an Install of another window on another thread cannot run in the middle of that cleanup and lose the new state.
 #include <windows.h>
 
 namespace nvsplit {
@@ -50,6 +51,8 @@ unsigned long Swallowed();  // WM_ACTIVATE(WA_INACTIVE) messages kept from the e
 namespace test {
 // Install calls hook(h) after it reads the old window procedure and before it calls SetWindowLongPtrA. Null = no call.
 void SetInstallHook(void (*hook)(HWND));
+// The WM_NCDESTROY cleanup calls hook(h) after it has decided to forget h and before it clears the state. Null = no call.
+void SetDestroyHook(void (*hook)(HWND));
 // True when the saved original procedure is the guard itself. The guard would then call itself until the stack overflows.
 bool OrigIsGuard();
 }  // namespace test

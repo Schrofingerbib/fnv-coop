@@ -10,6 +10,7 @@
 //   4 = Uninstall reports success but leaves the guard in place
 //   5 = no reset on WM_NCDESTROY (the guard keeps the destroyed window and rejects the new one)
 //   6 = no mutex in Install and Uninstall (two Install calls on one window make the guard chain to itself)
+//   7 = WM_NCDESTROY cleanup without the mutex (an Uninstall + Install on another thread during it loses the new window)
 #ifndef FOCUS_GUARD_MUTANT
 #define FOCUS_GUARD_MUTANT 0
 #endif
@@ -19,9 +20,10 @@ namespace {
 std::atomic<HWND> g_hwnd{nullptr};
 std::atomic<WNDPROC> g_orig{nullptr};
 std::atomic<unsigned long> g_swallowed{0};
-std::mutex g_lock;  // held for the whole body of Install and Uninstall, never by GuardProc
+std::mutex g_lock;  // held for the whole body of Install and Uninstall, and by GuardProc only for WM_NCDESTROY cleanup
 #ifdef FOCUS_GUARD_TESTING
 std::atomic<void (*)(HWND)> g_installHook{nullptr};
+std::atomic<void (*)(HWND)> g_destroyHook{nullptr};
 #endif
 
 LRESULT CALLBACK GuardProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -35,11 +37,21 @@ LRESULT CALLBACK GuardProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 #endif
     const LRESULT r = orig ? CallWindowProcA(orig, h, msg, wp, lp) : DefWindowProcA(h, msg, wp, lp);
 #if FOCUS_GUARD_MUTANT != 5
-    if (msg == WM_NCDESTROY && g_hwnd.load() == h) {
+    if (msg == WM_NCDESTROY) {
         // The last message this window gets. The engine has seen it (above). Forget the window, so that Install accepts the
-        // window the game makes next. Clear g_orig first: an Install that sees g_hwnd == null then cannot lose its g_orig.
-        g_orig.store(nullptr);
-        g_hwnd.store(nullptr);
+        // window the game makes next. Hold the mutex: otherwise an Uninstall + Install of another window on another thread
+        // could run between the check and the stores, and this cleanup would then erase the new window's state. No deadlock:
+        // Install and Uninstall send no messages to the window while they hold it (SetWindowLongPtr of GWLP_WNDPROC does not).
+#if FOCUS_GUARD_MUTANT != 7
+        std::lock_guard<std::mutex> lock(g_lock);
+#endif
+        if (g_hwnd.load() == h) {
+#ifdef FOCUS_GUARD_TESTING
+            if (auto hook = g_destroyHook.load()) hook(h);  // the race test runs Uninstall + Install on another thread here
+#endif
+            g_orig.store(nullptr);
+            g_hwnd.store(nullptr);
+        }
     }
 #endif
     return r;
@@ -111,6 +123,7 @@ unsigned long Swallowed() { return g_swallowed.load(); }
 #ifdef FOCUS_GUARD_TESTING
 namespace test {
 void SetInstallHook(void (*hook)(HWND)) { g_installHook.store(hook); }
+void SetDestroyHook(void (*hook)(HWND)) { g_destroyHook.store(hook); }
 bool OrigIsGuard() { return g_orig.load() == &GuardProc; }
 }  // namespace test
 #endif

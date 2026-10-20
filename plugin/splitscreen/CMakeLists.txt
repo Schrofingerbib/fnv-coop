@@ -24,7 +24,7 @@ nvsplit_flags(nvsplit_focus)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_LIST_DIR)
   # FOCUS_GUARD_TESTING gives the test-only hooks in focus_guard.h. The nvsplit_focus library above never defines it.
-  foreach(n 0 1 2 3 4 5 6)
+  foreach(n 0 1 2 3 4 5 6 7)
     add_executable(nvsplit_focus_tests_m${n} ${NVSPLIT_DIR}/tests/test_focus_guard.cpp ${NVSPLIT_DIR}/focus_guard.cpp)
     target_compile_definitions(nvsplit_focus_tests_m${n} PRIVATE FOCUS_GUARD_MUTANT=${n} FOCUS_GUARD_TESTING=1)
     target_link_libraries(nvsplit_focus_tests_m${n} PRIVATE user32)

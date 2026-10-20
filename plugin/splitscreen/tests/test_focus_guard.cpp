@@ -58,6 +58,20 @@ void RaceHook(HWND h) {
     g_racer = std::thread([h] { g_racerResult.store(nvsplit::Install(h)); });
     Sleep(100);
 }
+
+// Destroy race: while the guarded window A is in its WM_NCDESTROY cleanup, another thread uninstalls A and installs B.
+// With the mutex the other thread waits for the cleanup and then installs B cleanly. Without it, the cleanup erases B's state.
+std::thread g_destroyRacer;
+HWND g_raceB = nullptr;
+std::atomic<bool> g_destroyRacerInstalled{false};
+void DestroyRaceHook(HWND) {
+    nvsplit::test::SetDestroyHook(nullptr);
+    std::thread([] {
+        nvsplit::Uninstall();
+        g_destroyRacerInstalled.store(nvsplit::Install(g_raceB));
+    }).swap(g_destroyRacer);
+    Sleep(100);
+}
 }  // namespace
 
 int main() {
@@ -168,6 +182,24 @@ int main() {
     g_seen.clear();
     DestroyWindow(h2);  // this time the guard is the top of the chain
     CHECK(CountSeen(WM_NCDESTROY, 0) == 1);
+    CHECK(nvsplit::Installed() == nullptr);
+
+    // ---- WM_NCDESTROY cleanup vs Uninstall + Install of another window on another thread ----
+    HWND a = MakeWindow("nvsplit_focus_test_d");
+    g_raceB = MakeWindow("nvsplit_focus_test_e");
+    CHECK(a != nullptr && g_raceB != nullptr);
+    CHECK(nvsplit::Install(a));
+    nvsplit::test::SetDestroyHook(&DestroyRaceHook);
+    DestroyWindow(a);
+    if (g_destroyRacer.joinable()) g_destroyRacer.join();
+    CHECK(g_destroyRacerInstalled.load());
+    CHECK(nvsplit::Installed() == g_raceB);  // the cleanup of A must not erase B's state
+    r = SendMessageA(g_raceB, WM_USER + 1, 11, 0);
+    CHECK(r == 42);  // B's own procedure still gets its messages through the guard
+    g_seen.clear();
+    SendMessageA(g_raceB, WM_ACTIVATE, MAKEWPARAM(WA_INACTIVE, 0), 0);
+    CHECK(CountSeen(WM_ACTIVATE, MAKEWPARAM(WA_INACTIVE, 0)) == 0);
+    DestroyWindow(g_raceB);
     CHECK(nvsplit::Installed() == nullptr);
 
     std::printf("focus guard: %d checks, %d failed\n", g_checks, g_failed);

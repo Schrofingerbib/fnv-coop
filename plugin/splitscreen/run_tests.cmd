@@ -1,6 +1,6 @@
 @echo off
 rem One-command split-screen tests (focus guard): x86 standalone build in build\splitscreen (inside the repo, not %%TEMP%%),
-rem   real tests must report " 0 failed"; every mutant (FOCUS_GUARD_MUTANT=1..6) must report ", N failed" with N > 0.
+rem   real tests must report " 0 failed"; every mutant (FOCUS_GUARD_MUTANT=1..7) must report ", N failed" with N > 0.
 setlocal EnableDelayedExpansion
 set HERE=%~dp0
 set BLD=%HERE%..\..\build\splitscreen
@@ -20,7 +20,7 @@ type "%BLD%\real.txt"
 findstr /C:" 0 failed" "%BLD%\real.txt" >nul
 set REAL_OK=%ERRORLEVEL%
 set BAD=0
-for /L %%N in (1,1,6) do (
+for /L %%N in (1,1,7) do (
   "%BLD%\nvsplit_focus_tests_m%%N.exe" > "%BLD%\mutant%%N.txt"
   set RC=!ERRORLEVEL!
   findstr /R /C:", [1-9][0-9]* failed" "%BLD%\mutant%%N.txt" >nul
@@ -31,5 +31,5 @@ for /L %%N in (1,1,6) do (
 if not "%REAL_RC%"=="0" exit /b 1
 if not "%REAL_OK%"=="0" exit /b 1
 if not "%BAD%"=="0" ( echo splitscreen: a mutant slipped through & exit /b 1 )
-echo splitscreen focus guard: real tests pass, all 6 mutants rejected - ALL OK
+echo splitscreen focus guard: real tests pass, all 7 mutants rejected - ALL OK
 exit /b 0
