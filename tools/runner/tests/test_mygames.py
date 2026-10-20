@@ -40,6 +40,22 @@ def redirect_errors(documents_fn) -> list:
     return errs
 
 
+def override_errors(documents_fn) -> list:
+    """Errors when FNV_DOCUMENTS_DIR is used without expanding ~ / %VARS% or without making it absolute."""
+    errs = []
+    cases = {
+        "~/OneDrive/Documents": Path.home() / "OneDrive" / "Documents",
+        "%FNV_TEST_DOCS_ROOT%\\Docs": Path(tempfile.gettempdir()) / "Docs",
+        "rel_docs": Path.cwd() / "rel_docs",
+    }
+    for value, want in cases.items():
+        with mock.patch.dict(os.environ, {"FNV_DOCUMENTS_DIR": value, "FNV_TEST_DOCS_ROOT": tempfile.gettempdir()}):
+            got = documents_fn(lambda: None)
+        if got != want.resolve():
+            errs.append(f"{value!r} -> {got}, want {want.resolve()}")
+    return errs
+
+
 def forbidden_lookups(root: Path) -> list:
     hits = []
     for p in sorted(root.rglob("*.py")):
@@ -63,6 +79,14 @@ class MyGames(unittest.TestCase):
         with mock.patch.dict(os.environ, {"FNV_DOCUMENTS_DIR": r"X:\Docs"}):
             self.assertEqual(mygames.documents_dir(lambda: Path(r"Y:\Other")), Path(r"X:\Docs"))
             self.assertEqual(mygames.saves_dir(), Path(r"X:\Docs") / "My Games" / "FalloutNV" / "Saves")
+
+    def test_env_override_is_expanded_and_absolute(self):
+        self.assertEqual(override_errors(mygames.documents_dir), [])
+
+    def test_twin_raw_env_override_is_caught(self):
+        def raw(resolver=mygames.shell_documents):  # the first version: Path(env) as given
+            return Path(os.environ["FNV_DOCUMENTS_DIR"])
+        self.assertNotEqual(override_errors(raw), [])
 
     def test_fallback_when_shell_has_no_answer(self):
         with mock.patch.dict(os.environ, {}, clear=False):

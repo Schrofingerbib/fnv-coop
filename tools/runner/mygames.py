@@ -30,10 +30,16 @@ def shell_documents() -> Optional[Path]:
     return Path(buf.value) if hr == 0 and buf.value else None
 
 
+def normalize_override(value: str) -> Path:
+    """An operator-supplied folder: expand ~ and %VARS%, then make it absolute (a relative path must not depend on
+    whatever the working directory is when a tool runs)."""
+    return Path(os.path.expandvars(os.path.expanduser(value.strip()))).resolve()
+
+
 def documents_dir(resolver: Callable[[], Optional[Path]] = shell_documents) -> Path:
     env = os.environ.get("FNV_DOCUMENTS_DIR")
-    if env:
-        return Path(env)
+    if env and env.strip():
+        return normalize_override(env)
     found = resolver()
     return found if found else Path.home() / "Documents"
 
