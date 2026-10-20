@@ -127,6 +127,60 @@ PREFS_EDITS = [
 ]
 
 
+class PrefsUnavailable(RuntimeError):
+    pass
+
+
+def display_adapter_name() -> Optional[str]:
+    """The primary display adapter's name (EnumDisplayDevicesW), which is what the game's launcher writes as sD3DDevice."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class DisplayDevice(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("DeviceName", wintypes.WCHAR * 32), ("DeviceString", wintypes.WCHAR * 128),
+                    ("StateFlags", wintypes.DWORD), ("DeviceID", wintypes.WCHAR * 128), ("DeviceKey", wintypes.WCHAR * 128)]
+
+    first, i = None, 0
+    while True:
+        dd = DisplayDevice()
+        dd.cb = ctypes.sizeof(dd)
+        if not ctypes.windll.user32.EnumDisplayDevicesW(None, i, ctypes.byref(dd), 0):
+            break
+        if dd.DeviceString and first is None:
+            first = dd.DeviceString
+        if dd.StateFlags & 0x4:  # DISPLAY_DEVICE_PRIMARY_DEVICE
+            return dd.DeviceString
+        i += 1
+    return first
+
+
+def default_prefs(adapter=None) -> str:
+    """FalloutPrefs.ini for an owner who has none (the game never ran here): Fallout_default.ini, the game's own low.ini
+    preset over it, and sD3DDevice. FalloutNV.exe 1.4.0.525 starts FalloutNVLauncher.exe instead of the game when the
+    prefs have no sD3DDevice (checked in game on 2026-10-21: a 6-line prefs file and a defaults-only one both opened the
+    launcher on the owner's desktop; the same defaults plus sD3DDevice started the game)."""
+    g = game_dir()
+    d = g / "Fallout_default.ini"
+    text = d.read_text(encoding="latin-1") if d.exists() else ""
+    low = g / "low.ini"
+    if low.exists():
+        sec = None
+        for line in low.read_text(encoding="latin-1").splitlines():
+            s = line.strip()
+            if s.startswith("[") and s.endswith("]"):
+                sec = s[1:-1]
+            elif "=" in s and sec and not s.startswith(";"):
+                k, v = s.split("=", 1)
+                text = ini_set(text, sec, k.strip(), v.strip())
+    name = (adapter or display_adapter_name)()
+    if not name:
+        raise PrefsUnavailable("no FalloutPrefs.ini in My Games and the display adapter name is unknown: start Fallout: New "
+                               "Vegas once through Steam so its launcher writes FalloutPrefs.ini, then provision again")
+    return ini_set(text, "Display", "sD3DDevice", f'"{name}"')
+
+
 def _base_ini(name: str) -> str:
     """Start from the user's My Games ini (has the DLC archive list etc.), else the game default."""
     mg = mygames.my_games_dir() / name
@@ -136,6 +190,8 @@ def _base_ini(name: str) -> str:
         d = game_dir() / "Fallout_default.ini"
         if d.exists():
             return d.read_text(encoding="latin-1")
+    if name.lower() == "falloutprefs.ini":
+        return default_prefs()
     return ""
 
 
