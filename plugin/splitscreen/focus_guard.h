@@ -15,6 +15,15 @@
 // reference in the whole .text section, the write at 0x86A26F). Checked against a Steamless-unpacked 1.4.0.525 image.
 // The subclass must live in a DLL that is never unloaded (the monolithic nvcoop.dll or the split-mode loader), otherwise a
 // hot reload would leave the window procedure pointing into freed code.
+//
+// Window lifetime: the game can destroy its window and make a new one (tools/runner/winproc.py: the game recreates its
+// window after the splash). When the guarded window gets WM_NCDESTROY, the guard forwards it to the original procedure
+// first, then forgets the window and the original procedure. Install then accepts the new window. The guard does not use
+// IsWindow for this, because Windows can give a destroyed window's handle value to a new window.
+//
+// Threads: Install and Uninstall hold one mutex for their whole body, so calls from different threads run one at a time.
+// Without it, two Install calls on the same window could both subclass it, and the guard would then chain to itself.
+// The guard's window procedure does not take the mutex. It reads only atomics, and on WM_NCDESTROY it clears them.
 #include <windows.h>
 
 namespace nvsplit {
@@ -25,13 +34,25 @@ enum class Action { Pass, Swallow };
 Action Decide(UINT msg, WPARAM wParam);
 
 // Subclasses h once. Returns true when the guard is on h after the call (installed now or earlier).
-// Returns false when the guard is already on another window, or SetWindowLongPtr fails. Safe from any thread of the process.
+// Returns false when the guard is already on another live window, or SetWindowLongPtr fails.
+// Safe from any thread of the process: calls are serialized by the mutex (see "Threads" above).
 bool Install(HWND h);
 
 // Puts the original window procedure back if the guard is still the top of the chain. Returns true if it did.
+// Holds the same mutex as Install.
 bool Uninstall();
 
 HWND Installed();
 unsigned long Swallowed();  // WM_ACTIVATE(WA_INACTIVE) messages kept from the engine so far
+
+#ifdef FOCUS_GUARD_TESTING
+// Test-only hooks. The test build defines FOCUS_GUARD_TESTING. The plugin build does not, so these do not exist there.
+namespace test {
+// Install calls hook(h) after it reads the old window procedure and before it calls SetWindowLongPtrA. Null = no call.
+void SetInstallHook(void (*hook)(HWND));
+// True when the saved original procedure is the guard itself. The guard would then call itself until the stack overflows.
+bool OrigIsGuard();
+}  // namespace test
+#endif
 
 }  // namespace nvsplit

@@ -1,8 +1,11 @@
 // Game-free tests for the focus guard, on a real hidden Win32 window whose procedure stands in for the engine's.
 // Prints "focus guard: N checks, M failed". plugin\splitscreen\run_tests.cmd builds it once per FOCUS_GUARD_MUTANT.
+// The test build defines FOCUS_GUARD_TESTING (CMakeLists.txt), which gives the test-only hooks in focus_guard.h.
 #include "../focus_guard.h"
 
+#include <atomic>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -18,10 +21,12 @@ void Check(bool ok, const char* what, int line) {
 
 struct Seen { UINT msg; WPARAM wp; };
 std::vector<Seen> g_seen;  // what the stand-in engine procedure received
+HWND g_installedAtNcDestroy = nullptr;  // nvsplit::Installed() while the engine procedure handles WM_NCDESTROY
 
 // Stand-in for the engine procedure 0x86A0A0: records every message; WM_USER+1 returns 42 to prove return values pass.
 LRESULT CALLBACK EngineProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     g_seen.push_back({msg, wp});
+    if (msg == WM_NCDESTROY) g_installedAtNcDestroy = nvsplit::Installed();
     if (msg == WM_USER + 1) return 42;
     if (msg == WM_ACTIVATE) return 0;
     return DefWindowProcA(h, msg, wp, lp);
@@ -40,6 +45,18 @@ HWND MakeWindow(const char* cls) {
     wc.lpszClassName = cls;
     RegisterClassA(&wc);
     return CreateWindowExA(0, cls, "focus guard test", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, nullptr, nullptr, wc.hInstance, nullptr);
+}
+
+// Race test: the first Install calls this after it reads the old procedure and before it subclasses the window.
+// It starts a second thread that installs on the same window, then waits. With the mutex, the second Install waits for the
+// first one and then finds the window installed. Without it, the second Install subclasses the window inside this gap, and
+// the first one then reads the guard back as "the original procedure".
+std::thread g_racer;
+std::atomic<bool> g_racerResult{false};
+void RaceHook(HWND h) {
+    nvsplit::test::SetInstallHook(nullptr);  // one call only: the second Install must not start a third
+    g_racer = std::thread([h] { g_racerResult.store(nvsplit::Install(h)); });
+    Sleep(100);
 }
 }  // namespace
 
@@ -60,7 +77,21 @@ int main() {
     HWND h = MakeWindow("nvsplit_focus_test_a");
     CHECK(h != nullptr);
     CHECK(nvsplit::Installed() == nullptr);
+    // The first Install races a second Install on the same window from another thread (RaceHook).
+    nvsplit::test::SetInstallHook(&RaceHook);
     CHECK(nvsplit::Install(h));
+    const bool raced = g_racer.joinable();
+    CHECK(raced);  // the hook ran, so the race really happened
+    if (raced) g_racer.join();
+    CHECK(g_racerResult.load());  // the second Install found the guard on h
+    // Check the chain before any message goes through the window: a guard that chains to itself overflows the stack.
+    const bool chainOk = !nvsplit::test::OrigIsGuard();
+    CHECK(chainOk);
+    if (!chainOk) {
+        SetWindowLongPtrA(h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&EngineProc));  // no message can reach the loop now
+        std::printf("focus guard: %d checks, %d failed (stopped: the guard chains to itself)\n", g_checks, g_failed);
+        return 1;
+    }
     CHECK(nvsplit::Installed() == h);
     CHECK(nvsplit::Install(h));  // idempotent
     HWND other = MakeWindow("nvsplit_focus_test_b");
@@ -113,7 +144,31 @@ int main() {
     // ---- bad input ----
     CHECK(!nvsplit::Install(nullptr));
     DestroyWindow(other);
-    DestroyWindow(h);
+
+    // ---- the guarded window is destroyed (the game recreates its window): the guard forgets it, takes the new one ----
+    g_seen.clear();
+    g_installedAtNcDestroy = nullptr;
+    DestroyWindow(h);  // through the outer subclass Top::Proc, then the guard
+    CHECK(CountSeen(WM_NCDESTROY, 0) == 1);  // the engine procedure got WM_NCDESTROY
+    CHECK(g_installedAtNcDestroy == h);      // ... before the guard forgot the window
+    CHECK(nvsplit::Installed() == nullptr);
+    HWND h2 = MakeWindow("nvsplit_focus_test_c");
+    CHECK(h2 != nullptr);
+    CHECK(nvsplit::Install(h2));
+    CHECK(nvsplit::Installed() == h2);
+    const unsigned long swallowedBefore = nvsplit::Swallowed();
+    g_seen.clear();
+    r = SendMessageA(h2, WM_ACTIVATE, MAKEWPARAM(WA_INACTIVE, 0), 0);
+    CHECK(r == 0);
+    CHECK(CountSeen(WM_ACTIVATE, MAKEWPARAM(WA_INACTIVE, 0)) == 0);  // swallowed on the new window
+    CHECK(nvsplit::Swallowed() == swallowedBefore + 1);
+    r = SendMessageA(h2, WM_USER + 1, 9, 0);
+    CHECK(r == 42);  // the new window's own procedure is the one the guard chains to
+    CHECK(CountSeen(WM_USER + 1, 9) == 1);
+    g_seen.clear();
+    DestroyWindow(h2);  // this time the guard is the top of the chain
+    CHECK(CountSeen(WM_NCDESTROY, 0) == 1);
+    CHECK(nvsplit::Installed() == nullptr);
 
     std::printf("focus guard: %d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
