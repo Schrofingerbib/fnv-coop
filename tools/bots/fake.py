@@ -27,12 +27,14 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from .bot import PLAYER_REF, angle_diff, heading_deg
-from .bot import ConnectionLost, RpcError  # re-exported from nvbridge
+from .bot import BridgeError, ConnectionLost, RpcError  # re-exported from nvbridge
 from . import primitives as P
 
 PLAYER_ID = 0x14
 _DRIVER_METHODS = {P.M_BOT_STATUS, P.M_BOT_MOVE, P.M_BOT_STOP, P.M_BOT_LOOK, P.M_BOT_FIRE, P.M_BOT_RELOAD, P.M_BOT_JUMP,
                    P.M_BOT_SNEAK, P.M_BOT_ACTIVATE}
+# Functions the fake console evaluates. The game has IsSneaking. It has no GetSneaking ("Unknown variable", first in-game run 2026-10-21).
+_EXPR_FUNCS = {"issneaking", "getangle", "getequipped", "getitemcount", "getopenstate", "getlocked", "getstage"}
 
 
 class VirtualClock:
@@ -179,7 +181,10 @@ class FakeBridge:
 
     def eval(self, expr: str) -> float:
         out = self.exec('printc "NVCOOP_EVAL=%g" (' + expr + ')')["output"]
-        return float(out.rsplit("NVCOOP_EVAL=", 1)[1].split()[0])
+        i = out.rfind("NVCOOP_EVAL=")
+        if i < 0:   # the same error as NvBridge.eval
+            raise BridgeError(f"cannot evaluate {expr!r}: {out!r}")
+        return float(out[i + 12:].split()[0])
 
     def exec(self, cmd: str, timeout_ms: Optional[int] = None) -> Dict[str, Any]:
         if self.mutant == "crash":
@@ -187,6 +192,9 @@ class FakeBridge:
         self.calls.append(("exec", cmd))
         m = re.fullmatch(r'printc "NVCOOP_EVAL=%g" \((.*)\)', cmd)
         if m:
+            fm = re.match(r"(?:\w+\.)?(\w+)", m.group(1).strip())
+            if fm and fm.group(1).lower() not in _EXPR_FUNCS:
+                return {"ok": False, "output": f"Unknown variable '{fm.group(1)}'"}   # what the game's console prints
             v = self._expr(m.group(1).strip())
             if v is None:
                 return {"ok": False, "output": "unknown expression"}
@@ -537,7 +545,7 @@ class FakeBridge:
             return None
         tgt, fn, rest = m.group(1), m.group(2).lower(), (m.group(3) or "").split()
         me = self.me
-        if fn == "getsneaking":
+        if fn == "issneaking":
             return 1.0 if self.sneaking else 0.0
         if fn == "getangle":
             return me.angle[rest[0].upper()]

@@ -129,6 +129,15 @@ struct FakeGame : nvbots::IEngine {
     Addr32 newTravelObj() override { calls.push_back("newtravel"); return travelObj; }
     void setPendingTravel(Addr32 p, Addr32 obj) override { calls.push_back("pending " + hex(obj)); set32(p + nvbots::addr::kPlayerPending, obj); }
 
+    // ---- always-run: the bytes the engine's run decision reads. Literal addresses from the RE (bots_addrs.h kRunPins), not the eng::
+    // constants, so a wrong constant cannot pass its own test. player+0x652 (the auto-move byte next to the toggle) stays 0 like in game.
+    void setAlwaysRun(bool on, bool padConnected = false, bool padDisabled = false) {
+        set8(player + 0x651, on ? 1 : 0);
+        if (!mem.count(player + 0x652)) set8(player + 0x652, 0);
+        set8(0x11D8A84, padConnected ? 1 : 0);
+        set8(0x11D8C50, padDisabled ? 1 : 0);
+    }
+
     // ---- references
     bool resolveRef(const std::string& r, Addr32* out) override {
         if (r.empty()) { *out = player; return true; }

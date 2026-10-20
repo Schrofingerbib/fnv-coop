@@ -1,7 +1,7 @@
 # T6a-actions: bot action layer (tools/bots/)
 
 Status: Python API, fake bridge, in-process input driver (C++), engine-glue bridge methods, tests and mutation twins done and green (`python -I tools/bots/run_tests.py` prints ALL OK; wired into tools/test_all.py).
-Nothing in the real game has been run: every console line and engine call is UNVERIFIED until the lead's first in-game run. C++ tests: `plugin\\bots\\run_tests.cmd` (32 mutants).
+Nothing in the real game has been run: every console line and engine call is UNVERIFIED until the lead's first in-game run. C++ tests: `plugin\\bots\\run_tests.cmd` (37 mutants).
 
 No OS keyboard or mouse input anywhere. Everything goes through nvbridge (`exec`, `ref.info`, `activate.ref`, `world.query`, `ui.dialogopen`, `ui.closedialog`, `state`, `plugins`).
 
@@ -51,8 +51,8 @@ Look/aim sets the player angles with `SetAngle`; movement is real held Forward/R
 Controls 0..9, 12, 14, 16 are proven from call sites; 10, 11 and 13..27 follow the NVSE table.
 | Method | Notes |
 |---|---|
-| bot.status | {enabled, hooked, frame, held[], shotsLeft, vats{phase,reason}} |
-| bot.move {forward,strafe,run?,ms?} / bot.stop | axes in [-1,1], digital with a 0.3 dead zone |
+| bot.status | {enabled, hooked, frame, held[], shotsLeft, alwaysRun, vats{phase,reason}} |
+| bot.move {forward,strafe,run?,ms?} / bot.stop | axes in [-1,1], digital with a 0.3 dead zone. `run` is the SPEED (true = run, false = walk), not the Run key: see Always-run below |
 | bot.look {yaw,pitch} or {ref} | degrees, same convention as SetAngle |
 | bot.fire {shots,gapMs} | queued Attack pulses; Reload is a tap of ReadyItem (UNVERIFIED which control) |
 | bot.reload / bot.sneak / bot.jump / bot.activate / bot.input | taps and generic hold/release/tap by name or id |
@@ -78,6 +78,14 @@ Pins for every engine function called: `tools/bots/re/verify_pins.py` (and the C
 - **Drop ref:** the module registers a native `OnDrop` handler through `NVSEEventManagerInterface::SetNativeEventHandler` (interface taken from the NVSE interface at load, handler set at DeferredInit, removed on shutdown and hot reload). Params are `void*[2] = {dropper, droppedRef}`; the base form is read at ref+0x20. If registration fails `bot.drops` is "unsupported" and `Bot.drop` falls back to the cell scan.
 - **Genuine fast travel** (found statically in the map menu): clicking a marker stores the ref at MapMenu(*0x11DA368)+0x118; the Yes callback queues deferred worker 0x798A00, which does `obj = heap(0x34) [0x401000]; ctor 0x456540(obj); obj+0x30 = marker; player(*0x11DEA3C)->0x93BE30(obj)`. The main loop (0x86F94F calling 0x93BEA0) consumes player+0x1EC and calls 0x93CDF0 to move. The may-travel check is 0x93D660(player) -> bool and shows the engine's own refusal message (combat, hostiles, cell, script block, overencumbered, health damage, undiscovered, alarm, in air). `fastTravel()` in bot_engine.h replicates the worker with those gates. Pins: PlayerCanTravel, PendingTravelSet, TravelObjCtor, HeapAlloc in bots_addrs.h (checked against the exe by `tools/bots/re/verify_pins.py`). UNVERIFIED in game: that the marker handed over (any TESObjectREFR, e.g. the map marker ref) is what +0x118 holds, and that the worker has no hidden dependency on the MapMenu being open (we skip the menu). If the first run shows no movement, read player+0x1EC after the call.
 - **VATS limb choice: unsupported, documented.** Limb-select is mode 2, but the RE has no field for the currently highlighted limb and no mapping from limb to Left/Right presses, so a bot cannot know when it landed on the wanted limb. `bot.vats {limb}` keeps refusing with `unsupported`.
+
+### Always-run (first in-game run, 2026-10-21, then static RE)
+- **What the game did.** New Vegas has always-run on by default. `bot.move run:true` held the Run control (9) and the player WALKED: 152-165 units in 2 s. `run:false` RAN: 608-646 units in 2 s. proof_input forward (300..700) and back (< -150) failed.
+- **Engine state** (static RE, 1.4.0.525 Steamless-unpacked image). `PlayerCharacter+0x651` is the always-run byte. The player-controls update `PlayerCharacter::vf2F8` (0x93E860) flips it on the AlwaysRun (10) press edge (0x940C7D). Player init 0x938A52 fills it from `bAlwaysRunByDefault:Controls` (Setting 0x11E0B4C). The run decision at 0x941A2B is: keyboard mode and byte set: run unless Run is pressed or held. Otherwise: run only while Run is pressed or held. Gamepad mode (0x4B71D0) = byte 0x11D8A84 (an XInput pad answered) and `bDisable360Controller:Interface` (Setting 0x11D8C4C, value at +4) is 0. In gamepad mode the byte is ignored. Then forward/back/strafe set walk (0x100) when run (0x200) is clear.
+- **Driver.** `run` is now the speed. `alwaysRunState()` (bot_engine.h) reads the byte and the gamepad gate. `bot.move` holds Run only when run != always-run, and the tick re-checks it while the move lasts (a toggle press during a move is followed). The move reply and bot.status give `alwaysRun` (true/false, null when unknown) and the move reply gives `runControl` (Run held or not). Unknown (the player is not loaded, or a pin does not match): Run is held for run:true, the old key meaning.
+- **Pins** (`kRunPins` in bots_addrs.h, code bytes, nothing is called or patched): AlwaysRunEdge 0x940C7D, AlwaysRunFlip 0x940C8D, RunPadGate 0x941A2B, RunAlwaysRead 0x941A3E, PadModeConnected 0x4B71D0, PadModeSetting 0x4B71E0. Init compares them with the running exe. The tests compare them with the reference exe (BOTS_EXE). A game-free test checks that the pinned bytes hold the addresses the reader uses.
+- **Sneak read.** The console has `IsSneaking`. `player.GetSneaking` gave "Unknown variable 'GetSneaking'". proof_input reads `player.IsSneaking` and a failed read is now a FAIL.
+- UNVERIFIED in game: the new run semantics (the lead runs proof_input). Gamepad mode was read statically only.
 
 Known limits: terminal state only knows the bot's own picks; VATS limb choice; Reload control id; full inventory enumeration of base-container-only items.
 

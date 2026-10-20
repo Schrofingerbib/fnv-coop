@@ -23,6 +23,7 @@
 //  25 terminal pick is not recorded
 //  26 speech-check INFOs refused again   27 drop log ignores the base form    28 drop log ignores the time window    29 fast travel skips the may-travel gate
 //  30 fast travel skips the busy-menu gate  31 fast travel writes the marker at the wrong offset  32 refs list includes disabled refs
+//  35 always-run state ignores gamepad mode  36 always-run state reads player+0x652 (the auto-move byte)
 
 namespace nvbots {
 
@@ -38,6 +39,10 @@ constexpr uint32_t kVatsMode = 8, kVatsSelValid = 0x118, kVatsSelRef = 0x128;
 constexpr int kDlgReady = 2;
 constexpr Addr32 kTerminalMenuPtr = 0x11D9334;   // *(TerminalMenu**), set while the terminal menu (id 0x421) is open
 constexpr uint32_t kTermList = 0x68, kTermTerminal = 0xA8, kTermRef = 0xAC;
+// Always-run (the code that uses each one is pinned in bots_addrs.h kRunPins):
+constexpr uint32_t kPlayerAlwaysRun = 0x651;      // PlayerCharacter byte, flipped on the AlwaysRun (10) press edge
+constexpr Addr32 kPadConnected = 0x11D8A84;       // byte: an XInput pad answered this frame
+constexpr Addr32 kDisable360Value = 0x11D8C50;    // value byte of Setting bDisable360Controller:Interface (object 0x11D8C4C, +4)
 // Prologue pins for the engine functions the live engine calls (verified by tools/bots/re/verify_pins.py; thiscall unless noted)
 }  // namespace eng
 
@@ -117,6 +122,28 @@ inline bool menuInfo(IEngine& e, Value* out, std::string* err) {
         out->set("dialogState", (int64_t)st).set("dialogReady", st == (uint32_t)eng::kDlgReady);
     }
     return true;
+}
+
+// ---- always-run state for bot.move ----
+// What the player-controls update (PlayerCharacter::vf2F8, run decision at 0x941A2B) does with the Run control (9):
+//   keyboard mode, always-run on:  Run up = run speed, Run down = walk     (so holding Run for "run" made the player walk)
+//   keyboard mode, always-run off: Run down = run speed, Run up = walk
+//   gamepad mode (a pad answers and bDisable360Controller is 0): the toggle is ignored, Run down = run speed
+// Returns 1 when the engine treats always-run as on, 0 when off (or ignored), -1 when the bytes cannot be read.
+inline int alwaysRunState(IEngine& e) {
+    Addr32 player = 0;
+    uint8_t on = 0, pad = 0, padOff = 0;
+    if (!e.resolveRef("", &player) || !player) return -1;
+#if NVBOTS_MUTANT == 36
+    if (!e.rd8(player + eng::kPlayerAlwaysRun + 1, &on)) return -1;
+#else
+    if (!e.rd8(player + eng::kPlayerAlwaysRun, &on)) return -1;
+#endif
+    if (!e.rd8(eng::kPadConnected, &pad) || !e.rd8(eng::kDisable360Value, &padOff)) return -1;
+#if NVBOTS_MUTANT != 35
+    if (pad && !padOff) return 0;
+#endif
+    return on ? 1 : 0;
 }
 
 // ---- bot.say ----

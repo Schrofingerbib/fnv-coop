@@ -58,4 +58,27 @@ inline constexpr CallPin TravelObjCtor = {"TravelObjCtor", 0x456540U, {0x55, 0x8
 inline constexpr CallPin HeapAlloc = {"HeapAlloc", 0x401000U, {0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x50, 0xe8, 0x14, 0x00, 0x00, 0x00, 0x8b, 0xc8, 0xe8, 0x2d}, 0};
 inline constexpr unsigned kPlayerPending = 0x1ECU, kTravelObjSize = 0x34U, kTravelObjMarker = 0x30U;   // player+0x1EC pending object; obj+0x30 = marker ref
 inline constexpr const CallPin* kAllCalls[] = {&PlayerCanTravel, &PendingTravelSet, &TravelObjCtor, &HeapAlloc, &TermClick, &GetContainerData, &ItemTotal, &TopMenuId, &LbSelect, &LbSelected, &ItemInfo, &InfoFlag80, &InfoSpecialB, &InfoSpecialC, &DlgItemClick, &LbAfter, &DlgSpeak, &Tick};
+
+// ---- always-run state, read (never written) by bot.move so that `run` picks the speed, not the key. Static RE on the Steamless-unpacked
+// 1.4.0.525 image. Code pins: 16 bytes of the engine code that uses each address. Nothing is called or patched here.
+// PlayerCharacter::vf2F8 (0x93E860, the player-controls update, this = PlayerCharacter in [ebp-0x18], OSInputGlobals in [ebp-0x1C]):
+//   0x940C7D  GetControlState(10 AlwaysRun, 1 pressed) != 0  ->  0x940C8D  player+0x651 = !player+0x651  (the always-run toggle byte)
+//   0x941A2B  if (!PadMode() 0x4B71D0 && player+0x651) { Run (9) not pressed and not held -> flags |= 0x200 run }
+//             else { Run (9) pressed or held -> flags |= 0x200 run }  (forward/back/strafe then set 0x100 walk when 0x200 is clear)
+// PadMode 0x4B71D0 = byte 0x11D8A84 (XInputGetState(0) == 0, refreshed every frame) && Setting 0x11D8C4C "bDisable360Controller:Interface"
+// value byte (+4) == 0. The 0x651 byte starts from Setting 0x11E0B4C "bAlwaysRunByDefault:Controls" (player init 0x938A52).
+struct CodePin { const char* name; unsigned addr; unsigned char bytes[16]; };
+// push 1; push 0Ah; mov ecx,[ebp-1Ch]; call GetControlState; test eax,eax; jz +1Ah
+inline constexpr CodePin AlwaysRunEdge = {"AlwaysRunEdge", 0x940C7DU, {0x6a, 0x01, 0x6a, 0x0a, 0x8b, 0x4d, 0xe4, 0xe8, 0xd7, 0x39, 0x0e, 0x00, 0x85, 0xc0, 0x74, 0x1a}};
+// mov edx,[ebp-18h]; movzx eax,byte [edx+651h]; neg eax; sbb eax,eax; add eax,1  (then mov [ecx+651h],al)
+inline constexpr CodePin AlwaysRunFlip = {"AlwaysRunFlip", 0x940C8DU, {0x8b, 0x55, 0xe8, 0x0f, 0xb6, 0x82, 0x51, 0x06, 0x00, 0x00, 0xf7, 0xd8, 0x1b, 0xc0, 0x83, 0xc0}};
+// call PadMode (0x4B71D0); movzx ecx,al; test ecx,ecx; jnz <Run-key branch>
+inline constexpr CodePin RunPadGate = {"RunPadGate", 0x941A2BU, {0xe8, 0xa0, 0x57, 0xb7, 0xff, 0x0f, 0xb6, 0xc8, 0x85, 0xc9, 0x0f, 0x85, 0x88, 0x00, 0x00, 0x00}};
+// movzx eax,byte [edx+651h]; test eax,eax; jz <Run-key branch>; push 1; push 9; mov ecx,...  (always-run branch asks for Run (9))
+inline constexpr CodePin RunAlwaysRead = {"RunAlwaysRead", 0x941A3EU, {0x0f, 0xb6, 0x82, 0x51, 0x06, 0x00, 0x00, 0x85, 0xc0, 0x74, 0x7a, 0x6a, 0x01, 0x6a, 0x09, 0x8b}};
+// PadMode: push ebp; mov ebp,esp; push ecx; movzx eax,byte [11D8A84h]; test eax,eax; jz ...; call ...
+inline constexpr CodePin PadModeConnected = {"PadModeConnected", 0x4B71D0U, {0x55, 0x8b, 0xec, 0x51, 0x0f, 0xb6, 0x05, 0x84, 0x8a, 0x1d, 0x01, 0x85, 0xc0, 0x74, 0x1f, 0xe8}};
+// PadMode (cont.): mov ecx,11D8C4Ch (bDisable360Controller); call 0x4B9930 (returns byte [ecx+4] == 0); movzx ...
+inline constexpr CodePin PadModeSetting = {"PadModeSetting", 0x4B71E0U, {0x2c, 0x00, 0x00, 0x00, 0xb9, 0x4c, 0x8c, 0x1d, 0x01, 0xe8, 0x42, 0x27, 0x00, 0x00, 0x0f, 0xb6}};
+inline constexpr const CodePin* kRunPins[] = {&AlwaysRunEdge, &AlwaysRunFlip, &RunPadGate, &RunAlwaysRead, &PadModeConnected, &PadModeSetting};
 }  // namespace nvbots::addr

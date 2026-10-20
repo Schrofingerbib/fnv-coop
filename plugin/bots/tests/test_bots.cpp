@@ -1,4 +1,4 @@
-// Game-free tests for the bot input driver (T6a). Built once against the real code and once per NVBOTS_MUTANT=<n> (1..12); every mutant MUST fail.
+// Game-free tests for the bot input driver (T6a). Built once against the real code and once per NVBOTS_MUTANT=<n> (1..37); every mutant MUST fail.
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -264,6 +264,7 @@ struct GlueEngine : MockEngine {
     int pressed = -1;
     std::string moved;
     IEngine* engine() override { return g; }
+    int alwaysRun() override { return g ? alwaysRunState(*g) : -1; }
     bool pressBox(int b, uint32_t* menu, std::string*) override { pressed = b; *menu = 900; return true; }
     bool moveTo(const std::string& r, std::string*) override { moved = r; return true; }
 };
@@ -611,6 +612,127 @@ TEST(glue_methods_need_the_engine) {
     CHECK(!r.call("test.fasttravel", "{\"marker\":\"x\"}") && r.out.find("unsupported") != std::string::npos);
 }
 
+// ---- bot.move run = the speed (always-run) ----
+// The engine side of the contract, one frame of PlayerCharacter::vf2F8 (static RE, bots_addrs.h kRunPins). Literal addresses on purpose.
+//   0x940C7D: the AlwaysRun (10) press edge flips player+0x651.
+//   0x941A2B: keyboard mode and always-run on -> run unless Run (9) is pressed or held; otherwise run only while Run is pressed or held.
+// Returns true when the player moves at run speed this frame.
+struct RunEngine {
+    FakeGame& g;
+    ForcedInput& in;
+    bool frame() {
+        uint8_t on = 0, pad = 0, padOff = 0;
+        if (in.filter(kAlwaysRun, kPressed, 0)) {
+            g.rd8(g.player + 0x651, &on);
+            g.set8(g.player + 0x651, on ? 0 : 1);
+        }
+        g.rd8(g.player + 0x651, &on);
+        g.rd8(0x11D8A84, &pad);
+        g.rd8(0x11D8C50, &padOff);
+        const bool padMode = pad && !padOff;
+        const bool runDown = in.filter(kRun, kPressed, 0) || in.filter(kRun, kHeld, 0);
+        return (!padMode && on) ? !runDown : runDown;
+    }
+};
+
+TEST(always_run_state_reads_the_engine_bytes) {
+    FakeGame g;
+    CHECK(alwaysRunState(g) == -1);          // nothing readable: unknown
+    g.setAlwaysRun(true);
+    CHECK(alwaysRunState(g) == 1);
+    g.setAlwaysRun(false);
+    CHECK(alwaysRunState(g) == 0);
+    g.setAlwaysRun(true, true, false);
+    CHECK(alwaysRunState(g) == 0);           // gamepad mode: the engine ignores the toggle, Run alone picks the speed
+    g.setAlwaysRun(true, true, true);
+    CHECK(alwaysRunState(g) == 1);           // a pad answers but bDisable360Controller=1: keyboard mode
+    g.set8(g.player + 0x652, 1);
+    g.setAlwaysRun(false);
+    CHECK(alwaysRunState(g) == 0);           // the auto-move byte next to the toggle is not the toggle
+}
+
+TEST(move_run_is_the_speed_whatever_the_always_run_toggle) {
+    // {always-run, pad connected, bDisable360Controller}; the first in-game run had always-run on (the New Vegas default)
+    const bool cfg[4][3] = {{true, false, false}, {false, false, false}, {true, true, false}, {true, true, true}};
+    for (const auto& c : cfg) {
+        for (int want = 0; want < 2; ++want) {
+            GlueRig r;
+            r.g.setAlwaysRun(c[0], c[1], c[2]);
+            RunEngine eng{r.g, r.in};
+            CHECK(r.call("bot.move", want ? "{\"forward\":1,\"strafe\":0,\"run\":true}" : "{\"forward\":1,\"strafe\":0,\"run\":false}"));
+            const bool engineOn = c[0] && !(c[1] && !c[2]);
+            CHECK(r.out.find(engineOn ? "\"alwaysRun\":true" : "\"alwaysRun\":false") != std::string::npos);
+            CHECK(r.out.find(want ? "\"run\":true" : "\"run\":false") != std::string::npos);
+            int asked = 0;
+            for (int f = 0; f < 10; ++f) {
+                asked += eng.frame() == (want != 0);
+                r.e.now += 16;
+                r.rpc.tick();
+            }
+            CHECK(asked == 10);
+            CHECK(r.in.isHeld(kForward));
+        }
+    }
+}
+
+TEST(move_follows_an_always_run_toggle_during_the_move) {
+    GlueRig r;
+    r.g.setAlwaysRun(true);
+    RunEngine eng{r.g, r.in};
+    auto frames = [&](int n, int* walked) {
+        bool last = false;
+        for (int f = 0; f < n; ++f) {
+            last = eng.frame();
+            *walked += !last;
+            r.e.now += 16;
+            r.rpc.tick();
+        }
+        return last;
+    };
+    CHECK(r.call("bot.move", "{\"forward\":1,\"strafe\":0,\"run\":true}"));
+    int walked = 0;
+    CHECK(frames(5, &walked) && walked == 0);
+    CHECK(r.call("bot.input", "{\"tap\":[\"AlwaysRun\"]}"));   // someone flips the toggle while the bot runs
+    walked = 0;
+    CHECK(frames(12, &walked));
+    CHECK(walked <= 1);                                         // at most the frame of the flip itself
+    uint8_t v = 9;
+    r.g.rd8(r.g.player + 0x651, &v);
+    CHECK(v == 0);                                              // the edge reached the engine once
+    CHECK(r.call("bot.input", "{\"tap\":[\"AlwaysRun\"]}"));   // and back on
+    walked = 0;
+    CHECK(frames(12, &walked));
+    CHECK(walked <= 1);
+    CHECK(r.call("bot.stop"));
+    CHECK(!r.in.isHeld(kRun) && !r.in.isHeld(kForward));
+    walked = 0;
+    frames(3, &walked);
+    CHECK(!r.in.isHeld(kRun));                                  // a stopped move no longer drives Run
+}
+
+TEST(move_with_unknown_always_run_keeps_the_key_meaning) {
+    GlueRig r;   // no player bytes: alwaysRunState is -1 (in game: the always-run pins did not match this exe)
+    CHECK(r.call("bot.move", "{\"forward\":1,\"run\":true}"));
+    CHECK(r.in.isHeld(kRun) && r.out.find("\"alwaysRun\":null") != std::string::npos && r.out.find("\"runControl\":true") != std::string::npos);
+    CHECK(r.call("bot.move", "{\"forward\":1,\"run\":false}"));
+    CHECK(!r.in.isHeld(kRun) && r.out.find("\"runControl\":false") != std::string::npos);
+    CHECK(r.call("bot.status") && r.out.find("\"alwaysRun\":null") != std::string::npos);
+    r.g.setAlwaysRun(true);
+    CHECK(r.call("bot.status") && r.out.find("\"alwaysRun\":true") != std::string::npos);
+}
+
+TEST(always_run_pins_hold_the_addresses_the_reader_uses) {
+    auto u32at = [](const unsigned char* b) { uint32_t v; std::memcpy(&v, b, 4); return v; };
+    CHECK(addr::AlwaysRunEdge.bytes[3] == kAlwaysRun);                          // push 0Ah: GetControlState(AlwaysRun, pressed)
+    CHECK(u32at(addr::AlwaysRunFlip.bytes + 6) == eng::kPlayerAlwaysRun);       // movzx eax, byte [edx+651h]
+    CHECK(u32at(addr::RunAlwaysRead.bytes + 3) == eng::kPlayerAlwaysRun);
+    CHECK(addr::RunAlwaysRead.bytes[14] == kRun);                               // push 9: the always-run branch asks for Run
+    CHECK(u32at(addr::PadModeConnected.bytes + 7) == eng::kPadConnected);
+    CHECK(u32at(addr::PadModeSetting.bytes + 5) + 4 == eng::kDisable360Value);  // Setting object + 4 = its value byte
+    // the run decision calls the pad-mode gate that alwaysRunState replicates (call rel32 at 0x941A2B lands on 0x4B71D0)
+    CHECK(addr::RunPadGate.addr + 5 + u32at(addr::RunPadGate.bytes + 1) == addr::PadModeConnected.addr);
+}
+
 // ---- pins ----
 struct FakeMem : nvhooks::MemoryOps {
     std::map<nvhooks::Addr, std::vector<uint8_t>> regions;
@@ -683,6 +805,23 @@ TEST(pins_match_real_exe_if_available) {
         }
         CHECK(found);
     }
+    int runPins = 0;
+    for (const addr::CodePin* c : addr::kRunPins) {
+        bool found = false;
+        for (size_t i = 0; i < nsec && !found; ++i) {
+            size_t o = e + 24 + opt + i * 40;
+            unsigned vs = u32(o + 8), va = u32(o + 12) + 0x400000, rs = u32(o + 16), rp = u32(o + 20);
+            if (c->addr >= va && c->addr + 16 <= va + rs) {
+                found = true;
+                const bool same = std::memcmp(&d[rp + (c->addr - va)], c->bytes, 16) == 0;
+                CHECK(same);
+                runPins += same;
+            }
+            (void)vs;
+        }
+        CHECK(found);
+    }
+    std::printf("  always-run pins matched in the reference exe: %d of %d\n", runPins, (int)(sizeof addr::kRunPins / sizeof addr::kRunPins[0]));
 }
 
 int main() {
@@ -719,6 +858,11 @@ int main() {
     run("count_refs_by_base_in_a_cell", count_refs_by_base_in_a_cell);
     run("terminal_pick_clicks_the_requested_entry_and_records_it", terminal_pick_clicks_the_requested_entry_and_records_it);
     run("glue_methods_need_the_engine", glue_methods_need_the_engine);
+    run("always_run_state_reads_the_engine_bytes", always_run_state_reads_the_engine_bytes);
+    run("move_run_is_the_speed_whatever_the_always_run_toggle", move_run_is_the_speed_whatever_the_always_run_toggle);
+    run("move_follows_an_always_run_toggle_during_the_move", move_follows_an_always_run_toggle_during_the_move);
+    run("move_with_unknown_always_run_keeps_the_key_meaning", move_with_unknown_always_run_keeps_the_key_meaning);
+    run("always_run_pins_hold_the_addresses_the_reader_uses", always_run_pins_hold_the_addresses_the_reader_uses);
     run("spec_is_valid_and_installs_and_restores_on_a_fake_image", spec_is_valid_and_installs_and_restores_on_a_fake_image);
     run("pins_match_real_exe_if_available", pins_match_real_exe_if_available);
     std::printf("%d checks, %d failed\n", g_checks, g_fail);

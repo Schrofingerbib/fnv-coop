@@ -11,6 +11,7 @@ spec = importlib.util.spec_from_file_location("proof_input", ROOT / "tools" / "b
 proof = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(proof)
 from bots import FakeBridge, World  # noqa: E402
+from bots.bot import BridgeError  # noqa: E402
 
 
 def run_with(mutant=None):
@@ -26,6 +27,28 @@ class Proof(unittest.TestCase):
         rep = run_with()
         self.assertEqual([r for r in rep.rows if r["result"] != "PASS"], [])
         self.assertGreaterEqual(len(rep.rows), 11)
+
+    def test_sneak_reads_the_console_name_the_game_has(self):
+        self.assertEqual(proof.SNEAK_EXPR, "player.IsSneaking")
+        row = next(r for r in run_with().rows if r["check"] == "sneak")
+        self.assertEqual(row["result"], "PASS", row)
+        self.assertEqual((row["before"], row["after_one_tap"], row["after_two_taps"]), (0, 1, 0))
+        # twin: the name of the first in-game run. The console does not know it, and the proof must say FAIL (not PASS, not SKIP).
+        old = proof.SNEAK_EXPR
+        proof.SNEAK_EXPR = "player.GetSneaking"
+        try:
+            row = next(r for r in run_with().rows if r["check"] == "sneak")
+        finally:
+            proof.SNEAK_EXPR = old
+        self.assertEqual(row["result"], "FAIL", row)
+        self.assertIn("Unknown variable 'GetSneaking'", row["error"])
+
+    def test_fake_console_rejects_functions_the_game_does_not_have(self):
+        nv = FakeBridge(World())
+        self.assertEqual(nv.eval("player.IsSneaking"), 0)
+        with self.assertRaises(BridgeError) as c:
+            nv.eval("player.GetSneaking")
+        self.assertIn("Unknown variable 'GetSneaking'", str(c.exception))
 
     def test_each_defect_fails_the_matching_check(self):
         expect = {"move_ignored": "forward", "look_ignored": "turn", "stop_ignored": "stop", "jump_noop": "jump",
