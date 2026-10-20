@@ -55,7 +55,8 @@ constexpr int kMsgClickId = 7;   // HandleClick acts only on id 7 (a button tile
 // The current message: FUN 0x7A92A0 = (*0x11DA4F4 < queue.count) ? queue.data[*0x11DA4F4] : 0; queue = BSSimpleArray at 0x11DA53C
 // (data @+4, count @+8). HandleClick runs the message callback only for a current message; none means the box is closing.
 constexpr Addr32 kMsgQueue = 0x11DA53C, kMsgQueueIdx = 0x11DA4F4;
-// Prologue pins for the engine functions the live engine calls (verified by tools/bots/re/verify_pins.py; thiscall unless noted)
+// Prologue pins for the engine functions the live engine calls (thiscall unless noted). The pin verifier that checked them,
+// tools/bots/re/verify_pins.py, is not in the public repo.
 }  // namespace eng
 
 struct IEngine {

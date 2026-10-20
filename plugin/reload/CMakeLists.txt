@@ -50,10 +50,19 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
   target_include_directories(nvr_api PUBLIC ${RELOAD_PLUGIN_DIR} ${RELOAD_PLUGIN_DIR}/common)
   target_compile_definitions(nvr_api PUBLIC _CRT_SECURE_NO_WARNINGS)
 
-  add_executable(nvreload_host_test ${RELOAD_DIR}/tests/test_reload_host.cpp ${RELOAD_PLUGIN_DIR}/loader/loader_host.cpp)
-  target_include_directories(nvreload_host_test PRIVATE ${RELOAD_PLUGIN_DIR} ${RELOAD_PLUGIN_DIR}/loader)
-  target_link_libraries(nvreload_host_test PRIVATE nvr_api ws2_32)
-  reload_flags(nvreload_host_test)
+  # nvreload_host_test = real loader; nvreload_host_test_<twin> = T3a loader twins that must fail the config checks
+  function(reload_host_test name)
+    add_executable(${name} ${RELOAD_DIR}/tests/test_reload_host.cpp ${RELOAD_PLUGIN_DIR}/loader/loader_host.cpp)
+    target_include_directories(${name} PRIVATE ${RELOAD_PLUGIN_DIR} ${RELOAD_PLUGIN_DIR}/loader)
+    target_link_libraries(${name} PRIVATE nvr_api ws2_32)
+    reload_flags(${name})
+    foreach(d ${ARGN})
+      target_compile_definitions(${name} PRIVATE ${d})
+    endforeach()
+  endfunction()
+  reload_host_test(nvreload_host_test)
+  reload_host_test(nvreload_host_test_noconfig NVLOADER_MUTANT_NOCONFIG)
+  reload_host_test(nvreload_host_test_configonce NVLOADER_MUTANT_CONFIGONCE)
 
   foreach(n 0 1 2 3 4 5 6 7 8 9)
     add_library(nvtestcore_m${n} SHARED

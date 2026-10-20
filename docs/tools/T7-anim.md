@@ -58,7 +58,7 @@ Kinds: sliding, tpose, floating, sinking, jitter, rubberband, stuck, deathpose. 
 Flight trace: findings are exported as Marker records (`nvfr_export.py`, uses `tools/flight/nvfr.py`); raw samples stay in JSONL.
 
 ## First in-game check (for the lead, one game)
-1. `[dev] animprobe=1`, run `cli.py collect` while walking, drawing, reloading, sneaking; print the group numbers and compare with `animgroups.py` names.
+1. `[dev] animprobe=1` (provision with `python -I tools/runner/run.py provision --n 1 --ini dev.animprobe=1`; provisioning rewrites nvcoop.ini, so a hand edit is lost), run `cli.py collect` while walking, drawing, reloading, sneaking; print the group numbers and compare with `animgroups.py` names.
 2. Run with `scan_animdata:true` once; the offsets should be 0xE0.. in steps of 4 (plus 0x100).
 3. Walk in first person with a puppet on the other machine and run `analyze --avatar`.
 4. Tune `config.py` thresholds from the clean run.

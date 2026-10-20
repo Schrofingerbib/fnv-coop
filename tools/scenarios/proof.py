@@ -22,6 +22,7 @@ import runner  # noqa: E402
 from client import lease  # noqa: E402
 
 OUT = REPO / "out" / "scenarios"
+STATE = OUT / "proof_state.json"   # runner state, keyed by game process (runner.StateStore.lease_keys)
 
 
 def probes():
@@ -65,13 +66,15 @@ def mode_probe():
     return out
 
 
-def mode_jump():
+def mode_jump(lease_fn=lease, state_path=STATE, **kw):
+    """The first jump reloads unless the state store already knows this game process (then a later run in the same pool
+    jumps in place). kw goes to runner.Runner (the tests pass a fake clock)."""
     names = ["quest_stage_sync", "goodsprings_fight", "door_terminal_container_matrix", "goodsprings_fight"]
     rows = []
-    with lease("scenarios-proof", n=1, ttl_s=1800) as L:
+    with lease_fn("scenarios-proof", n=1, ttl_s=1800) as L:
         sc1 = [scenlib.load_scenario(scenlib.SCEN_DIR / (n + ".json")) for n in names]
         # one-player view of two-player scenarios: only the host side is exercised
-        rn = runner.Runner([L.bridge(0)], runner.StateStore(OUT / "proof_state.json"), keys=["0@proof"])
+        rn = runner.for_lease(L, state_path, **kw)
         for sc in sc1:
             sc = dict(sc, players=1)
             t0 = time.time()
@@ -80,13 +83,11 @@ def mode_jump():
     return rows
 
 
-def mode_suite():
-    with lease("scenarios-proof", n=2, ttl_s=3600) as L:
-        gens = getattr(L, "_gens", {})
-        rn = runner.Runner([L.bridge(i) for i in L.instances], runner.StateStore(OUT / "proof_state.json"),
-                           [runner.StateStore.key(i, gens.get(i, 0)) for i in L.instances])
+def mode_suite(lease_fn=lease, state_path=STATE, show=print, **kw):
+    with lease_fn("scenarios-proof", n=2, ttl_s=3600) as L:
+        rn = runner.for_lease(L, state_path, **kw)
         res = [rn.run(scenlib.load_scenario(p)) for p in scenlib.list_scenarios()]
-    print(runner.summarize(res))
+    show(runner.summarize(res))
     return res
 
 
