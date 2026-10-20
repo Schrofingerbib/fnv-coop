@@ -5,6 +5,11 @@
 // sequence, the blob store that survives reloads, the in-flight gate for bridge calls, an optional file
 // watcher, and the bridge methods dev.reload / dev.status.
 //
+// Config mirror: the core's modules read nvcoop.ini and their data files from the folder of their OWN module
+// file. The core runs from the cache folder, so before every LoadLibrary (first load, reload and rollback) the
+// host copies the config files (see IsCoreConfigFile) from configDir into the cache folder, and deletes cache
+// copies whose source is gone. Edits made between reloads therefore reach the next core.
+//
 // Threading: Load, Reload, Service, OnFrame, OnMessage and Shutdown must be called on the game main thread
 // between frames. RequestReload may be called from any thread.
 #pragma once
@@ -25,8 +30,15 @@ struct HostEnv {
     std::string gameDir;     // with trailing backslash ("" in tests)
     std::string corePath;    // the DLL the build writes, e.g. ...\Data\NVSE\Plugins\nvcoop_mod.dll
     std::string cacheDir;    // "" = <dir of corePath>\nvcoop_cache
+    std::string configDir;   // where nvcoop.ini and nvcoop_*.json live; "" = <gameDir>Data\NVSE\Plugins\ (the loader's
+                             // folder), or the dir of corePath when gameDir is "" (tests)
     void* nvse = nullptr;    // NVSEInterface*, passed through to the core
 };
+
+// True for the file names the loader mirrors into the cache folder: nvcoop.ini, nvcoop_*.json,
+// nvcoop_consent_messages.txt and nvcoop_volatile_keys.txt (case-insensitive). These are the files the core's modules
+// read beside their module.
+bool IsCoreConfigFile(const std::string& fileName);
 
 struct ReloadResult {
     bool ok = false;
@@ -66,7 +78,7 @@ public:
     uint32_t generation() const { return generation_; }
     uint32_t reloadCount() const { return reloadCount_; }
     const std::string& cachePathInUse() const { return cachePath_; }
-    std::string StatusJson() const;
+    std::string StatusJson() const;   // includes configDir and configFiles (the names copied by the last load)
 
     // ---- internal: api callbacks need these ----
     struct Gate {
@@ -96,6 +108,7 @@ private:
                       std::string& err);
     void UnloadCore(LoadedCore& c);
     void CleanStaleCache();
+    void SyncConfig();
     std::string MakeCachePath(uint32_t generation) const;
     void FillApi(uint32_t generation, bool isReload);
     void RegisterDevMethods();
@@ -103,6 +116,7 @@ private:
     HostEnv env_;
     LoadedCore cur_;
     std::string cachePath_;
+    std::vector<std::string> configFiles_;
     std::shared_ptr<Gate> gate_;
     bool loaded_ = false;
     bool devRegistered_ = false;

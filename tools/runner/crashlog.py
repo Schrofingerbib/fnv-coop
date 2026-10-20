@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Collect evidence after a game crash: logs + Windows crash record, into a run directory.
+r"""Collect evidence after a game crash: logs + Windows crash record, into a run directory.
 
     from crashlog import collect_crash_report
     collect_crash_report(r"runs\2026-10-16_x\crash")          # default game dir
 CLI: python crashlog.py <dest_dir> [--game-dir DIR]
+The default game dir is the one the runner uses (instances.game_dir): FNV_GAME_DIR, else the Steam default.
 """
 import json
 import shutil
@@ -12,7 +13,9 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_GAME_DIR = Path(r"C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import instances  # noqa: E402
+
 LOGS = ["nvse.log", "nvse_loader.log", "nvse_steam_loader.log", "falloutnv_error.log", "falloutnv_havok.log",
         r"Data\NVSE\Plugins\nvcoop.log"]
 
@@ -28,11 +31,16 @@ def _wer_events(minutes):
         return [f"(could not query event log: {e})"]
 
 
+def default_game_dir() -> Path:
+    """The game dir when the caller gives none. One source with the runner, so FNV_GAME_DIR works here too."""
+    return instances.game_dir()
+
+
 def collect_crash_report(dest, game_dir=None, event_minutes=30, event_query=None):
     """Copy the game's logs into `dest`, add a summary.json (last log lines, Windows crash records,
     any `CRASH code=...` line written by nvcoop.dll). `event_query(minutes)->list[str]` can be injected (tests do) instead of querying the real event log.
     Returns the summary dict."""
-    game = Path(game_dir) if game_dir else DEFAULT_GAME_DIR
+    game = Path(game_dir) if game_dir else default_game_dir()
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
     copied, tails = [], {}

@@ -13,6 +13,9 @@
 #include "common/nvcoop_api.h"
 #include "common/registry.h"
 #include "bridge/screenshot.h"
+#ifdef NVCOOP_WITH_FOCUS_GUARD
+#include "splitscreen/focus_guard.h"
+#endif
 #ifdef NVCOOP_LOADER
 #include "loader/loader_host.h"   // split build: this DLL is the permanent loader, the modules live in nvcoop_mod.dll
 #endif
@@ -261,14 +264,35 @@ char* ConsoleOutputFileBuf() {
 // ---- keep the game window out of the owner's way: minimize without activating, never steal focus ----
 std::atomic<bool> g_stopMinimizer{false};
 std::thread g_minimizer;
+std::atomic<bool> g_minimize{true};
+std::atomic<bool> g_focusGuard{false};  // plugin/splitscreen/focus_guard.h: deactivation must not open the pause menu
 
 BOOL CALLBACK MinimizeEnumProc(HWND h, LPARAM) {
     DWORD pid = 0;
     GetWindowThreadProcessId(h, &pid);
-    if (pid == GetCurrentProcessId() && IsWindowVisible(h) && !IsIconic(h) && GetWindow(h, GW_OWNER) == nullptr)
-        ShowWindowAsync(h, SW_SHOWMINNOACTIVE);
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(h) || GetWindow(h, GW_OWNER) != nullptr) return TRUE;
+#ifdef NVCOOP_WITH_FOCUS_GUARD
+    // Before minimizing: minimizing deactivates the window, and in gameplay the engine answers that with the pause menu.
+    char cls[128] = {0};
+    const char* gameClass = *reinterpret_cast<const char* const*>(0x11A2FE8);  // see Diag_FindWindowA
+    if (g_focusGuard.load() && nvsplit::Installed() != h && GetClassNameA(h, cls, sizeof(cls)) && gameClass &&
+        lstrcmpA(cls, gameClass) == 0) {
+        Log("focus guard %s on window %p", nvsplit::Install(h) ? "installed" : "NOT installed", h);
+    }
+#endif
+    if (g_minimize.load() && !IsIconic(h)) ShowWindowAsync(h, SW_SHOWMINNOACTIVE);
     return TRUE;
 }
+
+#ifdef NVCOOP_WITH_FOCUS_GUARD
+bool FocusStatusMethod(const std::string&, std::string& out) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "{\"enabled\":%s,\"installed\":%s,\"swallowed\":%lu}", g_focusGuard.load() ? "true" : "false",
+                  nvsplit::Installed() ? "true" : "false", nvsplit::Swallowed());
+    out = buf;
+    return true;
+}
+#endif
 
 void MinimizerLoop() {
     while (!g_stopMinimizer.load()) {
@@ -558,9 +582,15 @@ __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse) {
 #ifdef NVCOOP_WITH_SNAPSHOT
     nvcoop::SetStateProvider(StateProviderImpl);
 #endif
-    if (EnvOr("NVCOOP_MINIMIZED", ReadIni("bridge", "minimized", "1")) != "0") {
+    g_minimize = EnvOr("NVCOOP_MINIMIZED", ReadIni("bridge", "minimized", "1")) != "0";
+#ifdef NVCOOP_WITH_FOCUS_GUARD
+    // Default on whenever the plugin minimizes the window; split-screen sets it explicitly for visible copies.
+    g_focusGuard = EnvOr("NVCOOP_FOCUS_GUARD", ReadIni("bridge", "focusGuard", g_minimize.load() ? "1" : "0")) != "0";
+    nvcoop::RegisterMethod("focus.status", FocusStatusMethod, false);
+#endif
+    if (g_minimize.load() || g_focusGuard.load()) {
         g_minimizer = std::thread(MinimizerLoop);
-        Log("minimizer thread started");
+        Log("window thread started (minimize=%d focusGuard=%d)", g_minimize.load() ? 1 : 0, g_focusGuard.load() ? 1 : 0);
     }
 
     for (auto& m : nvcoop::registry::Modules()) {

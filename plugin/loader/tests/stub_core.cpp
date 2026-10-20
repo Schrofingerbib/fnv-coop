@@ -4,6 +4,8 @@
 //   STUB_FAIL_INIT     NvCore_Init succeeds but core init() fails after starting a thread
 //   STUB_BAD_ABI       reports a wrong ABI version
 // Env var NVSTUB_VETO=1 (read with the Win32 API; this DLL has its own CRT) makes before_unload refuse.
+// Config: at init the stub reads [stub] value= from nvcoop.ini and the text of nvcoop_stub.json, both from the folder
+// of its OWN module file (the same lookup as IniPath() in the real modules). Method stub.cfg returns what it read.
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -52,6 +54,38 @@ int MSlow(void*, const char*, NvOut* out) {
     return 1;
 }
 int MFail(void*, const char*, NvOut* out) { out->set(out->h, "deliberate failure"); return 0; }
+// ---- config beside this module (what the real modules do in onLoad) ----
+std::string g_cfgIni = "unread", g_cfgJson = "unread";
+std::string SelfDir() {
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCSTR>(&SelfDir), &self);
+    char buf[MAX_PATH] = {};
+    GetModuleFileNameA(self, buf, MAX_PATH);
+    std::string p = buf;
+    size_t s = p.find_last_of("\\/");
+    return s == std::string::npos ? std::string() : p.substr(0, s + 1);
+}
+void ReadConfig() {
+    const std::string dir = SelfDir();
+    char v[128] = {};
+    GetPrivateProfileStringA("stub", "value", "missing", v, sizeof v, (dir + "nvcoop.ini").c_str());
+    g_cfgIni = v;
+    g_cfgJson = "missing";
+    HANDLE h = CreateFileA((dir + "nvcoop_stub.json").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char b[128] = {};
+    DWORD n = 0;
+    ReadFile(h, b, sizeof b - 1, &n, nullptr);
+    CloseHandle(h);
+    g_cfgJson.assign(b, n);
+}
+int MCfg(void*, const char*, NvOut* out) {
+    const std::string s = "ini=" + g_cfgIni + ";json=" + g_cfgJson;
+    out->set(out->h, s.c_str());
+    return 1;
+}
+
 int SState(const char* csv, NvOut* out) {
     std::string s = std::string("{\"stub\":") + std::to_string(STUB_VERSION) + ",\"sections\":\"" + (csv ? csv : "") + "\"}";
     out->set(out->h, s.c_str());
@@ -63,10 +97,12 @@ int CoreInit() {
 #ifdef STUB_FAIL_INIT
     return 0;
 #else
+    ReadConfig();
     uint32_t len = 0, ver = 0;
     uint32_t frames = 0;
     if (g_api->is_reload && g_api->blob_get("stub.frames", &frames, sizeof frames, &len, &ver) && len == sizeof frames) g_frames = frames;
     g_api->register_method("stub.info", &MInfo, nullptr, 1);
+    g_api->register_method("stub.cfg", &MCfg, nullptr, 1);
     g_api->register_method("stub.slow", &MSlow, nullptr, 0);
     g_api->register_method("stub.fail", &MFail, nullptr, 1);
     static char onlyName[32];

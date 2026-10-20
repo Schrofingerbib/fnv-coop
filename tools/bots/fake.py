@@ -13,6 +13,7 @@ It implements the console grammar and bridge methods in primitives.py over a tin
   fire_miss         bot.fire reports fired:0
   health_stuck      shots land but health never changes
   dialog_never      activating an NPC never opens dialogue
+  dialog_lists_all  bot.dialog lists the topics of every actor, not only those of the NPC in dialogue
   ref_info_error    ref.info always fails with an RPC error
   crash             exec raises ConnectionLost
   drop_wrong_ref    the OnDrop event names a different ref than the one the engine created
@@ -291,7 +292,10 @@ class FakeBridge:
             if d is None:
                 raise RpcError(-32000, "no dialogue open", method)
             t = self.world.things[d]
-            return {"choices": [{"idx": i, "formId": top, "info": f"FalloutNV.esm:{top:X}"} for i, top in enumerate(t.topics)]}
+            tops = list(t.topics)
+            if self.mutant == "dialog_lists_all":
+                tops = [top for x in self.world.things.values() for top in x.topics]
+            return {"choices": [{"idx": i, "formId": top, "info": f"FalloutNV.esm:{top:X}"} for i, top in enumerate(tops)]}
         if method == P.M_BOT_INVENTORY:
             holder = self._by_ref(params["ref"]) if params.get("ref") else "player"
             items = self._holder_items(holder)

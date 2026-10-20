@@ -18,7 +18,8 @@ ROOT = HERE.parent.parent
 sys.path.insert(0, str(HERE.parent))
 
 MUTANTS = ("sliding", "tpose", "floating", "jitter", "rubberband", "stuck", "deathpose",
-           "group_compare", "weapon_compare", "facing_compare", "pose_compare", "aim_compare", "stance_compare", "counters")
+           "group_compare", "weapon_compare", "facing_compare", "pose_compare", "aim_compare", "stance_compare", "counters",
+           "verify_skip_all")
 
 
 def run(script: Path, mutant: str = "") -> subprocess.CompletedProcess:
@@ -50,22 +51,34 @@ def main() -> int:
     print(f"mutation twins: {len(MUTANTS)} run, {len(survivors)} survived{(': ' + ', '.join(survivors)) if survivors else ''}")
     bad += len(survivors)
 
-    ve = HERE / "verify_engine.py"
-    rv = run(ve)
-    print(rv.stdout.strip().splitlines()[-1])
-    if rv.returncode != 0:
-        print(rv.stdout[-3000:])
-        bad += 1
-    elif "SKIP" not in rv.stdout:
-        rvm = run(ve, "verify")
-        if rvm.returncode == 0:
-            print("SURVIVED: verify_engine twin")
-            bad += 1
-        else:
-            print("verify_engine twin caught")
+    vbad, lines = verify_step(HERE / "verify_engine.py")
+    print("\n".join(lines))
+    bad += vbad
 
     print(f"animcheck: {'FAILED' if bad else 'ALL OK'} ({time.time() - t0:.0f}s)")
     return 1 if bad else 0
+
+
+def verify_step(ve: Path, runner=run):
+    """Static engine-offset check (step 3). Returns (failures, report lines).
+
+    verify_engine.py reads a reference FalloutNV.exe and is not in the public repo, so a checkout without it skips the
+    step with a reason. A present script must pass and its own twin must fail.
+    """
+    if os.environ.get("ANIMCHECK_MUTANT") == "verify_skip_all":  # twin: never runs the check
+        return 0, ["SKIP verify_engine (mutant)"]
+    if not ve.exists():
+        return 0, [f"SKIP verify_engine: {ve.name} is not in this checkout (it needs a reference exe, see docs/tools/T7-anim.md)"]
+    rv = runner(ve)
+    out = rv.stdout.strip()
+    lines = [out.splitlines()[-1] if out else "(verify_engine printed nothing)"]
+    if rv.returncode != 0:
+        return 1, lines + [rv.stdout[-3000:] + rv.stderr[-1000:]]
+    if "SKIP" in rv.stdout:
+        return 0, lines
+    if runner(ve, "verify").returncode == 0:
+        return 1, lines + ["SURVIVED: verify_engine twin"]
+    return 0, lines + ["verify_engine twin caught"]
 
 
 if __name__ == "__main__":
