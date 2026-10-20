@@ -142,9 +142,15 @@ public:
             o.set("vats", v);
         } else if (method == "bot.move") {
             const int64_t ms = p.get("ms").asInt(0);
+            // `run` omitted: hold no Run key, so the game's own always-run toggle picks the speed (what bot.move did before
+            // run meant the speed). Only an explicit run:true/false asks for a speed.
+            speedGiven_ = !p.get("run").isNull();
+#if NVBOTS_MUTANT == 47
+            speedGiven_ = true;   // twin: an omitted run counts as run:false and walks under always-run
+#endif
             wantRun_ = p.get("run").asBool(false);
             const int alwaysRun = e_.alwaysRun();
-            const bool runControl = runControlFor(wantRun_, alwaysRun);
+            const bool runControl = speedGiven_ ? runControlFor(wantRun_, alwaysRun) : false;
             in_.setMove(p.get("forward").asNumber(0), p.get("strafe").asNumber(0), runControl);
             moving_ = in_.isHeld(kForward) || in_.isHeld(kBackward) || in_.isHeld(kLeft) || in_.isHeld(kRight);
             moveUntil_ = ms > 0 ? e_.nowMs() + (uint64_t)ms : 0;
@@ -295,6 +301,7 @@ public:
 private:
     // While a move lasts: the always-run toggle can change (a human key, bot.input tap AlwaysRun), so hold or release Run again.
     void followRun() {
+        if (!speedGiven_) return;   // no speed asked: the game's toggle decides, and the bot holds no Run key
         const bool k = runControlFor(wantRun_, e_.alwaysRun());
         if (k == in_.isHeld(kRun)) return;
         if (k) in_.hold(kRun);
@@ -344,7 +351,7 @@ private:
     ForcedInput& in_;
     uint64_t moveUntil_ = 0, nextShotAt_ = 0, gapMs_ = 180;
     int shotsLeft_ = 0, holdFrames_ = 3;
-    bool moving_ = false, wantRun_ = false;   // a bot.move with an axis held is active; the speed it asked for
+    bool moving_ = false, wantRun_ = false, speedGiven_ = false;   // a bot.move with an axis held is active; the speed it asked for
     VatsJob vats_;
     DropLog drops_;
     bool dropsLive_ = false;

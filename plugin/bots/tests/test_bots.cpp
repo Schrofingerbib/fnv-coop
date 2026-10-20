@@ -769,6 +769,24 @@ TEST(move_run_is_the_speed_whatever_the_always_run_toggle) {
     }
 }
 
+TEST(move_without_run_leaves_the_speed_to_the_game) {
+    // Review finding on PR #10: callers that omit `run` must keep the old behaviour (no Run key; the toggle picks the speed).
+    for (int on = 0; on < 2; ++on) {
+        GlueRig r;
+        r.g.setAlwaysRun(on != 0);
+        RunEngine eng{r.g, r.in};
+        CHECK(r.call("bot.move", "{\"forward\":1,\"strafe\":0}"));
+        int ran = 0;
+        for (int f = 0; f < 10; ++f) {
+            ran += eng.frame();
+            r.e.now += 16;
+            r.rpc.tick();
+        }
+        CHECK(!r.in.isHeld(kRun));
+        CHECK(ran == (on ? 10 : 0));   // always-run on: runs; off: walks, exactly like a player who presses nothing
+    }
+}
+
 TEST(move_follows_an_always_run_toggle_during_the_move) {
     GlueRig r;
     r.g.setAlwaysRun(true);
@@ -971,6 +989,7 @@ int main() {
     run("glue_methods_need_the_engine", glue_methods_need_the_engine);
     run("always_run_state_reads_the_engine_bytes", always_run_state_reads_the_engine_bytes);
     run("move_run_is_the_speed_whatever_the_always_run_toggle", move_run_is_the_speed_whatever_the_always_run_toggle);
+    run("move_without_run_leaves_the_speed_to_the_game", move_without_run_leaves_the_speed_to_the_game);
     run("move_follows_an_always_run_toggle_during_the_move", move_follows_an_always_run_toggle_during_the_move);
     run("move_with_unknown_always_run_keeps_the_key_meaning", move_with_unknown_always_run_keeps_the_key_meaning);
     run("always_run_pins_hold_the_addresses_the_reader_uses", always_run_pins_hold_the_addresses_the_reader_uses);
