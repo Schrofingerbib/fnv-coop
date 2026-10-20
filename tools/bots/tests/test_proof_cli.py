@@ -125,6 +125,23 @@ def lose_on(method, exc):
     return setup
 
 
+def lose_on_exec(text, exc):
+    """A setup for call_main: the fake loses the game (raises `exc`) on the first console line that contains `text`."""
+    def setup(nv):
+        exe = nv.exec
+
+        def lost_exec(cmd, timeout_ms=None):
+            if text in cmd:
+                raise exc
+            return exe(cmd, timeout_ms)
+        nv.exec = lost_exec
+    return setup
+
+
+class _NeverRaised(Exception):
+    """Stands in for ConnectionLost in a twin, so an `except ConnectionLost` clause catches nothing."""
+
+
 def lost_defect(mod, argv, setup):
     """None when a game lost in the middle of the run gives exit 2 and a 'could not run' message, with no traceback
     and no proof verdict. Else the defect."""
@@ -324,7 +341,8 @@ class RequiredArguments(unittest.TestCase):
 
 
 # A game lost in the middle of the run: script -> (argv, setup). proof_glue loses it when it asks for the dialogue
-# choices (after the talk), proof_input on its first console line (after the hook check).
+# choices (after the talk), proof_input on its first console line (after the hook check), or on its first sneak read
+# (after the jump check: the sneak check turns a failed read into a FAIL, but a lost game must still give 2).
 LOST = {
     "glue_connection_lost": (glue, ["--npc", NPC, "--info", INFO],
                              lose_on(P.M_BOT_DIALOG, ConnectionLost("fake: pipe closed"))),
@@ -332,6 +350,8 @@ LOST = {
                           lose_on(P.M_BOT_DIALOG, GameCrashed(4242, "fake: pipe closed"))),
     "input_connection_lost": (inp, [], lose_on("exec", ConnectionLost("fake: pipe closed"))),
     "input_game_crashed": (inp, [], lose_on("exec", GameCrashed(4242, "fake: pipe closed"))),
+    "input_lost_in_sneak": (inp, [], lose_on_exec(inp.SNEAK_EXPR, ConnectionLost("fake: pipe closed"))),
+    "input_crashed_in_sneak": (inp, [], lose_on_exec(inp.SNEAK_EXPR, GameCrashed(4242, "fake: pipe closed"))),
 }
 
 
@@ -348,6 +368,16 @@ class LostGame(unittest.TestCase):
             with self.subTest(case=case):
                 with mock.patch.object(proof_args, "guarded", lambda where, body: body()):
                     self.assertIsNotNone(lost_defect(mod, argv + common("unguarded_run.json"), setup))
+
+    def test_the_sneak_check_does_not_hide_a_lost_game(self):
+        for case in ("input_lost_in_sneak", "input_crashed_in_sneak"):
+            mod, argv, setup = LOST[case]
+            with self.subTest(case=case):
+                self.assertIsNone(lost_defect(mod, argv + common(case + ".json"), setup))
+                # twin: the sneak block catches the lost game as well (a sneak FAIL row and exit 1 instead of exit 2)
+                with mock.patch.object(inp, "ConnectionLost", _NeverRaised):
+                    defect = lost_defect(mod, argv + common("sneak_swallows_loss.json"), setup)
+                self.assertIsNotNone(defect, "twin sneak_swallows_loss slipped through " + case)
 
 
 class OtherInfo(unittest.TestCase):

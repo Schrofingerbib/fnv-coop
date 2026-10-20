@@ -20,6 +20,12 @@ It implements the console grammar and bridge methods in primitives.py over a tin
   travel_ignored    bot.fasttravel is accepted but the player never moves
   msgbox_stuck      bot.menu.press presses the engine's message box natively, but the box never closes
   msgbox_ui_only    bot.menu.press only answers the UI layer's box (the plugin before the native path existed)
+  run_is_key        bot.move holds Run for run:true whatever the always-run toggle is (the plugin before run = speed)
+
+Always-run: `always_run` is the engine's toggle (PlayerCharacter+0x651). True is the New Vegas default. bot.move `run` is the speed.
+The fake plugin holds Run only when run != always_run (runControlFor in bot_rpc.h). The fake engine moves at run speed when
+Run held != always_run (the run decision at 0x941A2B, keyboard mode). So with always-run on, Run held means walk. The bot.move
+reply and bot.status carry the same run fields as bot_rpc.h.
 
 Message boxes: `box` is the UI layer's own box (ui.open / ui.answer); `native_boxes` lists the engine's own queued boxes (MessageMenu,
 menu id 1001), one entry per box = its number of buttons. bot.menu reports kind "message" while either is shown.
@@ -39,12 +45,17 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from .bot import PLAYER_REF, angle_diff, heading_deg
-from .bot import ConnectionLost, RpcError  # re-exported from nvbridge
+from .bot import BridgeError, ConnectionLost, RpcError  # re-exported from nvbridge
 from . import primitives as P
 
 PLAYER_ID = 0x14
 _DRIVER_METHODS = {P.M_BOT_STATUS, P.M_BOT_MOVE, P.M_BOT_STOP, P.M_BOT_LOOK, P.M_BOT_FIRE, P.M_BOT_RELOAD, P.M_BOT_JUMP,
                    P.M_BOT_SNEAK, P.M_BOT_ACTIVATE}
+# Functions the fake console evaluates. The game has IsSneaking. It has no GetSneaking ("Unknown variable", first in-game run 2026-10-21).
+_EXPR_FUNCS = {"issneaking", "getangle", "getequipped", "getitemcount", "getopenstate", "getlocked", "getstage"}
+
+
+JUMP_SETTLE_S = 2.0  # see M_BOT_SNEAK in FakeBridge: crouch toggles right after a jump
 
 
 class VirtualClock:
@@ -167,6 +178,7 @@ class FakeBridge:
         self.box_waves: List[Tuple[float, List[int]]] = []   # (virtual time, [button counts]): engine boxes that appear later (tests set it)
         self.box_closing_s = 0.0                # seconds a pressed engine box stays closing (tests set it); 0 = it goes at once
         self._closing_until: Optional[float] = None
+        self.always_run = True                  # the engine's always-run toggle; True = on, the New Vegas default (tests set it)
         self.shots_left = 0
         self.vats_state = {"phase": "idle", "reason": ""}
         self.sneaking = False
@@ -196,7 +208,10 @@ class FakeBridge:
 
     def eval(self, expr: str) -> float:
         out = self.exec('printc "NVCOOP_EVAL=%g" (' + expr + ')')["output"]
-        return float(out.rsplit("NVCOOP_EVAL=", 1)[1].split()[0])
+        i = out.rfind("NVCOOP_EVAL=")
+        if i < 0:   # the same error as NvBridge.eval
+            raise BridgeError(f"cannot evaluate {expr!r}: {out!r}")
+        return float(out[i + 12:].split()[0])
 
     def exec(self, cmd: str, timeout_ms: Optional[int] = None) -> Dict[str, Any]:
         if self.mutant == "crash":
@@ -204,6 +219,9 @@ class FakeBridge:
         self.calls.append(("exec", cmd))
         m = re.fullmatch(r'printc "NVCOOP_EVAL=%g" \((.*)\)', cmd)
         if m:
+            fm = re.match(r"(?:\w+\.)?(\w+)", m.group(1).strip())
+            if fm and fm.group(1).lower() not in _EXPR_FUNCS:
+                return {"ok": False, "output": f"Unknown variable '{fm.group(1)}'"}   # what the game's console prints
             v = self._expr(m.group(1).strip())
             if v is None:
                 return {"ok": False, "output": "unknown expression"}
@@ -399,8 +417,10 @@ class FakeBridge:
         me = self.me
         if method == P.M_BOT_STATUS:
             return {"enabled": True, "hooked": True, "frame": int(self.clock.t * 60), "held": sorted(self.held),
-                    "shotsLeft": self.shots_left, "vats": self.vats_state}
+                    "shotsLeft": self.shots_left, "alwaysRun": self.always_run, "vats": self.vats_state}
         if method == P.M_BOT_MOVE:
+            want = bool(params.get("run", False))
+            run_control = want if self.mutant == "run_is_key" else want != self.always_run   # runControlFor in bot_rpc.h
             if self.mutant != "move_ignored":
                 self.held -= {"Forward", "Backward", "Left", "Right", "Run"}
                 f, st = float(params.get("forward", 0)), float(params.get("strafe", 0))
@@ -408,8 +428,8 @@ class FakeBridge:
                 if f < -0.3: self.held.add("Backward")
                 if st > 0.3: self.held.add("Right")
                 if st < -0.3: self.held.add("Left")
-                if params.get("run"): self.held.add("Run")
-            return {"held": sorted(self.held)}
+                if run_control: self.held.add("Run")
+            return {"held": sorted(self.held), "run": want, "runControl": run_control, "alwaysRun": self.always_run}
         if method == P.M_BOT_STOP:
             if self.mutant != "stop_ignored":
                 self.held.clear()
@@ -438,8 +458,15 @@ class FakeBridge:
         if method == P.M_BOT_JUMP:
             if self.mutant != "jump_noop" and self.jump_t <= 0:
                 self.jump_t, self.jump_base = 0.6, me.pos[2]
+                self.jump_settle_until, self.jump_toggles = self.clock.t + JUMP_SETTLE_S, 0
             return {}
         if method == P.M_BOT_SNEAK:
+            # In game (2026-10-21): within about 2 s of a jump only one crouch toggle takes effect; a second tap 1.1 s
+            # later left the player crouched. Two seconds after the jump both taps toggle again.
+            if self.clock.t < getattr(self, "jump_settle_until", 0.0):
+                self.jump_toggles += 1
+                if self.jump_toggles > 1:
+                    return {}
             self.sneaking = not self.sneaking
             return {}
         if method == P.M_BOT_ACTIVATE:
@@ -476,7 +503,8 @@ class FakeBridge:
             fwd = ("Forward" in self.held) - ("Backward" in self.held)
             side = ("Right" in self.held) - ("Left" in self.held)
             if (fwd or side) and not self.native_boxes:   # an engine message box is up: menu mode, the player does not move
-                speed = 220.0 if "Run" in self.held else 120.0
+                running = ("Run" in self.held) != self.always_run   # the engine's run decision: with always-run on, Run held = walk
+                speed = 220.0 if running else 120.0
                 yaw = math.radians(me.angle["Z"])
                 dx = (math.sin(yaw) * fwd + math.cos(yaw) * side) * speed * h
                 dy = (math.cos(yaw) * fwd - math.sin(yaw) * side) * speed * h
@@ -582,7 +610,7 @@ class FakeBridge:
             return None
         tgt, fn, rest = m.group(1), m.group(2).lower(), (m.group(3) or "").split()
         me = self.me
-        if fn == "getsneaking":
+        if fn == "issneaking":
             return 1.0 if self.sneaking else 0.0
         if fn == "getangle":
             return me.angle[rest[0].upper()]
