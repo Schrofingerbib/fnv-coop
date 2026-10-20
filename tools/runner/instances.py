@@ -234,6 +234,31 @@ def plugin_plan(plugin_dll: Optional[Path] = None, core_dll: Optional[Path] = No
     return files, ini
 
 
+class UnsafeInstance(RuntimeError):
+    """The instance layout would make provisioning write or delete outside the instance."""
+
+
+def check_plugins_inside(d: Path) -> None:
+    """Refuse when Data, Data/NVSE or Data/NVSE/Plugins of an instance is a symlink or junction, or resolves outside the
+    instance. Provisioning deletes stale DLLs and writes nvcoop.ini there; through a linked Data folder that would change
+    the game install itself."""
+    base = Path(os.path.realpath(d))
+    for p in (d / "Data", d / "Data" / "NVSE", d / "Data" / "NVSE" / "Plugins"):
+        if not (p.exists() or p.is_symlink()):
+            continue
+        is_junction = getattr(p, "is_junction", lambda: False)()
+        real = Path(os.path.realpath(p))
+        if p.is_symlink() or is_junction or not real.is_relative_to(base):
+            raise UnsafeInstance(f"{p} is a link (resolves to {real}); refusing to write plugins outside the instance")
+
+
+def same_file(a: Path, b: Path) -> bool:
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def stale_plugin_dlls(plugins: Path, keep: List[Path]) -> List[Path]:
     """nvcoop*.dll files in the instance Plugins folder that this provision does not install.
 
@@ -258,13 +283,12 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
         raise FileNotFoundError(f"game not found at {g}")
     d = instance_dir(i, root)
     d.mkdir(parents=True, exist_ok=True)
+    plugins = d / "Data" / "NVSE" / "Plugins"
+    check_plugins_inside(d)  # before mirror_tree: it must not write through a linked Data folder either
     counts = mirror_tree(g, d, modes)
     (d / "Saves").mkdir(exist_ok=True)
-    plugins = d / "Data" / "NVSE" / "Plugins"
-    for p in (d / "Data" / "NVSE", plugins):
-        if p.is_symlink():
-            raise RuntimeError(f"{p} is a symlink; refusing to write plugins into the game install")
     plugins.mkdir(parents=True, exist_ok=True)
+    check_plugins_inside(d)  # and again before anything is deleted from or written into Plugins
     for name, text in render_inis().items():
         (d / name).write_text(text, encoding="latin-1", newline="")
     if appid:
@@ -280,7 +304,8 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
         f.unlink()
         removed.append("Data/NVSE/Plugins/" + f.name)
     for p in sources:
-        _replace(p, plugins / p.name)
+        if not same_file(p, plugins / p.name):  # a source that is already the installed file must not be deleted
+            _replace(p, plugins / p.name)
         installed.append("Data/NVSE/Plugins/" + p.name)
     cfg = write_plugin_ini(d, i, role, autoload, autoload_delay_frames, ini_extra)
     meta = {
@@ -518,11 +543,15 @@ def main(argv=None) -> int:
             print("refusing: <2 GiB free", file=sys.stderr)
             return 2
         for i in range(a.n):
-            m = provision(i, role="host" if i == 0 else "client",
-                          nvse_dir=Path(a.nvse_dir) if a.nvse_dir else None,
-                          plugin_dll=dll, core_dll=core, extra_ini=extra_ini,
-                          autoload=a.autoload, modes=tuple(a.modes.split(",")),
-                          appid=None if a.no_appid else STEAM_APPID)
+            try:
+                m = provision(i, role="host" if i == 0 else "client",
+                              nvse_dir=Path(a.nvse_dir) if a.nvse_dir else None,
+                              plugin_dll=dll, core_dll=core, extra_ini=extra_ini,
+                              autoload=a.autoload, modes=tuple(a.modes.split(",")),
+                              appid=None if a.no_appid else STEAM_APPID)
+            except UnsafeInstance as e:
+                print(f"error: instance {i}: {e}", file=sys.stderr)
+                return 2
             print(f"instance {i}: {m['dir']} links={m['link_counts']}")
     elif a.cmd == "show":
         for i in range(a.n):
