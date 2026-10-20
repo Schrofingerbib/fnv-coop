@@ -117,9 +117,9 @@ Wired into `tools/test_all.py` as "T3a loader" (compiles, so skipped by `--quick
 
 ## Verification state and limits (plain)
 
-- Verified by running: the game-free tests and all four mutants (this file's "Tests" section); the loader DLL
+- Verified by running: the game-free tests and all twelve loader mutants (this file's "Tests" section); the loader DLL
   builds and exports `NVSEPlugin_Query` / `NVSEPlugin_Load`.
-- Not verified: a full split build of the core DLL (other lanes' files were mid-edit and failed to compile),
+- Not verified by these tests: the full split build of the core DLL (the first line of this file records that it built clean on 2026-10-20; the loader tests do not build it),
   and anything in the real game: that NVSE accepts the loader, that real modules survive a reload, and that no
   module registers NVSE-side callbacks. I found none in the plugin sources (no `RegisterListener` /
   command registration outside `main.cpp`), but that was a text search only.
