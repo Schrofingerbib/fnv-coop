@@ -16,7 +16,9 @@
 //   bot.jump / bot.activate                     -> {}             tap Jump / Activate (activate acts on the crosshair target)
 //   bot.input {hold?:[n],release?:[n],tap?:[n],frames?} -> {held}   generic, names or ids, e.g. "Forward", "Vats"
 //   bot.menu                                    -> {kind,id,vatsMode,dialogState?,dialogReady?}  current menu / VATS / dialogue state
-//   bot.menu.press {button}                     -> {menu,button}  answer the message box our ops layer is showing (consent, PNR confirm)
+//   bot.menu.press {button}                     -> {menu,button,path}  answer the message box our ops layer is showing (consent, PNR confirm),
+//                                                  path "ui"; when it shows none and the engine's own MessageMenu (1001) is the top menu, press that
+//                                                  box's button natively: path "native", plus {value,buttons} (see pressNativeMessageButton)
 //   bot.consent {answer:"ready"|"notyet"}       -> {menu,button}  answer the party-consent prompt (buttons: Ready=0, Not yet=1)
 //   bot.inventory {ref?,items?:[form]}          -> {items:[{item,count}],partial}  totals via the engine's own counting
 //   bot.say {info}                              -> {said,index,nextState}  choose that INFO in the open DialogMenu (state must be ready)
@@ -59,16 +61,19 @@ struct IBotEngine {
     virtual int alwaysRun() { return -1; }
 };
 
-// Mutants for this file (33, 34, 37), every one must make tests/test_bots.cpp fail:
-//  33 bot.move holds Run for run:true whatever the always-run toggle is (the behaviour the first in-game run measured)
-//  34 a toggle change during a move is not followed     37 an unknown always-run state is treated as on
+// Mutants for this file, every one must make tests/test_bots.cpp fail:
+//  native message box press (33, 36, 40; the others of 33..41 are in bot_engine.h):
+//  33 native path never used    36 native path tried before the UI layer    40 native reply says path "ui"
+//  always-run (42, 43, 46; 44 and 45 are in bot_engine.h):
+//  42 bot.move holds Run for run:true whatever the always-run toggle is (the behaviour the first in-game run measured)
+//  43 a toggle change during a move is not followed     46 an unknown always-run state is treated as on
 
 // The Run control (9) to hold so that the player moves at the wanted speed. alwaysRun: 1 on, 0 off, -1 unknown.
 inline bool runControlFor(bool wantRun, int alwaysRun) {
-#if NVBOTS_MUTANT == 33
+#if NVBOTS_MUTANT == 42
     (void)alwaysRun;
     return wantRun;
-#elif NVBOTS_MUTANT == 37
+#elif NVBOTS_MUTANT == 46
     if (alwaysRun < 0) return !wantRun;
     return wantRun != (alwaysRun == 1);
 #else
@@ -109,7 +114,7 @@ public:
 #if NVBOTS_MUTANT != 12
         if (moveUntil_ && now >= moveUntil_) { in_.stopMove(); moveUntil_ = 0; moving_ = false; }
 #endif
-#if NVBOTS_MUTANT != 34
+#if NVBOTS_MUTANT != 43
         if (moving_) followRun();
 #endif
         if (shotsLeft_ > 0 && now >= nextShotAt_) {
@@ -210,9 +215,13 @@ public:
 #endif
             }
             if (button < 0 || button > 9) { out = "bad button/answer"; return false; }
-            uint32_t menu = 0;
-            ok = e_.pressBox(button, &menu, &out);
-            if (ok) o.set("menu", (int64_t)menu).set("button", (int64_t)button);
+            if (method == "bot.consent") {   // the party-consent prompt is always the UI layer's own box
+                uint32_t menu = 0;
+                ok = e_.pressBox(button, &menu, &out);
+                if (ok) o.set("menu", (int64_t)menu).set("button", (int64_t)button);
+            } else {
+                ok = pressMenuButton(button, &o, &out);
+            }
         } else if (method == "bot.inventory") {
             IEngine* g = e_.engine();
             std::vector<std::string> want;
@@ -290,6 +299,34 @@ private:
         if (k == in_.isHeld(kRun)) return;
         if (k) in_.hold(kRun);
         else in_.release(kRun);
+    }
+    // bot.menu.press: the UI layer's box first (ui.answer). Only when it has none and the engine's own message box (MessageMenu, id 1001) is
+    // the top menu, press that box natively (pressNativeMessageButton in bot_engine.h). The reply says which path answered.
+    bool pressMenuButton(int button, Value* o, std::string* out) {
+        IEngine* g = e_.engine();
+        bool applies = false;
+        std::string uiErr, nativeErr;
+#if NVBOTS_MUTANT == 36
+        if (g && pressNativeMessageButton(*g, button, o, &nativeErr, &applies)) { o->set("path", "native"); return true; }
+#endif
+        uint32_t menu = 0;
+        if (e_.pressBox(button, &menu, &uiErr)) {
+            o->set("menu", (int64_t)menu).set("button", (int64_t)button).set("path", "ui");
+            return true;
+        }
+#if NVBOTS_MUTANT != 33
+        if (g && pressNativeMessageButton(*g, button, o, &nativeErr, &applies)) {
+#if NVBOTS_MUTANT == 40
+            o->set("path", "ui");
+#else
+            o->set("path", "native");
+#endif
+            return true;
+        }
+        if (applies) { *out = "native message box: " + nativeErr + " (ui layer: " + uiErr + ")"; return false; }
+#endif
+        *out = uiErr;
+        return false;
     }
     Value heldList() const {
         Value a = Value::array();

@@ -1,4 +1,4 @@
-// Game-free tests for the bot input driver (T6a). Built once against the real code and once per NVBOTS_MUTANT=<n> (1..37); every mutant MUST fail.
+// Game-free tests for the bot input driver (T6a). Built once against the real code and once per NVBOTS_MUTANT=<n> (1..46); every mutant MUST fail.
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -261,11 +261,18 @@ using nvbots_test::FakeGame;
 
 struct GlueEngine : MockEngine {
     FakeGame* g = nullptr;
-    int pressed = -1;
+    int pressed = -1, uiTries = 0;
+    bool uiBox = true;   // the UI layer (ui.answer) is showing a box
     std::string moved;
     IEngine* engine() override { return g; }
     int alwaysRun() override { return g ? alwaysRunState(*g) : -1; }
-    bool pressBox(int b, uint32_t* menu, std::string*) override { pressed = b; *menu = 900; return true; }
+    bool pressBox(int b, uint32_t* menu, std::string* err) override {
+        ++uiTries;
+        if (!uiBox) { *err = "no message box is being shown"; return false; }
+        pressed = b;
+        *menu = 900;
+        return true;
+    }
     bool moveTo(const std::string& r, std::string*) override { moved = r; return true; }
 };
 struct GlueRig {
@@ -479,6 +486,93 @@ TEST(consent_and_press_answer_the_right_button) {
     CHECK(!r.call("bot.menu.press", "{}"));
     Rig plain;   // an engine with no answer path says so
     CHECK(!plain.call("bot.consent", "{\"answer\":\"ready\"}") && plain.out.find("unsupported") != std::string::npos);
+}
+
+// ---- bot.menu.press native path: the engine's own MessageMenu (1001) when the UI layer has no box ----
+static bool anyMsgClick(const FakeGame& g) {
+    for (const std::string& c : g.calls)
+        if (c.rfind("msgclick", 0) == 0) return true;
+    return false;
+}
+static std::string msgClick(Addr32 tile) { return "msgclick " + FakeGame::hex(FakeGame::kMsgMenu) + " 7 " + FakeGame::hex(tile); }
+static std::string lastCall(const FakeGame& g) { return g.calls.empty() ? std::string() : g.calls.back(); }
+
+TEST(native_message_box_is_pressed_when_the_ui_layer_has_none) {
+    GlueRig r;
+    r.e.uiBox = false;
+    r.g.buildMessageBox({0, 1, 2});
+    CHECK(r.call("bot.menu.press", "{\"button\":1}"));
+    CHECK(r.out.find("\"path\":\"native\"") != std::string::npos && r.out.find("\"menu\":1001") != std::string::npos);
+    CHECK(r.out.find("\"button\":1") != std::string::npos && r.out.find("\"value\":1") != std::string::npos && r.out.find("\"buttons\":3") != std::string::npos);
+    CHECK(r.e.uiTries == 1);                                         // the UI layer was asked first
+    CHECK(lastCall(r.g) == msgClick(FakeGame::msgTile(1)));          // HandleClick(7, tile of the 2nd listed button)
+    r.g.calls.clear();
+    CHECK(r.call("bot.menu.press", "{\"button\":0}"));
+    CHECK(lastCall(r.g) == msgClick(FakeGame::msgTile(0)));          // never a SetField tile (menu+0x28..0x3C)
+    for (const std::string& c : r.g.calls) CHECK(c.find(FakeGame::hex(FakeGame::kMsgDecoy)) == std::string::npos);
+    r.g.calls.clear();
+    CHECK(r.call("bot.menu.press", "{\"button\":2}") && lastCall(r.g) == msgClick(FakeGame::msgTile(2)));   // the last one, no wrap
+    // an empty button text keeps its index in the engine value: the 2nd listed button reports value 2
+    r.g.buildMessageBox({0, 2});
+    r.g.calls.clear();
+    CHECK(r.call("bot.menu.press", "{\"button\":1}") && r.out.find("\"value\":2") != std::string::npos);
+    CHECK(lastCall(r.g) == msgClick(FakeGame::msgTile(1)));
+}
+
+TEST(native_message_press_refuses_with_a_reason) {
+    GlueRig r;
+    r.e.uiBox = false;
+    r.g.calls.clear();
+    // a button the box does not list
+    r.g.buildMessageBox({0, 1});
+    CHECK(!r.call("bot.menu.press", "{\"button\":2}") && r.out.find("is not shown (the box has 2 buttons)") != std::string::npos);
+    CHECK(r.out.find("ui layer: no message box is being shown") != std::string::npos);
+    // menu 1001 with another vtable (here the base Menu one)
+    r.g.buildMessageBox({0, 1}, 0x1095484);
+    CHECK(!r.call("bot.menu.press", "{\"button\":0}") && r.out.find("not a MessageMenu") != std::string::npos);
+    // a listed button without a tile
+    r.g.buildMessageBox({0, 1});
+    r.g.set32(FakeGame::kMsgItems, 0);
+    CHECK(!r.call("bot.menu.press", "{\"button\":0}") && r.out.find("has no tile") != std::string::npos);
+    // no current message: the box is closing
+    r.g.buildMessageBox({0, 1});
+    r.g.set32(nvbots::eng::kMsgQueueIdx, 1);
+    CHECK(!r.call("bot.menu.press", "{\"button\":0}") && r.out.find("closing") != std::string::npos);
+    // not on the game main thread
+    r.g.buildMessageBox({0, 1});
+    r.g.mainThread = false;
+    CHECK(!r.call("bot.menu.press", "{\"button\":0}") && r.out.find("main thread") != std::string::npos);
+    r.g.mainThread = true;
+    // the message menu is not the top menu (a stale MessageMenu object is still there): the UI layer's error comes back unchanged
+    r.g.buildMessageBox({0, 1});
+    r.g.topId = 0x3EC;
+    CHECK(!r.call("bot.menu.press", "{\"button\":0}") && r.out == "no message box is being shown");
+    CHECK(!anyMsgClick(r.g));                                        // no refusal above touched the engine
+    // the live glue refusing the call is reported, not hidden
+    r.g.buildMessageBox({0, 1});
+    r.g.clickOk = false;
+    CHECK(!r.call("bot.menu.press", "{\"button\":0}") && r.out.find("refused the HandleClick") != std::string::npos);
+}
+
+TEST(ui_path_wins_and_consent_is_unchanged) {
+    GlueRig r;
+    r.g.buildMessageBox({0, 1});   // both boxes exist: the UI layer's box answers
+    CHECK(r.call("bot.menu.press", "{\"button\":1}") && r.out.find("\"path\":\"ui\"") != std::string::npos && r.e.pressed == 1);
+    CHECK(r.out.find("\"menu\":900") != std::string::npos);
+    CHECK(!anyMsgClick(r.g));
+    CHECK(r.call("bot.consent", "{\"answer\":\"notyet\"}") && r.e.pressed == 1 && r.out.find("path") == std::string::npos);
+    r.e.uiBox = false;              // consent never presses the engine's box
+    CHECK(!r.call("bot.consent", "{\"answer\":\"ready\"}") && r.out == "no message box is being shown");
+    CHECK(!anyMsgClick(r.g));
+}
+
+TEST(native_press_pins_agree) {
+    CHECK(addr::MsgMenuSlotHandleClick.addr == addr::MessageMenuVtbl + addr::kMenuSlotHandleClick);
+    CHECK(addr::MsgMenuSlotHandleClick.value == addr::MsgMenuHandleClick.addr);
+    CHECK(addr::MsgMenuHandleClick.ret == 8);
+    bool listed = false;
+    for (const addr::CallPin* c : addr::kAllCalls) listed = listed || c == &addr::MsgMenuHandleClick;
+    CHECK(listed);
 }
 
 TEST(fasttravel_is_a_move_and_says_it_is_not_genuine) {
@@ -805,6 +899,19 @@ TEST(pins_match_real_exe_if_available) {
         }
         CHECK(found);
     }
+    for (const addr::DataPin* p : addr::kAllData) {   // vtable slots in .rdata
+        bool found = false;
+        for (size_t i = 0; i < nsec && !found; ++i) {
+            size_t o = e + 24 + opt + i * 40;
+            unsigned vs = u32(o + 8), va = u32(o + 12) + 0x400000, rs = u32(o + 16), rp = u32(o + 20);
+            if (p->addr >= va && p->addr + 4 <= va + rs) {
+                found = true;
+                CHECK(u32(rp + (p->addr - va)) == p->value);
+            }
+            (void)vs;
+        }
+        CHECK(found);
+    }
     int runPins = 0;
     for (const addr::CodePin* c : addr::kRunPins) {
         bool found = false;
@@ -850,6 +957,10 @@ int main() {
     run("vats_job_enters_cycles_to_the_target_accepts_and_finishes", vats_job_enters_cycles_to_the_target_accepts_and_finishes);
     run("vats_job_fails_clearly", vats_job_fails_clearly);
     run("consent_and_press_answer_the_right_button", consent_and_press_answer_the_right_button);
+    run("native_message_box_is_pressed_when_the_ui_layer_has_none", native_message_box_is_pressed_when_the_ui_layer_has_none);
+    run("native_message_press_refuses_with_a_reason", native_message_press_refuses_with_a_reason);
+    run("ui_path_wins_and_consent_is_unchanged", ui_path_wins_and_consent_is_unchanged);
+    run("native_press_pins_agree", native_press_pins_agree);
     run("fasttravel_is_a_move_and_says_it_is_not_genuine", fasttravel_is_a_move_and_says_it_is_not_genuine);
     run("dialogue_pick_allows_speech_checks_and_says_so", dialogue_pick_allows_speech_checks_and_says_so);
     run("genuine_fast_travel_queues_the_engine_travel_object", genuine_fast_travel_queues_the_engine_travel_object);

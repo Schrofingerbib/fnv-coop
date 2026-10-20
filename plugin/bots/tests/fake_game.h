@@ -106,6 +106,45 @@ struct FakeGame : nvbots::IEngine {
         }
     }
 
+    // ---- native message box (MessageMenu, id 1001): GetMenuByType chain, button ListBox at menu+0x40 (head node at +0x44), one current
+    // message in the queue. values[i] is the engine value of the i-th listed button; its tile is msgTile(i). The six SetField tiles at
+    // menu+0x28..0x3C are decoys (kMsgDecoy + i*0x10): a press must never pass them.
+    static constexpr Addr32 kTileMenus = 0x3D000000, kTileMenu = 0x3D100000, kMsgMenu = 0x3D200000, kMsgNodes = 0x3D300000, kMsgItems = 0x3D400000,
+                            kMsgTiles = 0x3D500000, kMsgDecoy = 0x3D600000;
+    bool mainThread = true;
+    bool clickOk = true;
+    static Addr32 msgTile(size_t i) { return kMsgTiles + Addr32(i) * 0x10; }
+    void buildMessageBox(const std::vector<int32_t>& values, uint32_t vtbl = nvbots::addr::MessageMenuVtbl) {
+        set32(nvbots::eng::kInterfaceMgrPtr, kMgr);
+        topId = nvbots::eng::kMenuIdMessage;
+        set32(nvbots::eng::kTileMenuArrayData, kTileMenus);
+        set32(kTileMenus + 4 * (nvbots::eng::kMenuIdMessage - nvbots::eng::kMenuIdMin), kTileMenu);
+        set32(kTileMenu + nvbots::eng::kTileMenuMenu, kMsgMenu);
+        set32(kMsgMenu, vtbl);
+        for (Addr32 i = 0; i < 6; ++i) set32(kMsgMenu + 0x28 + 4 * i, kMsgDecoy + i * 0x10);
+        set32(kMsgMenu + 0x40, 0x107286C);   // ListBox<int> vtable
+        Addr32 node = kMsgMenu + nvbots::eng::kMsgButtonHead;
+        set32(node, 0);
+        set32(node + 4, 0);
+        for (size_t i = 0; i < values.size(); ++i) {
+            const Addr32 item = kMsgItems + Addr32(i) * 0x10;
+            set32(item, msgTile(i));
+            set32(item + 4, uint32_t(values[i]));
+            set32(node, item);
+            const Addr32 next = i + 1 < values.size() ? kMsgNodes + Addr32(i) * 0x10 : 0;
+            set32(node + 4, next);
+            node = next;
+        }
+        set32(nvbots::eng::kMsgQueueIdx, 0);   // message 0 of 1 is current
+        set32(nvbots::eng::kMsgQueue + 4, 0x3D700000);
+        set32(nvbots::eng::kMsgQueue + 8, 1);
+    }
+    bool onMainThread() override { return mainThread; }
+    bool msgMenuHandleClick(Addr32 menu, int id, Addr32 tile) override {
+        calls.push_back("msgclick " + hex(menu) + " " + std::to_string(id) + " " + hex(tile));
+        return clickOk;
+    }
+
     // ---- inventory: entries {type, delta}
     void buildInventory(const std::vector<std::pair<Addr32, int>>& entries) {
         set32(player + 0x1000, kData);                               // containerData(player) result lives here

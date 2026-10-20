@@ -5,6 +5,10 @@ against a real game. It proves, with numbers, that forced controls reach the eng
     python tools/bots/proof_input.py --fake            # same script over the fake bridge (game-free self-test)
 
 Needs nvcoop.ini [dev] bots=1 on the instance. Writes out/T6a/proof_input.json and exits non-zero on any FAIL.
+--dismiss-messages (opt-in, off by default): first clear stray message boxes with Bot.dismiss_messages (button 0 while bot.menu says
+"message"), e.g. the DLC notices a fresh save shows after load. They come in waves (6, then 2, then 2 about 16 s later), so it presses
+until no box has been shown for --dismiss-quiet-s seconds (default 20), at most --dismiss-max-s (default 120). It adds a
+"dismiss_messages" row with the press count and the seconds it waited.
 Checks (each prints measured values so a failure says what the game did):
   hook      bot.status reports hooked=true and the control-state query counter rises each frame
   forward   bot.move forward, run:true (run SPEED) for 2 s: the player moves 300..700 units along the facing direction. With the
@@ -61,6 +65,9 @@ def rel_move(b, before, yaw_deg):
 def run(nv, args) -> Report:
     r = Report()
     b = Bot(nv, "proof")
+    if getattr(args, "dismiss_messages", False):
+        d = b.dismiss_messages(quiet_s=getattr(args, "dismiss_quiet_s", 20.0), max_s=getattr(args, "dismiss_max_s", 120.0))
+        r.check("dismiss_messages", d.ok, pressed=d.data.get("pressed"), waited_s=d.data.get("waited_s"), reply=str(d))
     st = nv.call("bot.status")
     q0 = st.get("frame", 0)
     b.wait(0.5)
@@ -142,6 +149,9 @@ def main() -> int:
     ap.add_argument("--target")
     ap.add_argument("--door")
     ap.add_argument("--fake", action="store_true")
+    ap.add_argument("--dismiss-messages", action="store_true", help="clear stray message boxes (button 0) before the checks")
+    ap.add_argument("--dismiss-quiet-s", type=float, default=20.0, help="done when no box has been shown for this many seconds")
+    ap.add_argument("--dismiss-max-s", type=float, default=120.0, help="give up (FAIL) after this many seconds")
     ap.add_argument("--out", default=str(ROOT / "out" / "T6a" / "proof_input.json"))
     args = ap.parse_args()
     if args.fake:
