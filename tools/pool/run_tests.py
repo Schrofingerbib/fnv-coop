@@ -158,6 +158,44 @@ def check_crash_restart(m):
     p.down()
 
 
+def check_boot_id_per_process(m):
+    """Every game process gets its own boot id. A pool restart starts gen at 1 again but must give a new boot id
+    (T4b keys its scenario state by it); the same live process keeps its boot id from lease to lease."""
+    seen = []
+    for _ in range(2):                          # two pool starts on the same machine
+        p, b, *_ = mk(1, m)
+        p.up()
+        L = p.lease("t")
+        assert L["gens"] == {"0": 1}, L["gens"]
+        boot = L["boots"]["0"]
+        assert boot and boot not in seen, f"boot id {boot!r} repeats an earlier game process {seen}"
+        assert p.status()["instances"][0]["boot"] == boot
+        seen.append(boot)
+        p.release(L["id"])
+        L = p.lease("t")
+        assert L["boots"]["0"] == boot, "the same live process must keep its boot id"
+        p.mark_dirty(L["id"], 0, "test")
+        p.release(L["id"])                      # recycled: a new process
+        L = p.lease("t")
+        assert L["gens"] == {"0": 2} and L["boots"]["0"] not in seen, (L, seen)
+        seen.append(L["boots"]["0"])
+        p.release(L["id"])
+        p.down()
+        assert p.insts[0].boot == "", "no process, no boot id"
+
+
+def check_boot_refreshed_at_lease(m):
+    p, b, *_ = mk(1, m)
+    p.up()
+    old = p.insts[0].boot
+    b.crash(0)
+    L = p.lease("t")                            # the health check restarts the dead instance before handing it out
+    assert L["gens"]["0"] == 2
+    assert L["boots"]["0"] == p.insts[0].boot != old, f"lease names the replaced process: {L['boots']} (old {old})"
+    assert p.leases[L["id"]]["boots"] == L["boots"]
+    p.down()
+
+
 def check_dead_instance_never_leased(m):
     p, b, *_ = mk(1, m)
     p.up()
@@ -322,6 +360,7 @@ def check_daemon_client(m):
     try:
         with client.lease("t1", n=1, ttl_s=60) as L:
             assert L.instances == [90]
+            assert L.boot() and L.boot() == L.boot(90) == pool.insts[90].boot, "boot id must reach the lessee"
             nv = L.bridge()
             assert nv.ping()["pong"] and nv.lease_info()["held"], "bridge must hold the lock.* lease"
             assert [x["state"] for x in client.status()["instances"]] == ["leased", "warm"]
@@ -383,14 +422,15 @@ def check_real_slots_cli(m):
 
 REAL = [check_exclusive, check_pair_lease_order, check_size_clamped, check_recycle_after_k, check_dirty_recycles,
         check_expiry, check_renew, check_kill_only_own, check_reap_previous_only_recorded, check_crash_restart,
-        check_dead_instance_never_leased, check_unresponsive_restart, check_memory_growth, check_start_failure,
-        check_failed_start_stops_lease, check_slot_renew, check_pids_registered, check_lowcost_applies,
+        check_boot_id_per_process, check_boot_refreshed_at_lease, check_dead_instance_never_leased,
+        check_unresponsive_restart, check_memory_growth, check_start_failure, check_failed_start_stops_lease, check_slot_renew, check_pids_registered, check_lowcost_applies,
         check_lowcost_guard_hardlink, check_lowcost_guard_mygames, check_owner_inis_untouched,
         check_doc_lists_every_key, check_daemon_client, check_client_not_running, check_real_slots_cli]
 
 TWINS = [(check_exclusive, "double_lease"), (check_recycle_after_k, "no_recycle_k"), (check_dirty_recycles, "no_dirty_recycle"),
          (check_expiry, "no_expire"), (check_kill_only_own, "kill_foreign"), (check_lowcost_guard_hardlink, "no_guard"),
-         (check_lowcost_guard_mygames, "no_guard"), (check_doc_lists_every_key, "doc_missing"), (check_daemon_client, "no_dirty_recycle")]
+         (check_lowcost_guard_mygames, "no_guard"), (check_doc_lists_every_key, "doc_missing"), (check_daemon_client, "no_dirty_recycle"),
+         (check_boot_id_per_process, "gen_boot"), (check_boot_refreshed_at_lease, "stale_boot")]
 
 
 def main() -> int:

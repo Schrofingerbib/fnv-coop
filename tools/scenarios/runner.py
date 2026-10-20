@@ -9,6 +9,7 @@ with a clean world that is a few quest-reset calls and some console lines: secon
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -20,7 +21,7 @@ sys.path.insert(0, str(HERE.parents[1] / "tools" / "runner"))
 import scenlib  # noqa: E402
 
 PARSE_ERRORS = ("could not parse", "error line", "unknown", "invalid")   # same list as the L7 sweep
-MUTANT = os.environ.get("SCEN_MUTANT", "")   # test-only: "noreload" | "passall" | "firsthost" | "nodirty"
+MUTANT = os.environ.get("SCEN_MUTANT", "")   # test-only: "noreload" | "passall" | "firsthost" | "nodirty" | "oldkey"
 
 
 class ScenarioError(Exception):
@@ -28,8 +29,11 @@ class ScenarioError(Exception):
 
 
 class StateStore:
-    """Per-instance memory of what is loaded and what the last scenario dirtied. Keyed by (instance, generation) so a
-    restarted game (new generation) is treated as empty."""
+    """Per-game-process memory of what is loaded and what the last scenario dirtied.
+
+    A key must name one game process, never only a slot: a key that a later game can repeat makes the next jump skip a
+    needed save load, so the checks run against a fresh game at the main menu or a different world. The pool generation
+    is not enough (it starts again at 1 on every pool start). Build keys with lease_keys() for pool instances."""
 
     def __init__(self, path=None):
         self.path = Path(path) if path else None
@@ -50,8 +54,26 @@ class StateStore:
             self.path.write_text(json.dumps(self.data, indent=1, sort_keys=True), encoding="utf-8")
 
     @staticmethod
-    def key(instance, generation):
-        return "%s@%s" % (instance, generation)
+    def key(instance, process):
+        """instance@process. `process` must identify one game process (see lease_keys)."""
+        return "%s@%s" % (instance, process)
+
+    @staticmethod
+    def lease_keys(lease):
+        """One key per lease instance, host first, from the id the pool gives each game process (client.Lease.boot).
+        The same live game gets the same key on every lease, so a later run still jumps in place. A new game process
+        gets a new key, also after a pool restart. When the pool reports no id (an older pool), the keys are new for
+        this call, so the first jump reloads the save."""
+        if MUTANT == "oldkey":   # test-only: the old instance@generation key, which repeats after a pool restart
+            gens = getattr(lease, "_gens", {})
+            return [StateStore.key(i, gens.get(i, 0)) for i in lease.instances]
+        boot = getattr(lease, "boot", None)
+        unknown = "unknown-" + secrets.token_hex(6)
+        out = []
+        for i in lease.instances:
+            b = boot(i) if callable(boot) else ""
+            out.append(StateStore.key(i, b or unknown))
+        return out
 
 
 class Runner:
@@ -59,7 +81,15 @@ class Runner:
                  frames=90, log=print, order=None, poll_s=0.25):
         self.nvs = list(bridges)
         self.store = store or StateStore()
-        self.keys = list(keys) if keys else [StateStore.key(i, 0) for i in range(len(self.nvs))]
+        if keys:
+            self.keys = list(keys)
+        elif MUTANT == "oldkey":
+            self.keys = [StateStore.key(i, 0) for i in range(len(self.nvs))]
+        else:
+            # No keys given: nothing says which game process is behind the bridges, so the state is private to this
+            # Runner. Jumps after the first one still go in place; a persistent store never lends this Runner old state.
+            run = "run-" + secrets.token_hex(6)
+            self.keys = [StateStore.key(i, run) for i in range(len(self.nvs))]
         self.caps = set(capabilities) if capabilities is not None else set(scenlib.PRESENT)
         self.sleep, self.now, self.frames, self.log, self.poll_s = sleep, now, frames, log, poll_s
         self.order = order or scenlib.load_order()
@@ -241,6 +271,12 @@ class Runner:
             self.store.put(k, st)
         return {"scenario": sc["name"], "status": status, "jump": {k: j[k] for k in ("reload", "reasons", "seconds")},
                 "steps": steps, "seconds": round(self.now() - t0, 2)}
+
+
+def for_lease(lease, store_path, **kw):
+    """Runner over every instance of a pool lease (tools/pool/client.py), host first, with its state in the file
+    store_path keyed by game process (StateStore.lease_keys). kw goes to Runner."""
+    return Runner([lease.bridge(i) for i in lease.instances], StateStore(store_path), StateStore.lease_keys(lease), **kw)
 
 
 def summarize(results):
