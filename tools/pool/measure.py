@@ -1,9 +1,9 @@
-"""Measurement script for the lead: how much RAM and CPU does a warm instance cost? (Numbers are UNKNOWN until this is run.)
+"""Measurement script for the lead: how much RAM and CPU does a warm instance cost? (Results: docs/tools/T4a-pool.md.)
 
     python -I tools/pool/measure.py --label lowcost --minutes 5 [--interval 5]
 
-Run it while the pool is up (`pool up`) and idle, then again after re-provisioning without the low-cost profile
-(`pool up --no-lowcost`, label "normal"). It samples every game pid the pool owns plus total system memory, and writes
+Run it while the pool is up (`pool up`) and idle, then again with the low-cost profile off (`pool down`, then
+`pool up --no-lowcost`, label "normal"; that start writes the provisioned INIs back, no re-provision needed). It samples every game pid the pool owns plus total system memory, and writes
 out/T4a-pool/measure-<label>.json and prints a summary: per-instance working set (MB), CPU percent of one core,
 and available system RAM. Compare the two labels to fill the estimate table in docs/tools/T4a-pool.md.
 It only reads process counters; it launches nothing and touches no INI.
