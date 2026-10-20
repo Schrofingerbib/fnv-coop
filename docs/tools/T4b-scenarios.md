@@ -8,7 +8,7 @@ Status 2026-10-20: code and tests done, game-free. Nothing was run in a game. Ru
 - `tools/scenarios/runner.py`: runs a scenario over bridge objects (duck-typed), keeps a state store keyed by game process.
 - `tools/scenarios/scen.py`: CLI (`list`, `validate`, `plan`, `run`, `jump`).
 - `tools/scenarios/fakegame.py`: in-memory fake of N instances sharing one world, with bug flags (tests only).
-- `tools/scenarios/run_tests.py`: 58 unit tests plus the mutation twin.
+- `tools/scenarios/run_tests.py`: 63 unit tests plus the mutation twin.
 - `tools/scenarios/proof.py`: in-game proof for the lead (not run by tests in a game; the tests drive its `jump` and `suite`
   modes on the fake pool and fake game only to check the state keys): `probe`, `jump`, `suite`.
 - `scenarios/*.json`: 14 scenario files, the 10 starters plus 4 added for the playbooks (table below). The files in
@@ -63,6 +63,13 @@ The runner remembers, per game process, which save is loaded and what the last s
 - Limit: the store assumes that nothing else changed the world of that game process between two of your leases (another
   lessee of the same warm instance, or a person at the console). If that can have happened, use `scen.py run --force-reload`
   (or `jump --force-reload`); for `proof.py`, delete `out/scenarios/proof_state.json`.
+
+Locking: two `scen.py` (or two `proof.py`) processes can use the same state file at the same time, with leases on
+different instances. Every read and every write of the file holds an exclusive lock on the sidecar file `<file>.lock`
+(`msvcrt.locking` on Windows, `fcntl.flock` elsewhere). A write reads the file, changes only its own keys, writes a
+temporary file in the same folder and replaces the state file with `os.replace`, so the state file is never partial.
+Each plan reads the file again, so it sees what the other process wrote. A lock that stays held for 30 s stops the run
+with `runner.StateLockTimeout`, which names the lock file. The `.lock` file stays in the folder; it is empty.
 
 ## The 10 starters plus 4 playbook scenarios (14 files; INFO and DIAL aliases resolve against dials/infos.jsonl.gz; the API for playbooks is `tools/scenarios/__init__.py`) (all `players: 2`; `start.save` is `autosave`)
 The 4 added for the playbooks are dialogue_spectator, pnr_vote, pnr_vote_guest_declines and goodsprings_opening.
@@ -121,7 +128,7 @@ and `scen.py jump` do this through `runner.for_lease`. The state key is `instanc
 process), stored in `out/scenarios/state.json`. See "State keys".
 
 ## Tests and twin
-58 tests: all 14 files valid; every form resolves with matching EditorID and type; load-order prefixes; validator rejections
+63 tests: all 14 files valid; every form resolves with matching EditorID and type; load-order prefixes; validator rejections
 (20 tests in `ValidatorRejects`: invented id, wrong EditorID, wrong type, unnormalized ref, unknown alias, bad stage/variable,
 wrong record type for a field, duplicate id, raw FormID in console, bad save name, no check, and a corrupted ref in each shipped
 file); translation of steps to exact console lines; comparison table; jump rules; runner against the fake world, including
@@ -131,7 +138,14 @@ State keys (6 tests in `GameProcessKeys`, on the real pool policy `tools/pool/co
 `client.Lease` and the fake game): after a pool restart, where the old `instance@generation` key repeats, a new game reloads
 the save; the same live game still jumps in place on the next lease; `proof.py jump`, `proof.py suite` and `scen.py jump` use
 these keys; a lease without a boot id and a `Runner` without keys never reuse old state.
-Twin: the suite is re-run under six mutants (`SCEN_MUTANT=` `noresolve`, `noreload`, `nodirty`, `passall`, `firsthost`,
-`oldkey`); each must make the suite fail, and the run prints `caught` for each. `oldkey` brings back the
-`instance@generation` key; all 6 `GameProcessKeys` tests fail under it. The pool suite has its own twins for the boot id
+Shared state file (5 tests in `SharedStateFile`): two stores loaded before each other's put keep both keys, and the older
+copy of a key in one store does not replace the newer key on disk; a plan sees a dirty state that another store wrote
+after this store was made, and reloads; a failure between the write and the replace leaves the old valid file and no
+temporary file; a held lock gives `StateLockTimeout`; two Python processes that each put 200 different keys end with all
+400 keys.
+Twin: the suite is re-run under nine mutants (`SCEN_MUTANT=` `noresolve`, `noreload`, `nodirty`, `passall`, `firsthost`,
+`oldkey`, `wholedict`, `noreread`, `inplace`); each must make the suite fail, and the run prints `caught` for each.
+`oldkey` brings back the `instance@generation` key; all 6 `GameProcessKeys` tests fail under it. `wholedict` brings back
+the write of the whole in-memory dict (lost update), `noreread` plans from the state read at start, and `inplace` writes
+into the state file itself; each fails its `SharedStateFile` test. The pool suite has its own twins for the boot id
 (`gen_boot`, `stale_boot`, see docs/tools/T4a-pool.md).

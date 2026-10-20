@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -560,6 +561,140 @@ class GameProcessKeys(unittest.TestCase):
         self.assertEqual(sorted(b.world.loads), [(0, "autosave"), (1, "autosave")])
 
 
+def clean_state(scenario="quest_stage_sync", dirty=()):
+    return {"loaded": True, "save": "autosave", "dirty": sorted(dirty), "failed": False, "quest_hex": [],
+            "scenario": scenario}
+
+
+def hammer(path, prefix, n, ready, go):
+    """Worker of SharedStateFile.test_two_processes_hammering_put_keep_all_keys (run_tests.py --hammer ...): make one
+    store, report ready, wait for the go file, then put n different keys one by one."""
+    store = runner.StateStore(path)
+    Path(ready).write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 60
+    while not Path(go).exists():
+        if time.monotonic() > deadline:
+            return 3
+        time.sleep(0.002)
+    for i in range(n):
+        store.put("%s%03d@hammer" % (prefix, i), {"by": prefix, "i": i})
+    return 0
+
+
+class SharedStateFile(unittest.TestCase):
+    """Two scen.py (or two proof.py) processes can share one state file, with leases on different instances at the same
+    time. A put must not lose a key that another store wrote, a plan must see what another store wrote, and a put never
+    leaves a partial or invalid file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.state = self.dir / "state.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def on_disk(self):
+        return json.loads(self.state.read_text(encoding="utf-8"))
+
+    def test_two_stores_on_one_file_keep_each_others_keys(self):
+        old = clean_state()
+        runner.StateStore(self.state).put("0@gameA", old)        # an earlier run left game A clean
+        a = runner.StateStore(self.state)
+        b = runner.StateStore(self.state)                        # both loaded before either put
+        newer = clean_state("goodsprings_fight", ["00104C70"])
+        a.put("0@gameA", newer)                                  # process A (lease on instance 0) dirties game A
+        b.put("1@gameB", clean_state("loot_race"))               # process B (lease on instance 1), stale copy of 0@gameA
+        disk = self.on_disk()
+        self.assertEqual(sorted(disk), ["0@gameA", "1@gameB"])
+        self.assertEqual(disk["0@gameA"], newer)                 # B did not write back its older copy of A's key
+        fresh = runner.StateStore(self.state)
+        self.assertEqual(fresh.get_many(["0@gameA", "1@gameB"]), [newer, clean_state("loot_race")])
+
+    def test_plan_sees_dirty_state_written_by_another_store(self):
+        keys = ["0@gameA", "1@gameB"]
+        runner.StateStore(self.state).put_many({k: clean_state() for k in keys})
+        w, clock, nvs = fakegame.make(2)
+        prime(w)
+        b = runner.StateStore(self.state)                        # this runner's store, made first
+        rn = runner.Runner(nvs, b, keys, sleep=clock.sleep, now=clock.now, log=lambda *a: None, order=ORDER)
+        sc = load("goodsprings_fight")
+        fp = scenlib.footprint(sc, order=ORDER)
+        self.assertFalse(scenlib.plan_jump(rn._same_world(), sc, fp)["reload"])   # clean: the jump would go in place
+        a = runner.StateStore(self.state)                        # another process writes after b was made
+        a.put_many({k: clean_state("goodsprings_fight", fp["dirty"]) for k in keys})
+        j = rn.jump(sc)
+        self.assertTrue(j["reload"], j)
+        self.assertTrue(any("changed refs" in x for x in j["reasons"]), j["reasons"])
+        self.assertEqual(sorted(w.loads), [(0, "autosave"), (1, "autosave")])
+
+    def test_failed_put_leaves_the_old_valid_file(self):
+        store = runner.StateStore(self.state)
+        store.put("0@old", clean_state())
+        before = self.state.read_bytes()
+        names = sorted(os.listdir(self.dir))
+        seen = {}
+
+        def crash(src, dst):
+            seen["dir"] = Path(src).parent
+            seen["new"] = json.loads(Path(src).read_text(encoding="utf-8"))
+            raise OSError("simulated failure between the write and the replace")
+        store._replace = crash
+        with self.assertRaises(OSError):
+            store.put("1@new", clean_state("loot_race"))
+        self.assertEqual(seen["dir"], self.dir)                  # the temporary file is in the same folder
+        self.assertIn("1@new", seen["new"])                      # and it was written in full before the replace
+        self.assertEqual(self.state.read_bytes(), before)        # the target is still the old file
+        self.assertEqual(self.on_disk(), {"0@old": clean_state()})
+        self.assertEqual(sorted(os.listdir(self.dir)), names)    # no temporary file is left
+        fresh = runner.StateStore(self.state)
+        self.assertEqual(fresh.get_many(["0@old", "1@new"]), [clean_state(), None])
+
+    def test_lock_timeout_gives_a_clear_error(self):
+        holder = runner.StateStore(self.state)
+        waiter = runner.StateStore(self.state, lock_timeout_s=0.3)
+        with holder._lock():
+            t0 = time.monotonic()
+            with self.assertRaises(runner.StateLockTimeout) as cm:
+                waiter.put("0@x", clean_state())
+            self.assertLess(time.monotonic() - t0, 5)
+        self.assertIn(str(self.state) + ".lock", str(cm.exception))
+        self.assertIn("another process held the lock", str(cm.exception))
+        self.assertFalse(self.state.exists())                    # nothing was written while the lock was held
+        waiter.put("0@x", clean_state())                         # free again: the put goes through
+        self.assertEqual(self.on_disk(), {"0@x": clean_state()})
+
+    def test_two_processes_hammering_put_keep_all_keys(self):
+        n = 200
+        go = self.dir / "go"
+        procs = []
+        try:
+            for name in ("a", "b"):
+                procs.append(subprocess.Popen(
+                    [sys.executable, "-I", str(HERE / "run_tests.py"), "--hammer", str(self.state), name, str(n),
+                     str(self.dir / (name + ".ready")), str(go)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+            deadline = time.monotonic() + 60
+            while not all((self.dir / (x + ".ready")).exists() for x in ("a", "b")):
+                self.assertTrue(all(p.poll() is None for p in procs), "a worker stopped before it was ready")
+                self.assertLess(time.monotonic(), deadline, "workers not ready after 60 s")
+                time.sleep(0.01)
+            go.write_text("go", encoding="utf-8")                # both stores are loaded before the first put
+            for p in procs:
+                out, err = p.communicate(timeout=180)
+                self.assertEqual(p.returncode, 0, out + err)
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+                    p.communicate()
+        want = {"%s%03d@hammer" % (x, i): {"by": x, "i": i} for x in ("a", "b") for i in range(n)}
+        self.assertEqual(len(self.on_disk()), 2 * n)
+        self.assertEqual(self.on_disk(), want)
+        self.assertEqual(runner.StateStore(self.state).get_many(sorted(want)), [want[k] for k in sorted(want)])
+        self.assertEqual([x for x in os.listdir(self.dir) if x.endswith(".tmp")], [])
+
+
 class Cli(unittest.TestCase):
     def test_validate_and_list_exit_codes(self):
         py = [sys.executable, "-I", "-X", "utf8", str(HERE / "scen.py")]
@@ -581,6 +716,9 @@ MUTANTS = {
     "passall": "every check passes",
     "firsthost": "every step runs only on the host",
     "oldkey": "state key is instance@generation again (repeats after a pool restart)",
+    "wholedict": "put writes the whole in-memory dict (loses keys of other processes)",
+    "noreread": "the plan uses the state read at start, not the file now",
+    "inplace": "put writes into the state file itself, no temp file and replace",
 }
 
 
@@ -608,4 +746,7 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--hammer"]:   # worker of the two-process state file test
+        _, _, path, prefix, n, ready, go = sys.argv
+        sys.exit(hammer(path, prefix, int(n), ready, go))
     sys.exit(main())
