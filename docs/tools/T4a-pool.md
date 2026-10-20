@@ -116,28 +116,34 @@ made at 3).
 
 ## RAM and CPU estimate
 
-Measured on 2026-10-20, one idle warm instance per profile:
+Measured on 2026-10-21, one warm instance per profile, with the game world running (see the first condition):
 
 | Profile | RAM per instance (MB) | CPU idle (% of one core) | CPU during a test | Free system RAM |
 |---|---|---|---|---|
-| low-cost | 254-699 (min-max working set) | 12.5 avg (max 56.8) | not measured | not measured |
-| normal | 272-710 (min-max working set) | 13.2 avg (max 57.2) | not measured | not measured |
+| low-cost | 678-710 (min-max working set) | 36.7 avg (max 47.0) | not measured | not measured |
+| normal | 684-716 (min-max working set) | 38.0 avg (max 46.2) | not measured | not measured |
 
 Conditions:
 
+- The world was running during every sample: game time advanced by about 2.2 to 2.5 hours in each 5-minute sample
+  (TimeScale 30). With all DLC the engine opens native message boxes (MessageMenu 1001, 10 boxes in waves) after a save
+  loads, and each one keeps the game in menu mode. They were pressed away first (PR cranebeaker/fnv-coop#9), after the
+  autoload had finished. Earlier numbers (about 250-700 MB, 12.5 to 13.2 % of one core) were measured with a box open,
+  so with the world paused. They are not used.
 - 1 instance, window minimized, 640x480 (provisioning sets 640x480 for both profiles).
 - `FalloutNV.exe` 1.4.0.525 (Steam) with all DLC, xNVSE 6.4.9.
 - A Goodsprings save, loaded by the nvcoop autoload.
-- `nvcoop.dll` with the focus guard from PR cranebeaker/fnv-coop#3, so the game world was not paused while minimized.
+- `nvcoop.dll` with the focus guard from PR cranebeaker/fnv-coop#3, so minimizing did not open the pause menu.
+- Exactly one nvcoop DLL in the instance's Plugins folder (provisioning left older copies there before PR #5).
 - 5 minutes of samples with `tools/pool/measure.py`.
 - Other heavy programs ran on the PC. Free system RAM is therefore not meaningful.
 
-In this setup the low-cost profile saves little: about 10-20 MB of working set and about 0.7 % of one core. The
-saving is small because the window is minimized.
+In this setup the low-cost profile saves little: about 6 MB of working set and about 1.3 % of one core. Plan for about
+0.7 GB of RAM and about 40 % of one core per running copy.
 
-The "normal" row comes from a re-provisioned instance. Before this fix (`lowcost.restore`), `up --no-lowcost` did not
-undo the INI edits of an earlier low-cost run. A first "normal" run therefore measured the low-cost profile again
-(254-688 MB, 12.7 % avg). It is not used.
+Both rows were measured after this fix: `up --no-lowcost` now restores the provisioned INIs, which was checked in the
+game (the low-cost keys were gone and the copy started normally). Before the fix, a "normal" run after a low-cost run
+measured the low-cost profile again.
 
 To measure again, with the pool idle:
 
