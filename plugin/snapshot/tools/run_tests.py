@@ -52,6 +52,8 @@ def main():
         failures.append("sweep driver/config tests")
     if run(py + [os.path.join(HERE, "test_effects.py")]) != 0:
         failures.append("effect oracle / check_stage tests")
+    if run(py + [os.path.join(HERE, "test_build_flags.py")]) != 0:
+        failures.append("synccore build flag parity")
     if "--no-cpp" not in sys.argv and os.path.exists(VCVARS):
         tmp = tempfile.mkdtemp(prefix="snaptest_")
         try:
@@ -75,7 +77,8 @@ def main():
                 core = " ".join("%s/src/%s.cpp" % (sc.replace("\\", "/"), n) for n in (
                     "wire shadow policy storylog protocol baseline replicator transport transport_util session").split())
                 bsrc = "tests/baseline_test.cpp src/baseline_build.cpp " + core
-                binc = '/std:c++17 /EHsc /Iinclude /I"%s/include"' % sc.replace("\\", "/")
+                # synccore's own conformance flags (synccore/CMakeLists.txt); test_build_flags.py keeps the two in step
+                binc = '/std:c++17 /EHsc /permissive- /utf-8 /Iinclude /I"%s/include"' % sc.replace("\\", "/")
                 for tag, extra in (("b", ""), ("bm", " /DBASELINE_MUTANT")):
                     os.mkdir(os.path.join(tmp, tag))
                     exe = os.path.join(tmp, tag + ".exe")

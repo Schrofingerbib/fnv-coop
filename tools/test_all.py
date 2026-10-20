@@ -3,6 +3,8 @@
 Usage: python -I tools/test_all.py [--quick]
 --quick skips suites that compile C++ (L1, L6, L8, L7 engine compile).
 """
+import os
+import shutil
 import subprocess
 import sys
 import time
@@ -13,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SUITES = [
     ("canonical nvcoop.dll build", ["cmd", "/c", r"tools\runner\build_l1.cmd"], True),
     # (name, command, compiles C++)
+    ("test_all preflight", [sys.executable, "-I", "tools/test_all_selftest.py"], False),
     ("T5 chaos box", [sys.executable, "-I", "tools/chaos/run_tests.py"], False),
     ("L3 questdata", [sys.executable, "-I", "tools/questdata/run_tests.py"], False),
     ("L7 snapshot", [sys.executable, "-I", "plugin/snapshot/tools/run_tests.py", "--no-engine"], False),
@@ -52,12 +55,45 @@ def _data(*parts):
     return (ROOT.joinpath(*parts)).exists()
 
 
+QUESTDATA = "needs out/questdata (python -I tools/questdata/run_all.py --data \"<your game>\\Data\")"
 NEEDS = {
     "L6 nvmp sigs (pinned 9.4)": (lambda: _data("third_party", "nvmp", "nvmp", "client.dll"),
                                   "needs your own NV:MP 9.4 client.dll under third_party/nvmp/nvmp/"),
     "L8 dialogue": (lambda: _data("out", "questdata", "risk.json"),
                     "needs out/questdata (python -I tools/questdata/run_all.py) and an MSVC x86 toolchain"),
+    "T6b co-op playbooks": (lambda: _data("out", "questdata", "quests.json"), QUESTDATA),
+    "T4b scenarios": (lambda: _data("out", "questdata", "forms.json.gz"), QUESTDATA),
 }
+
+# The C++ suites call vcvars, which puts the VS-bundled CMake and Ninja on PATH only when the VS component
+# "C++ CMake tools for Windows" is installed. Without it every build script dies on "'cmake' is not recognized".
+VS_CMAKE_DIR = Path(r"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake")
+
+
+def toolchain_problem(which=shutil.which, vs_dir=VS_CMAKE_DIR) -> str:
+    """Why the C++ suites cannot run, or "" when they can."""
+    if os.environ.get("TEST_ALL_MUTANT") == "no_preflight":  # twin: never checks
+        return ""
+    missing = [tool for tool, sub in (("cmake", r"CMake\bin\cmake.exe"), ("ninja", r"Ninja\ninja.exe"))
+               if not which(tool) and not (vs_dir / sub).exists()]
+    if not missing:
+        return ""
+    return (" and ".join(missing) + " not found: install them (winget install Kitware.CMake Ninja-build.Ninja) or the "
+            "Visual Studio 2022 component 'C++ CMake tools for Windows'")
+
+
+def decide(name: str, compiles: bool, quick: bool, toolchain: str):
+    """('run', '') or ('skip' | 'fail', reason) for one suite, before it runs."""
+    if quick and compiles:
+        return "skip", ""
+    need = NEEDS.get(name)
+    if need and os.environ.get("TEST_ALL_MUTANT") == "no_questdata_gate" and "out/questdata" in need[1]:
+        need = None  # twin: runs data suites without their data
+    if need and not need[0]():
+        return "skip", need[1]
+    if compiles and toolchain:
+        return "fail", toolchain
+    return "run", ""
 
 # Positive evidence that tests actually executed (unittest, ctest, custom runners).
 EVIDENCE = re.compile(
@@ -74,13 +110,17 @@ NEGATIVE = re.compile(r"^FAILED \((failures|errors)=|\b[1-9]\d* tests failed out
 def main() -> int:
     quick = "--quick" in sys.argv
     failed = []
+    toolchain = "" if quick else toolchain_problem()
+    if toolchain:
+        print(f"PREFLIGHT: {toolchain}. The C++ suites are marked FAIL without running.")
     for name, cmd, compiles in SUITES:
-        if quick and compiles:
-            print(f"SKIP {name}")
+        action, reason = decide(name, compiles, quick, toolchain)
+        if action == "skip":
+            print(f"SKIP {name}" + (f": {reason}" if reason else ""))
             continue
-        need = NEEDS.get(name)
-        if need and not need[0]():
-            print(f"SKIP {name}: {need[1]}")
+        if action == "fail":
+            print(f"FAIL {name}: {reason}")
+            failed.append(name)
             continue
         t0 = time.time()
         p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, errors="replace")
