@@ -20,7 +20,39 @@ from esm import EsmFile, ParseError  # noqa: E402
 from ctda_funcs import FUNCS  # noqa: E402
 import forms as forms_mod  # noqa: E402
 
-DEFAULT_DATA = r'C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas\Data'
+_HARDCODED_DATA = r'C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas\Data'
+
+
+def _find_data_dir():
+    """The Data folder of the installed game.
+
+    FNV_GAME_DIR (the env var the installer uses) wins, then the US Steam path, then whatever the repo's own
+    installer finds - regional/PCR releases live in a different folder ('Fallout New Vegas enplczru'), so the
+    hardcoded path alone is not enough to find them.
+    """
+    env = os.environ.get('FNV_GAME_DIR')
+    if env:
+        d = os.path.join(env, 'Data')
+        if os.path.isdir(d):
+            return d
+    if os.path.isdir(_HARDCODED_DATA):
+        return _HARDCODED_DATA
+    inst = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'installer'))
+    if os.path.isdir(inst):
+        sys.path.insert(0, inst)
+        try:
+            import fnv_find
+            for c in fnv_find.candidates():
+                d = os.path.join(str(c.path), 'Data')
+                if os.path.isdir(d):
+                    return d
+        except Exception:      # a broken/absent installer must not break the data tools
+            pass
+    return _HARDCODED_DATA
+
+
+DEFAULT_DATA = _find_data_dir()
+
 PLUGINS = ['FalloutNV.esm', 'DeadMoney.esm', 'HonestHearts.esm', 'OldWorldBlues.esm', 'LonesomeRoad.esm',
            'GunRunnersArsenal.esm', 'ClassicPack.esm', 'MercenaryPack.esm', 'TribalPack.esm', 'CaravanPack.esm']
 WANT = {'QUST', 'DIAL', 'INFO', 'SCPT', 'GLOB', 'FACT', 'REPU', 'TERM', 'PACK'}
