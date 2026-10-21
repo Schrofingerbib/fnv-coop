@@ -34,6 +34,7 @@
 //  49 the accept detour is never armed      50 execute is called with an empty queue     51 the tutorial box is never closed
 //  52 the target cycle is skipped           53 the tutorial box (0x423) is reported as "vats"
 //  57 a tutorial box that opens after the tutorial step is ignored
+//  58 an attack queued just before a late tutorial box is forgotten (a second attack is queued after the box)
 //  54 the accept gate forces every slot and the held query     55 the VATSMenu vtable check is skipped    56 the hit-chance gate is skipped
 
 namespace nvbots {
@@ -632,7 +633,7 @@ public:
         e.rd32(eng::kVatsCamera + eng::kVatsMode, &mode);
         if (mode != 0) { *err = "VATS is already active"; return false; }
         phase_ = kEnter; reason_.clear(); t0_ = tPhase_ = tClick_ = tClose_ = now; cycles_ = 0; closeCalls_ = 0;
-        sawPlayback_ = false; tapped_ = false; armed_ = false; queueBase_ = 0; hit_ = ap_ = 0.0f;
+        sawPlayback_ = false; tapped_ = false; armed_ = false; queued_ = false; queueBase_ = 0; hit_ = ap_ = 0.0f;
         return true;
     }
     // Called every frame while running. `tap(ctrl)` presses a control through the input driver.
@@ -650,6 +651,8 @@ public:
         // In game 2026-10-21 the VATS tutorial box (1059) opened AFTER the job had passed the tutorial step, and the hit chance then read 0
         // (VATSMenu::Update does nothing while it is open). So a tutorial box sends the job back to the tutorial step from any later step.
         if ((phase_ == kZoom || phase_ == kTarget || phase_ == kQueue) && !FNV_MUT(57) && e.menuByType(eng::kMenuIdTutorial)) {
+            // the attack may already be in the queue: keep that, so the job does not queue a second one after the box (PR #27 review)
+            if (armed_ && !FNV_MUT(58) && e.vatsQueueCount() > queueBase_) queued_ = true;
             if (armed_) disarm(e);
             armed_ = false;
             return to(kTutorial, now);
@@ -704,6 +707,7 @@ public:
                         }
                         break;
                     }
+                    if (queued_) { to(kExecute, now); break; }   // queued before a late tutorial box: execute it, never queue again
                     Addr32 menu = 0;
                     if (!vatsMenu(e, &menu)) return;
                     uint32_t part = 0;
@@ -806,7 +810,7 @@ private:
     uint64_t t0_ = 0, tPhase_ = 0, tClick_ = 0, tClose_ = 0;
     int cycles_ = 0, closeCalls_ = 0, queueBase_ = 0;
     float hit_ = 0.0f, ap_ = 0.0f;
-    bool sawPlayback_ = false, tapped_ = false, armed_ = false;
+    bool sawPlayback_ = false, tapped_ = false, armed_ = false, queued_ = false;
 };
 
 }  // namespace nvbots

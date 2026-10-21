@@ -515,6 +515,33 @@ TEST(vats_job_closes_a_tutorial_box_that_opens_late) {
     CHECK(r.g.queuedTargets.size() == 1 && r.g.execCalls == 1);
 }
 
+TEST(vats_job_keeps_an_attack_queued_before_a_late_tutorial_box) {
+    // PR #27 review: the accept was armed, the engine queued the attack, then the tutorial box opened before the job saw the queue.
+    // After the box the job must execute that attack, not queue a second one.
+    GlueRig r;
+    r.g.forms["T:1"] = 0x60000001;
+    r.g.buildVats({0x60000001, 0x60000002});
+    CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+    bool opened = false;
+    for (int i = 0; i < 700 && r.rpc.vats().running(); ++i) {
+        r.e.now += 50;
+        r.rpc.tick();
+        const bool vatsTap = r.in.filter(kVats, kPressed, 0) != 0;
+        const size_t before = r.g.queuedTargets.size();
+        r.g.vatsFrame(vatsTap);
+        if (!opened && r.g.queuedTargets.size() > before) {   // the frame that queued: the box opens before the job's next tick
+            r.g.tutorialOpen = true;
+            r.g.topId = 0x423;
+            opened = true;
+        }
+    }
+    CHECK(opened);
+    CHECK(r.rpc.vats().phase() == VatsJob::kDone);
+    if (r.rpc.vats().phase() != VatsJob::kDone) std::printf("  reason: %s\n", r.rpc.vats().reason().c_str());
+    CHECK(r.g.queuedTargets.size() == 1);   // one attack, not two
+    CHECK(r.g.execCalls == 1 && r.g.closeCalls >= 1);
+}
+
 TEST(vats_job_refuses_zero_hit_chance_and_zero_ap) {
     {   // hit chance 0: refused before the accept is armed
         GlueRig r;
@@ -1172,6 +1199,7 @@ int main() {
     run("vats_job_closes_the_tutorial_cycles_queues_and_executes", vats_job_closes_the_tutorial_cycles_queues_and_executes);
     run("vats_job_without_tutorial_on_the_default_target", vats_job_without_tutorial_on_the_default_target);
     run("vats_job_closes_a_tutorial_box_that_opens_late", vats_job_closes_a_tutorial_box_that_opens_late);
+    run("vats_job_keeps_an_attack_queued_before_a_late_tutorial_box", vats_job_keeps_an_attack_queued_before_a_late_tutorial_box);
     run("vats_job_refuses_zero_hit_chance_and_zero_ap", vats_job_refuses_zero_hit_chance_and_zero_ap);
     run("vats_job_never_executes_an_empty_queue", vats_job_never_executes_an_empty_queue);
     run("vats_job_fails_clearly", vats_job_fails_clearly);
