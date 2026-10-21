@@ -1,0 +1,52 @@
+# Game-free checks only: no game files, no secrets, no downloads of anything from the game.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python-quick:
+    name: python quick suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Suites that need the game, MSVC or a prebuilt DLL print "SKIP <name>: <reason>"; any FAIL fails the job.
+      - run: python -I tools/test_all.py --quick
+
+  synccore:
+    name: synccore tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5   # the drift_effect_table test calls python
+        with:
+          python-version: "3.11"
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libenet-dev
+      - name: Configure (Linux, Ninja)
+        if: runner.os == 'Linux'
+        run: cmake -S synccore -B build -G Ninja
+      - name: Configure (Windows, Visual Studio 2022)
+        if: runner.os == 'Windows'
+        run: cmake -S synccore -B build -G "Visual Studio 17 2022" -A x64
+      - run: cmake --build build --config Release --parallel
+      - run: ctest --test-dir build -C Release -j 4 --timeout 300 --output-on-failure
