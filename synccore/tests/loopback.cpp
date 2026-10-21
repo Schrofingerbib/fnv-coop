@@ -2,8 +2,16 @@
 // with the seeded fault-injection wrapper on top. `fnvcoop_loopback selftest [loss%]` orchestrates the child processes.
 //   host:   fnvcoop_loopback host   --port P --seed S --txns N --clients C --loss L --out F [--unreliable]
 //   client: fnvcoop_loopback client --port P --seed S --txns N --token T --loss L --out F [--unreliable]
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -144,7 +152,10 @@ int runClient(std::map<std::string, std::string>& a) {
     return ok ? 0 : 3;
 }
 
-HANDLE spawn(const std::string& cmdline) {
+#ifdef _WIN32
+using Proc = HANDLE;
+constexpr const char* kSep = "\\";
+Proc spawn(const std::string& cmdline) {
     STARTUPINFOA si{}; si.cb = sizeof si;
     PROCESS_INFORMATION pi{};
     std::string c = cmdline;
@@ -152,6 +163,46 @@ HANDLE spawn(const std::string& cmdline) {
     CloseHandle(pi.hThread);
     return pi.hProcess;
 }
+unsigned long selfPid() { return GetCurrentProcessId(); }
+std::string selfExe() { char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH); return exe; }
+// Waits up to 120 s; returns the exit code (99 if it could not be read).
+int waitProc(Proc h) {
+    WaitForSingleObject(h, 120000);
+    DWORD code = 99;
+    GetExitCodeProcess(h, &code);
+    CloseHandle(h);
+    return int(code);
+}
+void removeFile(const std::string& f) { DeleteFileA(f.c_str()); }
+#else
+using Proc = pid_t;  // 0 = spawn failed
+constexpr const char* kSep = "/";
+Proc spawn(const std::string& cmdline) {
+    const char* argv[] = {"/bin/sh", "-c", cmdline.c_str(), nullptr};
+    pid_t pid = 0;
+    if (posix_spawn(&pid, "/bin/sh", nullptr, nullptr, const_cast<char* const*>(argv), environ) != 0) return 0;
+    return pid;
+}
+unsigned long selfPid() { return static_cast<unsigned long>(getpid()); }
+std::string selfExe() {
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    return n > 0 ? std::string(exe, size_t(n)) : std::string();
+}
+int waitProc(Proc p) {
+    for (int waited = 0; waited < 120000; waited += 10) {
+        int st = 0;
+        pid_t r = waitpid(p, &st, WNOHANG);
+        if (r == p) return WIFEXITED(st) ? WEXITSTATUS(st) : 99;
+        if (r < 0) return 99;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    kill(p, SIGKILL);
+    waitpid(p, nullptr, 0);
+    return 99;
+}
+void removeFile(const std::string& f) { std::remove(f.c_str()); }
+#endif
 
 std::string slurp(const std::string& f) { std::ifstream i(f); std::stringstream s; s << i.rdbuf(); return s.str(); }
 
@@ -162,21 +213,23 @@ int selftest(int argc, char** argv) {
     std::string mutate = a.count("mutate") ? a["mutate"] : "";
     bool expectFail = !mutate.empty();
     const int C = 2, N = 150;
-    char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    int port = 27500 + int(GetCurrentProcessId() % 2000);
-    std::string tmp = std::string(std::getenv("TEMP") ? std::getenv("TEMP") : ".") + "\\fnvcoop_loop_" + std::to_string(GetCurrentProcessId());
+    std::string exe = selfExe();
+    if (exe.empty()) { std::printf("cannot find own executable\n"); return 1; }
+    int port = 27500 + int(selfPid() % 2000);
+    const char* tmpDir = std::getenv("TEMP") ? std::getenv("TEMP") : std::getenv("TMPDIR");
+    std::string tmp = std::string(tmpDir ? tmpDir : ".") + kSep + "fnvcoop_loop_" + std::to_string(selfPid());
     std::string common = std::string(" --port ") + std::to_string(port) + " --seed 7 --txns " + std::to_string(N) + " --loss " + loss + (unrel ? " --unreliable" : "");
     std::string clientExtra = mutate.empty() ? "" : " --mutate " + mutate;
-    std::string q = std::string("\"") + exe + "\" ";
-    HANDLE h = spawn(q + "host" + common + " --clients " + std::to_string(C) + " --out " + tmp + "_h.txt");
+    std::string q = "\"" + exe + "\" ";
+    Proc h = spawn(q + "host" + common + " --clients " + std::to_string(C) + " --out " + tmp + "_h.txt");
     if (!h) { std::printf("spawn host failed\n"); return 1; }
-    Sleep(300);
-    std::vector<HANDLE> hs{h};
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    std::vector<Proc> hs{h};
     for (int i = 0; i < C; ++i)
         hs.push_back(spawn(q + "client" + common + clientExtra + " --token " + std::to_string(1000 + i) + " --out " + tmp + "_c" + std::to_string(i) + ".txt"));
     for (auto x : hs) if (!x) { std::printf("spawn client failed\n"); return 1; }
     int bad = 0;
-    for (auto x : hs) { WaitForSingleObject(x, 120000); DWORD code = 99; GetExitCodeProcess(x, &code); if (code != 0) { ++bad; std::printf("child exit %lu\n", code); } CloseHandle(x); }
+    for (auto x : hs) { int code = waitProc(x); if (code != 0) { ++bad; std::printf("child exit %d\n", code); } }
     std::string host = slurp(tmp + "_h.txt");
     std::printf("host:    %s", host.c_str());
     std::string hd = host.substr(host.find("DIGEST"), host.find("DIALOGUE") - host.find("DIGEST"));
@@ -188,8 +241,8 @@ int selftest(int argc, char** argv) {
     }
     if (host.find("OK") != 0) ++bad;
     if (host.find("DIALOGUE 0") != std::string::npos) { std::printf("no dialogue datagrams demuxed\n"); ++bad; }
-    DeleteFileA((tmp + "_h.txt").c_str());
-    for (int i = 0; i < C; ++i) DeleteFileA((tmp + "_c" + std::to_string(i) + ".txt").c_str());
+    removeFile(tmp + "_h.txt");
+    for (int i = 0; i < C; ++i) removeFile(tmp + "_c" + std::to_string(i) + ".txt");
     if (expectFail) {  // mutation twin: the injected bug MUST be detected
         std::printf(bad ? "TWIN OK: bug '%s' detected over real UDP\n" : "TWIN FAIL: bug '%s' went unnoticed\n", mutate.c_str());
         return bad ? 0 : 1;

@@ -40,7 +40,9 @@ public:
         uint32_t serviceMenuMs = 600000;    // barter, repair, caravan, wheel, hacking...
     };
 
-    explicit HostDialogue(ResultRunner run, Config cfg = {}) : run_(std::move(run)), cfg_(cfg) {}
+    // No `Config cfg = {}` default argument: a nested type with member initializers is not complete there for GCC and clang.
+    explicit HostDialogue(ResultRunner run) : HostDialogue(std::move(run), Config()) {}
+    explicit HostDialogue(ResultRunner run, Config cfg) : run_(std::move(run)), cfg_(cfg) {}
 
     // ---- companions: owner-only command topics + owner takeover (see companions.h). Not owned; may be null.
     void setCompanions(CompanionRegistry* reg, std::set<FormRef> ownerOnlyTopics) { comp_ = reg; ownerOnly_ = std::move(ownerOnlyTopics); }
@@ -111,8 +113,12 @@ public:
     // `origin` = the player whose context the script runs in (ResultRequest.initiator / the activator), NOT the host
     // player by default. Returns the menu id via *menuOut (0 = resumed immediately because the origin is gone).
     std::vector<Out> raiseMenu(PlayerId origin, MenuKind kind, const std::string& text, std::vector<std::string> buttons,
-                               int32_t defaultChoice, const FormRef& subject, uint32_t now, uint32_t* menuOut = nullptr,
-                               const ModalOptions& opt = ModalOptions()) {
+                               int32_t defaultChoice, const FormRef& subject, uint32_t now, uint32_t* menuOut = nullptr) {
+        return raiseMenu(origin, kind, text, std::move(buttons), defaultChoice, subject, now, menuOut, ModalOptions());
+    }
+    std::vector<Out> raiseMenu(PlayerId origin, MenuKind kind, const std::string& text, std::vector<std::string> buttons,
+                               int32_t defaultChoice, const FormRef& subject, uint32_t now, uint32_t* menuOut,
+                               const ModalOptions& opt) {
         std::vector<Out> o;
         uint32_t id = ++nextMenu_;
         if (menuOut) *menuOut = id;

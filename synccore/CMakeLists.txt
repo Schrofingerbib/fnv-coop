@@ -16,11 +16,24 @@ target_include_directories(fnvcoop PUBLIC include)
 
 # Real transport (ENet, vendored MIT source). Separate so the pure core has no socket dependency.
 set(ENET_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third_party/enet)
-add_library(enet_static STATIC ${ENET_DIR}/callbacks.c ${ENET_DIR}/compress.c ${ENET_DIR}/host.c ${ENET_DIR}/list.c
-  ${ENET_DIR}/packet.c ${ENET_DIR}/peer.c ${ENET_DIR}/protocol.c ${ENET_DIR}/win32.c)
-target_include_directories(enet_static PUBLIC ${ENET_DIR}/include)
-target_compile_definitions(enet_static PRIVATE _WINSOCK_DEPRECATED_NO_WARNINGS)
-target_link_libraries(enet_static PUBLIC ws2_32 winmm)
+if(WIN32)
+  add_library(enet_static STATIC ${ENET_DIR}/callbacks.c ${ENET_DIR}/compress.c ${ENET_DIR}/host.c ${ENET_DIR}/list.c
+    ${ENET_DIR}/packet.c ${ENET_DIR}/peer.c ${ENET_DIR}/protocol.c ${ENET_DIR}/win32.c)
+  target_include_directories(enet_static PUBLIC ${ENET_DIR}/include)
+  target_compile_definitions(enet_static PRIVATE _WINSOCK_DEPRECATED_NO_WARNINGS)
+  target_link_libraries(enet_static PUBLIC ws2_32 winmm)
+else()
+  # The vendored copy has the Windows backend only (no unix.c). Elsewhere link the system ENet (same 1.3.18 API):
+  # Debian/Ubuntu libenet-dev, Fedora enet-devel, Arch enet, macOS brew install enet.
+  find_path(FNVCOOP_ENET_INCLUDE enet/enet.h)
+  find_library(FNVCOOP_ENET_LIB enet)
+  if(NOT FNVCOOP_ENET_INCLUDE OR NOT FNVCOOP_ENET_LIB)
+    message(FATAL_ERROR "ENet not found. This platform uses the system ENet: install libenet-dev (or the equivalent for your system).")
+  endif()
+  add_library(enet_static INTERFACE)
+  target_include_directories(enet_static INTERFACE ${FNVCOOP_ENET_INCLUDE})
+  target_link_libraries(enet_static INTERFACE ${FNVCOOP_ENET_LIB})
+endif()
 add_library(fnvcoop_enet STATIC src/enet_transport.cpp)
 target_link_libraries(fnvcoop_enet PUBLIC fnvcoop enet_static)
 

@@ -422,7 +422,7 @@ static bool checkIncremental(bool breakDirty) {
     for (int i = 0; i < 3000; ++i) {
         EffectTxn txn; txn.seq = 1 + i;
         switch (rng.next() % 15) {
-            case 0: txn.effects.push_back(SetStage{fr(40), rng.next() % 90}); break;
+            case 0: txn.effects.push_back(SetStage{fr(40), uint32_t(rng.next() % 90)}); break;
             case 1: txn.effects.push_back(SetGlobal{fr(40), float(rng.next() % 100)}); break;
             case 2: txn.effects.push_back(EnableRef{fr(40)}); break;
             case 3: txn.effects.push_back(DisableRef{fr(40)}); break;
