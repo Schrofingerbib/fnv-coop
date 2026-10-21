@@ -909,7 +909,11 @@ class Bot:
                     r = self._optional_call(P.M_BOT_SAY, {"info": self._norm(info_id)[0]})
                     break
                 except RpcError as e:
-                    if not any(w in e.message for w in SAY_WAIT) or self.clock.monotonic() >= end:
+                    left = end - self.clock.monotonic()
+                    if not any(w in e.message for w in SAY_WAIT) or left <= 0:
+                        raise
+                    if poll_s >= left:            # the next try would come after timeout_s: give up now (PR #14 review)
+                        self.clock.sleep(left)
                         raise
                 self.clock.sleep(poll_s)
                 if not self.dialogue_open():

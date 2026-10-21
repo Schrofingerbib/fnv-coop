@@ -584,6 +584,17 @@ class SayClickGate(unittest.TestCase):
         self.assertIn("click gate closed", r.reason)
         self.assertLess(nv.clock.t - t0, 2.5)
 
+    def test_no_retry_after_the_deadline(self):
+        # PR #14 review: a poll longer than the time left must not try again (and maybe succeed) after timeout_s
+        nv, b = make()
+        b.talk(ref(NPC))
+        t0 = nv.clock.t
+        r = b.choose_topic(ref(INFO), timeout_s=0.1, poll_s=10.0)
+        self.assertFalse(r.ok)
+        self.assertIn("click gate closed", r.reason)
+        self.assertLessEqual(nv.clock.t - t0, 0.1 + 1e-6)
+        self.assertEqual(nv.me.said, [])
+
     def test_other_refusals_are_not_retried(self):
         nv, b = make()
         b.talk(ref(NPC))
