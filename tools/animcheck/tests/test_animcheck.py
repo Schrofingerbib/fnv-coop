@@ -444,6 +444,21 @@ class PlumbingTests(unittest.TestCase):
         self.assertEqual(category(9999), "unknown")
         self.assertEqual(len(synth.NAMES), 245)
 
+    def test_anim_group_offsets_as_measured_in_game(self):
+        # In game 2026-10-21 every sequence reported group 0: the probe read BSAnimGroupSequence+0x68 (0x0000FFFF there, not a pointer).
+        # Measured: the TESAnimGroup pointer is at +0x74, the group id is the low byte of the dword at TESAnimGroup+0x10.
+        import re
+        src = (Path(__file__).resolve().parents[3] / "plugin" / "animprobe" / "animprobe_game.cpp").read_text(encoding="utf-8")
+        self.assertEqual(re.search(r"kSeqAnimGroup = (0x[0-9A-Fa-f]+)", src).group(1).lower(), "0x74")
+        self.assertEqual(re.search(r"kAnimGroupId = (0x[0-9A-Fa-f]+)", src).group(1).lower(), "0x10")
+        self.assertIn("id & 0xFF", src)
+        # twin: the measured bytes decoded the old way (byte at +0x08 of the group object) give 10 and 30, not Idle 0 and FastForward 7
+        idle = bytes.fromhex("e8840401050000000a000a0a0000000a0000000002000000")
+        fast = bytes.fromhex("e8840401050000001e1e1e1e0000001e0700000002000000")
+        self.assertEqual((idle[8], fast[8]), (10, 30))
+        self.assertEqual((int.from_bytes(idle[0x10:0x14], "little") & 0xFF, int.from_bytes(fast[0x10:0x14], "little") & 0xFF), (0, 7))
+        self.assertEqual((name(0), name(7)), ("Idle", "FastForward"))
+
     def test_move_flags_as_measured_in_game(self):
         # 2026-10-21, player in game: idle in run mode 0x240, walk 0x141, run 0x241, sneak idle 0x640, sneak walk 0x541
         from animcheck import model

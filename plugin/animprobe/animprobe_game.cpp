@@ -71,8 +71,11 @@ constexpr uintptr_t kActorBaseProcess = 0x68, kActorRagdoll = 0xAC, kActorLifeSt
 constexpr uintptr_t kNiName = 0x08, kNiWorldTranslate = 0x8C, kNiChildData = 0xA0, kNiChildFirstFree = 0xA6;
 // BSAnimGroupSequence / NiControllerSequence (offsets from the xNVSE header; the vtable check below guards them)
 constexpr uintptr_t kSeqBegin = 0x2C, kSeqEnd = 0x30, kSeqLast = 0x34, kSeqFreq = 0x28, kSeqWeight = 0x1C,
-                    kSeqState = 0x44, kSeqAnimGroup = 0x68;
-constexpr uintptr_t kAnimGroupId = 0x08;
+                    kSeqState = 0x44, kSeqAnimGroup = 0x74;
+// Measured in game 2026-10-21 (world.peek on the player's playing sequences): the TESAnimGroup pointer is the last dword of the
+// 0x78-byte BSAnimGroupSequence (+0x74; xNVSE's "//068" holds 0x0000FFFF here), and the group id is the dword at +0x10 of that object:
+// low byte = group (mtidle.kf 0 Idle, mtfastforward.kf 7 FastForward, h2hequip.kf 0x18 Equip, h2haim.kf 0x11 Aim), next byte = weapon type.
+constexpr uintptr_t kAnimGroupId = 0x10;
 // AnimData::animSequence[8] at 0xE0, animSeq100 at 0x100
 constexpr uintptr_t kAnimDataSeqBase = 0xE0, kAnimDataSize = 0x12C;
 
@@ -129,6 +132,7 @@ void WalkBones(uintptr_t node, std::vector<BoneWant>& want, int& remaining, int&
 }
 
 // ---- sequences ------------------------------------------------------------------------------------------------
+bool g_rawPtrs = false;   // set per call from scan_animdata: also report the raw sequence / group pointers (dev)
 bool ReadSeq(uintptr_t seq, int slot, SeqSample& s) {
     uintptr_t vt = 0;
     if (!seq || !Rd(seq, vt) || (vt != kVtblBSAnimGroupSequence && vt != kVtblNiControllerSequence)) return false;
@@ -143,9 +147,11 @@ bool ReadSeq(uintptr_t seq, int slot, SeqSample& s) {
     if (Rd(seq + kSeqWeight, f)) s.weight = f;
     if (vt == kVtblBSAnimGroupSequence) {
         uintptr_t grp = 0;
-        uint8_t id = 0;
-        if (Rd(seq + kSeqAnimGroup, grp) && grp && Rd(grp + kAnimGroupId, id)) s.group = id;
+        uint32_t id = 0;
+        if (Rd(seq + kSeqAnimGroup, grp) && grp && Rd(grp + kAnimGroupId, id)) s.group = static_cast<int>(id & 0xFF);
+        if (g_rawPtrs) s.grpPtr = static_cast<uint32_t>(grp);
     }
+    if (g_rawPtrs) s.seqPtr = static_cast<uint32_t>(seq);
     return true;
 }
 
@@ -255,6 +261,7 @@ bool MProbe(const std::string& params, std::string& out) {
         out = "bad params: " + err;
         return false;
     }
+    g_rawPtrs = req.scanAnimData;
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
 

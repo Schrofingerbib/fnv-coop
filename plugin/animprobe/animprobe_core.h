@@ -26,6 +26,7 @@ struct Vec3 {
 struct SeqSample {
     int slot = 0;        // index in AnimData::animSequence, 8 = animSeq100
     int group = -1;      // TESAnimGroup::animGroup (base group id; names in tools/animcheck/animgroups.py)
+    uint32_t seqPtr = 0, grpPtr = 0;   // dev (scan_animdata): the sequence object and the pointer read at +0x68, to locate the group in game
     int state = -1;      // NiControllerSequence::state (0 inactive, 1 animating, others unknown)
     float t = 0;         // NiControllerSequence::last (time of the last update, in sequence seconds)
     float begin = 0, end = 0;
