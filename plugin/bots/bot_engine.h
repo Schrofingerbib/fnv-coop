@@ -29,6 +29,8 @@
 //  39 closing-box gate skipped (no current message)    41 main-thread gate skipped
 // Always-run state for bot.move (42..46; 42, 43 and 46 are in bot_rpc.h):
 //  44 always-run state ignores gamepad mode  45 always-run state reads player+0x652 (the auto-move byte)
+// Drop log base match (48):
+//  48 the base form matches as case-sensitive text (the engine's "falloutnv.esm:015169" never equals "FalloutNV.esm:015169")
 
 namespace nvbots {
 
@@ -506,9 +508,40 @@ inline bool fastTravel(IEngine& e, const std::string& marker, Value* out, std::s
     return true;
 }
 
+// True when two form names ("Plugin.esm:HEX", or a bare HEX) name the same form. The plugin part compares without case and the
+// hex part compares as a number. The engine names forms "falloutnv.esm:015169" and callers send "FalloutNV.esm:15169" (in game, 2026-10-21).
+inline bool sameFormName(const std::string& a, const std::string& b) {
+#if NVBOTS_MUTANT == 48
+    return a == b;
+#else
+    const size_t ca = a.rfind(':'), cb = b.rfind(':');
+    const std::string pa = ca == std::string::npos ? "" : a.substr(0, ca), pb = cb == std::string::npos ? "" : b.substr(0, cb);
+    if (pa.size() != pb.size()) return false;
+    for (size_t i = 0; i < pa.size(); ++i) {
+        const char x = pa[i] >= 'A' && pa[i] <= 'Z' ? (char)(pa[i] - 'A' + 'a') : pa[i];
+        const char y = pb[i] >= 'A' && pb[i] <= 'Z' ? (char)(pb[i] - 'A' + 'a') : pb[i];
+        if (x != y) return false;
+    }
+    auto hex = [](const std::string& s, uint32_t* v) {
+        if (s.empty() || s.size() > 8) return false;
+        uint32_t n = 0;
+        for (char c : s) {
+            const int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (d < 0) return false;
+            n = n * 16 + (uint32_t)d;
+        }
+        *v = n;
+        return true;
+    };
+    uint32_t va = 0, vb = 0;
+    return hex(ca == std::string::npos ? a : a.substr(ca + 1), &va) && hex(cb == std::string::npos ? b : b.substr(cb + 1), &vb) && va == vb;
+#endif
+}
+
 // ---- bot.drops: what the engine's OnDrop event reported ----
 // xNVSE's event manager calls a native handler with (dropper, droppedRef) when something is dropped, from Cell and world code (the same
 // point the OnDrop script event fires). The handler records strings only, so this class is game-free. Correlate by base form plus a time window.
+// The base form matches by sameFormName, not by text.
 struct DropRec { int64_t seq; std::string ref, base, dropper; uint64_t atMs; };
 class DropLog {
 public:
@@ -528,7 +561,7 @@ public:
         for (const DropRec& r : recs_) {
             if (r.seq <= since) continue;
 #if NVBOTS_MUTANT != 27
-            if (!base.empty() && r.base != base) continue;
+            if (!base.empty() && !sameFormName(r.base, base)) continue;
 #endif
 #if NVBOTS_MUTANT != 28
             if (nowMs > r.atMs && nowMs - r.atMs > windowMs) continue;

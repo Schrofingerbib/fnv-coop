@@ -545,6 +545,62 @@ class MessageBoxes(unittest.TestCase):
         self.assertEqual(b.press_box(0).data["path"], "ui")
 
 
+class NoWaitSayBot(Bot):
+    """Twin: choose_topic before the click-gate wait. One bot.say call, so a refusal right after talk is final (in game 2026-10-21)."""
+
+    def choose_topic(self, info_id, timeout_s=5.0, poll_s=0.1):
+        def run():
+            r = self._optional_call(P.M_BOT_SAY, {"info": self._norm(info_id)[0]})
+            if not r.get("said"):
+                from bots.bot import _Fail
+                raise _Fail("postcondition", reply=r)
+            return {}
+        return self._act("choose_topic", run)
+
+
+class SayClickGate(unittest.TestCase):
+    def test_say_right_after_talk_waits_for_the_click_gate(self):
+        nv, b = make()
+        self.assertTrue(b.talk(ref(NPC)).ok)
+        t0 = nv.clock.t
+        r = b.choose_topic(ref(INFO))
+        self.assertTrue(r.ok, r)
+        self.assertGreaterEqual(nv.clock.t - t0, 0.5)              # it waited the gate out
+        self.assertEqual(nv.me.said, [INFO])
+        # twin: one call right after talk is refused by the gate
+        nv2, b2 = make()
+        b2.talk(ref(NPC))
+        r2 = NoWaitSayBot(nv2, "old").choose_topic(ref(INFO))
+        self.assertFalse(r2.ok)
+        self.assertIn("click gate closed", r2.reason)
+
+    def test_a_gate_that_never_opens_fails_after_the_timeout(self):
+        nv, b = make()
+        b.talk(ref(NPC))
+        nv.click_at = 1e9                                           # a click "in the future": the gate stays closed
+        t0 = nv.clock.t
+        r = b.choose_topic(ref(INFO), timeout_s=2.0)
+        self.assertFalse(r.ok)
+        self.assertIn("click gate closed", r.reason)
+        self.assertLess(nv.clock.t - t0, 2.5)
+
+    def test_other_refusals_are_not_retried(self):
+        nv, b = make()
+        b.talk(ref(NPC))
+        nv.clock.sleep(1.0)
+        orig = nv.call
+
+        def refuse(method, params=None, timeout_s=35.0):
+            if method == P.M_BOT_SAY:
+                raise RpcError(-32000, "INFO not offered in this dialogue", method)
+            return orig(method, params, timeout_s)
+        nv.call = refuse
+        t0 = nv.clock.t
+        r = b.choose_topic(ref(INFO))
+        self.assertEqual(r.reason, "rpc_error:INFO not offered in this dialogue")
+        self.assertEqual(nv.clock.t, t0)                            # no wait
+
+
 class GenuineActions(unittest.TestCase):
     def test_drop_returns_the_dropped_world_ref_from_the_event(self):
         nv, b = make()
@@ -558,6 +614,15 @@ class GenuineActions(unittest.TestCase):
         r2 = b.drop(ITEM, 1)
         self.assertEqual(r2.data["ref"], nv.drop_log[-1]["ref"])
         self.assertNotEqual(r2.data["ref"], r.data["ref"])
+
+    def test_drop_event_base_is_the_engine_form_name(self):
+        # in game 2026-10-21: the engine names the base 'falloutnv.esm:015169', Bot.drop asks for 'FalloutNV.esm:...'
+        nv, b = make()
+        r = b.drop(AMMO, 1)
+        self.assertEqual(nv.drop_log[-1]["base"], f"falloutnv.esm:{AMMO:06X}")
+        self.assertEqual((r.data["source"], r.data["ref"]), ("event", nv.drop_log[-1]["ref"]))
+        nv2, b2 = make("drops_base_text")                           # twin: the old text compare finds no event
+        self.assertIsNone(b2.drop(AMMO, 1).data["ref"])
 
     def test_drop_falls_back_to_a_nearby_ref_scan(self):
         nv, b = make(drop_events=False)
@@ -755,6 +820,7 @@ def _scenario(name):
         "exec_ref_ignored": lambda b: b.take(ref(CHEST), ITEM, 1),
         "msgbox_stuck": lambda b: _dismiss_two_boxes(b),
         "msgbox_ui_only": lambda b: _dismiss_two_boxes(b),
+        "drops_base_text": lambda b: _drop_ref_check(b),
     }[name]
 
 
@@ -774,7 +840,8 @@ def _drop_ref_check(b):
 
 
 MUTANTS = ["move_ignored", "look_ignored", "stop_ignored", "jump_noop", "fire_noop", "setpos_ignored", "angle_ignored", "activate_noop", "transfer_noop", "transfer_dup", "equip_noop",
-           "drop_noop", "fire_miss", "health_stuck", "dialog_never", "drop_wrong_ref", "travel_ignored", "exec_ref_ignored", "msgbox_stuck", "msgbox_ui_only"]
+           "drop_noop", "fire_miss", "health_stuck", "dialog_never", "drop_wrong_ref", "travel_ignored", "exec_ref_ignored", "msgbox_stuck", "msgbox_ui_only",
+           "drops_base_text"]
 
 
 class MutationTwins(unittest.TestCase):

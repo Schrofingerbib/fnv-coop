@@ -24,6 +24,8 @@ PLAYER_REF = "FalloutNV.esm:14"
 # The refusal of the native message-box press while menu 1001 is still the top menu but its current message is gone
 # (pressNativeMessageButton in plugin/bots/bot_engine.h). dismiss_messages waits and retries on this text only.
 MSGBOX_CLOSING = "the message box has no current message (it is closing)"
+# The bot.say refusals that clear by themselves (dialogPick in plugin/bots/bot_engine.h). choose_topic waits and retries on these only.
+SAY_WAIT = ("click gate closed", "dialogue not ready")
 
 
 class Pos(Tuple[float, float, float]):
@@ -893,12 +895,25 @@ class Bot:
             return {}
         return self._act("talk", run)
 
-    def choose_topic(self, info_id: Ref, timeout_s: float = 5.0) -> ActionResult:
-        """Speak one dialogue line by INFO form id. Needs bridge method bot.say (no console primitive exists)."""
+    def choose_topic(self, info_id: Ref, timeout_s: float = 5.0, poll_s: float = 0.1) -> ActionResult:
+        """Speak one dialogue line by INFO form id. Needs bridge method bot.say (no console primitive exists).
+        bot.say refuses while the engine's click gate is closed (500 ms after a click, the talk activation included) and while the
+        NPC still speaks (dialogue state not 2). A player waits there too, so this tries again every `poll_s` until `timeout_s`
+        (in game 2026-10-21: the first bot.say right after talk was refused by the click gate). Other refusals fail at once."""
         def run():
             if not self.dialogue_open():
                 raise _Fail("no_dialogue")
-            r = self._optional_call(P.M_BOT_SAY, {"info": self._norm(info_id)[0]})
+            end = self.clock.monotonic() + timeout_s
+            while True:
+                try:
+                    r = self._optional_call(P.M_BOT_SAY, {"info": self._norm(info_id)[0]})
+                    break
+                except RpcError as e:
+                    if not any(w in e.message for w in SAY_WAIT) or self.clock.monotonic() >= end:
+                        raise
+                self.clock.sleep(poll_s)
+                if not self.dialogue_open():
+                    raise _Fail("no_dialogue", why="the dialogue closed while bot.say waited")
             if r is None:
                 raise _Fail("unsupported", need=P.M_BOT_SAY)
             if not r.get("said"):

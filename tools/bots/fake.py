@@ -59,7 +59,8 @@ _DRIVER_METHODS = {P.M_BOT_STATUS, P.M_BOT_MOVE, P.M_BOT_STOP, P.M_BOT_LOOK, P.M
                    P.M_BOT_SNEAK, P.M_BOT_ACTIVATE}
 # Functions the fake console evaluates. The game has IsSneaking. It has no GetSneaking ("Unknown variable", first in-game run 2026-10-21).
 _EXPR_FUNCS = {"issneaking", "getangle", "getequipped", "getitemcount", "getopenstate", "getlocked", "getlocklevel",
-               "getplayerteammate", "getstage", "getav"}
+               "getplayerteammate", "getstage", "getav", "isininterior"}
+SAY_GATE_S = 0.5   # the dialogue's click gate: bot.say refuses for 500 ms after a click (kDlgClickGate in plugin/bots/bot_engine.h)
 
 
 JUMP_SETTLE_S = 2.0  # see M_BOT_SNEAK in FakeBridge: crouch toggles right after a jump
@@ -167,6 +168,21 @@ def _hex(tok: str) -> int:
     return int(tok, 16)
 
 
+def engine_form_name(fid: int) -> str:
+    """How the engine itself names a form in an OnDrop record: lower-case plugin, 6 hex digits ('falloutnv.esm:015169', in game 2026-10-21)."""
+    return f"falloutnv.esm:{fid & 0xFFFFFF:06X}"
+
+
+def same_form_name(a: str, b: str) -> bool:
+    """sameFormName in plugin/bots/bot_engine.h: the plugin part without case, the hex part as a number."""
+    pa, _, ha = a.rpartition(":")
+    pb, _, hb = b.rpartition(":")
+    try:
+        return pa.lower() == pb.lower() and int(ha, 16) == int(hb, 16)
+    except ValueError:
+        return False
+
+
 def form_name(fid: int) -> str:
     """How the plugin names a form (nameOfForm in plugin/bots/bots_module.cpp): 'FalloutNV.esm:HEX', or the bare 8-digit runtime
     id for a created ref (load index 0xFF, e.g. from placeatme or a drop), which no plugin owns."""
@@ -198,6 +214,8 @@ class FakeBridge:
         self.box_answers: List[int] = []
         self.native_boxes: List[int] = []     # engine message boxes (MessageMenu 1001) queued, each = its button count (tests set it)
         self.native_presses: List[int] = []   # buttons pressed natively, in order
+        self.click_at: Optional[float] = None  # virtual time of the last dialogue click (talk, bot.say): the click gate
+        self.interior_cells: set = set()      # cells that are interiors (the engine forbids fast travel there; tests set it)
         self.box_waves: List[Tuple[float, List[int]]] = []   # (virtual time, [button counts]): engine boxes that appear later (tests set it)
         self.box_closing_s = 0.0                # seconds a pressed engine box stays closing (tests set it); 0 = it goes at once
         self._closing_until: Optional[float] = None
@@ -343,8 +361,11 @@ class FakeBridge:
         if method == P.M_BOT_SAY:
             d = self.me.in_dialogue
             t = w.things.get(d) if d is not None else None
+            if t and self.click_at is not None and self.clock.t - self.click_at < SAY_GATE_S:
+                raise RpcError(-32000, "click gate closed (a click happened < 500 ms ago)", method)
             if t and _hex(params["info"].split(":")[1]) in t.topics:
                 self.me.said.append(_hex(params["info"].split(":")[1]))
+                self.click_at = self.clock.t
                 return {"said": True}
             return {"said": False}
         if method == P.M_BOT_MENU:
@@ -422,7 +443,7 @@ class FakeBridge:
             t = self._by_ref(params["marker"])
             if not isinstance(t, Thing):
                 raise RpcError(-32000, "marker not loaded", method)
-            if self.travel_refuses:
+            if self.travel_refuses or self.me.cell in self.interior_cells:
                 raise RpcError(-32000, "the engine refuses fast travel right now (combat)", method)
             if self.mutant not in ("travel_ignored", "setpos_ignored"):
                 self.travel_due = (self.clock.t + 3.0, t)
@@ -432,7 +453,7 @@ class FakeBridge:
                 raise RpcError(-32000, "unsupported: the OnDrop event handler is not registered", method)
             since, base, window = params.get("since", 0), params.get("base", ""), params.get("windowMs", 5000) / 1000.0
             return {"seq": len(self.drop_log), "drops": [{k: v for k, v in d.items() if k != "at"} for d in self.drop_log
-                                                        if d["seq"] > since and (not base or d["base"] == base) and self.clock.t - d["at"] <= window]}
+                                                        if d["seq"] > since and (not base or self._same_base(d["base"], base)) and self.clock.t - d["at"] <= window]}
         if method == P.M_REFS_OF:
             base = _hex(params["base"].split(":")[1])
             return {"refs": [form_name(t.id) for t in self.world.things.values()
@@ -463,6 +484,10 @@ class FakeBridge:
             return self.me.items
         return t.items if t is not None else None
 
+    def _same_base(self, recorded: str, wanted: str) -> bool:
+        """The bot.drops base filter. Mutant drops_base_text: the old text compare, which never matched in game."""
+        return recorded == wanted if self.mutant == "drops_base_text" else same_form_name(recorded, wanted)
+
     def _activate(self, t: Thing) -> None:
         me = self.me
         if t.kind == "door":
@@ -475,6 +500,7 @@ class FakeBridge:
         elif t.kind == "actor" and not t.dead:
             if self.mutant != "dialog_never":
                 me.in_dialogue = t.id
+                self.click_at = self.clock.t
         elif t.kind == "item":
             t.disabled = True
             me.items[t.base_item] = me.items.get(t.base_item, 0) + 1
@@ -657,7 +683,7 @@ class FakeBridge:
                 me.items[i] -= n
                 self._next_ref += 1
                 ground = self.world.add(Thing(self._next_ref, "item", list(me.pos), me.cell, base_item=i, base_id=i))
-                self.drop_log.append({"seq": len(self.drop_log) + 1, "ref": form_name(ground.id), "base": f"FalloutNV.esm:{i:X}",
+                self.drop_log.append({"seq": len(self.drop_log) + 1, "ref": form_name(ground.id), "base": engine_form_name(i),
                                       "dropper": PLAYER_REF, "at": self.clock.t})
                 if mut == "drop_wrong_ref":
                     self.drop_log[-1]["ref"] = "FalloutNV.esm:DEAD"
@@ -718,6 +744,8 @@ class FakeBridge:
         me = self.me
         if fn == "issneaking":
             return 1.0 if self.sneaking else 0.0
+        if fn == "isininterior":
+            return 1.0 if me.cell in self.interior_cells else 0.0
         if fn == "getangle":
             return me.angle[rest[0].upper()]
         if fn == "getequipped":

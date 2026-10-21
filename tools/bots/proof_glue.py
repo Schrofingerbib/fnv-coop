@@ -2,7 +2,7 @@
 test.fasttravel / dev.countRefs / dev.terminal). THE LEAD RUNS THIS, one game at a time; tests only run it over the fake bridge.
 
     python tools/bots/proof_glue.py --instance 0 --npc <ref> --info <INFO form> [--item <form>] [--target <ref>]
-                                    [--marker <ref>] [--base <form>] [--other-info <INFO form>]
+                                    [--marker <ref>] [--ft-from <ref>] [--base <form>] [--other-info <INFO form>]
     python tools/bots/proof_glue.py --fake
 
 Needs nvcoop.ini [dev] bots=1 and the player next to the NPC (a living NPC with a plain greeting, e.g. Sunny Smiles).
@@ -28,8 +28,13 @@ expected information, not a surprise: the printed 'reply' says which gate refuse
   inventory  bot.inventory totals equal the console's GetItemCount for --item (catches delta-vs-total mistakes)
   vats       with --target: bot.vats enters VATS, selects the target, plays it: phase done, target health reported
   consent    raise a box with ui.open, answer it with bot.consent, ui.menus/ui.reply sink sees the answer
-  fasttravel with --marker: test.fasttravel moves the player next to it
+  drop_ref   with --item: bot.drop of one --item reports the world ref that the drop made
   countrefs  with --base: dev.countRefs equals the number of matching refs from world.actors
+  fasttravel with --marker: bot.fasttravel moves the player next to it. It runs last, because it moves the player away from the NPC's
+             cell (countrefs counts in the player's cell). The engine forbids fast travel from an interior, so with --ft-from
+             <exterior ref> the proof first teleports there. In an interior without --ft-from the row is a SKIP that says so,
+             and with --ft-from it is a FAIL (--ft-from is not outdoors). In game 2026-10-21: from the Prospector Saloon the
+             engine refused, from the Goodsprings cemetery marker FalloutNV.esm:1088F6 it travelled to Primm FalloutNV.esm:0CDF46
 """
 import argparse
 import json
@@ -44,7 +49,9 @@ from bots import Bot, FakeBridge, World, proof_args  # noqa: E402
 # Required without --fake: dest -> what the user must give. FORMS: every dest that holds a form id.
 REQUIRED = {"npc": "the ref of the NPC to talk to (Plugin.esm:HEX)",
             "info": "an INFO form that the NPC offers now (Plugin.esm:HEX)"}
-FORMS = ("npc", "info", "other_info", "item", "target", "terminal", "marker", "base")
+FORMS = ("npc", "info", "other_info", "item", "target", "terminal", "marker", "ft_from", "base")
+INTERIOR_EXPR = "player.IsInInterior"   # 1 in an interior, where the engine forbids fast travel
+FT_FROM_SETTLE_S = 3.0                  # after the teleport to --ft-from: the exterior cell loads
 
 
 def choice_key(c, plugins):
@@ -144,11 +151,6 @@ def run(nv, a):
         check("terminal", u.ok and any(x["index"] == a.entry for x in b.terminal_used(a.terminal)), reply=str(u))
     else:
         skip("terminal", "pass --terminal <terminal ref in reach> [--entry N]; the engine result (door opens, log shown) must also be checked by eye/state")
-    if a.marker:
-        f = b.fast_travel(a.marker)
-        check("fasttravel", f.ok, reply=str(f), genuine=f.data.get("genuine"))
-    else:
-        skip("fasttravel", "pass --marker <map marker ref>")
     if a.item:
         have = b.inventory_count(a.item)
         if have >= 1:
@@ -163,7 +165,29 @@ def run(nv, a):
         check("countrefs", n == expect, dev_countRefs=n, world_actors=expect)
     else:
         skip("countrefs", "pass --base <actor base form present in the cell>")
+    if a.marker:
+        fast_travel_check(b, a, check, skip)
+    else:
+        skip("fasttravel", "pass --marker <map marker ref>")
     return rows
+
+
+def fast_travel_check(b, a, check, skip):
+    """The fasttravel row (see the module doc): go to --ft-from first, then refuse to judge from an interior."""
+    if a.ft_from:
+        g = b.goto(a.ft_from, mode="teleport")
+        b.wait(FT_FROM_SETTLE_S)
+        if not g.ok:
+            check("fasttravel", False, why="the teleport to --ft-from failed", reply=str(g))
+            return
+    if b._eval(INTERIOR_EXPR):
+        if a.ft_from:
+            check("fasttravel", False, why="--ft-from is in an interior: give an exterior ref", ft_from=a.ft_from)
+        else:
+            skip("fasttravel", "the player is in an interior, where the engine forbids fast travel: pass --ft-from <exterior ref>")
+        return
+    f = b.fast_travel(a.marker)
+    check("fasttravel", f.ok, reply=str(f), genuine=f.data.get("genuine"), ft_from=a.ft_from)
 
 
 def parser():
@@ -173,7 +197,9 @@ def parser():
     ap.add_argument("--info", help="INFO the NPC offers now (required without --fake)")
     ap.add_argument("--other-info", help="INFO the NPC does NOT offer now: the dialog check fails if bot.dialog lists it")
     ap.add_argument("--item"); ap.add_argument("--target")
-    ap.add_argument("--terminal"); ap.add_argument("--entry", type=int, default=0); ap.add_argument("--marker"); ap.add_argument("--base"); ap.add_argument("--fake", action="store_true")
+    ap.add_argument("--terminal"); ap.add_argument("--entry", type=int, default=0); ap.add_argument("--marker"); ap.add_argument("--base")
+    ap.add_argument("--ft-from", help="an exterior ref to teleport to before the fast travel (the engine forbids it from an interior)")
+    ap.add_argument("--fake", action="store_true")
     ap.add_argument("--dismiss-messages", action="store_true", help="clear stray message boxes (button 0) before the checks")
     ap.add_argument("--dismiss-quiet-s", type=float, default=20.0, help="done when no box has been shown for this many seconds")
     ap.add_argument("--dismiss-max-s", type=float, default=120.0, help="give up (FAIL) after this many seconds")
@@ -193,7 +219,7 @@ def check_args(a):
 # --fake: the arguments the self-test uses (0x801 is a line of another actor, so the NPC 0x602 does not offer it).
 FAKE_ARGS = {"npc": "FalloutNV.esm:602", "info": "FalloutNV.esm:800", "other_info": "FalloutNV.esm:801",
              "item": "FalloutNV.esm:500", "terminal": "FalloutNV.esm:605", "target": "FalloutNV.esm:603",
-             "marker": "FalloutNV.esm:600", "base": "FalloutNV.esm:603"}
+             "marker": "FalloutNV.esm:600", "ft_from": "FalloutNV.esm:606", "base": "FalloutNV.esm:603"}
 
 
 def fake_bridge(mutant=None):
@@ -202,8 +228,10 @@ def fake_bridge(mutant=None):
     w.add_actor(0x602, (100, 0, 0), topics=[0x800])
     w.add_actor(0x603, (500, 0, 0), topics=[0x801])
     w.add_actor(0x604, (600, 0, 0)).base_id = 0x603
-    w.add_container(0x600, (900, 0, 0))
+    w.add_container(0x600, (900, 0, 0), cell=3)   # the map marker, outdoors
+    w.add_container(0x606, (0, 900, 0), cell=2)   # --ft-from, outdoors
     nv = FakeBridge(w, mutant=mutant)
+    nv.interior_cells = {1}                       # the NPC's cell is an interior, like the Prospector Saloon
     nv.me.items[0x500] = 4
     nv.call = _wrap_fake(nv)
     w.add_terminal(0x605, (0, 300, 0)).topics_text = ["Read log", "Exit"]

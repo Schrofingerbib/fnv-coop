@@ -1,4 +1,4 @@
-// Game-free tests for the bot input driver (T6a). Built once against the real code and once per NVBOTS_MUTANT=<n> (1..46); every mutant MUST fail.
+// Game-free tests for the bot input driver (T6a). Built once against the real code and once per NVBOTS_MUTANT=<n> (1..48); every mutant MUST fail.
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -634,6 +634,21 @@ TEST(drop_log_correlates_by_base_and_time_window) {
     CHECK(r.call("bot.drops", "{\"since\":0,\"windowMs\":60000}") && r.out.find("A1") != std::string::npos);
 }
 
+TEST(drop_log_base_matches_the_engine_form_name) {
+    // In game the engine names the base "falloutnv.esm:015169". Bot.drop sends "FalloutNV.esm:015169" (2026-10-21).
+    Rig r;
+    r.rpc.setDropsLive(true);
+    r.e.now = 10100;
+    r.rpc.drops().record("FF001313", "falloutnv.esm:015169", "falloutnv.esm:000014", 10000);
+    CHECK(r.call("bot.drops", "{\"since\":0,\"base\":\"FalloutNV.esm:015169\"}") && r.out.find("FF001313") != std::string::npos);
+    CHECK(r.call("bot.drops", "{\"since\":0,\"base\":\"FALLOUTNV.ESM:15169\"}") && r.out.find("FF001313") != std::string::npos);
+    CHECK(r.call("bot.drops", "{\"since\":0,\"base\":\"FalloutNV.esm:115169\"}") && r.out.find("FF001313") == std::string::npos);
+    CHECK(r.call("bot.drops", "{\"since\":0,\"base\":\"DeadMoney.esm:015169\"}") && r.out.find("FF001313") == std::string::npos);
+    CHECK(sameFormName("falloutnv.esm:015169", "FalloutNV.esm:15169"));
+    CHECK(!sameFormName("falloutnv.esm:015169", "falloutnv.esm:zz"));
+    CHECK(!sameFormName("falloutnv.esm:015169", "15169"));   // a bare id never matches a plugin name: no load order here
+}
+
 TEST(refs_of_lists_enabled_refs_of_a_base) {
     GlueRig r;
     const uint32_t kBase = 0x1234;
@@ -983,6 +998,7 @@ int main() {
     run("dialogue_pick_allows_speech_checks_and_says_so", dialogue_pick_allows_speech_checks_and_says_so);
     run("genuine_fast_travel_queues_the_engine_travel_object", genuine_fast_travel_queues_the_engine_travel_object);
     run("drop_log_correlates_by_base_and_time_window", drop_log_correlates_by_base_and_time_window);
+    run("drop_log_base_matches_the_engine_form_name", drop_log_base_matches_the_engine_form_name);
     run("refs_of_lists_enabled_refs_of_a_base", refs_of_lists_enabled_refs_of_a_base);
     run("count_refs_by_base_in_a_cell", count_refs_by_base_in_a_cell);
     run("terminal_pick_clicks_the_requested_entry_and_records_it", terminal_pick_clicks_the_requested_entry_and_records_it);
