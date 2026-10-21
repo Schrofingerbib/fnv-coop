@@ -167,6 +167,12 @@ def _hex(tok: str) -> int:
     return int(tok, 16)
 
 
+def form_name(fid: int) -> str:
+    """How the plugin names a form (nameOfForm in plugin/bots/bots_module.cpp): 'FalloutNV.esm:HEX', or the bare 8-digit runtime
+    id for a created ref (load index 0xFF, e.g. from placeatme or a drop), which no plugin owns."""
+    return f"{fid:08X}" if fid >> 24 == 0xFF else f"FalloutNV.esm:{fid:X}"
+
+
 class FakeBridge:
     def __init__(self, world: Optional[World] = None, mutant: Optional[str] = None, bot_methods: bool = True,
                  menu_method: bool = True, input_driver: Optional[bool] = None, drop_events: bool = True,
@@ -232,11 +238,18 @@ class FakeBridge:
 
     def exec(self, cmd: str, timeout_ms: Optional[int] = None, *, ref: Optional[str] = None) -> Dict[str, Any]:
         """Like the game: a line runs with the calling reference `ref` (exec {cmd, ref}); "player.X" is the only
-        reference prefix the console accepts, and "<hex>.X" fails with: Script command "<hex>.X" not found."""
+        reference prefix the console accepts, and "<hex>.X" fails with: Script command "<hex>.X" not found.
+        With `ref`, the reply also has the resolved 8-digit runtime id, as bridge.cpp gives it (also when the line fails)."""
         if self.mutant == "crash":
             raise ConnectionLost("fake: pipe closed")
         self.calls.append(("exec", cmd) if ref is None else ("exec", cmd, ref))
         self_ref = None if ref is None else self._calling(ref)
+        reply = self._exec_line(cmd, self_ref)
+        if ref is not None:
+            reply["ref"] = f"{self._rid(ref):08X}"
+        return reply
+
+    def _exec_line(self, cmd: str, self_ref) -> Dict[str, Any]:
         if self.mutant == "exec_ref_ignored":
             self_ref = None
         m = re.fullmatch(r'printc "NVCOOP_EVAL=%g" \((.*)\)', cmd)
@@ -258,6 +271,16 @@ class FakeBridge:
     def _calling(self, ref: str):
         """exec's ref -> the Thing (or "player"), as the bridge resolves it: 'Plugin.esm:HEX' with the load order of
         plugins(), or a runtime id 'HEX' / '0xHEX'. Anything else raises the bridge's errors (-32602 / -32013)."""
+        rid = self._rid(ref)
+        if rid == PLAYER_ID:
+            return "player"
+        t = self.world.things.get(rid)
+        if t is None:
+            raise RpcError(-32013, f"exec: ref '{ref}' (form {rid:08X}) is not a loaded form", "exec")
+        return t
+
+    def _rid(self, ref: str) -> int:
+        """exec's ref -> the runtime form id (the bridge's parsing and its -32602 / -32013 errors)."""
         plugin, colon, hexpart = ref.rpartition(":")
         hexpart = hexpart[2:] if hexpart[:2] in ("0x", "0X") and len(hexpart) > 2 else hexpart
         if not re.fullmatch(r"[0-9A-Fa-f]{1,8}", hexpart) or (colon and (not plugin or int(hexpart, 16) > 0xFFFFFF)):
@@ -268,12 +291,7 @@ class FakeBridge:
             if plugin.lower() not in low:
                 raise RpcError(-32013, f"exec: ref '{ref}': plugin '{plugin}' is not loaded", "exec")
             rid |= low.index(plugin.lower()) << 24
-        if rid == PLAYER_ID:
-            return "player"
-        t = self.world.things.get(rid)
-        if t is None:
-            raise RpcError(-32013, f"exec: ref '{ref}' (form {rid:08X}) is not a loaded form", "exec")
-        return t
+        return rid
 
     def call(self, method: str, params: Optional[Dict[str, Any]] = None, timeout_s: float = 35.0) -> Any:
         params = params or {}
@@ -417,7 +435,7 @@ class FakeBridge:
                                                         if d["seq"] > since and (not base or d["base"] == base) and self.clock.t - d["at"] <= window]}
         if method == P.M_REFS_OF:
             base = _hex(params["base"].split(":")[1])
-            return {"refs": [f"FalloutNV.esm:{t.id:X}" for t in self.world.things.values()
+            return {"refs": [form_name(t.id) for t in self.world.things.values()
                              if t.cell == self.me.cell and not t.disabled and not t.dead and (t.base_id or t.id) == base]}
         if method == P.M_COUNT_REFS:
             base = _hex(params["base"].split(":")[1])
@@ -430,6 +448,8 @@ class FakeBridge:
     def _by_ref(self, form: str):
         if form == PLAYER_REF:
             return "player"
+        if ":" not in form:   # a created ref's bare runtime id (form_name). UNVERIFIED: the real ref.info/activate.ref need Plugin.esm:HEX
+            return self.world.things.get(_hex(form))
         name, local = form.rsplit(":", 1)
         return self.world.things.get(_hex(local))
 
@@ -637,7 +657,7 @@ class FakeBridge:
                 me.items[i] -= n
                 self._next_ref += 1
                 ground = self.world.add(Thing(self._next_ref, "item", list(me.pos), me.cell, base_item=i, base_id=i))
-                self.drop_log.append({"seq": len(self.drop_log) + 1, "ref": f"FalloutNV.esm:{ground.id:X}", "base": f"FalloutNV.esm:{i:X}",
+                self.drop_log.append({"seq": len(self.drop_log) + 1, "ref": form_name(ground.id), "base": f"FalloutNV.esm:{i:X}",
                                       "dropper": PLAYER_REF, "at": self.clock.t})
                 if mut == "drop_wrong_ref":
                     self.drop_log[-1]["ref"] = "FalloutNV.esm:DEAD"
