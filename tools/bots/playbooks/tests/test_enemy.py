@@ -1231,5 +1231,30 @@ class SpawnPlacement(unittest.TestCase):
         self.assertFalse(any("teleported" in n for n in self.lines), self.lines)
 
 
+
+class EquipAllGivesAMissingWeapon(unittest.TestCase):
+    """In game 2026-10-22: --from-step 2 arranged the world and failed 'host equips FalloutNV.esm:0E3778: not_in_inventory'."""
+
+    def test_a_missing_weapon_is_given_then_equipped(self):
+        w, refs = pb_enemy.fake_enemy_fight(2) if hasattr(pb_enemy, "fake_enemy_fight") else (None, None)
+        if w is None:
+            self.skipTest("no fake_enemy_fight fixture")
+        ms = fakecoop.make_machines(w)
+        weapon = refs.get("weapon")
+        if not weapon:
+            self.skipTest("the fixture has no weapon ref")
+        for m in ms:
+            m.bot.me["inv"].pop(weapon, None)
+            m.bot.me["inv"].pop(fakecoop.hexid(weapon) if weapon[:1].isdigit() else weapon, None)
+        lines = []
+        ctx = core.Ctx(ms, fakecoop.FakeComparer(), tmp(), refs, dict(OPTS), "test", lines.append)
+        ctx.equip_all()
+        self.assertTrue(all(m.bot.me.get("equipped") == weapon for m in ms))
+        self.assertTrue(any("gave one" in l for l in lines), lines)
+        # twin: equipping alone (the old equip_all) fails on the same empty inventory
+        for m in ms:
+            m.bot.me["inv"].pop(weapon, None)
+        self.assertFalse(ms[0].bot.equip(weapon).ok)
+
 if __name__ == "__main__":
     unittest.main()

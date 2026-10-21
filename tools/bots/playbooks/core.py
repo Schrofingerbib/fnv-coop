@@ -279,7 +279,16 @@ class Ctx:
         if not w:
             return
         for m in self.machines:
-            self.must(m.bot.equip(w), f"{m.name} equips {w}")
+            r = m.bot.equip(w)
+            if not getattr(r, "ok", False) and "inventory" in str(getattr(r, "reason", "")):
+                # The start save may hold no such weapon (in game 2026-10-22, enemy_fight --from-step 2: "host equips
+                # FalloutNV.esm:0E3778: not_in_inventory"): give one, note it, and equip again.
+                self.must(m.bot.give(w, 1), f"{m.name} gets {w}")
+                note = f"{m.name}: had no {w}, gave one before equipping it"
+                self.notes.append(note)
+                self.log(note)
+                r = m.bot.equip(w)
+            self.must(r, f"{m.name} equips {w}")
 
     def on_all(self, fn: Callable[[Machine], Any], machines: Optional[Sequence[Machine]] = None) -> Dict[str, Any]:
         """Run fn(machine) on every machine at the same time (threads; each bot has its own pipe)."""

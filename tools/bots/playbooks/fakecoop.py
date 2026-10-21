@@ -729,6 +729,11 @@ class FakeBot:
         return Result(True)
 
     # --- combat ---
+    def give(self, item, count=1, timeout_s=5):
+        k = hexid(item) if item[:1].isdigit() else item
+        self.me["inv"][k] = self.me["inv"].get(k, 0) + int(count)
+        return Result(True)
+
     def equip(self, item, timeout_s=5):
         if self.me["inv"].get(hexid(item) if item[:1].isdigit() else item, 0) <= 0:
             return Result(False, f"{item} is not in the inventory")

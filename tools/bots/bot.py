@@ -588,6 +588,17 @@ class Bot:
             return {"item": h}
         return self._act("equip", run)
 
+    def give(self, item: Ref, count: int = 1, timeout_s: float = 5.0) -> ActionResult:
+        """Add `count` of `item` to the player (player.additem). Post: the inventory count rose by `count`."""
+        def run():
+            h = self._item(item)
+            before = self.inventory_count(item)
+            self._exec(f"player.additem {h} {int(count)}", "give")
+            if not self._poll(lambda: self.inventory_count(item) >= before + count, timeout_s):
+                raise _Fail("postcondition", why="item not added", item=h, before=before)
+            return {"item": h, "count": int(count)}
+        return self._act("give", run)
+
     def unequip(self, item: Ref, timeout_s: float = 5.0) -> ActionResult:
         def run():
             h = self._item(item)
