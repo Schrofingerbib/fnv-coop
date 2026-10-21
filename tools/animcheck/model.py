@@ -80,7 +80,10 @@ def _vec(v, default=(0.0, 0.0, 0.0)) -> Vec:
     return default
 
 
-MOVE_WALK, MOVE_RUN, MOVE_SNEAK, MOVE_SWIM = 1 << 7, 1 << 8, 1 << 9, 1 << 11
+# ActorMover movement flags as measured in game (2026-10-21, player, anim.probe move_flags): 0x100 while walking, 0x200 in run mode
+# (also standing, with always-run on), 0x400 only while sneaking (0x640 sneak idle, 0x541 sneak walk). The xNVSE comment
+# ("7 walking, 8 running, 9 sneaking") is one bit low; swimming (0x800) is not measured yet.
+MOVE_WALK, MOVE_RUN, MOVE_SNEAK, MOVE_SWIM = 1 << 8, 1 << 9, 1 << 10, 1 << 11
 
 
 def parse_actor(a: dict, t: float, frame: int = 0) -> Actor:

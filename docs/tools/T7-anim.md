@@ -14,7 +14,7 @@ Bridge methods, read only, main thread, every raw read SEH-guarded (a wrong offs
   (same cell only; other cells need explicit `refs`). No params = player + everything within 2000 units.
 - `anim.stats` returns probe cost (p50/p95/max/mean us, us per actor). `anim.bones` lists the default 16 bones.
 - Per actor: `ref, base, player, valid3d, first_person, dead, life, pos, rot, cell`; `anim {action, sequence_raw, seqs[{slot, group, state, t, begin, end, freq, weight}]}`
-  (AnimData slots 0..7 plus animSeq100 as slot 8); `move_flags` (ActorMover bits: 7 walk, 8 run, 9 sneak, 11 swim);
+  (AnimData slots 0..7 plus animSeq100 as slot 8); `move_flags` (ActorMover flags, measured in game: 0x100 walk, 0x200 run mode, 0x400 sneak; 0x800 swim not measured);
   `weapon {out, aiming, form}`; `stance {knocked, sit_sleep, swimming, ragdoll_ctrl}`; `ai {in_combat, combat_target, package}`;
   `bones {name:[x,y,z] world}` for Pelvis, Spine1/2, Neck1, Head, L/R UpperArm/Forearm/Hand, L/R Calf/Foot, Weapon (found by name in the NiNode tree, up to 700 nodes).
 - Group ids follow the xNVSE enum (`tools/animcheck/animgroups_table.py`, generated). That the game uses the same numbering is NOT yet measured.

@@ -405,6 +405,33 @@ class PlumbingTests(unittest.TestCase):
         self.assertEqual(c2.poll_once(), 1)
         self.assertEqual(c2.errors["a"], 1)
 
+    def test_collect_asks_for_the_player(self):
+        # In game 2026-10-21: anim.probe {near} walks the player's cell list, which does not hold the player, so `collect` never saw it.
+        from animcheck.collect import probe_params
+
+        class EngineLike:
+            """Answers like the plugin: `near` gives the NPCs only, `refs` adds the named refs."""
+            def __init__(self):
+                self.params = []
+
+            def call(self, method, params=None):
+                self.params.append(params)
+                acts = [{"ref": "0x0014C44A"}] if params and "near" in params else []
+                if params and "player" in params.get("refs", []):
+                    acts.insert(0, {"ref": "0x00000014", "player": True})
+                return {"v": 1, "frame": 1, "t_ms": 0.0, "cost_us": 1.0, "actors": acts}
+
+        b = EngineLike()
+        c = Collector({"host": b})
+        c.poll_once()                                         # the default parameters
+        c.poll_once(probe_params(1500, 16))                   # what `cli.py collect` sends
+        for p in b.params:
+            self.assertIn("player", p["refs"])
+            self.assertIn("near", p)
+        self.assertEqual(probe_params(1500, 16)["max"], 16)
+        # twin: the old request (near only) gets no player from the same engine
+        self.assertFalse(any(a.get("player") for a in b.call("anim.probe", {"near": {"radius": 1500}, "max": 16})["actors"]))
+
     def test_animgroups(self):
         self.assertEqual(name(G["Forward"]), "Forward")
         self.assertEqual(category(G["Forward"]), "walk")
@@ -416,6 +443,17 @@ class PlumbingTests(unittest.TestCase):
         self.assertEqual(category(G["JumpLoop"]), "jump")
         self.assertEqual(category(9999), "unknown")
         self.assertEqual(len(synth.NAMES), 245)
+
+    def test_move_flags_as_measured_in_game(self):
+        # 2026-10-21, player in game: idle in run mode 0x240, walk 0x141, run 0x241, sneak idle 0x640, sneak walk 0x541
+        from animcheck import model
+        cases = {0x240: False, 0x141: False, 0x241: False, 0x640: True, 0x541: True}
+        for flags, sneaking in cases.items():
+            a = parse_actor({"ref": "0x14", "player": True, "move_flags": flags}, 0.0)
+            self.assertEqual(a.sneaking, sneaking, hex(flags))
+        # twin: the old constants (sneak = 1 << 9) call plain run mode "sneaking"
+        self.assertTrue(bool(0x241 & (1 << 9)))
+        self.assertEqual(model.MOVE_SNEAK, 0x400)
 
     def test_cpp_golden_sample_parses(self):
         """plugin/animprobe/tests/golden_sample.json is what the C++ side emits (checked byte for byte by its test)."""

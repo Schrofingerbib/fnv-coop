@@ -78,7 +78,8 @@ def cmd_collect(a) -> int:
         n, _, i = s.partition("=")
         inst[n] = int(i)
     with Collector.from_instances(inst, out_dir=a.out) as c:
-        c.run(a.seconds, a.hz, {"near": {"radius": a.radius}, "max": a.max})
+        from animcheck.collect import probe_params
+        c.run(a.seconds, a.hz, probe_params(a.radius, a.max))
         print("probes:", {m: len(p) for m, p in c.probes.items()}, "errors:", c.errors)
         print("cost:", json.dumps(c.costs()))
     return 0
