@@ -58,12 +58,19 @@ def run_door(door_pos=(3000, 3000, 0), load_to=0, reach=150.0, **extra):
 
 
 class QueryFails(FakeBridge):
-    """world.query refuses every actor (seen in game, 2026-10-21) and the bridge has no other health read."""
+    """Every health read fails with an RPC error: world.query (it refused every actor in game, 2026-10-21) and a
+    'GetAV Health' line (a fallback read)."""
+    WHY = "query failed (unknown fn, ref not loaded or evaluator drifted)"
 
     def call(self, method, params=None, timeout_s=35.0):
         if method == "world.query":
-            raise RpcError(-32000, "query failed (unknown fn, ref not loaded or evaluator drifted)", method)
+            raise RpcError(-32000, self.WHY, method)
         return super().call(method, params, timeout_s)
+
+    def exec(self, cmd, timeout_ms=None, **kw):
+        if "getav" in cmd.lower():
+            raise RpcError(-32000, self.WHY, "exec")
+        return super().exec(cmd, timeout_ms, **kw)
 
 
 class Proof(unittest.TestCase):
