@@ -5,8 +5,28 @@ The console grammar here has NOT been run against the real game yet (code-only s
   UNVERIFIED - written from NVSE/console knowledge; the lead's first in-game run may need to fix the text here
 Fixing a string in this file is the only change needed; the Bot code and the fake bridge tests keep working as long
 as the fake bridge (fake.py) is updated to the same grammar.
+
+A line for a reference other than the player is a Line(cmd, ref): the bridge runs `cmd` with `ref` as the console's
+calling reference (exec {cmd, ref}). VERIFIED in game on 2026-10-21: the console does not accept "<hexFormID>.Command"
+(Script command "00103E61.GetOpenState" not found); "player." lines work and stay plain strings.
 """
 from __future__ import annotations
+
+from typing import NamedTuple, Optional
+
+
+class Line(NamedTuple):
+    """One console line and its calling reference (None: no reference, for example 'player.X' or 'GetStage Q')."""
+    cmd: str
+    ref: Optional[str] = None
+
+
+def on(holder: str, text: str) -> Line:
+    """`text` run on `holder`. 'player' keeps the 'player.' prefix (a valid script reference). Any other holder
+    ('Plugin.esm:HEX' or a runtime hex id) becomes the exec ref."""
+    if holder.lower() == "player":
+        return Line(f"player.{text}")
+    return Line(text, holder)
 
 # ---- bridge methods (existing, VERIFIED to be registered in plugin/) ----
 M_REF_INFO = "ref.info"            # {ref:"plugin:HEX"} -> {x,y,z,lifeState,flags,type,cell}
@@ -87,28 +107,32 @@ def is_equipped(item: str) -> str:            # UNVERIFIED (expression)
     return f"player.GetEquipped {item}"
 
 
-def item_count(holder: str, item: str) -> str:  # UNVERIFIED (expression); holder is "player" or a hex ref id
-    return f"{holder}.GetItemCount {item}"
+def item_count(holder: str, item: str) -> Line:  # UNVERIFIED (expression); holder is "player" or the holder's ref
+    return on(holder, f"GetItemCount {item}")
 
 
-def transfer(src: str, item: str, dst: str, count: int) -> str:   # UNVERIFIED: NVSE RemoveItemTarget
-    return f"{src}.RemoveItemTarget {item} {dst} {count} 1"
+def transfer(src: str, item: str, dst: str, count: int) -> Line:   # UNVERIFIED: NVSE RemoveItemTarget, run on src
+    return on(src, f"RemoveItemTarget {item} {dst} {count} 1")     # dst: "player" or a runtime hex id (an argument)
 
 
 def drop(item: str, count: int) -> str:       # UNVERIFIED
     return f"player.Drop {item} {count}"
 
 
-def activate_console(hexid: str) -> str:      # UNVERIFIED fallback when activate.ref is missing
-    return f"{hexid}.Activate player 1"
+def activate_console(ref: str) -> Line:       # UNVERIFIED fallback when activate.ref is missing
+    return Line("Activate player 1", ref)
 
 
-def open_state(hexid: str) -> str:            # UNVERIFIED (expression)
-    return f"{hexid}.GetOpenState"
+def open_state(ref: str) -> Line:             # UNVERIFIED (expression)
+    return Line("GetOpenState", ref)
 
 
-def locked(hexid: str) -> str:                # UNVERIFIED (expression)
-    return f"{hexid}.GetLocked"
+def locked(ref: str) -> Line:                 # UNVERIFIED (expression)
+    return Line("GetLocked", ref)
+
+
+def get_health(holder: str) -> Line:          # VERIFIED in game 2026-10-21 (eval with ref: Doc Mitchell -> 65.0)
+    return on(holder, "GetAV Health")
 
 
 def get_stage(quest: str) -> str:             # VERIFIED (used by nvbridge.stage)

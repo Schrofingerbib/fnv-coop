@@ -212,9 +212,47 @@ void InstallMutexDiagHooks() {
 }
 
 // Isolated in its own function: __try cannot live in a function that has C++ objects needing unwinding.
-int RunLineSEH(const char* line) {
+// thisObj = the console's CALLING REFERENCE (nullptr = none). The game's console script compiler accepts "player.X" but
+// not "<hexFormID>.X" (Script command "00103E61.GetOpenState" not found) nor the EditorID of a non-persistent ref, so
+// bridge exec {cmd, ref} passes the reference here instead (as plugin/hooks/apply_lines.h does for Track A).
+int RunLineSEH(const char* line, TESObjectREFR* thisObj) {
     __try {
-        return g_console->RunScriptLine2(line, nullptr, false) ? 1 : 0;
+        return g_console->RunScriptLine2(line, thisObj, false) ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+// ---- exec {cmd, ref}: the engine's load order and form map (the same data plugin/hooks' DefaultResolver reads) ----
+constexpr UInt32 kDataHandlerPtr = 0x011C3F2C;  // DataHandler* (NVSE DataHandler::Get for runtime 1.4.0.525)
+constexpr UInt32 kLookupFormByID = 0x004839C0;  // cdecl TESForm*(UInt32 refID); prologue pinned in plugin/hooks/engine_addrs.h
+
+// Load-order index = position in DataHandler::modList.modInfoList (NVSE GetModIndex, plugin/hooks FormResolver::fromRef).
+int PluginIndexSEH(const char* name) {
+    __try {
+        DataHandler* dh = *reinterpret_cast<DataHandler**>(kDataHandlerPtr);
+        if (!dh) return -1;
+        int i = 0;
+        for (auto it = dh->modList.modInfoList.Begin(); !it.End(); ++it, ++i)
+            if (it.Get() && _stricmp(it.Get()->name, name) == 0) return i;
+        return -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+TESForm* LookupFormSEH(UInt32 id) {
+    __try {
+        return id ? reinterpret_cast<TESForm*(__cdecl*)(UInt32)>(kLookupFormByID)(id) : nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+int FormTypeSEH(UInt32 id) {
+    __try {
+        TESForm* f = LookupFormSEH(id);
+        return f ? static_cast<int>(f->typeID) : -1;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
@@ -352,7 +390,23 @@ SaveAttempt DirectSaveSEH(const char* name) {
 
 class GameHost : public nvcoop::bridge::Host {
 public:
-    nvcoop::bridge::ExecResult Exec(const std::string& line) override {
+    nvcoop::bridge::ExecResult Exec(const std::string& line) override { return ExecLine(line, nullptr); }
+
+    // exec {cmd, ref}: the bridge core parses the ref and checks the form type through these two, then calls ExecOn.
+    int PluginIndex(const std::string& plugin) override { return PluginIndexSEH(plugin.c_str()); }
+    int FormType(uint32_t runtimeId) override { return FormTypeSEH(runtimeId); }
+
+    nvcoop::bridge::ExecResult ExecOn(const std::string& line, uint32_t runtimeId) override {
+        TESForm* form = LookupFormSEH(runtimeId);  // the bridge checked its type on this main thread a moment ago
+        if (!form) {
+            nvcoop::bridge::ExecResult r;
+            r.output = "reference is no longer loaded";
+            return r;
+        }
+        return ExecLine(line, reinterpret_cast<TESObjectREFR*>(form));
+    }
+
+    nvcoop::bridge::ExecResult ExecLine(const std::string& line, TESObjectREFR* thisObj) {
         nvcoop::bridge::ExecResult r;
         if (!g_console) return r;
         // Capture console output: the engine mirrors console prints into ConsoleManager::COFileName
@@ -370,7 +424,7 @@ public:
         int rc;
         {
             ConsoleModeScope echo;
-            rc = RunLineSEH(line.c_str());
+            rc = RunLineSEH(line.c_str(), thisObj);
         }
         if (cof) {
             std::memcpy(cof, saved, sizeof saved);

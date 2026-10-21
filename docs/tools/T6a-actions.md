@@ -1,9 +1,9 @@
 # T6a-actions: bot action layer (tools/bots/)
 
 Status: Python API, fake bridge, in-process input driver (C++), engine-glue bridge methods, tests and mutation twins done and green (`python -I tools/bots/run_tests.py` prints ALL OK; wired into tools/test_all.py).
-In-game status: one real run so far (2026-10-21). It verified the native message box press and six `proof_input.py` checks: see "First in-game run" below.
-That run also showed the always-run inversion that "Always-run" below fixes. The fix has not run in the game yet.
-Every other console line and engine call is still UNVERIFIED in the game. C++ tests: `plugin\bots\run_tests.cmd` (46 mutants).
+In-game status: two real runs (2026-10-21), see "In-game runs" below. The second run passed `proof_input.py` (PROOF OK):
+hook, forward, back, strafes, turn, stop, jump and sneak. `fire` and `activate` did not run (no `--target` and `--door` given).
+Every other console line and engine call is still UNVERIFIED in the game. C++ tests: `plugin\bots\run_tests.cmd` (47 mutants).
 
 No OS keyboard or mouse input anywhere. Everything goes through nvbridge (`exec`, `ref.info`, `activate.ref`, `world.query`, `ui.dialogopen`, `ui.closedialog`, `state`, `plugins`).
 
@@ -40,8 +40,31 @@ Failure reasons: `timeout`, `not_found`, `dead`, `postcondition`, `unsupported`,
 
 Queries: pos, cell, alive, health, inventory_count(item, holder), quest_stage, dialogue_open, door_state, locked.
 
+## Lines for a reference: exec {cmd, ref} (VERIFIED in game, 2026-10-21)
+The game's console does not accept `<hexFormID>.Command`. On FalloutNV.exe 1.4.0.525 the line `00103E61.GetOpenState` got
+`Script command "00103E61.GetOpenState" not found`, and the EditorID of a non-persistent ref got `Invalid reference ...`.
+Only `player.` works as a prefix. So every line for another reference names it in the bridge's `ref` parameter, and the
+bridge runs the line with that reference as the console's calling reference (`RunScriptLine2(cmd, ref)`, see
+docs/CONTRACTS.md):
+- primitives.py returns a `Line(cmd, ref)` for these lines (`open_state`, `locked`, `item_count`, `transfer`,
+  `activate_console`). `P.on(holder, text)` keeps `player.` for the player and puts any other holder in `ref`.
+- `Bot._exec` / `Bot._eval` send a `Line` as `nv.exec(cmd, ref=ref)` / `nv.eval(expr, ref=ref)`. `Bot._exec_on(ref, cmd)`
+  does the same for a raw command. The ref is `Plugin.esm:HEX`, so the bridge resolves it with the game's own load order.
+- Argument refs (for example the destination of `RemoveItemTarget`, the marker of `player.MoveTo`) stay runtime hex ids
+  in the line: the console accepts hex FormID arguments.
+- fake.py behaves like the game: a `<hex>.Func` line fails with `Script command "<hex>.Func" not found`, and
+  `exec(cmd, ref=...)` runs the line on that reference. A bad ref raises the bridge's errors (-32602, -32013).
+- Twins: the fake mutant `exec_ref_ignored` (the host checks the ref, then drops it) and `LegacyBot` in
+  tests/test_bots.py (a bot that still builds `<hex>.Func` lines) must both fail.
+- `Bot.health`: in game (2026-10-21) `world.query` failed for every actor query on Doc Mitchell (`GetActorValue`,
+  `GetDead`, `GetDisabled`: "query failed (unknown fn, ref not loaded or evaluator drifted)") and worked for a door
+  (`GetLocked` -> 0). `eval("GetAV Health", ref=...)` gave 65.0. So `health()` tries `world.query` first and on an RPC
+  error reads `GetAV Health` with the actor as the calling reference (`P.get_health`). The fake's `query_actors=False`
+  models the game. Twins: with that fallback, `health_stuck`, `fire_miss` and `exec_ref_ignored` must still fail
+  `fire(expect_hit=True)`.
+
 ## Unverified grammar (fix in tools/bots/primitives.py only)
-All of primitives.py except `GetStage`. In particular: `player.SetPos/SetAngle/GetAngle`, `EquipItem/UnequipItem/GetEquipped`, `RemoveItemTarget item target count silent` argument order, `Drop`, `GetOpenState` values (1 open, 3 closed), `GetLocked`, the FLAG_DISABLED bit 0x800, Health = actor value 16 for `world.query p1`, angle sign conventions in `heading_deg`, and whether hex refs work as `HEX.Cmd` prefixes and inside `printc` expressions. Update fake.py to the same grammar if you change a string.
+All of primitives.py except `GetStage`. In particular: `player.SetPos/SetAngle/GetAngle`, `EquipItem/UnequipItem/GetEquipped`, `RemoveItemTarget item target count silent` argument order, `Drop`, `GetOpenState` values (1 open, 3 closed), `GetLocked`, the FLAG_DISABLED bit 0x800, Health = actor value 16 for `world.query p1`, angle sign conventions in `heading_deg`, and whether an expression inside `printc` uses the calling reference that exec's `ref` gives it (`eval(expr, ref=...)`). Update fake.py to the same grammar if you change a string.
 Walking is a stepped SetPos: it does not path around walls, so use it inside open areas and teleport otherwise.
 
 ## In-process input driver and bridge methods (plugin/bots, ini `[dev] bots=1`) - BUILT, PARTLY RUN IN GAME
@@ -102,7 +125,11 @@ Its `--table` output is the source of the ~170 call sites of `GetControlState` g
 - **Driver.** `run` is now the speed. `alwaysRunState()` (bot_engine.h) reads the byte and the gamepad gate. `bot.move` holds Run only when run != always-run, and the tick re-checks it while the move lasts (a toggle press during a move is followed). The move reply and bot.status give `alwaysRun` (true/false, null when unknown) and the move reply gives `runControl` (Run held or not). Unknown (the player is not loaded, or a pin does not match): Run is held for run:true, the old key meaning.
 - **Pins** (`kRunPins` in bots_addrs.h, code bytes, nothing is called or patched): AlwaysRunEdge 0x940C7D, AlwaysRunFlip 0x940C8D, RunPadGate 0x941A2B, RunAlwaysRead 0x941A3E, PadModeConnected 0x4B71D0, PadModeSetting 0x4B71E0. Init compares them with the running exe. The tests compare them with the reference exe (BOTS_EXE). A game-free test checks that the pinned bytes hold the addresses the reader uses.
 - **Sneak read.** The console has `IsSneaking`. `player.GetSneaking` gave "Unknown variable 'GetSneaking'". proof_input reads `player.IsSneaking` and a failed read is now a FAIL.
-- UNVERIFIED in game: the new run semantics (the lead runs proof_input). Gamepad mode was read statically only.
+- **Verified in game** (second run, 2026-10-21): with always-run on, `run:true` held no Run key (`runControl:false`) and the player ran:
+  forward +610, back -482, strafes +600 / -590 units in 2 s. Only unit-tested: gamepad mode (no pad connected), the unknown-state
+  fallback and a toggle change during a move.
+- **`run` omitted** (review finding on PR #10): `bot.move` without `run` holds no Run key, so the game's toggle picks the speed, as
+  before `run` meant the speed. Test `move_without_run_leaves_the_speed_to_the_game`; twin 47 (an omitted run counts as run:false).
 
 ### Native message box press (static RE on the 1.4.0.525 exe, the press ran in game on 2026-10-21)
 Problem seen in game: with all DLC installed, the engine shows its own message boxes (MessageMenu, menu id 1001) about 5 s after a fresh save loads.
@@ -135,23 +162,31 @@ Limits: only MessageMenu 1001, and only when it is the top menu. Button order is
 In-game status: the press path ran in the game on 2026-10-21 (see "First in-game run" below). The refusal paths (wrong vtable, bad button, closing box, not on the main thread) did not occur in that run. Only the unit tests check them.
 Python: `Bot.dismiss_messages(quiet_s=20, max_s=120, max_n=8, button=0, settle_s=0.3, poll_s=0.5, max_closing=10)` presses `button` while `bot.menu` reports kind `message`, and polls every `poll_s` otherwise. It is done when no box has been shown for `quiet_s` seconds. The boxes come in waves: in the first in-game run (all DLC, a fresh save) 6 boxes came at once, then 2, then 2 more about 16 s later. A press-only-now loop returned after the first wave and the later waves stopped movement in the middle of the proof. It fails with `timeout` when `max_s` passes first and with `postcondition` when a box is still shown after `max_n` presses in a row (a box that does not close). A closing box (menu 1001 is still the top menu, but its current message is gone) refuses the native press with "the message box has no current message (it is closing)". dismiss_messages matches only that text (`MSGBOX_CLOSING` in bot.py), waits `settle_s` and tries again. A retry is not a press. It fails with `postcondition` after more than `max_closing` retries in a row, and the count starts again after each press. Every other refusal still ends it (`rpc_error:...`). data: `{pressed, paths, waited_s, quiet_s, closing}`. `quiet_s=0` gives the old press-only-now behaviour. No proof calls it on its own. Pass `--dismiss-messages` to `proof_input.py` or `proof_glue.py` to clear the boxes before the checks (`--dismiss-quiet-s`, `--dismiss-max-s`). It adds a `dismiss_messages` row with `pressed` and `waited_s`.
 
-### First in-game run (2026-10-21)
+### In-game runs (2026-10-21)
+First run.
 Setup: FalloutNV.exe 1.4.0.525 (Steam), all DLC, one minimized copy with the focus guard.
 What the run verified:
 - After a fresh save loaded, 10 native MessageMenu (1001) boxes appeared in waves of 6, 2 and 2. `bot.menu.press {button:0}` answered `path` `native` for each box.
 - After the presses, `bot.menu` reported kind `none` and the game time advanced.
 - Then `proof_input.py` passed `hook`, `strafe_right`, `strafe_left`, `turn`, `stop` and `jump`.
 
-What the run did not verify:
-- `forward` and `back` walked, because of the always-run inversion. "Always-run" above has the fix (`run` is the speed). The fix has not run in the game yet.
-- `sneak`: `player.GetSneaking` gave "Unknown variable". proof_input now reads `player.IsSneaking` (see "Sneak read" in "Always-run" above).
+What the first run did not verify: `forward` and `back` walked (the always-run inversion), and `sneak` failed (`player.GetSneaking`
+gave "Unknown variable").
+
+Second run, with this branch: `proof_input.py --dismiss-messages` printed PROOF OK (exit 0): forward +610, back -482, strafe_right
++600, strafe_left -590, turn, stop, jump, sneak 0 -> 1 -> 0. The sneak check needed the landing wait (`SETTLE_AFTER_JUMP_S`): within
+about 2 s of a jump the engine applies only one crouch toggle. The forward check also needs open ground: right outside Doc
+Mitchell's door an obstacle cut a forward burst to 180 units.
+
+Still not verified in the game:
 - The refusal paths of the native press (wrong vtable, bad button, closing box, not on the main thread) are only unit-tested (`plugin/bots/tests/test_bots.cpp` and its twins).
-- Every other check of `proof_input.py` and `proof_glue.py` is still unverified in the game.
+- `fire` and `activate` (no `--target` / `--door` given), and every check of `proof_glue.py`. These need ref-targeted console lines,
+  which the bridge `exec` cannot run yet (a `<hex>.Command` line fails in the game).
 
 Known limits: terminal state only knows the bot's own picks; VATS limb choice; Reload control id; full inventory enumeration of base-container-only items.
 
 ## Tests
-`tools/bots/tests/test_bots.py`: 24 tests over the fake bridge (virtual clock, milliseconds). Mutation twins in fake.py (`setpos_ignored, angle_ignored, activate_noop, transfer_noop, transfer_dup, equip_noop, drop_noop, fire_miss, health_stuck, dialog_never, ref_info_error, crash, msgbox_stuck, msgbox_ui_only`): each must make the matching action fail. `msgbox_stuck` (the box never closes) and `msgbox_ui_only` (the plugin before the native path) must make `dismiss_messages` fail. The fake's `box_waves` adds engine boxes later in virtual time, and while an engine box is shown the fake player does not move (menu mode). The waves tests press all 10 boxes of the in-game pattern. Their twin (`_press_only_now`, the old loop) leaves 4 boxes, and in proof_input it makes `forward` fail. The fake's `box_closing_s` keeps a pressed box in the closing state for that many seconds. Its twin (`_any_refusal_fatal`, the old loop) fails on the first closing refusal.
+`tools/bots/tests/test_bots.py`: 24 tests over the fake bridge (virtual clock, milliseconds). Mutation twins in fake.py (`setpos_ignored, angle_ignored, activate_noop, transfer_noop, transfer_dup, equip_noop, drop_noop, fire_miss, health_stuck, dialog_never, ref_info_error, crash, msgbox_stuck, msgbox_ui_only, exec_ref_ignored`): each must make the matching action fail. `msgbox_stuck` (the box never closes) and `msgbox_ui_only` (the plugin before the native path) must make `dismiss_messages` fail. The fake's `box_waves` adds engine boxes later in virtual time, and while an engine box is shown the fake player does not move (menu mode). The waves tests press all 10 boxes of the in-game pattern. Their twin (`_press_only_now`, the old loop) leaves 4 boxes, and in proof_input it makes `forward` fail. The fake's `box_closing_s` keeps a pressed box in the closing state for that many seconds. Its twin (`_any_refusal_fatal`, the old loop) fails on the first closing refusal.
 The fake's `always_run` (default True, the New Vegas default) models the always-run toggle. The fake plugin holds Run only when run != always_run, and the fake engine runs when Run held != always_run. Its twin `run_is_key` (Run held for run:true, the plugin before run = speed) makes the proof_input `forward` row FAIL with always-run on (`tools/bots/tests/test_proof.py`).
 The fake uses the same grammar as primitives.py, so it proves the Bot logic, not the real console.
 C++ twins for the native press (`plugin/bots/tests/test_bots.cpp`, NVBOTS_MUTANT): 33 native path never used, 34 vtable check skipped, 35 button index off by one, 36 native path tried before the UI layer, 37 null tile not refused, 38 top-menu gate skipped, 39 closing-box gate skipped, 40 native reply says path "ui", 41 main-thread gate skipped.

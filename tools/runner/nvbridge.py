@@ -10,11 +10,16 @@ Library use::
         nv.load_save("goodsprings_start")
         nv.exec("setstage VMS01 10")
         nv.wait_for("GetStage VMS01", op=">=", value=10, timeout_ms=5000)
+        nv.exec("GetOpenState", ref="00103E61")      # a line for a reference: never "00103E61.GetOpenState"
+
+A console line for a reference other than the player names the reference in `ref` (exec {cmd, ref}): the game's console
+does not accept "<hexFormID>.Command" (see console_ref.py). split_ref_line() converts an old "<ref>.<Func> args" line.
 
 CLI::
 
     python nvbridge.py --instance 0 ping
     python nvbridge.py --instance 0 exec "player.getpos x"
+    python nvbridge.py --instance 0 exec GetOpenState --ref FalloutNV.esm:103E61
     python nvbridge.py --instance 0 waitfor "GetStage VMS01" --op ">=" --value 10 --timeout-ms 5000
     python nvbridge.py --instance 0 events --since 0
 """
@@ -29,7 +34,12 @@ import threading
 import time
 import ctypes
 from ctypes import wintypes
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from console_ref import RefLineError, join_ref_line, split_ref_line  # noqa: E402,F401  (re-exported)
 
 PROTOCOL_VERSION = 1
 
@@ -224,17 +234,27 @@ class NvBridge:
         self.game_pid = int(r.get("pid", 0) or 0)
         return r
 
-    def exec(self, cmd: str, timeout_ms: Optional[int] = None) -> Dict[str, Any]:
-        """Run a console line on the main thread. Returns {'ok': bool, 'output': str}."""
+    def exec(self, cmd: str, timeout_ms: Optional[int] = None, *, ref: Optional[str] = None) -> Dict[str, Any]:
+        """Run a console line on the main thread. Returns {'ok': bool, 'output': str} (plus 'ref': the runtime id as
+        8 hex digits, when `ref` is given).
+
+        ref: run the line with this reference as the console's calling reference: "Plugin.esm:HEX" (the bridge adds the
+        plugin's load-order index) or a runtime id "HEX" / "0xHEX". The game's console does not accept
+        "<hexFormID>.Command", so exec("GetOpenState", ref="00103E61"), never exec("00103E61.GetOpenState").
+        "player.X" lines need no ref. A ref that names no loaded reference raises RpcError -32013."""
         p: Dict[str, Any] = {"cmd": cmd}
+        if ref is not None:
+            p["ref"] = ref
         if timeout_ms is not None:
             p["timeoutMs"] = timeout_ms
         return self.call("exec", p, timeout_s=(timeout_ms or 30000) / 1000 + 5)
 
-    def eval(self, expr: str) -> float:
+    def eval(self, expr: str, ref: Optional[str] = None) -> float:
         """Evaluate an NVSE expression once (printc) and return it as a number. Use hex FormIDs
-        (e.g. 'GetStage 104C1C'): editor IDs do not resolve in the console parser."""
-        out = self.exec('printc "NVCOOP_EVAL=%g" (' + expr + ')')["output"]
+        (e.g. 'GetStage 104C1C'): editor IDs do not resolve in the console parser. With `ref` the expression runs with
+        that reference as the calling reference: eval("GetOpenState", ref="00103E61") (see exec)."""
+        line = 'printc "NVCOOP_EVAL=%g" (' + expr + ')'
+        out = (self.exec(line) if ref is None else self.exec(line, ref=ref))["output"]
         i = out.rfind("NVCOOP_EVAL=")
         if i < 0:
             raise BridgeError(f"cannot evaluate {expr!r}: {out!r}")
@@ -348,6 +368,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ping")
     s = sub.add_parser("exec"); s.add_argument("line")
+    s.add_argument("--ref", help="calling reference: Plugin.esm:HEX or a runtime id HEX (the console has no <hex>.Command)")
     s = sub.add_parser("state"); s.add_argument("sections", nargs="*")
     s = sub.add_parser("waitfor")
     s.add_argument("expr"); s.add_argument("--op", default="truthy"); s.add_argument("--value", type=float, default=0)
@@ -366,7 +387,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
             if a.cmd == "ping":
                 out = nv.ping()
             elif a.cmd == "exec":
-                out = nv.exec(a.line)
+                out = nv.exec(a.line, ref=a.ref)
             elif a.cmd == "state":
                 out = nv.state(a.sections or None)
             elif a.cmd == "waitfor":
