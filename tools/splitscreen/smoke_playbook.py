@@ -174,6 +174,9 @@ class FakeMachine(Machine):
 
     def dismiss_messages(self) -> str:
         self.menu = "none"
+        if self.bug == "msgbox_wave" and not getattr(self, "_waved", False):
+            self._waved = True                  # a second wave arrives while the other copies are being cleared
+            self.menu = "message"
         return "dismiss_messages: ok"
 
 
@@ -318,17 +321,33 @@ def step_movement(ms: List[Machine]) -> Result:
     return Result("movement", not bad, "; ".join(bad) or "each seat walked with its own pad only")
 
 
+DISMISS_ROUNDS = 4   # --dismiss-messages: rounds over all copies at most
+
+
 def run_steps(ms: List[Machine], inject: bool = True, movement: bool = False, out: Callable[[str], None] = print,
               dismiss: bool = False) -> List[Result]:
+    pre: List[Result] = []
     if dismiss:
-        for m in ms:
-            out(f"P{m.seat.index + 1}: {m.dismiss_messages()}")
+        # The DLC notices come in waves (in game 2026-10-21, 3 copies: a new wave reached P1 and P2 while P3 was cleared), so clear every
+        # copy, then look again, until one round finds no box on any copy.
+        for rnd in range(DISMISS_ROUNDS):
+            for m in ms:
+                out(f"P{m.seat.index + 1}: {m.dismiss_messages()}")
+            boxed = [f"P{m.seat.index + 1}" for m in ms if m.menu_kind() == "message"]
+            if not boxed:
+                break
+            if rnd + 1 == DISMISS_ROUNDS:   # still a box after the last round: a failure, also when the movement step does not run (PR #29 review)
+                r = Result("dismiss", False, f"{', '.join(boxed)}: a message box is still open after {DISMISS_ROUNDS} rounds")
+                out(f"FAIL {r.step}: {r.detail}")
+                pre.append(r)
+            else:
+                out(f"a message box is open again after round {rnd + 1}: clearing again")
     steps: List[Callable[[List[Machine]], Result]] = [step_windows, step_hooks]
     if inject:
         steps += [step_pads, step_unfocused]
         if movement:
             steps.append(step_movement)
-    results = []
+    results = list(pre)
     for fn in steps:
         try:
             r = fn(ms)
@@ -385,6 +404,17 @@ def selftest() -> int:
     p = _plan(2)
     ms = [FakeMachine(s, foreground=(s.index == 0), bug=("msgbox" if s.index == 1 else "")) for s in p.seats]
     check("--dismiss-messages clears the box and every step passes", all(r.ok for r in run_steps(ms, True, True, out=lambda _l: None, dismiss=True)))
+    ms = [FakeMachine(s, foreground=(s.index == 0), bug=("msgbox_wave" if s.index == 1 else "")) for s in p.seats]
+    check("--dismiss-messages clears a second wave too", all(r.ok for r in run_steps(ms, True, True, out=lambda _l: None, dismiss=True)))
+    global DISMISS_ROUNDS
+    keep, DISMISS_ROUNDS = DISMISS_ROUNDS, 1          # twin: one round only (the first version) misses the second wave
+    ms = [FakeMachine(s, foreground=(s.index == 0), bug=("msgbox_wave" if s.index == 1 else "")) for s in p.seats]
+    check("twin: one dismiss round misses a second wave", not all(r.ok for r in run_steps(ms, True, True, out=lambda _l: None, dismiss=True)))
+    # the same with movement off: the failed dismissal is still reported (PR #29 review); without it every step would pass
+    ms = [FakeMachine(s, foreground=(s.index == 0), bug=("msgbox_wave" if s.index == 1 else "")) for s in p.seats]
+    rs = run_steps(ms, True, False, out=lambda _l: None, dismiss=True)
+    check("a box left after the last round fails 'dismiss' even without movement", any(r.step == "dismiss" and not r.ok for r in rs))
+    DISMISS_ROUNDS = keep
     if fails:
         print("smoke_playbook selftest FAILED: " + ", ".join(fails))
         return 1
