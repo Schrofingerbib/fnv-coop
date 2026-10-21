@@ -56,12 +56,14 @@ docs/CONTRACTS.md):
   `exec(cmd, ref=...)` runs the line on that reference. A bad ref raises the bridge's errors (-32602, -32013).
 - Twins: the fake mutant `exec_ref_ignored` (the host checks the ref, then drops it) and `LegacyBot` in
   tests/test_bots.py (a bot that still builds `<hex>.Func` lines) must both fail.
-- `Bot.health`: in game (2026-10-21) `world.query` failed for every actor query on Doc Mitchell (`GetActorValue`,
-  `GetDead`, `GetDisabled`: "query failed (unknown fn, ref not loaded or evaluator drifted)") and worked for a door
-  (`GetLocked` -> 0). `eval("GetAV Health", ref=...)` gave 65.0. So `health()` tries `world.query` first and on an RPC
-  error reads `GetAV Health` with the actor as the calling reference (`P.get_health`). The fake's `query_actors=False`
-  models the game. Twins: with that fallback, `health_stuck`, `fire_miss` and `exec_ref_ignored` must still fail
-  `fire(expect_hit=True)`.
+- `Bot.health`: in game (2026-10-21) `world.query {fn: "GetActorValue"}` failed for every ref (the player, Doc Mitchell,
+  a door): "query failed (unknown fn, ref not loaded or evaluator drifted)". Other functions worked, also on actors
+  (`GetRestrained` on Doc Mitchell -> 1). The cause is in Track A: `plugin/hooks` detours `Cond_GetActorValue` (0x59C4F0),
+  so the live bytes start with `E9` (a jump into nvcoop.dll), and `queryCondition` refuses an evaluator without its
+  `55 8B EC` prologue. `GetItemCount` (0x59D8E0) fails the same way. `eval("GetAV Health", ref=...)` gave 65.0.
+  So `health()` tries `world.query` first and on an RPC error reads `GetAV Health` with the ref as the calling reference
+  (`P.get_health`). The fake's `query_av=False` models the game. Twins: with that fallback, `health_stuck`, `fire_miss`
+  and `exec_ref_ignored` must still fail `fire(expect_hit=True)`.
 
 ## Unverified grammar (fix in tools/bots/primitives.py only)
 All of primitives.py except `GetStage`. In particular: `player.SetPos/SetAngle/GetAngle`, `EquipItem/UnequipItem/GetEquipped`, `RemoveItemTarget item target count silent` argument order, `Drop`, `GetOpenState` values (1 open, 3 closed), `GetLocked`, the FLAG_DISABLED bit 0x800, Health = actor value 16 for `world.query p1`, angle sign conventions in `heading_deg`, and whether an expression inside `printc` uses the calling reference that exec's `ref` gives it (`eval(expr, ref=...)`). Update fake.py to the same grammar if you change a string.
@@ -196,6 +198,7 @@ A missing game, and a game lost in the middle of the run (`ConnectionLost` and `
 A game lost during the `player.IsSneaking` read must also give 2: the sneak FAIL is for a failed read only, so proof_input lets `ConnectionLost` through to the run guard.
 `--info FalloutNV.esm:1800 --other-info FalloutNV.esm:800` must pass on a fake whose NPC offers 1800. A `form_key` table and the load-order refusals (exit 2 before the first check) check the runtime id rule.
 Twins: in-process copies of the scripts with each check removed or with the old code put back (text and suffix matching, the number-only same-INFO check, empty values let through, `ap.error` exits, an unguarded run, low 24 bits compared without the plugin, a sneak check that also catches a lost game).
+proof_input activate: the proof walks back to `--door-dist` units (default 100) from the door first, and a cell change (a load door) also passes. The fake's `activate_reach` (the game's reach is about 150) and `Thing.load_to` (a load door) model the game. Twins: `--door-dist 0` (the door must already be in reach) fails after the movement checks, and the state-only rule fails a load door. An RPC error in the fire or activate check gives a FAIL row. Its twin (no guard) stops the run with the error.
 
 ## For T6b
 FakeBridge.pair() gives two bridges on one World (host and client views are not synchronised by the fake; a playbook that needs sync behaviour must simulate it on top). Agreed API was sent by message; any requested change goes to T6a-actions.

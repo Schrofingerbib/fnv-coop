@@ -11,7 +11,7 @@ spec = importlib.util.spec_from_file_location("proof_input", ROOT / "tools" / "b
 proof = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(proof)
 from bots import FakeBridge, World  # noqa: E402
-from bots.bot import BridgeError  # noqa: E402
+from bots.bot import BridgeError, RpcError  # noqa: E402
 
 
 def run_with(mutant=None, always_run=True):
@@ -46,7 +46,143 @@ def run_with_waves(**dismiss_kw):
     return proof.run(nv, args), nv
 
 
+def run_door(door_pos=(3000, 3000, 0), load_to=0, reach=150.0, **extra):
+    """The proof with the door far from where the movement checks leave the player, and the game's activation reach."""
+    w = World()
+    w.add_actor(0x603, (0, 400, 0))
+    w.add_door(0x601, door_pos).load_to = load_to
+    nv = FakeBridge(w)
+    nv.activate_reach = reach
+    args = argparse.Namespace(target="FalloutNV.esm:603", door="FalloutNV.esm:601", fake=True, **extra)
+    return next(r for r in proof.run(nv, args).rows if r["check"] == "activate"), nv
+
+
+class QueryFails(FakeBridge):
+    """Every health read fails with an RPC error: world.query (its GetActorValue failed for every ref in game, 2026-10-21)
+    and a 'GetAV Health' line (a fallback read)."""
+    WHY = "query failed (unknown fn, ref not loaded or evaluator drifted)"
+
+    def call(self, method, params=None, timeout_s=35.0):
+        if method == "world.query":
+            raise RpcError(-32000, self.WHY, method)
+        return super().call(method, params, timeout_s)
+
+    def exec(self, cmd, timeout_ms=None, **kw):
+        if "getav" in cmd.lower():
+            raise RpcError(-32000, self.WHY, "exec")
+        return super().exec(cmd, timeout_ms, **kw)
+
+
+class DoorInfoFails(FakeBridge):
+    """ref.info fails for the door only, so b.pos(door) raises the Bot's _Fail outside an action."""
+
+    def call(self, method, params=None, timeout_s=35.0):
+        if method == "ref.info" and (params or {}).get("ref") == "FalloutNV.esm:601":
+            raise RpcError(-32000, "reference not loaded", method)
+        return super().call(method, params, timeout_s)
+
+
+class SecondStateReadFails(FakeBridge):
+    """The door's GetOpenState line fails from the second read on (a short eval failure, same cell)."""
+    reads = 0
+
+    def exec(self, cmd, timeout_ms=None, **kw):
+        if "GetOpenState" in cmd:
+            self.reads += 1
+            if self.reads >= 2:
+                raise RpcError(-32000, "eval failed", "exec")
+        return super().exec(cmd, timeout_ms, **kw)
+
+
+def activate_row(bridge_cls):
+    w = World()
+    w.add_actor(0x603, (0, 400, 0))
+    w.add_door(0x601, (50, 50, 0))
+    args = argparse.Namespace(target="FalloutNV.esm:603", door="FalloutNV.esm:601", fake=True)
+    return next(r for r in proof.run(bridge_cls(w), args).rows if r["check"] == "activate")
+
+
 class Proof(unittest.TestCase):
+    def test_a_bot_query_failure_in_activate_is_a_fail_row(self):
+        # PR #13 review: b.pos(ref) and b.cell() raise the Bot's _Fail (not a BridgeError) when ref.info fails
+        row = activate_row(DoorInfoFails)
+        self.assertEqual(row["result"], "FAIL", row)
+        self.assertIn("not_found", row["error"])
+        # twin: the first guard (BridgeError only) lets the _Fail escape and stops the run
+        old = proof.CHECK_ERRORS
+        proof.CHECK_ERRORS = (BridgeError,)
+        try:
+            with self.assertRaises(Exception) as c:
+                activate_row(DoorInfoFails)
+            self.assertEqual(type(c.exception).__name__, "_Fail")
+        finally:
+            proof.CHECK_ERRORS = old
+
+    def test_an_unreadable_door_state_in_the_same_cell_is_a_fail(self):
+        # PR #13 review: 'unloaded' is accepted only after a cell change; a failed read in the same cell is not a state change
+        row = activate_row(SecondStateReadFails)
+        self.assertEqual(row["result"], "FAIL", row)
+        self.assertIn("eval failed", row["error"])
+        # twin: the first fallback (any failed read means 'unloaded') turns the failed read into a PASS
+        old = proof.unreadable_after_ok
+        proof.unreadable_after_ok = lambda c0, c1: True
+        try:
+            row = activate_row(SecondStateReadFails)
+        finally:
+            proof.unreadable_after_ok = old
+        self.assertEqual((row["result"], row["after"]), ("PASS", "unloaded"))
+
+    def test_activate_walks_back_into_reach_first(self):
+        row, nv = run_door()
+        self.assertEqual(row["result"], "PASS", row)
+        self.assertEqual((row["before"], row["after"]), ("closed", "open"))
+        self.assertGreaterEqual(row["door_dist"], proof.DOOR_DIST - 5)
+        self.assertLess(row["door_dist"], 150)
+        # twin: the old check (the door must already be in reach). After the movement checks it is not, and the row fails.
+        row, nv = run_door(door_dist=0)
+        self.assertEqual(row["result"], "FAIL", row)
+        self.assertEqual(row["after"], "closed")
+
+    def test_activate_passes_through_a_load_door(self):
+        # in game: Doc Mitchell's front door (103E61) moved the player outside, and GetOpenState stayed 3 (closed)
+        row, nv = run_door(load_to=7)
+        self.assertEqual(row["result"], "PASS", row)
+        self.assertEqual((row["before"], row["after"], row["cell_after"]), ("closed", "closed", 7))
+        # twin: the old rule (the door state must change) fails a load door that worked
+        old = proof.door_activated
+        proof.door_activated = lambda before, after, c0, c1: before != after
+        try:
+            row, nv = run_door(load_to=7)
+        finally:
+            proof.door_activated = old
+        self.assertEqual(row["result"], "FAIL", row)
+
+    def test_an_rpc_error_in_a_check_is_a_fail_row(self):
+        w = World()
+        w.add_actor(0x603, (0, 400, 0))
+        w.add_door(0x601, (50, 50, 0))
+        args = argparse.Namespace(target="FalloutNV.esm:603", door="FalloutNV.esm:601", fake=True)
+        rows = {r["check"]: r for r in proof.run(QueryFails(w), args).rows}
+        self.assertEqual(rows["fire"]["result"], "FAIL", rows["fire"])
+        self.assertIn("query failed", rows["fire"]["error"])
+        self.assertEqual(rows["activate"]["result"], "PASS", rows["activate"])     # the proof went on after the error
+        # twin: no guard. The first in-game fire run stopped with a traceback here.
+        old = proof.CHECK_ERRORS
+        proof.CHECK_ERRORS = ()
+        try:
+            with self.assertRaises(RpcError):
+                proof.run(QueryFails(w), args)
+        finally:
+            proof.CHECK_ERRORS = old
+
+    def test_door_dist_must_not_be_negative(self):
+        for bad in ("-1", "nan"):
+            with self.subTest(value=bad):
+                args = proof.parser().parse_args(["--door", "FalloutNV.esm:601", "--door-dist", bad])
+                self.assertTrue(any("--door-dist" in p for p in proof.check_args(args)))
+        args = proof.parser().parse_args(["--door", "FalloutNV.esm:601", "--door-dist", "0"])
+        self.assertEqual(proof.check_args(args), [])
+
     def test_passes_on_a_healthy_fake(self):
         rep = run_with()
         self.assertEqual([r for r in rep.rows if r["result"] != "PASS"], [])
@@ -94,6 +230,25 @@ class Proof(unittest.TestCase):
         self.assertTrue(row["move"]["runControl"])
         row = next(r for r in run_with("run_is_key", always_run=False).rows if r["check"] == "forward")
         self.assertEqual(row["result"], "PASS", row)                   # with always-run off the key meaning was right
+
+    def test_move_without_run_leaves_the_speed_to_the_toggle(self):
+        # PR #10 review: the fake must match bot_rpc.h. An omitted run holds no Run key, so the always-run toggle picks the speed.
+        def two_seconds(always_run, mutant=None):
+            nv = FakeBridge(World(), mutant=mutant)
+            nv.always_run = always_run
+            reply = nv.call("bot.move", {"forward": 1, "strafe": 0})
+            nv.clock.sleep(2.0)
+            nv.call("bot.stop")
+            return reply, nv.me.pos[1]
+        for on, fast in ((True, True), (False, False)):
+            with self.subTest(always_run=on):
+                reply, moved = two_seconds(on)
+                self.assertEqual((reply["runControl"], reply["run"], "Run" in reply["held"]), (False, False, False))
+                self.assertEqual(moved > 300, fast, moved)         # run speed with always-run on, walk speed with it off
+        # twin (C++ twin 47): an omitted run counts as run:false, holds Run under always-run, and the player walks
+        reply, moved = two_seconds(True, "run_omitted_is_false")
+        self.assertTrue(reply["runControl"])
+        self.assertLess(moved, 300)
 
     def test_fake_console_rejects_functions_the_game_does_not_have(self):
         nv = FakeBridge(World())

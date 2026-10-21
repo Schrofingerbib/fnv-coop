@@ -22,9 +22,11 @@ It implements the console grammar and bridge methods in primitives.py over a tin
   msgbox_stuck      bot.menu.press presses the engine's message box natively, but the box never closes
   msgbox_ui_only    bot.menu.press only answers the UI layer's box (the plugin before the native path existed)
   run_is_key        bot.move holds Run for run:true whatever the always-run toggle is (the plugin before run = speed)
+  run_omitted_is_false  bot.move without run counts as run:false (C++ twin 47): under always-run it holds Run and walks
 
 Always-run: `always_run` is the engine's toggle (PlayerCharacter+0x651). True is the New Vegas default. bot.move `run` is the speed.
-The fake plugin holds Run only when run != always_run (runControlFor in bot_rpc.h). The fake engine moves at run speed when
+The fake plugin holds Run only when run != always_run (runControlFor in bot_rpc.h). A bot.move without run holds no Run key, so the
+always-run toggle picks the speed (speedGiven_ in bot_rpc.h). The fake engine moves at run speed when
 Run held != always_run (the run decision at 0x941A2B, keyboard mode). So with always-run on, Run held means walk. The bot.move
 reply and bot.status carry the same run fields as bot_rpc.h.
 
@@ -93,8 +95,9 @@ class Thing:
     topics_text: List[str] = field(default_factory=list)   # terminal entry names
     base_id: int = 0                # base form id (0 = same as id); used by dev.countRefs
     topics: List[int] = field(default_factory=list)
-    life: int = 0                   # ref.info lifeState of a living actor: 0 alive, 3 unconscious, 5 restrained, 6 essential unconscious
     teammate: bool = False          # SetPlayerTeammate
+    life: int = 0                   # ref.info lifeState of a living actor: 0 alive, 3 unconscious, 5 restrained, 6 essential unconscious
+    load_to: int = 0                # door only: the cell a load door leads to (0 = an ordinary door that opens and closes)
 
     @property
     def dead(self) -> bool:
@@ -167,7 +170,7 @@ def _hex(tok: str) -> int:
 class FakeBridge:
     def __init__(self, world: Optional[World] = None, mutant: Optional[str] = None, bot_methods: bool = True,
                  menu_method: bool = True, input_driver: Optional[bool] = None, drop_events: bool = True,
-                 genuine_travel: bool = True, travel_refuses: bool = False, query_actors: bool = True):
+                 genuine_travel: bool = True, travel_refuses: bool = False, query_av: bool = True):
         self.world = world or World()
         self.me = self.world.new_player()
         self.mutant = mutant
@@ -177,7 +180,9 @@ class FakeBridge:
         self.drop_events = drop_events          # the OnDrop native handler is registered
         self.genuine_travel = genuine_travel    # bot.fasttravel exists (engine glue on)
         self.travel_refuses = travel_refuses    # the engine's may-travel check says no
-        self.query_actors = query_actors        # False = world.query fails for actor refs (seen in game 2026-10-21, doors work)
+        self.query_av = query_av                # False = world.query GetActorValue fails for every ref (in game 2026-10-21:
+                                                # Track A's own detour on Cond_GetActorValue fails queryCondition's prologue check)
+        self.activate_reach = 400.0             # bot.activate range; the game's activation reach is about 150 (tests set it)
         self.drop_log: List[Dict[str, Any]] = []
         self.travel_due: Optional[Tuple[float, "Thing"]] = None   # (virtual time, marker): the player moves a little after the call
         self._next_ref = 0xFF000000
@@ -296,7 +301,7 @@ class FakeBridge:
             t = self._by_ref(params["ref"])
             if params["fn"] != "GetActorValue" or params.get("p1") != P.HEALTH_AV:
                 raise RpcError(-32000, "query failed", method)
-            if not self.query_actors and isinstance(t, Thing) and t.kind == "actor":   # the game's own message
+            if not self.query_av:   # the game's own message
                 raise RpcError(-32000, "query failed (unknown fn, ref not loaded or evaluator drifted)", method)
             return {"value": self.me.health if t == "player" else (t.health if t else 0)}
         if method == P.M_DIALOG_OPEN:
@@ -443,6 +448,9 @@ class FakeBridge:
         if t.kind == "door":
             if t.locked:
                 return
+            if t.load_to:   # a load door moves the player to the other cell; its open state stays closed (in game, 2026-10-21)
+                me.cell = t.load_to
+                return
             t.open_state = 1 if t.open_state == 3 else 3
         elif t.kind == "actor" and not t.dead:
             if self.mutant != "dialog_never":
@@ -463,7 +471,12 @@ class FakeBridge:
                     "shotsLeft": self.shots_left, "alwaysRun": self.always_run, "vats": self.vats_state}
         if method == P.M_BOT_MOVE:
             want = bool(params.get("run", False))
-            run_control = want if self.mutant == "run_is_key" else want != self.always_run   # runControlFor in bot_rpc.h
+            # bot_rpc.h speedGiven_: an omitted run holds no Run key, so the always-run toggle picks the speed
+            speed_given = params.get("run") is not None or self.mutant == "run_omitted_is_false"
+            if not speed_given:
+                run_control = False
+            else:
+                run_control = want if self.mutant == "run_is_key" else want != self.always_run   # runControlFor in bot_rpc.h
             if self.mutant != "move_ignored":
                 self.held -= {"Forward", "Backward", "Left", "Right", "Run"}
                 f, st = float(params.get("forward", 0)), float(params.get("strafe", 0))
@@ -516,7 +529,8 @@ class FakeBridge:
             if self.mutant != "activate_noop":
                 for t in self.world.things.values():
                     z, x = heading_deg((me.pos[0], me.pos[1], me.pos[2] + 120), (t.pos[0], t.pos[1], t.pos[2] + 60))
-                    if t.kind in ("door", "actor", "item") and math.dist(me.pos, t.pos) < 400 and angle_diff(z, me.angle["Z"]) <= 10:
+                    if (t.kind in ("door", "actor", "item") and math.dist(me.pos, t.pos) < self.activate_reach
+                            and angle_diff(z, me.angle["Z"]) <= 10):
                         self._activate(t)
                         break
             return {}

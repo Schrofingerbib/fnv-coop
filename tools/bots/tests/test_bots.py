@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from bots import ActionFailed, Bot, FakeBridge, World  # noqa: E402
 from bots import primitives as P  # noqa: E402
-from bots.bot import MSGBOX_CLOSING, ActionResult, BridgeError, ConnectionLost, RpcError, heading_deg  # noqa: E402
+from bots.bot import MSGBOX_CLOSING, PLAYER_REF, ActionResult, BridgeError, ConnectionLost, RpcError, heading_deg  # noqa: E402
 from nvbridge import join_ref_line  # noqa: E402  (bots.bot put tools/runner on sys.path)
 
 REPO = Path(__file__).resolve().parents[3]
@@ -327,13 +327,15 @@ class GlueActions(unittest.TestCase):
         self.assertEqual(b.vats_target(ref(RAIDER), expect_hit=True).reason, "postcondition")
         self.assertEqual(b.health(ref(RAIDER)), before)
 
-    def test_health_falls_back_to_getav_when_world_query_fails_for_actors(self):
-        nv, b = make(query_actors=False)
-        with self.assertRaises(RpcError):          # the condition seen in game: world.query refuses the actor
-            nv.call(P.M_QUERY, {"ref": ref(RAIDER), "fn": "GetActorValue", "p1": P.HEALTH_AV})
+    def test_health_falls_back_to_getav_when_world_query_fails(self):
+        nv, b = make(query_av=False)
+        for who in (ref(RAIDER), PLAYER_REF):      # the condition seen in game: world.query GetActorValue fails for every ref
+            with self.assertRaises(RpcError):
+                nv.call(P.M_QUERY, {"ref": who, "fn": "GetActorValue", "p1": P.HEALTH_AV})
         self.assertEqual(b.health(ref(RAIDER)), 100.0)
         self.assertIn(("exec", 'printc "NVCOOP_EVAL=%g" (GetAV Health)', ref(RAIDER)), nv.calls)   # the actor is the calling ref
-        self.assertEqual(b.health(), 200.0)        # the player still answers world.query
+        self.assertEqual(b.health(), 200.0)        # the player: 'player.GetAV Health'
+        self.assertIn(("exec", 'printc "NVCOOP_EVAL=%g" (player.GetAV Health)'), nv.calls)
         r = b.fire(ref(RAIDER), expect_hit=True)
         self.assertTrue(r.ok, r)
         self.assertEqual(r.data["health"], 75.0)
@@ -760,11 +762,11 @@ class MutationTwins(unittest.TestCase):
         self.assertEqual(_dismiss_two_boxes(b).reason, "rpc_error:no message box is being shown")   # the bug seen in game
 
     def test_health_fallback_does_not_hide_defects(self):
-        """world.query fails for actors (game, 2026-10-21): health() reads GetAV through eval {ref}. The fallback must
+        """world.query GetActorValue fails (game, 2026-10-21): health() reads GetAV through eval {ref}. The fallback must
         read the target's real health, so a stuck health, a missed shot or a lost calling ref still fails the shot."""
         for m in ("health_stuck", "fire_miss", "exec_ref_ignored"):
             with self.subTest(mutant=m):
-                nv, b = make(m, query_actors=False)
+                nv, b = make(m, query_av=False)
                 r = b.fire(ref(RAIDER), expect_hit=True)
                 self.assertFalse(r.ok, f"mutant {m} slipped through the health fallback: {r}")
 
