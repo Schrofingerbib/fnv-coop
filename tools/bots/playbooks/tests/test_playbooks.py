@@ -552,7 +552,8 @@ class ConsoleRefLines(unittest.TestCase):
         """Twin: the old '<hex>.Func' fallbacks fail on the fake console, as they did in game."""
         nv, bot = self.world()
         ref = lambda i: f"FalloutNV.esm:{i:X}"      # noqa: E731
-        with self.assertRaises(Exception):
+        from bots.bot import BridgeError                          # what the fake bridge's eval raises, as NvBridge.eval does
+        with self.assertRaisesRegex(BridgeError, "not found"):   # the game's 'Script command "<hex>.GetLockLevel" not found'
             bot.nv.eval(f"{probe.hexid(ref(0x601))}.GetLockLevel")
         self.assertFalse(legacy_exec_ref(bot, ref(0x602), "SetPlayerTeammate 1"))
         self.assertFalse(probe.is_teammate(bot, ref(0x602)))
