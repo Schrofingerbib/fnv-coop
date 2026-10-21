@@ -21,9 +21,11 @@ It implements the console grammar and bridge methods in primitives.py over a tin
   msgbox_stuck      bot.menu.press presses the engine's message box natively, but the box never closes
   msgbox_ui_only    bot.menu.press only answers the UI layer's box (the plugin before the native path existed)
   run_is_key        bot.move holds Run for run:true whatever the always-run toggle is (the plugin before run = speed)
+  run_omitted_is_false  bot.move without run counts as run:false (C++ twin 47): under always-run it holds Run and walks
 
 Always-run: `always_run` is the engine's toggle (PlayerCharacter+0x651). True is the New Vegas default. bot.move `run` is the speed.
-The fake plugin holds Run only when run != always_run (runControlFor in bot_rpc.h). The fake engine moves at run speed when
+The fake plugin holds Run only when run != always_run (runControlFor in bot_rpc.h). A bot.move without run holds no Run key, so the
+always-run toggle picks the speed (speedGiven_ in bot_rpc.h). The fake engine moves at run speed when
 Run held != always_run (the run decision at 0x941A2B, keyboard mode). So with always-run on, Run held means walk. The bot.move
 reply and bot.status carry the same run fields as bot_rpc.h.
 
@@ -420,7 +422,12 @@ class FakeBridge:
                     "shotsLeft": self.shots_left, "alwaysRun": self.always_run, "vats": self.vats_state}
         if method == P.M_BOT_MOVE:
             want = bool(params.get("run", False))
-            run_control = want if self.mutant == "run_is_key" else want != self.always_run   # runControlFor in bot_rpc.h
+            # bot_rpc.h speedGiven_: an omitted run holds no Run key, so the always-run toggle picks the speed
+            speed_given = params.get("run") is not None or self.mutant == "run_omitted_is_false"
+            if not speed_given:
+                run_control = False
+            else:
+                run_control = want if self.mutant == "run_is_key" else want != self.always_run   # runControlFor in bot_rpc.h
             if self.mutant != "move_ignored":
                 self.held -= {"Forward", "Backward", "Left", "Right", "Run"}
                 f, st = float(params.get("forward", 0)), float(params.get("strafe", 0))

@@ -95,6 +95,25 @@ class Proof(unittest.TestCase):
         row = next(r for r in run_with("run_is_key", always_run=False).rows if r["check"] == "forward")
         self.assertEqual(row["result"], "PASS", row)                   # with always-run off the key meaning was right
 
+    def test_move_without_run_leaves_the_speed_to_the_toggle(self):
+        # PR #10 review: the fake must match bot_rpc.h. An omitted run holds no Run key, so the always-run toggle picks the speed.
+        def two_seconds(always_run, mutant=None):
+            nv = FakeBridge(World(), mutant=mutant)
+            nv.always_run = always_run
+            reply = nv.call("bot.move", {"forward": 1, "strafe": 0})
+            nv.clock.sleep(2.0)
+            nv.call("bot.stop")
+            return reply, nv.me.pos[1]
+        for on, fast in ((True, True), (False, False)):
+            with self.subTest(always_run=on):
+                reply, moved = two_seconds(on)
+                self.assertEqual((reply["runControl"], reply["run"], "Run" in reply["held"]), (False, False, False))
+                self.assertEqual(moved > 300, fast, moved)         # run speed with always-run on, walk speed with it off
+        # twin (C++ twin 47): an omitted run counts as run:false, holds Run under always-run, and the player walks
+        reply, moved = two_seconds(True, "run_omitted_is_false")
+        self.assertTrue(reply["runControl"])
+        self.assertLess(moved, 300)
+
     def test_fake_console_rejects_functions_the_game_does_not_have(self):
         nv = FakeBridge(World())
         self.assertEqual(nv.eval("player.IsSneaking"), 0)
