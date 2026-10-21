@@ -24,6 +24,7 @@ env:
   # -fno-sanitize-recover makes the first UBSan finding fail the process instead of printing and carrying on.
   SAN_FLAGS: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -O1 -g
   ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:abort_on_error=0
+  LSAN_OPTIONS: suppressions=${{ github.workspace }}/.github/lsan.supp:print_suppressions=1
   UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
 
 jobs:
@@ -44,13 +45,14 @@ jobs:
           python-version: "3.11"
       - run: sudo apt-get update && sudo apt-get install -y ninja-build libenet-dev clang
       - name: Twin of the sanitizers themselves
-        # A planted heap overflow and a planted signed overflow must make the process fail with these exact flags.
-        # If this step passes while the lines below are "fixed", the sanitizers are not really on.
+        # A planted heap overflow, signed overflow and leak must make the process fail with these exact flags and with the
+        # suppressions in .github/lsan.supp loaded (so a suppression that is too wide shows up here too).
         run: |
           set -u
           printf 'int main(int c, char**) { int* p = new int[2]; p[c + 1] = 1; return p[0]; }\n' > twin_asan.cpp
           printf '#include <climits>\nint main(int c, char**) { int x = INT_MAX - 1 + c; return (x + 1) > 0; }\n' > twin_ubsan.cpp
-          for t in twin_asan twin_ubsan; do
+          printf '#include <cstdio>\nint main() { int* p = new int[4]; std::printf("%%p\\n", (void*)p); p = nullptr; return 0; }\n' > twin_lsan.cpp
+          for t in twin_asan twin_ubsan twin_lsan; do
             ${{ matrix.cxx }} $SAN_FLAGS $t.cpp -o $t
             if ./$t; then echo "::error::$t exited 0: the sanitizer did not stop the planted bug"; exit 1; fi
           done
@@ -62,8 +64,9 @@ jobs:
       - run: cmake --build build --parallel
       # Excluded, each with its reason:
       #  - soak_smoke_threaded: about 15% flaky, a real worker-thread race (issue #43); ASan/UBSan do not see data races (that is TSan's job).
-      #  - unit_perf / twin_perf_regression_still_fails: wall-clock budgets, meaningless at sanitizer speed.
-      - run: ctest --test-dir build -j 4 --timeout 900 --output-on-failure -E '^(soak_smoke_threaded|unit_perf|twin_perf_regression_still_fails)$'
+      #  - unit_perf / twin_perf_regression_still_fails / flight_perf: wall-clock budgets, meaningless at sanitizer speed (flight_perf failed under load).
+      # One known leak is suppressed in .github/lsan.supp (runAsync reference cycle, reported in the PR); everything else must be clean.
+      - run: ctest --test-dir build -j 4 --timeout 900 --output-on-failure -E '^(soak_smoke_threaded|unit_perf|twin_perf_regression_still_fails|flight_perf)$'
 
   simfuzz-soak:
     name: simfuzz soak, ASan+UBSan (${{ matrix.cxx }})
@@ -108,7 +111,7 @@ jobs:
       - name: Soak (em, hell)
         run: ./build/fnvcoop_simfuzz --target em --profile hell --seed "$SEED_BASE" --count "$COUNT" --duration 8000 --out out/em-hell
       - name: Soak (mini)
-        run: ./build/fnvcoop_simfuzz --target mini --seed "$SEED_BASE" --count "$(( COUNT * 3 ))" --duration 8000 --out out/mini
+        run: ./build/fnvcoop_simfuzz --target mini --seed "$SEED_BASE" --count "$(( COUNT * 10 ))" --duration 8000 --out out/mini
       - name: Keep shrunk repros and traces of a failure
         if: failure()
         uses: actions/upload-artifact@v4
