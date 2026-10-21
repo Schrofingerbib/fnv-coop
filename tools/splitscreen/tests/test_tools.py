@@ -464,6 +464,12 @@ def launcher_cli_plan_matches():
     a = ap.parse_args(["plan", "--players", "2", "--split", "tb", "--workarea", "--pads", "none,2"])
     p = launch.make_plan(a, ms, [])
     ok(p.seats[1].pad == 2 and p.seats[1].cell == Rect(0, 700, 2560, 700) and p.mode == "2tb")
+    # --dev-inject: synthetic pads 0..3 exist on every copy, so no seat is idle without real controllers (in game 2026-10-21 the
+    # seats stayed idle and the smoke playbook's pad step failed)
+    a = ap.parse_args(["plan", "--players", "2", "--dev-inject"])
+    ok([s.pad for s in launch.make_plan(a, ms, []).seats] == [None, 0], "--dev-inject seats take synthetic pads")
+    a = ap.parse_args(["plan", "--players", "2", "--allow-missing-pads"])
+    ok([s.pad for s in launch.make_plan(a, ms, []).seats] == [None, None], "without --dev-inject a seat with no controller stays idle")
     a = ap.parse_args(["plan", "--players", "3"])
     try:
         launch.make_plan(a, ms, [0])

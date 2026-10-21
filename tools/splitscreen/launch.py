@@ -144,6 +144,10 @@ def make_plan(a: argparse.Namespace, monitors: List[mon.Monitor], pads_now: List
     if a.pads:
         pads = planmod.parse_pad_spec(a.pads, a.players)
     else:
+        if getattr(a, "dev_inject", False):
+            # --dev-inject: split.inject gives every copy a synthetic pad 0..3, so every seat has a pad without a real controller.
+            # In game 2026-10-21 without controllers the seats stayed idle and the smoke playbook's pad step failed (it expects pad 0).
+            pads_now = list(range(4))
         pads = planmod.assign_pads(a.players, pads_now, p1_pad=a.p1_pad, allow_missing=a.allow_missing_pads)
     return planmod.build_plan(a.players, a.split, area, m.index, pads, base_id=a.base_id, port=a.port, autoload=a.autoload, audio=a.audio,
                               fps_cap=a.fps_cap, vsync=a.vsync, dev_inject=a.dev_inject, gap=a.gap, force_small=a.force_small, fit_ratio=a.fit)
