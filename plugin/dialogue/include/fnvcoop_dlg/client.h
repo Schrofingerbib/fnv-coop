@@ -46,7 +46,8 @@ public:
     void setAppliedProvider(AppliedProvider p) { applied_ = std::move(p); }
     enum class Role : uint8_t { Idle, Requesting, Initiator, Spectator };
 
-    ClientDialogue(PlayerId self, Config cfg = {}) : self_(self), cfg_(cfg) {}
+    ClientDialogue(PlayerId self) : ClientDialogue(self, Config()) {}
+    ClientDialogue(PlayerId self, Config cfg) : self_(self), cfg_(cfg) {}
 
     Role role() const { return role_; }
     ConvId conv() const { return conv_; }
