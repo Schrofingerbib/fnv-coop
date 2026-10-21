@@ -584,6 +584,36 @@ class SayClickGate(unittest.TestCase):
         self.assertIn("click gate closed", r.reason)
         self.assertLess(nv.clock.t - t0, 2.5)
 
+    def test_no_retry_after_the_deadline(self):
+        # PR #14 review: a poll longer than the time left must not try again (and maybe succeed) after timeout_s
+        nv, b = make()
+        b.talk(ref(NPC))
+        t0 = nv.clock.t
+        r = b.choose_topic(ref(INFO), timeout_s=0.1, poll_s=10.0)
+        self.assertFalse(r.ok)
+        self.assertIn("click gate closed", r.reason)
+        self.assertLessEqual(nv.clock.t - t0, 0.1 + 1e-6)
+        self.assertEqual(nv.me.said, [])
+
+    def test_no_retry_when_the_dialogue_check_uses_up_the_time(self):
+        # PR #22 review: poll_s < time left, but the dialogue check after the sleep takes the rest: no bot.say after timeout_s
+        nv, b = make()
+        b.talk(ref(NPC))
+        orig = b.dialogue_open
+        checks = []
+
+        def slow_open():
+            checks.append(1)
+            nv.clock.sleep(0.3 if len(checks) > 1 else 0.0)   # the first call is choose_topic's own entry check
+            return orig()
+        b.dialogue_open = slow_open
+        says_before = len([c for c in nv.calls if c[0] == P.M_BOT_SAY])
+        r = b.choose_topic(ref(INFO), timeout_s=0.25, poll_s=0.1)
+        self.assertFalse(r.ok)
+        self.assertIn("click gate closed", r.reason)
+        self.assertEqual(len([c for c in nv.calls if c[0] == P.M_BOT_SAY]) - says_before, 1)   # one try, no retry after the deadline
+        self.assertEqual(nv.me.said, [])
+
     def test_other_refusals_are_not_retried(self):
         nv, b = make()
         b.talk(ref(NPC))
