@@ -42,7 +42,7 @@ add_library(fnvcoop_sim STATIC sim/sim.cpp)
 target_include_directories(fnvcoop_sim PUBLIC sim)
 target_link_libraries(fnvcoop_sim PUBLIC fnvcoop)
 
-add_executable(fnvcoop_tests tests/main.cpp tests/test_wire.cpp tests/test_core.cpp tests/test_session.cpp tests/test_sim.cpp tests/test_transport.cpp tests/test_baseline.cpp tests/test_saveload.cpp tests/test_rules.cpp tests/test_desync.cpp tests/test_handshake.cpp tests/test_perf.cpp tests/test_perfguard.cpp tests/test_rejoin.cpp tests/test_rejoin_dlg.cpp tests/test_failquest.cpp tests/test_round3.cpp tests/test_hostload.cpp tests/test_refcmd.cpp)
+add_executable(fnvcoop_tests tests/main.cpp tests/test_wire.cpp tests/test_core.cpp tests/test_session.cpp tests/test_sim.cpp tests/test_transport.cpp tests/test_baseline.cpp tests/test_saveload.cpp tests/test_rules.cpp tests/test_desync.cpp tests/test_desync_clientonly.cpp tests/test_handshake.cpp tests/test_perf.cpp tests/test_perfguard.cpp tests/test_rejoin.cpp tests/test_rejoin_dlg.cpp tests/test_failquest.cpp tests/test_round3.cpp tests/test_hostload.cpp tests/test_refcmd.cpp)
 target_compile_definitions(fnvcoop_tests PRIVATE FNVCOOP_RULES_JSON="${CMAKE_CURRENT_SOURCE_DIR}/../docs/quest-policies/rules.json")
 target_include_directories(fnvcoop_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../plugin/dialogue/include)
 # perf_guard.h uses runtime mutation twins (tools/mut/fnvcoop_mut.h, FNVCOOP_MUT=<n>); only this test exe, never the plugin
@@ -102,6 +102,11 @@ add_test(NAME twin_perf_regression_still_fails COMMAND fnvcoop_tests --group per
 set_tests_properties(twin_perf_regression_still_fails PROPERTIES WILL_FAIL TRUE ENVIRONMENT "FNVCOOP_PERF_SCALE=0.1")
 add_test(NAME unit_handshake COMMAND fnvcoop_tests --group handshake)
 add_test(NAME unit_desync COMMAND fnvcoop_tests --group desync)
+add_test(NAME unit_desync_clientonly COMMAND fnvcoop_tests --group desync_clientonly --name client_only_keys_with_an_inverse_converge_even_above_the_repair_cap)
+# KNOWN BUG #25: client-only quest running keys have no inverse (revertEffectFor), so the digest never converges. Passing = fixed: drop WILL_FAIL.
+add_test(NAME known_bug_25_desync_client_only_quest_keys COMMAND fnvcoop_tests --group desync_clientonly --name client_only_quest_running_keys_converge)
+set_tests_properties(known_bug_25_desync_client_only_quest_keys PROPERTIES WILL_FAIL TRUE)
+add_test(NAME twin_unit_desync_clientonly_heal_disabled COMMAND fnvcoop_tests --group twin --name unit_desync_clientonly_heal_disabled)
 add_test(NAME unit_rules COMMAND fnvcoop_tests --group rules)
 add_test(NAME unit_saveload COMMAND fnvcoop_tests --group saveload)
 add_test(NAME unit_baseline COMMAND fnvcoop_tests --group baseline)
