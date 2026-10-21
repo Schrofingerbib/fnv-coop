@@ -915,9 +915,12 @@ class Bot:
                     if poll_s >= left:            # the next try would come after timeout_s: give up now (PR #14 review)
                         self.clock.sleep(left)
                         raise
+                    refusal = e
                 self.clock.sleep(poll_s)
                 if not self.dialogue_open():
                     raise _Fail("no_dialogue", why="the dialogue closed while bot.say waited")
+                if self.clock.monotonic() >= end:   # the sleep or the dialogue check used up the time left (PR #22 review)
+                    raise refusal
             if r is None:
                 raise _Fail("unsupported", need=P.M_BOT_SAY)
             if not r.get("said"):
