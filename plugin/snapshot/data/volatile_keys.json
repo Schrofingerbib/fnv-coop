@@ -84,6 +84,30 @@
     "reasons": [
      "manual:fight-test"
     ]
+   },
+   {
+    "edid": "vDialogueEDE",
+    "name": "icounter",
+    "owner": "FalloutNV.esm:1572E8",
+    "reasons": [
+     "manual:fight-test"
+    ]
+   },
+   {
+    "edid": "vDialogueGomorrah",
+    "name": "fdays",
+    "owner": "FalloutNV.esm:10C721",
+    "reasons": [
+     "manual:fight-test"
+    ]
+   },
+   {
+    "edid": "vDialogueGomorrah",
+    "name": "time",
+    "owner": "FalloutNV.esm:10C721",
+    "reasons": [
+     "manual:fight-test"
+    ]
    }
   ]
  },

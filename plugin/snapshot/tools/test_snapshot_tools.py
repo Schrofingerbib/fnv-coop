@@ -272,6 +272,24 @@ class VolatileQuestVars(unittest.TestCase):
     def test_twin_pre_classification_diff_keeps_the_timer(self):
         self.assertEqual(len(snaplib.diff(self.snap(8.0), self.snap(0.4), local_split=False)), 1)
 
+    @staticmethod
+    def fight_snap(ede, gom_time, gom_days, stalkers_on, stalkers_count):
+        """The quest vars of the first two-copy enemy_fight run in game (2026-10-21, step 01, host vs guest)."""
+        q = {"FalloutNV.esm:1572E8": {"edid": "vDialogueEDE", "vars": {"iCounter": ede}},
+             "FalloutNV.esm:10C721": {"edid": "vDialogueGomorrah", "vars": {"Time": gom_time, "fDays": gom_days}},
+             "FalloutNV.esm:1617A2": {"edid": "VERStalkersSouth01", "vars": {"StalkersOn": stalkers_on, "iCount": stalkers_count}}}
+        return {"schemaVersion": 1, "meta": {}, "perPlayer": {"0": {}}, "shared": {"quests": q}}
+
+    def test_fight_run_frame_counter_and_clock_copies_are_per_machine(self):
+        for key in (("falloutnv.esm:1572e8", "icounter"), ("falloutnv.esm:10c721", "time"), ("falloutnv.esm:10c721", "fdays")):
+            self.assertIn(key, snaplib.load_volatile_vars())
+        host, guest = self.fight_snap(41, 6.333857, 6.333857, 0, 18), self.fight_snap(40, 5.959093, 6.028465, 1, 0)
+        # only the night-stalker quest still differs: its script ran on the host and not on the guest (a real difference)
+        self.assertEqual(sorted(d["path"] for d in snaplib.diff(host, guest)),
+                         ["shared/quests/FalloutNV.esm:1617A2/vars/StalkersOn", "shared/quests/FalloutNV.esm:1617A2/vars/iCount"])
+        # twin: without the volatile classification all five differ, as in the failing run
+        self.assertEqual(len(snaplib.diff(host, guest, local_split=False)), 5)
+
 
 class GoldensProtected(unittest.TestCase):
     def test_manifest_matches(self):
