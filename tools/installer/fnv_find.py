@@ -123,7 +123,7 @@ def _steam_roots(reg: Registry, env: Dict[str, str]) -> List[Path]:
                              ("HKLM", r"SOFTWARE\Valve\Steam", "InstallPath")):
         v = reg.get(hive, key, value)
         if v:
-            roots.append(Path(v.replace("/", "\\")))
+            roots.append(Path(v.replace("/", "\\")) if fnv_mut.on("find_windows_only_separators") else Path(v))
     pf = env.get("ProgramFiles(x86)")
     if pf:
         roots.append(Path(pf) / "Steam")
@@ -185,14 +185,14 @@ def candidates(arg: Optional[str] = None, env: Optional[Dict[str, str]] = None, 
         if v:
             add(v, "retail", "retail")
     for d in drives():
-        d = d.rstrip("\\/") + "\\"
+        d = d.rstrip("\\/") + ("\\" if fnv_mut.on("find_windows_only_separators") else os.sep)
         for rel in (r"GOG Games\Fallout New Vegas", r"GOG Games\Fallout New Vegas Ultimate Edition",
                     r"Program Files (x86)\GOG Galaxy\Games\Fallout New Vegas", r"Program Files (x86)\GOG Galaxy\Games\Fallout New Vegas Ultimate Edition",
                     r"Program Files (x86)\Steam\steamapps\common\Fallout New Vegas", r"Program Files\Steam\steamapps\common\Fallout New Vegas",
                     r"SteamLibrary\steamapps\common\Fallout New Vegas", r"Steam\steamapps\common\Fallout New Vegas",
                     r"Games\Fallout New Vegas", r"Games\Steam\steamapps\common\Fallout New Vegas",
                     r"Program Files (x86)\Bethesda Softworks\Fallout New Vegas", r"Program Files\Bethesda Softworks\Fallout New Vegas"):
-            add(Path(d) / rel, "common")
+            add(Path(d) / rel if fnv_mut.on("find_windows_only_separators") else Path(d, *rel.split("\\")), "common")
     return found
 
 

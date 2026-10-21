@@ -8,7 +8,8 @@
    A Python-only slow suite (T1b full) runs without CMake or MSVC. A cl-only suite (L6, L8) runs without CMake.
 4. Without out/questdata, or with only part of it, the suites that read it (T6b, T4b, L8) SKIP with the command that
    generates it and the names of the missing files.
-Twins (TEST_ALL_MUTANT): no_preflight, no_questdata_gate, questdata_one_file, no_vcvars_check, tools_from_quick.
+5. Off Windows (no MSVC, no vcvars, no build_l1.cmd) the suites that need CMake or MSVC SKIP with that reason instead of FAIL.
+Twins (TEST_ALL_MUTANT): no_preflight, no_questdata_gate, questdata_one_file, no_vcvars_check, tools_from_quick, no_platform_skip.
 Each must make the Behaviour tests fail.
 Run: python -I tools/test_all_selftest.py   (prints ALL OK)
 """
@@ -30,7 +31,7 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import test_all  # noqa: E402
 
-MUTANTS = ("no_preflight", "no_questdata_gate", "questdata_one_file", "no_vcvars_check", "tools_from_quick")
+MUTANTS = ("no_preflight", "no_questdata_gate", "questdata_one_file", "no_vcvars_check", "tools_from_quick", "no_platform_skip")
 DATA_SUITES = ("T6b co-op playbooks", "T4b scenarios", "L8 dialogue")
 SUITE = {name: (slow, tools) for name, _, slow, tools in test_all.SUITES}
 OK_TOOLS = {"cmake": "", "msvc": ""}
@@ -69,7 +70,8 @@ def runner_scripts(cmd) -> list:
     """The repo scripts a SUITES command runs: the script itself, or every module of a unittest discover folder."""
     if "discover" in cmd:
         return sorted((ROOT / cmd[cmd.index("-s") + 1]).resolve().glob("*.py"))
-    return [(ROOT / a).resolve() for a in cmd if a.endswith((".py", ".cmd", ".bat")) and (ROOT / a).is_file()]
+    return [(ROOT / a.replace("\\", "/")).resolve() for a in cmd
+            if a.endswith((".py", ".cmd", ".bat")) and (ROOT / a.replace("\\", "/")).is_file()]   # SUITES spell some paths with backslashes
 
 
 def called_scripts(path: Path) -> list:
@@ -77,7 +79,7 @@ def called_scripts(path: Path) -> list:
     out = []
     text = code_text(path)
     for tok in SCRIPT_REF.findall(text):
-        tok = VAR_PREFIX.sub("", tok)
+        tok = VAR_PREFIX.sub("", tok).replace("\\", "/")
         for base in (ROOT, path.parent):
             p = (base / tok).resolve()
             if p.is_file() and ROOT in p.parents:
@@ -111,6 +113,9 @@ class Behaviour(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.empty = Path(self.tmp.name)
+        patcher = mock.patch.object(test_all, "WINDOWS", True)   # the decisions below are the Windows ones; the platform tests switch it off
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -218,6 +223,32 @@ class Behaviour(unittest.TestCase):
         self.assertEqual(self.decide("T1b flight analyzer (full + mutation twin)", problems=nothing), ("run", ""))
         self.assertEqual(self.decide("L7 snapshot", problems=nothing), ("run", ""))  # uses cl only when vcvars exists
         self.assertEqual(self.decide("L5 hooks", problems=problems), ("fail", "cmake not found"))
+
+    # --- not Windows
+    def test_off_windows_toolchain_suites_skip_with_a_reason_instead_of_failing(self):
+        self.with_all_data()
+        broken = {"cmake": "cmake not found", "msvc": "vcvars32.bat not found"}
+        with mock.patch.object(test_all, "WINDOWS", False):
+            for name, (slow, tools) in SUITE.items():
+                needs = any(t in ("cmake", "msvc") for t in tools)
+                action, reason = self.decide(name, problems=broken)
+                if needs:
+                    self.assertEqual(action, "skip", name)
+                    self.assertIn("Windows only", reason)
+                else:
+                    self.assertEqual(action, "run", name)
+
+    def test_off_windows_preflight_checks_nothing_and_prints_nothing(self):
+        out = io.StringIO()
+        with mock.patch.object(test_all, "WINDOWS", False), mock.patch.object(test_all, "toolchain", lambda: self.fail("toolchain probed")), \
+                redirect_stdout(out):
+            self.assertEqual(test_all.preflight(quick=False), {})
+        self.assertEqual(out.getvalue(), "")
+
+    def test_on_windows_toolchain_problems_still_fail(self):
+        self.with_all_data()
+        action, _ = self.decide("L5 hooks", problems={"cmake": "cmake not found", "msvc": ""})
+        self.assertEqual(action, "fail")
 
     def test_quick_still_skips_slow_suites_silently(self):
         self.assertEqual(self.decide("L4 synccore", quick=True, problems={"cmake": "x", "msvc": "y"}), ("skip", ""))

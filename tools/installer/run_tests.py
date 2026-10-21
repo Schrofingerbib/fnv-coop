@@ -789,6 +789,8 @@ TWINS = [
     (check_pe_version, "pe_swap_words"),
     (check_find_steam, "find_ignore_libraries"),
     (check_find_common_and_order, "find_no_dedup"),
+    *([(check_find_steam, "find_windows_only_separators"), (check_find_common_and_order, "find_windows_only_separators")]
+      if os.name != "nt" else []),   # the old Windows-only path building is only wrong off Windows
     (check_inspect, "skip_version_check"), (check_inspect, "skip_nvse_check"), (check_inspect, "nvse_no_min"),
     (check_ini, "ini_allow_newline"),
     (check_manifest_destinations, "allow_traversal"), (check_manifest_destinations, "allow_any_dest"),
