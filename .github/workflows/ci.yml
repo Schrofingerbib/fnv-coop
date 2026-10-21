@@ -45,8 +45,8 @@ jobs:
       - name: Configure (Linux, Ninja)
         if: runner.os == 'Linux'
         run: cmake -S synccore -B build -G Ninja
-      - name: Configure (Windows, Visual Studio 2022)
+      - name: Configure (Windows, newest installed Visual Studio, x64)
         if: runner.os == 'Windows'
-        run: cmake -S synccore -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S synccore -B build
       - run: cmake --build build --config Release --parallel
       - run: ctest --test-dir build -C Release -j 4 --timeout 300 --output-on-failure
