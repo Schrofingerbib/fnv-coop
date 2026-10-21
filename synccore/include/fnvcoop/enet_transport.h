@@ -24,7 +24,12 @@ public:
     bool listen(uint16_t port, size_t maxPeers = 8, bool loopbackOnly = false);
     // Client: begin connecting to host:port (asynchronous; watch for the Connected event).
     bool connect(const std::string& host, uint16_t port);
+    // Client: drop the dead link and start a fresh connection to the same host:port (after a Disconnected event).
+    bool reconnect();
     void disconnect();  // graceful for all peers
+    // A peer is dropped only after this long without an acknowledgement. ENet's default (5-30 s) is shorter than a long loading
+    // screen, and the socket is serviced from the game's main loop, so a load would otherwise end the session.
+    static constexpr unsigned kPeerTimeoutMinMs = 60000, kPeerTimeoutMaxMs = 120000, kPeerTimeoutLimit = 64;
 
     void send(PeerId to, Bytes data) override { sendEx(to, std::move(data), Channel::Reliable); }
     void sendEx(PeerId to, Bytes data, Channel ch) override;
@@ -45,6 +50,8 @@ private:
 
     _ENetHost* host_ = nullptr;
     bool server_ = false;
+    std::string connectHost_;
+    uint16_t connectPort_ = 0;
     uint16_t port_ = 0;
     int connectedPeers_ = 0;
     std::deque<std::pair<PeerId, Bytes>> inbox_;

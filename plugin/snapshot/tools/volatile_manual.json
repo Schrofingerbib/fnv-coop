@@ -9,6 +9,16 @@
       {
         "owner": "FalloutNV.esm:102037",
         "name": "fTimer"
+      },
+      {
+        "owner": "FalloutNV.esm:0B16D0",
+        "name": "bFixedEde",
+        "reason": "VNPCFollowers load-time ED-E fix-up flag: each machine's own script sets it after a load (two-copy fight test 2026-10-21: host 1, guest 0)"
+      },
+      {
+        "owner": "FalloutNV.esm:0B16D0",
+        "name": "bWeaponCheck",
+        "reason": "VNPCFollowers load-time companion weapon check flag, set per machine after a load (two-copy fight test 2026-10-21)"
       }
     ],
     "fields": [],

@@ -620,6 +620,27 @@ void Runtime::frame() {
         if (replicator_) replicator_->flush(t);
     }
     if (client_) {
+        if (enet_) {
+            // The host link dropped (a stall or long load past the peer timeout, a network blip): re-create it and rejoin. The session
+            // keeps its shadow, so the host replays what it missed (or sends a snapshot) instead of a full rejoin.
+            fnvcoop::EnetTransport::Event ev;
+            while (enet_->nextEvent(ev)) {
+                if (ev.type == fnvcoop::EnetTransport::Event::Disconnected) {
+                    ++counters_.disconnects;
+                    client_->disconnect();
+                    reconnectAt_ = t + kReconnectDelayMs;
+                }
+            }
+            if (reconnectAt_ && t >= reconnectAt_) {
+                if (enet_->reconnect()) {
+                    reconnectAt_ = 0;
+                    ++counters_.reconnects;
+                    client_->connect(t, client_->lastSession() + 1);
+                } else {
+                    reconnectAt_ = t + kReconnectDelayMs;
+                }
+            }
+        }
         client_->tick(t);
         if (sink_) sink_->flush();
     }
@@ -912,7 +933,8 @@ std::string Runtime::statusJson() const {
         .set("droppedEmpty", (int64_t)counters_.droppedEmpty).set("applied", (int64_t)counters_.applied)
         .set("applyFailed", (int64_t)counters_.applyFailed).set("injected", (int64_t)counters_.injected)
         .set("saves", (int64_t)counters_.saves).set("loads", (int64_t)counters_.loads).set("loadsBlocked", (int64_t)counters_.loadsBlocked)
-        .set("actions", (int64_t)counters_.actions).set("baselineEffects", (int64_t)counters_.baselineEffects);
+        .set("actions", (int64_t)counters_.actions).set("baselineEffects", (int64_t)counters_.baselineEffects)
+        .set("disconnects", (int64_t)counters_.disconnects).set("reconnects", (int64_t)counters_.reconnects);
     o.set("counters", c);
     if (uiEnabled_) {
         Value u = Value::object();

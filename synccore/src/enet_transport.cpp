@@ -45,11 +45,29 @@ bool EnetTransport::connect(const std::string& hostName, uint16_t port) {
         enet_host_destroy(host_); host_ = nullptr; enetRelease(); return false;
     }
     a.port = port;
-    if (!enet_host_connect(host_, &a, kChannels, 0)) {
+    ENetPeer* peer = enet_host_connect(host_, &a, kChannels, 0);
+    if (!peer) {
         enet_host_destroy(host_); host_ = nullptr; enetRelease(); return false;
     }
+    enet_peer_timeout(peer, kPeerTimeoutLimit, kPeerTimeoutMinMs, kPeerTimeoutMaxMs);
     server_ = false;
+    connectHost_ = hostName;
+    connectPort_ = port;
     return true;
+}
+
+bool EnetTransport::reconnect() {
+    if (server_ || connectHost_.empty()) return false;
+    if (host_) {
+        enet_host_destroy(host_);
+        host_ = nullptr;
+        enetRelease();
+    }
+    connectedPeers_ = 0;
+    inbox_.clear();
+    events_.clear();
+    const std::string h = connectHost_;
+    return connect(h, connectPort_);
 }
 
 void EnetTransport::disconnect() {
@@ -88,6 +106,7 @@ void EnetTransport::service() {
     while (enet_host_service(host_, &ev, 0) > 0) {
         switch (ev.type) {
             case ENET_EVENT_TYPE_CONNECT:
+                enet_peer_timeout(ev.peer, kPeerTimeoutLimit, kPeerTimeoutMinMs, kPeerTimeoutMaxMs);  // server side of the link too
                 ++connectedPeers_;
                 events_.push_back({Event::Connected, idOf(ev.peer)});
                 break;

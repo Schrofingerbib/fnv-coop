@@ -229,7 +229,9 @@ public:
     struct Counters {
         uint64_t frames = 0, captured = 0, committed = 0, droppedEmpty = 0;
         uint64_t applied = 0, applyFailed = 0, injected = 0, actions = 0, rulesActions = 0, disconnects = 0, baselineEffects = 0, saves = 0, loads = 0, loadsBlocked = 0;
+        uint64_t reconnects = 0;   // client: link re-created after the transport dropped (a stall, a long load, a network blip)
     };
+    static constexpr uint64_t kReconnectDelayMs = 2000;
     const Counters& counters() const { return counters_; }
 
 private:
@@ -307,6 +309,7 @@ private:
     std::map<std::string, uint64_t> tally_;   // "<baseline|snapshot|live> <Effect>:<status>" -> count (survives log eviction)
     std::vector<std::string> firstErrors_;
     Counters counters_;
+    uint64_t reconnectAt_ = 0;   // client: when to re-create the transport after it dropped (0 = connected or not needed)
     std::string lastError_;
     bool running_ = false;
     fnvcoop::Bytes leaveView_;   // client: saveState() taken by leave(), consumed by join()

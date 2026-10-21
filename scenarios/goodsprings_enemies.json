@@ -83,6 +83,22 @@
       "ref": "$gecko2"
     },
     {
+      "id": "gecko1_to_gang",
+      "op": "moveto",
+      "who": "$gecko1",
+      "to": "$gangMarker",
+      "on": "host",
+      "note": "VCG02Gecko1REF stands about 11k units away (Goodsprings Source): bring it into the fight"
+    },
+    {
+      "id": "gecko2_to_gang",
+      "op": "moveto",
+      "who": "$gecko2",
+      "to": "$gangMarker",
+      "on": "host",
+      "note": "VCG02Gecko2REF, same"
+    },
+    {
       "id": "players_to_gang",
       "op": "moveto",
       "who": "player",

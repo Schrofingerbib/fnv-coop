@@ -68,6 +68,22 @@
     "reasons": [
      "manual:sweep"
     ]
+   },
+   {
+    "edid": "VNPCFollowers",
+    "name": "bfixedede",
+    "owner": "FalloutNV.esm:0B16D0",
+    "reasons": [
+     "manual:fight-test"
+    ]
+   },
+   {
+    "edid": "VNPCFollowers",
+    "name": "bweaponcheck",
+    "owner": "FalloutNV.esm:0B16D0",
+    "reasons": [
+     "manual:fight-test"
+    ]
    }
   ]
  },

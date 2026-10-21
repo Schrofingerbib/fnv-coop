@@ -700,6 +700,20 @@ TEST(suppress_guest_result_scripts_never_run_locally) {
     CHECK(p.stats().resultScripts == 1);
 }
 
+TEST(guest_console_line_on_own_player_is_local) {
+    // per-machine: the guest's own player
+    CHECK(SuppressPolicy::isLocalPlayerConsoleLine("player.moveto 104C70"));
+    CHECK(SuppressPolicy::isLocalPlayerConsoleLine("  Player.SetAV Health 5000"));
+    CHECK(SuppressPolicy::isLocalPlayerConsoleLine("PLAYER.setpos x 100\r\n"));
+    // shared state stays blocked on a guest
+    CHECK(!SuppressPolicy::isLocalPlayerConsoleLine("setstage VMS01 10"));
+    CHECK(!SuppressPolicy::isLocalPlayerConsoleLine("104C70.moveto player"));
+    CHECK(!SuppressPolicy::isLocalPlayerConsoleLine("playerref.disable"));
+    CHECK(!SuppressPolicy::isLocalPlayerConsoleLine("player.moveto 104C70\nsetstage VMS01 10"));
+    CHECK(!SuppressPolicy::isLocalPlayerConsoleLine(""));
+    CHECK(!SuppressPolicy::isLocalPlayerConsoleLine(nullptr));
+}
+
 TEST(suppress_lifted_while_applying_host_txn) {
     SuppressPolicy p;
     p.setGuest(true);
@@ -1301,6 +1315,7 @@ int main() {
     run("suppress_guest_blocks_script_mutations_only_inside_scripts", suppress_guest_blocks_script_mutations_only_inside_scripts);
     run("suppress_guest_skips_quest_scripts_but_not_object_scripts", suppress_guest_skips_quest_scripts_but_not_object_scripts);
     run("suppress_guest_result_scripts_never_run_locally", suppress_guest_result_scripts_never_run_locally);
+    run("guest_console_line_on_own_player_is_local", guest_console_line_on_own_player_is_local);
     run("suppress_lifted_while_applying_host_txn", suppress_lifted_while_applying_host_txn);
     run("effect_json_roundtrip_every_type", effect_json_roundtrip_every_type);
     run("script_vars_become_setscriptvar_effects", script_vars_become_setscriptvar_effects);

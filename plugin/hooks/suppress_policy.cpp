@@ -58,6 +58,32 @@ constexpr bool kMutGateIgnoresBypass = true;  // deferred stage can never be re-
 constexpr bool kMutGateIgnoresBypass = false;
 #endif
 
+bool SuppressPolicy::isLocalPlayerConsoleLine(const char* text) {
+#ifdef NVHOOKS_MUTANT
+    (void)text;
+    return false;  // mutant: a guest's own-player console lines are dropped again (a scenario cannot move the guest)
+#else
+    if (!text) return false;
+    const char* p = text;
+    while (*p == ' ' || *p == '\t') ++p;
+    static const char kPrefix[] = "player.";
+    for (size_t i = 0; i + 1 < sizeof(kPrefix); ++i) {
+        char c = p[i];
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (c != kPrefix[i]) return false;
+    }
+    // one line only: a multi-line console script could hide a shared-state mutation after the player line
+    for (const char* q = p; *q; ++q) {
+        if (*q == '\n' || *q == '\r') {
+            for (const char* r = q; *r; ++r)
+                if (*r != '\n' && *r != '\r' && *r != ' ' && *r != '\t') return false;
+            break;
+        }
+    }
+    return true;
+#endif
+}
+
 bool StageGate::allow(uint32_t quest, uint32_t stage, bool applying) {
     if (!fn_) return true;
     if (applying) return true;

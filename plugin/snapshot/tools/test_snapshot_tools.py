@@ -255,6 +255,24 @@ class LocalRunClassification(unittest.TestCase):
             self.assertNotIn(e["label"].split(" ")[0].split("/")[-1].lower(), names, e)
 
 
+class VolatileQuestVars(unittest.TestCase):
+    """Quest timers in the plugin's volatile-keys list (per-machine clocks) never count as shared divergence."""
+
+    def snap(self, curtime):
+        q = {"edid": "REPCONHQFreeform", "vars": {"CurTime": curtime, "Done": 1}}
+        return {"schemaVersion": 1, "meta": {}, "perPlayer": {"0": {}}, "shared": {"quests": {"FalloutNV.esm:0E7533": q}}}
+
+    def test_listed_timer_is_ignored_but_a_real_var_is_not(self):
+        self.assertIn(("falloutnv.esm:0e7533", "curtime"), snaplib.load_volatile_vars())
+        a, b = self.snap(8.0072), self.snap(0.393561)
+        self.assertEqual(snaplib.diff(a, b), [])
+        b["shared"]["quests"]["FalloutNV.esm:0E7533"]["vars"]["Done"] = 0   # a story var still differs
+        self.assertEqual([d["path"] for d in snaplib.diff(a, b)], ["shared/quests/FalloutNV.esm:0E7533/vars/Done"])
+
+    def test_twin_pre_classification_diff_keeps_the_timer(self):
+        self.assertEqual(len(snaplib.diff(self.snap(8.0), self.snap(0.4), local_split=False)), 1)
+
+
 class GoldensProtected(unittest.TestCase):
     def test_manifest_matches(self):
         with open(os.path.join(GOLD, "MANIFEST.sha256")) as f:

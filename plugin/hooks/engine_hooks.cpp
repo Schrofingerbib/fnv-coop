@@ -308,6 +308,20 @@ inline uint64_t qpc() {
     return static_cast<uint64_t>(v.QuadPart);
 }
 
+// A console / bridge line runs as a temporary script (refID 0 or 0xFF......) that keeps its source text (Script::text, runtime
+// offset 0x2C, xNVSE GameScript.h). On a guest, a single line on the local player is per-machine (suppress_policy.h).
+bool guestOwnPlayerConsoleLine(void* script) {
+    if (!g_pol.guest() || !script) return false;
+    const uint32_t id = refIdOf(script);
+    if (id != 0 && (id >> 24) != 0xFF) return false;  // ESM scripts are never console lines
+    __try {
+        const char* text = *reinterpret_cast<const char* const*>(reinterpret_cast<char*>(script) + 0x2C);
+        return SuppressPolicy::isLocalPlayerConsoleLine(text);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool __fastcall h_ScriptExec(void* script, void*, void* thisObj, void* ev, void* contObj, bool arg3) {
     const uint64_t t0 = g_perfOn ? qpc() : 0;
     if (g_gate > 0) {  // gate closed: pretend the script ran
@@ -323,7 +337,7 @@ bool __fastcall h_ScriptExec(void* script, void*, void* thisObj, void* ev, void*
     }
     // Host: any script that runs outside an explicit capture scope (quest GameMode/MenuMode blocks, object and effect scripts) gets an
     // implicit weak scope so its mutations are captured (cause = Script / the script form) instead of dropped as ambient.
-    const bool local = g_pol.isGuestLocalRun(refIdOf(script));
+    const bool local = g_pol.isGuestLocalRun(refIdOf(script)) || guestOwnPlayerConsoleLine(script);
     if (local && g_hub) g_hub->pushMute();  // per-machine: effects stay local, never captured
     bool weak = g_hub && g_hub->enabled() && g_applierExec == 0 && g_hub->beginWeak(refIdOf(script));
     if (local) {

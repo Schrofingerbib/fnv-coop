@@ -335,10 +335,15 @@ class Runner:
         if MUTANT == "noreload":
             plan = {"reload": False, "reasons": []}
         save = sc["start"]["save"]
+        coop_sync = None
         if plan["reload"]:
             for nv in self.nvs:
                 nv.load_save(save)
             self.sleep(self.frames / 60.0)
+            # Every client reloaded its own save, so it rejoins the co-op session. Setup steps the host runs before a client has
+            # finished that are applied to a game that is still loading, and the load then overwrites them (seen in the two-copy
+            # fight test 2026-10-21: the geckos the host enabled stayed disabled on the guest). Wait until the session is synced.
+            coop_sync = self._wait_coop_synced()
         ids = scenlib.reset_ids(sc, self.order)
         prev = set((st or {}).get("quest_hex") or [])
         # quests left changed by the previous scenario are reset too (in-place jumps must not inherit stage/var state)
@@ -354,7 +359,35 @@ class Runner:
         new = {"loaded": True, "save": save, "dirty": sorted(fp["dirty"]), "failed": False, "quest_hex": ids, "scenario": sc["name"]}
         self.store.put_many({k: new for k in self.keys})
         return {"reload": plan["reload"], "reasons": plan["reasons"], "seconds": round(self.now() - t0, 2), "setup": out,
-                "reset": ids}
+                "reset": ids, "coopSync": coop_sync}
+
+    def _wait_coop_synced(self, timeout_s=180.0, poll_s=0.5):
+        """After a reload: wait until every co-op client has rejoined and applied everything the host committed. A no-op (None)
+        when the instances are not in a co-op session (no coop.status method, or role off)."""
+        if len(self.nvs) < 2:
+            return None
+        t0 = self.now()
+        last = {}
+        while True:
+            try:
+                sts = [nv.call("coop.status") for nv in self.nvs]
+            except Exception:  # noqa: BLE001 - no co-op module on these instances
+                return None
+            hosts = [s for s in sts if s.get("role") == "host"]
+            clients = [s for s in sts if s.get("role") == "client"]
+            if not hosts or not clients:
+                return None
+            head = (hosts[0].get("host") or {}).get("lastSeq", 0)
+            ready = all((c.get("client") or {}).get("joined") and not (c.get("client") or {}).get("baselineActive")
+                        and (c.get("client") or {}).get("applied", -1) >= head
+                        and (c.get("transport") or {}).get("connected", True) for c in clients)
+            last = {"head": head, "applied": [(c.get("client") or {}).get("applied") for c in clients]}
+            if ready:
+                self.sleep(1.0)  # let the last applied effects reach the engine
+                return dict(last, synced=True, seconds=round(self.now() - t0, 2))
+            if self.now() - t0 > timeout_s:
+                return dict(last, synced=False, seconds=round(self.now() - t0, 2))
+            self.sleep(poll_s)
 
     # ---- run
     def run(self, sc, force_reload=False):

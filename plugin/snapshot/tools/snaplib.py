@@ -237,6 +237,33 @@ def volatile_paths(snap):
     return res
 
 
+VOLATILE_KEYS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "volatile_keys.txt")
+
+
+def load_volatile_vars(path=None):
+    """{("plugin.esm:QUESTID", "varname")} from the volatile-keys list the plugin uses (nvcoop_volatile_keys.txt), lower case.
+    These quest variables are per-machine clocks and timers (CurTime, fStartTimer, ...): the session never syncs them, so a
+    shared compare must not count them either. Lines: "var <Plugin.esm:QUESTID> <varname>   # comment"."""
+    out = set()
+    try:
+        with open(path or VOLATILE_KEYS_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split("#", 1)[0].split()
+                if len(parts) == 3 and parts[0].lower() == "var":
+                    out.add((_canon(parts[1]).lower(), parts[2].lower()))
+    except OSError:
+        pass
+    return out
+
+
+def _is_volatile_var(path, vol_vars):
+    """path like shared/quests/<Plugin.esm:QUESTID>/vars/<name>[/...] whose (quest, var) is in vol_vars."""
+    p = path.split("/")
+    if len(p) < 5 or p[0] != "shared" or p[1] != "quests" or p[3] != "vars":
+        return False
+    return (_canon(p[2]).lower(), p[4].lower()) in vol_vars
+
+
 GUEST_LOCAL_RUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "hooks", "data",
                                     "guest_local_run.json")
 
@@ -309,9 +336,13 @@ def diff(a, b, sections=("shared",), include_meta=False, tolerances=None, ignore
         return r
 
     fa, fb = pick(a), pick(b)
+    # per-machine clocks / timers are part of the per-machine classification (like local_split): the pre-classification diff keeps them
+    vol_vars = load_volatile_vars() if (default_ignores and local_split) else set()
     out = []
     for path in sorted(set(fa) | set(fb)):
         if any(fnmatch.fnmatchcase(path, pat) or path == pat for pat in ignore):
+            continue
+        if vol_vars and _is_volatile_var(path, vol_vars):
             continue
         if path not in fb:
             out.append({"kind": "removed", "path": path, "a": fa[path], "b": None, "label": _label(a, path)})

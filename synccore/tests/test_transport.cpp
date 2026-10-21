@@ -56,6 +56,61 @@ TEST(transport, faulty_wrapper_is_seeded_and_applies_faults) {
     CHECK(got > 1000);
 }
 
+// The host drops the client's link (what a stall past the peer timeout looks like to the client): the client re-creates its
+// transport, reconnects with a new session id and resumes from its shadow, then keeps applying the host's txns exactly once.
+TEST(transport, enet_client_reconnects_after_the_link_drops_and_resumes) {
+    EnetTransport server, client;
+    REQUIRE(server.listen(0, 4, true));
+    REQUIRE(client.connect("127.0.0.1", server.port()));
+    NullSink sink;
+    HostSession host(server);
+    ClientSession cs(client, 0, 43, sink);
+    auto t0 = std::chrono::steady_clock::now();
+    auto ms = [&] { return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()); };
+    auto commit = [&](uint32_t i) {
+        host.commit(0, Cause{CauseKind::QuestResult, FormRef("falloutnv.esm", 1), 0}, {SetStage{FormRef("falloutnv.esm", 1), i}});
+    };
+    int phase = 0;  // 0 joining, 1 dropped, 2 reconnected
+    bool started = false, sawDrop = false;
+    uint32_t committed = 0;
+    uint64_t appliedAtDrop = 0;
+    while (ms() < 20000) {
+        EnetTransport::Event ev;
+        while (client.nextEvent(ev)) {
+            if (ev.type == EnetTransport::Event::Connected && !started) { started = true; cs.connect(ms(), 1); }
+            if (ev.type == EnetTransport::Event::Disconnected) { sawDrop = true; cs.disconnect(); }
+        }
+        EnetTransport::Event sev;
+        while (server.nextEvent(sev))
+            if (sev.type == EnetTransport::Event::Disconnected) host.peerDisconnected(sev.peer);
+        host.tick(ms());
+        cs.tick(ms());
+        if (phase == 0 && cs.joined() && committed < 10) commit(committed++);
+        if (phase == 0 && committed == 10 && cs.applied() == 10) { server.disconnect(); phase = 1; }
+        if (phase == 1 && sawDrop) {
+            appliedAtDrop = cs.applied();
+            for (uint32_t i = 0; i < 5; ++i) commit(committed++);          // the host moves on while the client is away
+            CHECK(client.reconnect());
+            cs.connect(ms(), cs.lastSession() + 1);
+            phase = 2;
+        }
+        if (phase == 2 && cs.joined() && committed < 20) commit(committed++);
+        if (phase == 2 && committed == 20 && cs.applied() == 20) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(sawDrop);
+    CHECK(appliedAtDrop == 10);           // nothing arrived while the link was down
+    CHECK(cs.applied() == 20);            // after the reconnect: the missed 5 and the next 5, each once
+    CHECK(cs.state() == host.state());
+    CHECK(client.connected());
+}
+
+TEST(transport, enet_peer_timeouts_tolerate_a_long_load) {
+    // A loading screen can block the game's main loop (which services the socket) for tens of seconds.
+    CHECK(EnetTransport::kPeerTimeoutMinMs >= 60000);
+    CHECK(EnetTransport::kPeerTimeoutMaxMs >= EnetTransport::kPeerTimeoutMinMs);
+}
+
 TEST(transport, enet_in_process_session_converges_on_both_channels) {
     for (int unreliable = 0; unreliable < 2; ++unreliable) {
         EnetTransport server, client;

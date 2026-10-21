@@ -370,10 +370,21 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
     # source-tree path by default, because that path would carry the builder's user name into every built dll.
     vk = Path(__file__).resolve().parents[2] / "plugin" / "snapshot" / "data" / "volatile_keys.txt"
     vk_dst = plugins / "nvcoop_volatile_keys.txt"
-    plugin_installed = any(p.suffix.lower() == ".dll" and p.name.lower().startswith("nvcoop") for p in sources)
-    if plugin_installed and vk.is_file() and not same_file(vk, vk_dst):
+    plugin_dlls = [p for p in sources if p.suffix.lower() == ".dll" and p.name.lower().startswith("nvcoop")]
+    if plugin_dlls and vk.is_file() and not same_file(vk, vk_dst):
         _replace(vk, vk_dst)
         installed.append("Data/NVSE/Plugins/" + vk_dst.name)
+    # The build puts the plugin's data files next to nvcoop.dll (nvcoop_guest_local_run.json: the per-machine scripts guests keep
+    # running). Without them a guest blocks every DLC setup script and the session repairs hundreds of effects on each check.
+    for dll in plugin_dlls:
+        for data in sorted(Path(dll).parent.glob("nvcoop_*")):
+            if data.suffix.lower() not in (".json", ".txt") or not data.is_file():
+                continue
+            dst = plugins / data.name
+            if not same_file(data, dst):
+                _replace(data, dst)
+            if "Data/NVSE/Plugins/" + data.name not in installed:
+                installed.append("Data/NVSE/Plugins/" + data.name)
     cfg = write_plugin_ini(d, i, role, autoload, autoload_delay_frames, ini_extra)
     meta = {
         "instance": i, "role": role, "dir": str(d), "pipe": rf"\\.\pipe\nvcoop-{i}",

@@ -153,6 +153,7 @@
   "Doctors",
   "FFradioSignals02",
   "HD00JukeboxMusic",
+  "NVDLC03RadioBroadcast",
   "RadioRepconQuest",
   "RadioTenpenny",
   "StripRadioQuest",
@@ -160,5 +161,15 @@
   "VDoctors",
   "vCampGuardianRadio",
   "vGSRadioQuest"
- ]
+ ],
+ "factionRanks": [
+  "HonestHearts.esm:00B42E",
+  "LonesomeRoad.esm:003E41",
+  "OldWorldBlues.esm:016154"
+ ],
+ "factionReasons": {
+  "HonestHearts.esm:00B42E": "NVDLC02PlayerFaction: the Honest Hearts setup (NVDLC02MQ00, GuestLocalRun) ranks each machine's own player; seen in the two-copy fight test 2026-10-21 (rank 1 on the guest only)",
+  "LonesomeRoad.esm:003E41": "NVDLC04PlayerFaction: the Lonesome Road setup (NVDLC04MQ00, GuestLocalRun) ranks each machine's own player; seen in the two-copy fight test 2026-10-21 (rank 1 on the guest only)",
+  "OldWorldBlues.esm:016154": "NVDLC03PlayerFaction: the Old World Blues setup (NVDLC03MQ00, GuestLocalRun) ranks each machine's own player; seen in the two-copy fight test 2026-10-21 (rank 1 on the host only)"
+ }
 }

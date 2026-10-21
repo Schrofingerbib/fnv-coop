@@ -38,7 +38,12 @@ below. Both tracks land in this repo through pull requests.
 - **Stay inside your Track B directories** (below) unless a PR explains a minimal shared edit. Track A changes
   `synccore/`, `plugin/coop/` and `plugin/hooks*/` a lot, so avoid editing those to prevent merge pain.
 
-## Track B tasks (in priority order)
+## Current tasks: see [docs/WORK-QUEUE.md](WORK-QUEUE.md)
+The code for every roadmap step is written now, including split-screen (`plugin/splitscreen`, `tools/splitscreen`) and
+real-time VATS (`plugin/vats`). Track B's job is to run all of it in the game, in the order listed in the work queue, fix the
+test tools, and report game-side desyncs as issues. The older task list below is kept for reference.
+
+## Track B tasks (older list, kept for reference)
 0. **Run the enemy tests in game** (section "Track B task: run the enemy tests in game" below) as soon as a build with the actor adapter exists.
 1. **In-game validation of the toolkit.** You have the game; the maintainer's PC is RAM-limited. Run the in-game
    proof scripts, one game copy at a time unless a test needs two, and fix what's wrong in the tools:

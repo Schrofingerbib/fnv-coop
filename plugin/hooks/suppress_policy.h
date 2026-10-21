@@ -52,6 +52,10 @@ public:
     void enterLocalScript() { ++depth_; ++localDepth_; }
     void leaveLocalScript() { if (depth_ > 0) --depth_; if (localDepth_ > 0) --localDepth_; }
     int localScriptDepth() const { return localDepth_; }
+    // A console or bridge line that acts on the local player ("player.MoveTo ...", "player.SetAV Health 5000") is per-machine by
+    // nature (each machine owns its own player), so on a guest it runs like a GuestLocalRun script instead of being dropped. Only
+    // a single line that starts with "player." qualifies; anything else typed on a guest console (SetStage, Enable, ...) stays blocked.
+    static bool isLocalPlayerConsoleLine(const char* text);
     int scriptDepth() const { return depth_; }
 
     bool blockMutation();      // shared-state mutator called from a running script

@@ -33,7 +33,7 @@ A step marked **Claimed** is being worked on right now. Want to take one? Open a
 | # | Step | What it means when you play | Status |
 |---|---|---|---|
 | 1 | Enemy and NPC sync | One PC runs each enemy's AI and everyone sees a smooth copy. Hits count once, deaths happen once, encounters spawn once, and enemy attacks, flinches and death poses look right on every screen. | Code written, in-game test next |
-| 2 | Enemy sync in the real game | The two-copy fight, ownership handoff, spawn and corpse-loot tests pass on a real PC, and the feature is switched on by default. | Next: the two-copy fight test in game |
+| 2 | Enemy sync in the real game | The two-copy fight, ownership handoff, spawn and corpse-loot tests pass on a real PC, and the feature is switched on by default. | **Claimed**: in-game tests running. The actor adapter passes all 36 checks in game, and the two-copy fight test passes its first step; the full task list is in docs/WORK-QUEUE.md |
 | 3 | Player avatars | You see your friends as characters that walk, run, aim and animate, without needing NV:MP. | Code written, in-game test next |
 | 4 | Full combat | Real-time VATS for every player, projectiles and explosions, companions in fights, crime and faction hostility. | Code written (combat, real-time VATS, companions, crime), in-game test next |
 | 5 | Loot, items and containers | Shared containers and corpses, item drops and pickups, and no duplicated items. | Code written, in-game test next |

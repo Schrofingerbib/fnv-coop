@@ -7,3 +7,5 @@ var HonestHearts.esm:00EDE7 pdepth   # NVDLC02RainQuest
 var LonesomeRoad.esm:003603 fstarttimer   # NVDLC04MQ00
 var OldWorldBlues.esm:002FCA fstarttimer   # NVDLC03MQ00
 var FalloutNV.esm:102037 ftimer   # VCG00 (manual add: moves once the quest runs, seen in the Goodsprings sweep)
+var FalloutNV.esm:0B16D0 bfixedede   # VNPCFollowers (manual add: load-time ED-E fix-up flag, set per machine)
+var FalloutNV.esm:0B16D0 bweaponcheck   # VNPCFollowers (manual add: load-time companion weapon check flag, set per machine)

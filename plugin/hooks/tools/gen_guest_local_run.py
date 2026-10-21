@@ -11,7 +11,7 @@ import os
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 EXTRA_QUESTS = ['NVDLC01MQ00', 'NVDLC02MQ00', 'NVDLC03MQ00', 'NVDLC04MQ00', 'NVDLC05MQ00', 'VDLCPackQuest',
-                'VStreetLighting', 'NVDLC02RainQuest', 'NVDLC02RadioMessage']
+                'VStreetLighting', 'NVDLC02RainQuest', 'NVDLC02RadioMessage', 'NVDLC03RadioBroadcast']
 # Why each EXTRA quest is per-machine (the two-game diff, out/L10/twogame/live/snapdiff.txt). Written into the json "reason" field.
 # Deliberately NOT here: VERNovac01 / VERStalkersSouth01 (random-encounter spawners: a guest copy would spawn a second set of creatures;
 # their iSpawnMonsters / iCount are host-private counters that must not count as shared divergence, see internal lane notes round 12)
@@ -21,6 +21,18 @@ REASONS = {
     'NVDLC02RainQuest': 'Honest Hearts rain: pDepth tracks the local player height/camera every frame, presentation only',
     'NVDLC02RadioMessage': 'Happy Trails radio broadcast: playback state of the local radio (running flag), stub script, never gates story',
     'VDLCPackQuest': 'DLC pack item grants run once per machine on each save (bClassicItemsGiven, nGiven)',
+    'NVDLC03RadioBroadcast': 'Old World Blues radio broadcast: playback state of the local radio (running flag), like NVDLC02RadioMessage; '
+                             'seen in the two-copy fight test 2026-10-21 (running on the host only)',
+}
+# Faction ranks that per-machine DLC setup scripts give the local player; their membership is per-machine by definition, so the
+# shared snapshot compare leaves them out (plugin/snapshot/tools/snaplib.py load_local_allowlist reads "factionRanks").
+FACTION_RANKS = {
+    'HonestHearts.esm:00B42E': 'NVDLC02PlayerFaction: the Honest Hearts setup (NVDLC02MQ00, GuestLocalRun) ranks each machine\'s own '
+                               'player; seen in the two-copy fight test 2026-10-21 (rank 1 on the guest only)',
+    'LonesomeRoad.esm:003E41': 'NVDLC04PlayerFaction: the Lonesome Road setup (NVDLC04MQ00, GuestLocalRun) ranks each machine\'s own '
+                               'player; seen in the two-copy fight test 2026-10-21 (rank 1 on the guest only)',
+    'OldWorldBlues.esm:016154': 'NVDLC03PlayerFaction: the Old World Blues setup (NVDLC03MQ00, GuestLocalRun) ranks each machine\'s '
+                                'own player; seen in the two-copy fight test 2026-10-21 (rank 1 on the host only)',
 }
 
 
@@ -43,7 +55,8 @@ def main():
             entry['reason'] = REASONS[edid]
         scripts.append(entry)
     out = {'schema': 1, 'note': 'GuestLocalRun allow-list: quest scripts that keep running on guests. script = "plugin:hexLocalId".',
-           'scripts': scripts, 'no_script': no_script}
+           'scripts': scripts, 'no_script': no_script,
+           'factionRanks': sorted(FACTION_RANKS), 'factionReasons': FACTION_RANKS}
     path = os.path.join(ROOT, 'plugin', 'hooks', 'data', 'guest_local_run.json')
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:

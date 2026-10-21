@@ -177,7 +177,18 @@ def start(playbook: str, bridges: list, repo: str, log: Callable[[str], None] = 
     if scen and os.path.isfile(os.path.join(repo, "scenarios", scen + ".json")):
         scenlib, runner = _import_scenarios(repo)
         sc = scenlib.load_scenario(os.path.join(repo, "scenarios", scen + ".json"))
-        r = runner.Runner(bridges, log=log).jump(sc)
+        # Key the jump state by game process (pid from ping), stored in a file: the next playbook on the same running games jumps
+        # in place instead of reloading the save every run. A reload makes every guest rejoin, and setup steps the host runs
+        # meanwhile can be overwritten by the guest's own load. A new game process has a new pid, so it reloads.
+        keys = store = None
+        try:
+            pids = [int(nv.call("ping").get("pid") or 0) for nv in bridges]
+            if all(pids):
+                store = runner.StateStore(os.path.join(repo, "out", "scenarios", "playbook_jump_state.json"))
+                keys = [runner.StateStore.key(i, f"pid-{p}") for i, p in enumerate(pids)]
+        except Exception:  # noqa: BLE001 - fakes without ping: keep the private per-run state
+            keys = store = None
+        r = runner.Runner(bridges, store=store, keys=keys, log=log).jump(sc)
         bad = [s for s in r.get("setup", []) if s.get("status") in ("error", "fail")]
         if bad:
             raise RuntimeError(f"scenario {scen} setup failed: {bad[:2]}")

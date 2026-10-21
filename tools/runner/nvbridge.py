@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import msvcrt
 import sys
 import threading
@@ -286,8 +287,11 @@ class NvBridge:
         return self.wait_for(f"GetStage {q}", op="==", value=stage, timeout_ms=timeout_ms)
 
     def state_to_file(self, path: str, sections: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Dump the L7 snapshot to `path` (feed it to plugin/snapshot/tools/snapdiff.py)."""
-        p: Dict[str, Any] = {"path": path}
+        """Dump the L7 snapshot to `path` (feed it to plugin/snapshot/tools/snapdiff.py).
+
+        The game process writes the file, and its working directory is the game folder, so a relative path is made absolute
+        here (relative to this process), or the dump fails with "cannot open"."""
+        p: Dict[str, Any] = {"path": os.path.abspath(path)}
         if sections:
             p["sections"] = sections
         return self.call("state", p, timeout_s=120)
@@ -344,7 +348,7 @@ class NvBridge:
             time.sleep(poll_s)
 
     def screenshot(self, path: str = "") -> Dict[str, Any]:
-        return self.call("screenshot", {"path": path} if path else None)
+        return self.call("screenshot", {"path": os.path.abspath(path)} if path else None)  # the game resolves relative paths in its own folder
 
     def load_save(self, name: str, timeout_ms: int = 180000) -> Dict[str, Any]:
         return self.call("loadSave", {"name": name, "timeoutMs": timeout_ms}, timeout_s=timeout_ms / 1000 + 5)
