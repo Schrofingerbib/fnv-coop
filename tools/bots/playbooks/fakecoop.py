@@ -696,12 +696,12 @@ class FakeBot:
             return Result(False, "stuck")
         off = dist * (0.5 + 0.1 * self.idx)     # players stop short of the ref, each a bit differently
         pos = self._ref_pos(ref)
-        return self._move((pos[0] + off, pos[1], pos[2]), r["cell"])
+        return self._move((pos[0] + off, pos[1], pos[2]), r["cell"], mode)
 
     def goto_pos(self, x, y, z, cell=None, timeout_s=30):
         return self._move((x, y, z), cell or self.me["cell"])
 
-    def _move(self, pos, cell) -> Result:
+    def _move(self, pos, cell, mode="walk") -> Result:
         w = self.world
         tcfg = w.tether
         if tcfg and w.tether_active and "tether_off" not in w.bugs:
@@ -709,7 +709,7 @@ class FakeBot:
             if a and w.dist(pos, a["pos"]) > tcfg["radius"]:
                 return Result(False, f"tethered: {tcfg['radius']} units around the anchor")
         far = 0.0
-        if w.walk_speed and cell == self.me["cell"]:
+        if w.walk_speed and cell == self.me["cell"] and mode != "teleport":   # a teleport jumps at once (PR #23 review)
             far = math.hypot(pos[0] - self.me["pos"][0], pos[1] - self.me["pos"][1])
         self.me["pos"], self.me["cell"] = tuple(pos), cell
         if far:        # a walk takes virtual time: the bot blocks until its character has arrived

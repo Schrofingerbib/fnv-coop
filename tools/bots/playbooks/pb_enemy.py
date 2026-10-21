@@ -821,7 +821,9 @@ def goto_or_teleport(ctx: Ctx, m: Machine, ref: str, dist: float) -> Any:
     note = f"{m.name}: the walk to {ref} was stuck ({getattr(r, 'reason', '')}), teleported there"
     ctx.notes.append(note)
     ctx.log(note)
-    return m.bot.goto_ref(ref, dist, mode="teleport")
+    r = m.bot.goto_ref(ref, dist, mode="teleport")
+    ctx.settle()          # a teleport lands at once: let the engine and the session catch up (cell load, replication)
+    return r
 
 
 def fake_enemy_spawn(n: int = 2, bugs: Optional[Set[str]] = None, **kw) -> Tuple[FakeCoop, dict]:

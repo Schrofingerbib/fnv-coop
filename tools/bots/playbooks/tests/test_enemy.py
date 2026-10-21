@@ -697,6 +697,17 @@ class SpawnPlacement(unittest.TestCase):
         self.assertFalse(r.steps[0].ok)
         self.assertIn("walks to the marker: stuck", r.steps[0].reason)
 
+    def test_the_fake_teleport_jumps_at_once(self):
+        # PR #23 review: with walk_speed set, mode="teleport" must not take walking time in the fake
+        w, refs = pb_enemy.fake_enemy_spawn(2)
+        bot = fakecoop.make_machines(w)[0].bot
+        t0 = w.vt
+        self.assertTrue(bot.goto_ref(refs["marker"], 300, mode="teleport").ok)
+        self.assertLess(w.vt - t0, 0.05)
+        t1 = w.vt
+        bot.goto_pos(15000, 0, 0)                 # a walk back over 5000 units takes virtual time
+        self.assertGreater(w.vt - t1, 1.0)
+
     def test_an_open_walk_needs_no_teleport(self):
         r = self.run_host_mode(blocked=False)
         self.assertTrue(r.steps[0].ok, r.steps[0].reason)
