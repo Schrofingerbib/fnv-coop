@@ -125,6 +125,9 @@ playbook explains how to send it back.
 
 ## Credits
 
+- **Zacharia Raven** ([@ZachariaRaven](https://github.com/ZachariaRaven)): in-game testing on a real PC and a big part of
+  the code: the split-screen focus guard, the bot, scenario, pool and runner fixes, the bridge `exec` on a reference, and
+  the first proof scripts to pass in the game. Thanks a lot for helping with the code!
 - **xNVSE** (the New Vegas Script Extender team): https://github.com/xNVSE/NVSE
 - **NV:MP** by the NV:MP team (nv-mp.com). Not included; we patch it only at runtime.
 - **ENet** by Lee Salzman: https://github.com/lsalzman/enet (bundled in `third_party/enet`, MIT licensed).
