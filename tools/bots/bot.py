@@ -219,7 +219,12 @@ class Bot:
         return int(self._info(ref)["lifeState"]) == 0
 
     def health(self, ref: Optional[Ref] = None) -> float:
-        return float(self.nv.call(P.M_QUERY, {"ref": self._norm(ref)[0], "fn": "GetActorValue", "p1": P.HEALTH_AV})["value"])
+        """world.query first. In game (2026-10-21) it fails for actor refs (Doc Mitchell) and works for a door, so on an
+        RPC error read 'GetAV Health' with the actor as the calling reference (eval {ref}, proven in game: 65.0)."""
+        try:
+            return float(self.nv.call(P.M_QUERY, {"ref": self._norm(ref)[0], "fn": "GetActorValue", "p1": P.HEALTH_AV})["value"])
+        except RpcError:
+            return float(self._eval(P.get_health(self._ref_of(ref))))
 
     def inventory_count(self, item: Ref, holder: Optional[Ref] = None) -> int:
         return int(self._eval(P.item_count(self._ref_of(holder), self._item(item))))

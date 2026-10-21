@@ -126,6 +126,10 @@ def locked(ref: str) -> Line:                 # UNVERIFIED (expression)
     return Line("GetLocked", ref)
 
 
+def get_health(holder: str) -> Line:          # VERIFIED in game 2026-10-21 (eval with ref: Doc Mitchell -> 65.0)
+    return on(holder, "GetAV Health")
+
+
 def get_stage(quest: str) -> str:             # VERIFIED (used by nvbridge.stage)
     return f"GetStage {quest}"
 

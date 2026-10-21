@@ -276,6 +276,17 @@ class GlueActions(unittest.TestCase):
         self.assertEqual(b.vats_target(ref(RAIDER), expect_hit=True).reason, "postcondition")
         self.assertEqual(b.health(ref(RAIDER)), before)
 
+    def test_health_falls_back_to_getav_when_world_query_fails_for_actors(self):
+        nv, b = make(query_actors=False)
+        with self.assertRaises(RpcError):          # the condition seen in game: world.query refuses the actor
+            nv.call(P.M_QUERY, {"ref": ref(RAIDER), "fn": "GetActorValue", "p1": P.HEALTH_AV})
+        self.assertEqual(b.health(ref(RAIDER)), 100.0)
+        self.assertIn(("exec", 'printc "NVCOOP_EVAL=%g" (GetAV Health)', ref(RAIDER)), nv.calls)   # the actor is the calling ref
+        self.assertEqual(b.health(), 200.0)        # the player still answers world.query
+        r = b.fire(ref(RAIDER), expect_hit=True)
+        self.assertTrue(r.ok, r)
+        self.assertEqual(r.data["health"], 75.0)
+
     def test_menu_dialog_inventory_queries(self):
         nv, b = make()
         self.assertEqual(b.menu_info()["kind"], "none")
@@ -696,6 +707,15 @@ class MutationTwins(unittest.TestCase):
         self.assertEqual((r.reason, r.data["pressed"]), ("postcondition", 8))   # pressed, re-checked, gave up: never looped forever
         nv, b = make("msgbox_ui_only")
         self.assertEqual(_dismiss_two_boxes(b).reason, "rpc_error:no message box is being shown")   # the bug seen in game
+
+    def test_health_fallback_does_not_hide_defects(self):
+        """world.query fails for actors (game, 2026-10-21): health() reads GetAV through eval {ref}. The fallback must
+        read the target's real health, so a stuck health, a missed shot or a lost calling ref still fails the shot."""
+        for m in ("health_stuck", "fire_miss", "exec_ref_ignored"):
+            with self.subTest(mutant=m):
+                nv, b = make(m, query_actors=False)
+                r = b.fire(ref(RAIDER), expect_hit=True)
+                self.assertFalse(r.ok, f"mutant {m} slipped through the health fallback: {r}")
 
     def test_ref_info_error_reports_rpc_failure(self):
         nv, b = make("ref_info_error")

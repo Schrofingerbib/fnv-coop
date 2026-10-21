@@ -150,7 +150,7 @@ def _hex(tok: str) -> int:
 class FakeBridge:
     def __init__(self, world: Optional[World] = None, mutant: Optional[str] = None, bot_methods: bool = True,
                  menu_method: bool = True, input_driver: Optional[bool] = None, drop_events: bool = True,
-                 genuine_travel: bool = True, travel_refuses: bool = False):
+                 genuine_travel: bool = True, travel_refuses: bool = False, query_actors: bool = True):
         self.world = world or World()
         self.me = self.world.new_player()
         self.mutant = mutant
@@ -160,6 +160,7 @@ class FakeBridge:
         self.drop_events = drop_events          # the OnDrop native handler is registered
         self.genuine_travel = genuine_travel    # bot.fasttravel exists (engine glue on)
         self.travel_refuses = travel_refuses    # the engine's may-travel check says no
+        self.query_actors = query_actors        # False = world.query fails for actor refs (seen in game 2026-10-21, doors work)
         self.drop_log: List[Dict[str, Any]] = []
         self.travel_due: Optional[Tuple[float, "Thing"]] = None   # (virtual time, marker): the player moves a little after the call
         self._next_ref = 0xFF000000
@@ -274,6 +275,8 @@ class FakeBridge:
             t = self._by_ref(params["ref"])
             if params["fn"] != "GetActorValue" or params.get("p1") != P.HEALTH_AV:
                 raise RpcError(-32000, "query failed", method)
+            if not self.query_actors and isinstance(t, Thing) and t.kind == "actor":   # the game's own message
+                raise RpcError(-32000, "query failed (unknown fn, ref not loaded or evaluator drifted)", method)
             return {"value": self.me.health if t == "player" else (t.health if t else 0)}
         if method == P.M_DIALOG_OPEN:
             return {"open": self.me.in_dialogue is not None}
@@ -667,4 +670,8 @@ class FakeBridge:
             return float(who.teammate) if isinstance(who, Thing) else None
         if fn == "getstage":
             return float(self.world.stages.get(_hex(rest[0]), 0))
+        if fn == "getav" and rest and rest[0].lower() == "health":
+            if who == "player":
+                return me.health
+            return who.health if isinstance(who, Thing) and who.kind == "actor" else None
         return None
