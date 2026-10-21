@@ -193,6 +193,7 @@ struct PortStats {
     uint64_t standInsMade = 0, standInsRemoved = 0, standInsRefused = 0, standInsPurged = 0;
     uint64_t baseSwaps = 0, baseSwapFailed = 0, protectOn = 0, protectOff = 0, kills = 0, revives = 0;
     uint64_t ledgerReleased = 0, ledgerWrites = 0, resyncs = 0;
+    uint64_t ledgerDropped = 0;   // stale created-ref entries whose id now names someone else: dropped, never touched
 };
 PortStats portStats();
 

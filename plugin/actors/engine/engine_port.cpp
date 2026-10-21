@@ -686,33 +686,52 @@ size_t EnginePort::staleCount() const {
     return n;
 }
 
+// A created ref (0xFF......) is not the same object after a save load or in a new process: the engine hands its id to the next
+// object it creates. A stale ledger entry for one may therefore name an unrelated live object, and deleting or un-restraining that
+// in the middle of a load hung the host (two-copy fight test 2026-10-21). Ours are actors we restrained (stand-ins always are), so
+// a created ref that is not a restrained actor now is only dropped from the ledger, never touched.
+bool EnginePort::staleCreatedRefIsForeign(LedgerKind k, uint32_t r) {
+    if ((r >> 24) != 0xFF || FNV_MUT(67)) return false;   // twin 67: a reused created-ref id is acted on (the hang)
+    ActorRaw raw;
+    raw.wantRestrained = true;
+    if (eng_.read(r, raw) && raw.valid && raw.restrainedKnown && raw.restrained && !raw.isPlayer) return false;
+    led_.remove(k, r);
+    ++st_.ledgerDropped;
+    return true;
+}
+
 size_t EnginePort::undoStale() {
     if (FNV_MUT(37)) return 0;   // BAD: what a save, a crash or an earlier session left behind is never undone
     size_t n = 0;
     ActorRaw raw;
     // clones first (a restrained clone needs no separate undo), then the real actors they replaced, then the flags
     for (uint32_t r : led_.all(LedgerKind::StandIn)) {
-        if (live_.count({'s', r}) || !eng_.read(r, raw)) continue;
+        if (live_.count({'s', r})) continue;
+        if (staleCreatedRefIsForeign(LedgerKind::StandIn, r)) {
+            if (led_.has(LedgerKind::Restrained, r)) { led_.remove(LedgerKind::Restrained, r); ++st_.ledgerDropped; }
+            continue;
+        }
+        if (!eng_.read(r, raw)) continue;
         if (!deleteRef(r)) continue;
         led_.remove(LedgerKind::StandIn, r);
         led_.remove(LedgerKind::Restrained, r);
         ++n; ++st_.ledgerReleased;
     }
     for (uint32_t r : led_.all(LedgerKind::Disabled)) {
-        if (live_.count({'d', r}) || !eng_.read(r, raw)) continue;
+        if (live_.count({'d', r}) || staleCreatedRefIsForeign(LedgerKind::Disabled, r) || !eng_.read(r, raw)) continue;
         eng_.setDisabled(r, false);
         led_.remove(LedgerKind::Disabled, r);
         ++n; ++st_.ledgerReleased;
     }
     for (uint32_t r : led_.all(LedgerKind::Restrained)) {
-        if (live_.count({'r', r}) || !eng_.read(r, raw)) continue;
+        if (live_.count({'r', r}) || staleCreatedRefIsForeign(LedgerKind::Restrained, r) || !eng_.read(r, raw)) continue;
         eng_.setRestrained(r, false);
         eng_.evaluatePackage(r);
         led_.remove(LedgerKind::Restrained, r);
         ++n; ++st_.ledgerReleased;
     }
     for (uint32_t r : led_.all(LedgerKind::Essential)) {
-        if (live_.count({'e', r}) || !eng_.read(r, raw)) continue;
+        if (live_.count({'e', r}) || staleCreatedRefIsForeign(LedgerKind::Essential, r) || !eng_.read(r, raw)) continue;
         eng_.setEssential(r, false);
         led_.remove(LedgerKind::Essential, r);
         ++n; ++st_.ledgerReleased;

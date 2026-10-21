@@ -580,6 +580,25 @@ TEST(port, entries_left_by_an_earlier_run_are_undone_and_this_runs_entries_are_n
     CHECK(r.port.undoStale() == 1 && !r.eng.a[0x7777].restrained);
 }
 
+// After a load or in a new process the engine reuses created-ref ids: a stale stand-in / restrained entry for 0xFF...... may name an
+// unrelated object now. It must be dropped, never deleted or un-restrained (deleting one in the middle of a load hung the host).
+TEST(port, a_reused_created_ref_id_from_an_earlier_run_is_dropped_not_touched) {
+    PortRig r;
+    r.eng.addNpc(0xFF000011, 0x600, {0, 0, 0});                  // someone else's new actor took the id: not restrained
+    r.eng.addNpc(0xFF000012, 0x600, {0, 0, 0});
+    r.led.add(LedgerKind::StandIn, 0xFF000011);
+    r.led.add(LedgerKind::Restrained, 0xFF000011);
+    r.led.add(LedgerKind::Restrained, 0xFF000012);
+    r.led.add(LedgerKind::StandIn, 0xFF000013);                  // the id is free now (nothing there): dropped as well
+    const uint64_t linesBefore = r.eng.lines;
+    CHECK(r.port.undoStale() == 0);
+    CHECK(!r.eng.a[0xFF000011].deleted && !r.eng.a[0xFF000012].deleted);       // not touched
+    CHECK(!r.led.has(LedgerKind::StandIn, 0xFF000011) && !r.led.has(LedgerKind::Restrained, 0xFF000011));
+    CHECK(!r.led.has(LedgerKind::Restrained, 0xFF000012) && !r.led.has(LedgerKind::StandIn, 0xFF000013));
+    CHECK(r.port.stats().ledgerDropped == 4);
+    CHECK(r.eng.lines == linesBefore);                            // not a single console line ran
+}
+
 TEST(port, a_world_change_forgets_the_directory_without_touching_the_new_world) {
     PortRig r;
     const NetId a = r.npc(0x100);

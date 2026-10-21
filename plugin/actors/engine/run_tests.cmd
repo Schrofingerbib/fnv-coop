@@ -7,5 +7,5 @@ setlocal
 for %%I in ("%~dp0..\..\..") do set "REPO=%%~fI"
 if not defined PYTHON set "PYTHON=python"
 "%PYTHON%" -I "%REPO%\tools\build\build.py" --target nvcoop_actor_engine_tests --label "M3 actor port" || exit /b 1
-"%PYTHON%" -I "%REPO%\tools\mut\run_twins.py" --label "M3 actor port" --twins 1-39,41-57,59-66 --real-regex ", 0 failed" --caught-regex ", [1-9][0-9]* failed" -- "%REPO%\build\all\actor_engine_tests\nvcoop_actor_engine_tests.exe" || exit /b 1
+"%PYTHON%" -I "%REPO%\tools\mut\run_twins.py" --label "M3 actor port" --twins 1-39,41-57,59-67 --real-regex ", 0 failed" --caught-regex ", [1-9][0-9]* failed" -- "%REPO%\build\all\actor_engine_tests\nvcoop_actor_engine_tests.exe" || exit /b 1
 exit /b 0

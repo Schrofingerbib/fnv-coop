@@ -132,6 +132,9 @@ private:
     // ledger with a live/stale split
     void ledgerAdd(LedgerKind k, RefId ref);
     void ledgerRemove(LedgerKind k, RefId ref);
+    // undoStale: a stale created-ref (0xFF) entry whose id now names something that is not a restrained actor (the id was reused
+    // after a load / restart) is dropped from the ledger and true is returned; the engine is not touched.
+    bool staleCreatedRefIsForeign(LedgerKind k, uint32_t ref);
 
     bool linesLeft() const;
     uint64_t lines() const { return eng_.linesRun(); }

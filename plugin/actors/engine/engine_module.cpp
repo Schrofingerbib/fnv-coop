@@ -162,7 +162,7 @@ Value StatsJson(const PortStats& s) {
     n("standInsMade", s.standInsMade); n("standInsRemoved", s.standInsRemoved); n("standInsRefused", s.standInsRefused);
     n("standInsPurged", s.standInsPurged); n("baseSwaps", s.baseSwaps); n("baseSwapFailed", s.baseSwapFailed);
     n("protectOn", s.protectOn); n("protectOff", s.protectOff); n("kills", s.kills); n("revives", s.revives);
-    n("ledgerReleased", s.ledgerReleased); n("ledgerWrites", s.ledgerWrites);
+    n("ledgerReleased", s.ledgerReleased); n("ledgerWrites", s.ledgerWrites); n("ledgerDropped", s.ledgerDropped);
     return o;
 }
 
