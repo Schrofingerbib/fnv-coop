@@ -32,16 +32,16 @@ A step marked **Claimed** is being worked on right now. Want to take one? Open a
 
 | # | Step | What it means when you play | Status |
 |---|---|---|---|
-| 1 | Enemy and NPC sync | One PC runs each enemy's AI and everyone sees a smooth copy. Hits count once, deaths happen once, encounters spawn once, and enemy attacks, flinches and death poses look right on every screen. | **Claimed**: code written, final checks running |
+| 1 | Enemy and NPC sync | One PC runs each enemy's AI and everyone sees a smooth copy. Hits count once, deaths happen once, encounters spawn once, and enemy attacks, flinches and death poses look right on every screen. | **Claimed**: code written, finishing |
 | 2 | Enemy sync in the real game | The two-copy fight, ownership handoff, spawn and corpse-loot tests pass on a real PC, and the feature is switched on by default. | Next |
-| 3 | Player avatars | You see your friends as characters that walk, run, aim and animate, without needing NV:MP. | Code written, in-game test next |
-| 4 | Full combat | Real-time VATS for every player, projectiles and explosions, companions in fights, crime and faction hostility. | Combat code in progress, VATS open |
-| 5 | Loot, items and containers | Shared containers and corpses, item drops and pickups, and no duplicated items. | Open |
-| 6 | World, time and travel | Doors, terminals, switches and traps; time and weather; fast travel, waiting and sleeping by party vote; saving and rejoining. | Mostly built, finishing |
-| 7 | Desync check and repair | Every area checks itself every few seconds and fixes any difference it finds. | Built for the story, extending to everything |
-| 8 | The whole main story in game | Every main questline swept stage by stage with two game copies, from Goodsprings to the endings. | Goodsprings: 65 of 104 stages pass |
-| 9 | Every side quest and DLC | All side quests, companions and the four DLCs, played through by two-copy test bots. | Open |
-| 10 | Player release 1.0 | Installer, one-click host and join, split-screen on one PC, player guide. | **Claimed**: split-screen started |
+| 3 | Player avatars | You see your friends as characters that walk, run, aim and animate, without needing NV:MP. | **Claimed**: finishing the code |
+| 4 | Full combat | Real-time VATS for every player, projectiles and explosions, companions in fights, crime and faction hostility. | **Claimed**: combat and real-time VATS being written |
+| 5 | Loot, items and containers | Shared containers and corpses, item drops and pickups, and no duplicated items. | **Claimed**: being written |
+| 6 | World, time and travel | Doors, terminals, switches and traps; time and weather; fast travel, waiting and sleeping by party vote; saving and rejoining. | **Claimed**: finishing the code |
+| 7 | Desync check and repair | Every area checks itself every few seconds and fixes any difference it finds. | **Claimed**: extending to enemies, loot and the world |
+| 8 | The whole main story in game | Every main questline swept stage by stage with two game copies, from Goodsprings to the endings. | **Claimed**: closing script gaps and writing sweeps for every questline (Goodsprings: 65 of 104 stages pass) |
+| 9 | Every side quest and DLC | All side quests, companions and the four DLCs, played through by two-copy test bots. | **Claimed**: sweeps and test bots being written |
+| 10 | Player release 1.0 | Installer, one-click host and join, split-screen on one PC, player guide. | **Claimed**: installer, launcher, split-screen and player guide being written |
 
 ## Play in three steps
 
