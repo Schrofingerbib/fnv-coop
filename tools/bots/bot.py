@@ -141,6 +141,8 @@ class Bot:
         if isinstance(ref, int) or (isinstance(ref, str) and ":" not in ref):
             rid = ref if isinstance(ref, int) else int(ref, 16)
             idx = rid >> 24
+            if idx == 0xFF:   # a created ref (placeatme, a drop): no plugin owns it, the plugin names it by its runtime id
+                return f"{rid:08X}", f"{rid:08X}", f"{rid:08X}"
             if idx >= len(plugins):
                 raise _Fail("not_found", ref=ref, why="load index not in plugin list")
             return f"{plugins[idx]}:{rid & 0xFFFFFF:X}", f"{rid:08X}", f"{rid:08X}"

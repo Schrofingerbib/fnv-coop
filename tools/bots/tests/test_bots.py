@@ -37,6 +37,18 @@ def ref(i):
     return f"FalloutNV.esm:{i:X}"
 
 
+class OldNormBot(Bot):
+    """Twin: the _norm before PR #11's review fix. A created ref (load index 0xFF) is 'not in the plugin list'."""
+
+    def _norm(self, ref):
+        if isinstance(ref, int) or (isinstance(ref, str) and ":" not in ref and ref != "player"):
+            rid = ref if isinstance(ref, int) else int(ref, 16)
+            if rid >> 24 >= len(self._plugin_list()):
+                from bots.bot import _Fail
+                raise _Fail("not_found", ref=ref, why="load index not in plugin list")
+        return super()._norm(ref)
+
+
 class Movement(unittest.TestCase):
     def test_walk_to_coords_and_ref(self):
         nv, b = make()
@@ -491,7 +503,7 @@ class GenuineActions(unittest.TestCase):
         self.assertTrue(r.ok, r)
         self.assertEqual(r.data["source"], "event")
         self.assertEqual(r.data["ref"], nv.drop_log[-1]["ref"])
-        self.assertIn(r.data["ref"].split(":")[1], {f"{t:X}" for t in nv.world.things})   # it is a real ref in the world
+        self.assertIn(int(r.data["ref"].split(":")[-1], 16), nv.world.things)   # it is a real ref in the world (a created ref: bare runtime id)
         # a second drop of another base form is told apart by the base form, not just the order
         b.pickup(ref(GROUND), item=ITEM)
         r2 = b.drop(ITEM, 1)
@@ -503,16 +515,39 @@ class GenuineActions(unittest.TestCase):
         r = b.drop(AMMO, 1)
         self.assertTrue(r.ok, r)
         self.assertEqual(r.data["source"], "scan")
-        self.assertEqual(r.data["ref"], f"FalloutNV.esm:{nv._next_ref:X}")
+        self.assertEqual(r.data["ref"], f"{nv._next_ref:08X}")   # a created ref: the plugin names it by its runtime id
         nv2, b2 = make(bot_methods=False)           # no bot.* methods at all: dev.refsOf still answers, so the scan still finds it
         r = b2.drop(AMMO, 1)
         self.assertTrue(r.ok, r)
         self.assertEqual(r.data["source"], "scan")
 
+    def test_a_spawned_actor_is_usable_in_ref_scoped_calls(self):
+        # PR #11 review: placeatme makes FF000001. dev.refsOf names it by its runtime id (nameOfForm cannot give it a plugin),
+        # and a ref-scoped call on it must work: eval("GetAV Health", ref=...) through Bot.health.
+        nv, b = make(query_av=False)
+        nv.exec("placeatme 00000777 1", ref=ref(NPC))
+        spawned = b.refs_of(0x777)
+        self.assertEqual(spawned, ["FF000001"])
+        self.assertEqual(b.health(spawned[0]), 100.0)
+        self.assertIn(("exec", 'printc "NVCOOP_EVAL=%g" (GetAV Health)', "FF000001"), nv.calls)
+        self.assertEqual(b.health(0xFF000001), 100.0)                  # an int runtime id works the same way
+        # twin: the old _norm (load index 0xFF is "not in the plugin list") refuses the spawned actor
+        with self.assertRaises(Exception) as c:
+            OldNormBot(nv, "old").health(spawned[0])
+        self.assertEqual(getattr(c.exception, "reason", None), "not_found")
+
+    def test_ref_scoped_exec_replies_carry_the_runtime_id(self):
+        # PR #11 review: bridge.cpp adds the resolved 8-digit runtime id to every exec {cmd, ref} reply, also when the line fails
+        nv, b = make()
+        self.assertEqual(nv.exec("GetOpenState", ref=ref(DOOR))["ref"], f"{DOOR:08X}")
+        bad = nv.exec("NoSuchCommand", ref=ref(DOOR))
+        self.assertEqual((bad["ok"], bad["ref"]), (False, f"{DOOR:08X}"))
+        self.assertNotIn("ref", nv.exec("player.GetAngle Z"))       # no ref asked, no ref in the reply
+
     def test_drop_event_for_the_wrong_ref_is_visible(self):
         nv, b = make("drop_wrong_ref")
         r = b.drop(AMMO, 1)
-        self.assertNotEqual(r.data["ref"], f"FalloutNV.esm:{nv._next_ref:X}")   # the difference is observable, so the mutation twin can catch it
+        self.assertNotEqual(r.data["ref"], f"{nv._next_ref:08X}")   # the difference is observable, so the mutation twin can catch it
 
     def test_genuine_fast_travel_waits_for_the_arrival(self):
         nv, b = make()
