@@ -1231,5 +1231,26 @@ class SpawnPlacement(unittest.TestCase):
         self.assertFalse(any("teleported" in n for n in self.lines), self.lines)
 
 
+
+class ScenarioGivesWhatItEquips(unittest.TestCase):
+    """In game 2026-10-22: the start save had no 9mm pistol, so 'equip_pistol' did nothing and enemy_handoff failed at step 01."""
+
+    def test_every_equipped_item_is_given_first(self):
+        import re
+        with open(os.path.join(REPO, "scenarios", "goodsprings_enemies.json"), encoding="utf-8") as f:
+            sc = json.load(f)
+        given = set()
+        for s in sc["setup"]:
+            cmd = s.get("cmd", "")
+            m = re.match(r"player\.additem (\{\w+\})", cmd)
+            if m:
+                given.add(m.group(1))
+            m = re.match(r"player\.equipitem (\{\w+\})", cmd)
+            if m:
+                self.assertIn(m.group(1), given, f"{s['id']} equips {m.group(1)} before any step gives it")
+        # twin: the old setup (no give_pistol) fails the same rule
+        old = [s for s in sc["setup"] if s.get("id") != "give_pistol"]
+        self.assertFalse(any(re.match(r"player\.additem \{pistol\}", s.get("cmd", "")) for s in old))
+
 if __name__ == "__main__":
     unittest.main()

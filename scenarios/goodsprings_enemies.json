@@ -130,6 +130,13 @@
       "note": "Ammo9mm (FalloutNV.esm:08ED03): the save carries 21 rounds, too few for a whole fight"
     },
     {
+      "id": "give_pistol",
+      "op": "console",
+      "cmd": "player.additem {pistol} 1",
+      "on": "all",
+      "note": "the start save may have no 9mm pistol (the owner's autosave has no weapon): give one before equip_pistol (in game 2026-10-22, enemy_handoff step 01 failed 'host equips FalloutNV.esm:0E3778: not_in_inventory')"
+    },
+    {
       "id": "equip_pistol",
       "op": "console",
       "cmd": "player.equipitem {pistol}",
