@@ -154,6 +154,12 @@ class Bot:
     def _item(self, item: Ref) -> str:
         return self._norm(item)[2]
 
+    def _ref_of(self, ref: Optional[Ref]) -> str:
+        """The calling reference of a console line: 'player' (the line keeps its 'player.' prefix) or 'Plugin.esm:HEX',
+        which the bridge's exec {cmd, ref} resolves with the game's own load order."""
+        info, prefix, _ = self._norm(ref)
+        return "player" if prefix == "player" else info
+
     def _info(self, ref: Optional[Ref]) -> Dict[str, Any]:
         info_ref = self._norm(ref)[0]
         try:
@@ -163,7 +169,10 @@ class Bot:
                 raise
             raise _Fail("not_found", ref=info_ref, why=e.message)
 
-    def _eval(self, expr: str) -> float:
+    def _eval(self, expr: Union[str, P.Line]) -> float:
+        """Evaluate an expression: a plain str, or a P.Line whose ref is the calling reference (never '<hex>.Func')."""
+        if isinstance(expr, P.Line):
+            return self.nv.eval(expr.cmd) if expr.ref is None else self.nv.eval(expr.cmd, ref=expr.ref)
         return self.nv.eval(expr)
 
     def _optional_call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -175,11 +184,19 @@ class Bot:
                 return None
             raise
 
-    def _exec(self, cmd: str, what: str = "") -> str:
-        r = self.nv.exec(cmd)
+    def _exec(self, cmd: Union[str, P.Line], what: str = "") -> str:
+        """Run a console line: a plain str, or a P.Line whose ref is the calling reference (exec {cmd, ref})."""
+        line = cmd if isinstance(cmd, P.Line) else P.Line(cmd)
+        r = self.nv.exec(line.cmd) if line.ref is None else self.nv.exec(line.cmd, ref=line.ref)
         if not r.get("ok", False):
-            raise _Fail("unsupported", cmd=cmd, output=r.get("output", ""), what=what)
+            extra = {} if line.ref is None else {"ref": line.ref}
+            raise _Fail("unsupported", cmd=line.cmd, output=r.get("output", ""), what=what, **extra)
         return r.get("output", "")
+
+    def _exec_on(self, ref: Optional[Ref], cmd: str, what: str = "") -> str:
+        """Run `cmd` on `ref` with exec {cmd, ref} (the player keeps the 'player.' prefix). The console has no
+        '<hexFormID>.Command' form, so never build one."""
+        return self._exec(P.on(self._ref_of(ref), cmd), what)
 
     def _poll(self, pred: Callable[[], bool], timeout_s: float, poll_s: float = 0.1) -> bool:
         end = self.clock.monotonic() + timeout_s
@@ -202,11 +219,15 @@ class Bot:
         return int(self._info(ref)["lifeState"]) == 0
 
     def health(self, ref: Optional[Ref] = None) -> float:
-        return float(self.nv.call(P.M_QUERY, {"ref": self._norm(ref)[0], "fn": "GetActorValue", "p1": P.HEALTH_AV})["value"])
+        """world.query first. In game (2026-10-21) it fails for actor refs (Doc Mitchell) and works for a door, so on an
+        RPC error read 'GetAV Health' with the actor as the calling reference (eval {ref}, proven in game: 65.0)."""
+        try:
+            return float(self.nv.call(P.M_QUERY, {"ref": self._norm(ref)[0], "fn": "GetActorValue", "p1": P.HEALTH_AV})["value"])
+        except RpcError:
+            return float(self._eval(P.get_health(self._ref_of(ref))))
 
     def inventory_count(self, item: Ref, holder: Optional[Ref] = None) -> int:
-        h = self._norm(holder)[1]
-        return int(self._eval(P.item_count(h, self._item(item))))
+        return int(self._eval(P.item_count(self._ref_of(holder), self._item(item))))
 
     def quest_stage(self, quest: Ref) -> int:
         return int(self._eval(P.get_stage(self._item(quest))))
@@ -215,10 +236,10 @@ class Bot:
         return bool(self.nv.call(P.M_DIALOG_OPEN).get("open"))
 
     def door_state(self, ref: Ref) -> str:
-        return P.OPEN_STATES.get(int(self._eval(P.open_state(self._norm(ref)[1]))), "none")
+        return P.OPEN_STATES.get(int(self._eval(P.open_state(self._ref_of(ref)))), "none")
 
     def locked(self, ref: Ref) -> bool:
-        return self._eval(P.locked(self._norm(ref)[1])) != 0
+        return self._eval(P.locked(self._ref_of(ref))) != 0
 
     def target_pos(self, target: Target) -> Pos:
         if isinstance(target, tuple):
@@ -729,7 +750,7 @@ class Bot:
 
     # ------------------------------------------------------------------ interaction
     def _do_activate(self, ref: Ref) -> None:
-        info, _, hexid = self._norm(ref)
+        info = self._norm(ref)[0]
         try:
             r = self.nv.call(P.M_ACTIVATE, {"ref": info})
             if not r.get("ok", False):
@@ -737,7 +758,7 @@ class Bot:
         except RpcError as e:
             if e.code != METHOD_NOT_FOUND:
                 raise
-            self._exec(P.activate_console(hexid), "activate")
+            self._exec(P.activate_console(info), "activate")
 
     def activate(self, ref: Ref) -> ActionResult:
         """Activate a ref as the player. Post: the engine accepted it. Use open/pickup/talk for state checks."""
@@ -785,12 +806,13 @@ class Bot:
         return self._act("close", run)
 
     def _transfer(self, name: str, src: Optional[Ref], dst: Optional[Ref], item: Ref, count: int, timeout_s: float) -> Dict[str, Any]:
-        sh, dh, ih = self._norm(src)[1], self._norm(dst)[1], self._item(item)
+        # the source runs RemoveItemTarget (calling reference); the destination is an argument (runtime hex or "player")
+        sh, dh, ih = self._ref_of(src), self._ref_of(dst), self._item(item)
         have = int(self._eval(P.item_count(sh, ih)))
         if have < count:
             raise _Fail("not_enough", have=have, wanted=count)
         dst_before = int(self._eval(P.item_count(dh, ih)))
-        self._exec(P.transfer(sh, ih, dh, count), name)
+        self._exec(P.transfer(sh, ih, self._norm(dst)[1], count), name)
         if not self._poll(lambda: int(self._eval(P.item_count(dh, ih))) == dst_before + count, timeout_s):
             raise _Fail("postcondition", why="destination count wrong", before=dst_before, wanted=count,
                         got=int(self._eval(P.item_count(dh, ih))))

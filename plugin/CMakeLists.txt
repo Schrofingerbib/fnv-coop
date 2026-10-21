@@ -31,7 +31,7 @@ add_custom_target(nvcoop_buildinfo ALL
 
 # ---- game-free core (bridge + registries). The _mutant twin deliberately misbehaves (see bridge.cpp). ----
 set(NVCOOP_CORE_SRC common/nvcoop_api.cpp bridge/bridge.cpp bridge/screenshot.cpp)
-foreach(v "" _mutant _mutant_lock _mutant_save)
+foreach(v "" _mutant _mutant_lock _mutant_save _mutant_execref)
   add_library(nvcoop_core${v} STATIC ${NVCOOP_CORE_SRC})
   target_include_directories(nvcoop_core${v} PUBLIC common bridge PRIVATE ${NVCOOP_BUILDINFO_DIR})
   add_dependencies(nvcoop_core${v} nvcoop_buildinfo)
@@ -45,6 +45,7 @@ endforeach()
 target_compile_definitions(nvcoop_core_mutant PUBLIC NVBRIDGE_MUTANT=1)
 target_compile_definitions(nvcoop_core_mutant_lock PUBLIC NVBRIDGE_MUTANT_LOCK=1)
 target_compile_definitions(nvcoop_core_mutant_save PUBLIC NVBRIDGE_MUTANT_SAVE=1)
+target_compile_definitions(nvcoop_core_mutant_execref PUBLIC NVBRIDGE_MUTANT_EXECREF=1)   # exec {cmd, ref} ignores ref
 
 # PNG encoder self-test exe (+ mutant that corrupts the zlib checksum)
 add_executable(nvbridge_pngtest bridge/png_test_main.cpp bridge/screenshot.cpp)

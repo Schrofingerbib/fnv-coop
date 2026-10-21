@@ -18,6 +18,7 @@ It implements the console grammar and bridge methods in primitives.py over a tin
   crash             exec raises ConnectionLost
   drop_wrong_ref    the OnDrop event names a different ref than the one the engine created
   travel_ignored    bot.fasttravel is accepted but the player never moves
+  exec_ref_ignored  exec {cmd, ref} checks the ref, then runs the line with no calling reference
   msgbox_stuck      bot.menu.press presses the engine's message box natively, but the box never closes
   msgbox_ui_only    bot.menu.press only answers the UI layer's box (the plugin before the native path existed)
   run_is_key        bot.move holds Run for run:true whatever the always-run toggle is (the plugin before run = speed)
@@ -26,6 +27,9 @@ Always-run: `always_run` is the engine's toggle (PlayerCharacter+0x651). True is
 The fake plugin holds Run only when run != always_run (runControlFor in bot_rpc.h). The fake engine moves at run speed when
 Run held != always_run (the run decision at 0x941A2B, keyboard mode). So with always-run on, Run held means walk. The bot.move
 reply and bot.status carry the same run fields as bot_rpc.h.
+
+Console lines follow the game (in game, 2026-10-21): "player.X" works, "<hex>.X" fails with
+Script command "<hex>.X" not found, and a line for another reference names it in exec's `ref` (calling reference).
 
 Message boxes: `box` is the UI layer's own box (ui.open / ui.answer); `native_boxes` lists the engine's own queued boxes (MessageMenu,
 menu id 1001), one entry per box = its number of buttons. bot.menu reports kind "message" while either is shown.
@@ -52,7 +56,8 @@ PLAYER_ID = 0x14
 _DRIVER_METHODS = {P.M_BOT_STATUS, P.M_BOT_MOVE, P.M_BOT_STOP, P.M_BOT_LOOK, P.M_BOT_FIRE, P.M_BOT_RELOAD, P.M_BOT_JUMP,
                    P.M_BOT_SNEAK, P.M_BOT_ACTIVATE}
 # Functions the fake console evaluates. The game has IsSneaking. It has no GetSneaking ("Unknown variable", first in-game run 2026-10-21).
-_EXPR_FUNCS = {"issneaking", "getangle", "getequipped", "getitemcount", "getopenstate", "getlocked", "getstage"}
+_EXPR_FUNCS = {"issneaking", "getangle", "getequipped", "getitemcount", "getopenstate", "getlocked", "getlocklevel",
+               "getplayerteammate", "getstage", "getav"}
 
 
 JUMP_SETTLE_S = 2.0  # see M_BOT_SNEAK in FakeBridge: crouch toggles right after a jump
@@ -88,6 +93,7 @@ class Thing:
     topics_text: List[str] = field(default_factory=list)   # terminal entry names
     base_id: int = 0                # base form id (0 = same as id); used by dev.countRefs
     topics: List[int] = field(default_factory=list)
+    teammate: bool = False          # SetPlayerTeammate
 
     @property
     def dead(self) -> bool:
@@ -156,7 +162,7 @@ def _hex(tok: str) -> int:
 class FakeBridge:
     def __init__(self, world: Optional[World] = None, mutant: Optional[str] = None, bot_methods: bool = True,
                  menu_method: bool = True, input_driver: Optional[bool] = None, drop_events: bool = True,
-                 genuine_travel: bool = True, travel_refuses: bool = False):
+                 genuine_travel: bool = True, travel_refuses: bool = False, query_actors: bool = True):
         self.world = world or World()
         self.me = self.world.new_player()
         self.mutant = mutant
@@ -166,6 +172,7 @@ class FakeBridge:
         self.drop_events = drop_events          # the OnDrop native handler is registered
         self.genuine_travel = genuine_travel    # bot.fasttravel exists (engine glue on)
         self.travel_refuses = travel_refuses    # the engine's may-travel check says no
+        self.query_actors = query_actors        # False = world.query fails for actor refs (seen in game 2026-10-21, doors work)
         self.drop_log: List[Dict[str, Any]] = []
         self.travel_due: Optional[Tuple[float, "Thing"]] = None   # (virtual time, marker): the player moves a little after the call
         self._next_ref = 0xFF000000
@@ -206,28 +213,57 @@ class FakeBridge:
     def state_to_file(self, path: str, sections=None) -> Dict[str, Any]:
         return {"path": path, "sections": sections or []}
 
-    def eval(self, expr: str) -> float:
-        out = self.exec('printc "NVCOOP_EVAL=%g" (' + expr + ')')["output"]
-        i = out.rfind("NVCOOP_EVAL=")
-        if i < 0:   # the same error as NvBridge.eval
+    def eval(self, expr: str, ref: Optional[str] = None) -> float:
+        line = 'printc "NVCOOP_EVAL=%g" (' + expr + ')'
+        out = (self.exec(line) if ref is None else self.exec(line, ref=ref))["output"]
+        if "NVCOOP_EVAL=" not in out:                       # same failure as nvbridge.NvBridge.eval
             raise BridgeError(f"cannot evaluate {expr!r}: {out!r}")
-        return float(out[i + 12:].split()[0])
+        return float(out.rsplit("NVCOOP_EVAL=", 1)[1].split()[0])
 
-    def exec(self, cmd: str, timeout_ms: Optional[int] = None) -> Dict[str, Any]:
+    def exec(self, cmd: str, timeout_ms: Optional[int] = None, *, ref: Optional[str] = None) -> Dict[str, Any]:
+        """Like the game: a line runs with the calling reference `ref` (exec {cmd, ref}); "player.X" is the only
+        reference prefix the console accepts, and "<hex>.X" fails with: Script command "<hex>.X" not found."""
         if self.mutant == "crash":
             raise ConnectionLost("fake: pipe closed")
-        self.calls.append(("exec", cmd))
+        self.calls.append(("exec", cmd) if ref is None else ("exec", cmd, ref))
+        self_ref = None if ref is None else self._calling(ref)
+        if self.mutant == "exec_ref_ignored":
+            self_ref = None
         m = re.fullmatch(r'printc "NVCOOP_EVAL=%g" \((.*)\)', cmd)
+        text = m.group(1).strip() if m else cmd.strip()
+        bad = re.match(r"(\w+)\.\w+", text)
+        if bad and bad.group(1).lower() != "player":
+            return {"ok": False, "output": f'Script command "{text.split()[0]}" not found'}
         if m:
-            fm = re.match(r"(?:\w+\.)?(\w+)", m.group(1).strip())
+            fm = re.match(r"(?:\w+\.)?(\w+)", text)
             if fm and fm.group(1).lower() not in _EXPR_FUNCS:
                 return {"ok": False, "output": f"Unknown variable '{fm.group(1)}'"}   # what the game's console prints
-            v = self._expr(m.group(1).strip())
+            v = self._expr(text, self_ref)
             if v is None:
                 return {"ok": False, "output": "unknown expression"}
             return {"ok": True, "output": f"NVCOOP_EVAL={v:g}"}
-        ok = self._stmt(cmd.strip())
+        ok = self._stmt(text, self_ref)
         return {"ok": ok, "output": "" if ok else "unknown command"}
+
+    def _calling(self, ref: str):
+        """exec's ref -> the Thing (or "player"), as the bridge resolves it: 'Plugin.esm:HEX' with the load order of
+        plugins(), or a runtime id 'HEX' / '0xHEX'. Anything else raises the bridge's errors (-32602 / -32013)."""
+        plugin, colon, hexpart = ref.rpartition(":")
+        hexpart = hexpart[2:] if hexpart[:2] in ("0x", "0X") and len(hexpart) > 2 else hexpart
+        if not re.fullmatch(r"[0-9A-Fa-f]{1,8}", hexpart) or (colon and (not plugin or int(hexpart, 16) > 0xFFFFFF)):
+            raise RpcError(-32602, f"exec: bad ref '{ref}'", "exec")
+        rid = int(hexpart, 16)
+        if colon:
+            low = [p.lower() for p in self.plugins()]
+            if plugin.lower() not in low:
+                raise RpcError(-32013, f"exec: ref '{ref}': plugin '{plugin}' is not loaded", "exec")
+            rid |= low.index(plugin.lower()) << 24
+        if rid == PLAYER_ID:
+            return "player"
+        t = self.world.things.get(rid)
+        if t is None:
+            raise RpcError(-32013, f"exec: ref '{ref}' (form {rid:08X}) is not a loaded form", "exec")
+        return t
 
     def call(self, method: str, params: Optional[Dict[str, Any]] = None, timeout_s: float = 35.0) -> Any:
         params = params or {}
@@ -255,6 +291,8 @@ class FakeBridge:
             t = self._by_ref(params["ref"])
             if params["fn"] != "GetActorValue" or params.get("p1") != P.HEALTH_AV:
                 raise RpcError(-32000, "query failed", method)
+            if not self.query_actors and isinstance(t, Thing) and t.kind == "actor":   # the game's own message
+                raise RpcError(-32000, "query failed (unknown fn, ref not loaded or evaluator drifted)", method)
             return {"value": self.me.health if t == "player" else (t.health if t else 0)}
         if method == P.M_DIALOG_OPEN:
             return {"open": self.me.in_dialogue is not None}
@@ -544,11 +582,13 @@ class FakeBridge:
         if best:
             best[1].health -= 25
 
-    def _stmt(self, line: str) -> bool:
+    def _stmt(self, line: str, self_ref=None) -> bool:
+        """One statement. self_ref = the calling reference from exec's ref (a Thing, "player" or None)."""
         m = re.fullmatch(r"(?:(\w+)\.)?(\w+)(?:\s+(.*))?", line)
         if not m:
             return False
         tgt, cmd, rest = m.group(1), m.group(2).lower(), (m.group(3) or "").split()
+        who = "player" if (tgt or "").lower() == "player" else self_ref
         me = self.me
         mut = self.mutant
         if cmd == "setpos" and tgt == "player":
@@ -584,12 +624,12 @@ class FakeBridge:
                     self.drop_log[-1]["ref"] = "FalloutNV.esm:DEAD"
             return True
         if cmd == "activate":
-            t = self._target(tgt or "")
+            t = who
             if isinstance(t, Thing) and mut != "activate_noop":
                 self._activate(t)
             return isinstance(t, Thing)
         if cmd == "removeitemtarget":
-            src, dst = self._target(tgt or ""), self._target(rest[1])
+            src, dst = who, self._target(rest[1])
             si, di = self._holder_items(src), self._holder_items(dst)
             if si is None or di is None:
                 return False
@@ -600,15 +640,42 @@ class FakeBridge:
                 si[i] -= n
             di[i] = di.get(i, 0) + n
             return True
+        if cmd == "additem":
+            items = self._holder_items(who)
+            if items is None:
+                return False
+            items[_hex(rest[0])] = items.get(_hex(rest[0]), 0) + int(rest[1])
+            return True
+        if cmd in ("lock", "unlock"):
+            if not isinstance(who, Thing) or who.kind not in ("door", "container", "terminal"):
+                return False
+            who.locked = cmd == "lock"
+            return True
+        if cmd == "setplayerteammate":
+            if not isinstance(who, Thing) or who.kind != "actor":
+                return False
+            who.teammate = bool(int(rest[0]))
+            return True
+        if cmd == "placeatme":
+            at = me if who == "player" else who
+            if at is None:
+                return False
+            base = _hex(rest[0])
+            for _ in range(int(rest[1]) if len(rest) > 1 else 1):
+                self._next_ref += 1
+                self.world.add(Thing(self._next_ref, "actor", list(at.pos), at.cell, base_id=base))
+            return True
         if cmd == "fireweapon":
             return False  # the console fallback does not exist in the fake: tests the "unsupported" path
         return False
 
-    def _expr(self, e: str) -> Optional[float]:
+    def _expr(self, e: str, self_ref=None) -> Optional[float]:
+        """One expression. self_ref = the calling reference from exec's ref (a Thing, "player" or None)."""
         m = re.fullmatch(r"(?:(\w+)\.)?(\w+)(?:\s+(.*))?", e)
         if not m:
             return None
         tgt, fn, rest = m.group(1), m.group(2).lower(), (m.group(3) or "").split()
+        who = "player" if (tgt or "").lower() == "player" else self_ref
         me = self.me
         if fn == "issneaking":
             return 1.0 if self.sneaking else 0.0
@@ -617,14 +684,20 @@ class FakeBridge:
         if fn == "getequipped":
             return 1.0 if _hex(rest[0]) in me.equipped else 0.0
         if fn == "getitemcount":
-            items = self._holder_items(self._target(tgt or ""))
+            items = self._holder_items(who)
             return float(items.get(_hex(rest[0]), 0)) if items is not None else None
         if fn == "getopenstate":
-            t = self._target(tgt or "")
-            return float(t.open_state) if isinstance(t, Thing) else None
+            return float(who.open_state) if isinstance(who, Thing) else None
         if fn == "getlocked":
-            t = self._target(tgt or "")
-            return float(t.locked) if isinstance(t, Thing) else None
+            return float(who.locked) if isinstance(who, Thing) else None
+        if fn == "getlocklevel":
+            return (50.0 if who.locked else 0.0) if isinstance(who, Thing) else None
+        if fn == "getplayerteammate":
+            return float(who.teammate) if isinstance(who, Thing) else None
         if fn == "getstage":
             return float(self.world.stages.get(_hex(rest[0]), 0))
+        if fn == "getav" and rest and rest[0].lower() == "health":
+            if who == "player":
+                return me.health
+            return who.health if isinstance(who, Thing) and who.kind == "actor" else None
         return None

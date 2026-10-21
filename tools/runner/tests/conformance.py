@@ -35,6 +35,8 @@ def run(nv, expect_state_stub=True, check_load=True, connect2=None):
         assert r == {"ok": True, "output": f"hello {i}"}, r
     assert nv.exec("bogus_command_xyz")["ok"] is False
 
+    check_exec_ref(nv)
+
     # error shapes
     expect_rpc_error(lambda: nv.call("no_such_method"), -32601)
     expect_rpc_error(lambda: nv.call("exec", {}), -32602)
@@ -105,6 +107,37 @@ def run(nv, expect_state_stub=True, check_load=True, connect2=None):
     if connect2 is not None:
         check_lease(nv, connect2())
     return True
+
+
+def check_exec_ref(nv):
+    """exec {cmd, ref}. The fakes model the game (fakehost_main.cpp / fake_server.py): the console has no
+    '<hexFormID>.Command' form, and a ref-targeted line runs with the reference as the console's calling reference.
+    Fake load order: FalloutNV.esm (0), DeadMoney.esm (1). Forms: 00000014 player, 00103E61 door, 01000ABC creature,
+    0000000F Caps001 (not a reference)."""
+    old = nv.exec("00103E61.getref")
+    assert old["ok"] is False and 'Script command "00103E61.getref" not found' in old["output"], old
+    assert nv.exec("getref")["ok"] is False, "a line without ref must have no calling reference"
+    for spelled in ("FalloutNV.esm:103E61", "falloutnv.esm:00103E61", "FalloutNV.esm:0x103E61", "00103E61", "0x103e61", "103E61"):
+        r = nv.exec("getref", ref=spelled)
+        assert r == {"ok": True, "output": "REF=00103E61", "ref": "00103E61"}, (spelled, r)
+    r = nv.exec("getref", ref="DeadMoney.esm:ABC")                # the plugin's load-order index goes into the top byte
+    assert r == {"ok": True, "output": "REF=01000ABC", "ref": "01000ABC"}, r
+    assert nv.exec("player.getref") == {"ok": True, "output": "REF=00000014"}   # player. lines need no ref
+    assert nv.eval("refid", ref="FalloutNV.esm:14") == 20.0             # eval passes the ref on
+    try:
+        nv.eval("refid")
+        raise AssertionError("eval without ref must have no calling reference")
+    except nvbridge.BridgeError as e:
+        assert not isinstance(e, RpcError), e
+    # a ref that names no loaded reference is refused with a clear error, and the line does not run
+    for text, why in (("Nope.esm:1", "plugin 'Nope.esm' is not loaded"), ("00ABCDEF", "00ABCDEF"),
+                      ("0000000F", "is not a reference")):
+        e = expect_rpc_error(lambda t=text: nv.exec("getref", ref=t), -32013)
+        assert why in e.message, (text, e.message)
+    for junk in ("", "xyz", "FalloutNV.esm:", ":12", "123456789", "FalloutNV.esm:1000000", "0x", "12 34"):
+        expect_rpc_error(lambda j=junk: nv.exec("getref", ref=j), -32602)
+    expect_rpc_error(lambda: nv.call("exec", {"cmd": "getref", "ref": 5}), -32602)
+    expect_rpc_error(lambda: nv.call("exec", {"cmd": "getref", "ref": None}), -32602)
 
 
 def check_lease(a, b):

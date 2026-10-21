@@ -48,8 +48,23 @@ Never break another lane's suite; if your change does, fix it or coordinate with
 
 ## Shared interface: nvbridge JSON-RPC (L1 owns, others consume)
 Request `{"id":1,"method":"exec","params":{"cmd":"setstage VMS01 10"}}` → Response `{"id":1,"result":{...}}` / `{"id":1,"error":{"code":..,"message":..}}`.
-Methods v0: `ping`, `exec{cmd}`, `state{sections?}` (delegates to L7 snapshot), `waitFor{expr,timeoutMs}`, `events{since}`, `screenshot`, `loadSave{name}`, `quit`.
+Methods v0: `ping`, `exec{cmd, ref?}`, `state{sections?}` (delegates to L7 snapshot), `waitFor{expr,timeoutMs}`, `events{since}`, `screenshot`, `loadSave{name}`, `quit`.
 All game calls are marshalled to the main thread.
+
+`exec{cmd, ref?}`: with `ref`, the bridge runs `cmd` with that reference as the console's calling reference
+(`RunScriptLine2(cmd, ref)`). The game's console does not accept `<hexFormID>.Command`. In game (FalloutNV 1.4.0.525,
+2026-10-21) `00103E61.GetOpenState` got `Script command "00103E61.GetOpenState" not found`, and the EditorID of a
+non-persistent ref got `Invalid reference ...`. Only `player.` works as a prefix. So a line for any other reference is
+`{"cmd":"GetOpenState","ref":"FalloutNV.esm:103E61"}`, never `{"cmd":"00103E61.GetOpenState"}`.
+- `ref` is `"Plugin.esm:HEX"` (HEX is the id inside the plugin, at most `FFFFFF`; the bridge adds the plugin's load-order
+  index) or a runtime form id `"HEX"` / `"0xHEX"` (1 to 8 hex digits).
+- Result: `{ok, output, ref}`. `ref` is the runtime id that ran the line, as 8 hex digits.
+- Errors: `-32602` when `ref` is not a string or not one of the forms above. `-32013` when the plugin is not loaded, the
+  form is not loaded, or the form is not a reference (only REFR, ACHR and ACRE can be a calling reference). The line
+  does not run.
+- `exec{cmd}` without `ref` is unchanged. `waitFor` has no `ref`: poll with `exec`/`eval` and `ref` instead.
+- Python: `NvBridge.exec(cmd, ref=...)`, `NvBridge.eval(expr, ref=...)`. `nvbridge.split_ref_line(line)` turns an old
+  `"<ref>.<Func> args"` line into `("<Func> args", ref)` (in `tools/runner/console_ref.py`).
 
 ## Shared types (L4 owns): `synccore/include/fnvcoop/`
 - `FormRef { std::string plugin; uint32_t localId; }` - never raw load-order FormIDs on the wire.

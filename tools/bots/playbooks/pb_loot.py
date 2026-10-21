@@ -81,8 +81,8 @@ class ContainerSharePlaybook(Playbook):
         seed = ctx.refs.get("seed")
         if seed:      # put known contents into the container on the host (replicated like any other change)
             with ctx.step("host seeds the container", compare=False):
-                r = host.bot.nv.exec(f"{P.hexid(c)}.additem {P.hexid(seed['item'])} {int(seed['count'])}")
-                ctx.expect(r.get("ok", True), f"additem failed: {r.get('output')}")
+                r = P.seed_items(host.bot, c, seed["item"], int(seed["count"]))
+                ctx.expect(r.ok, f"additem failed: {r.reason}")
         with ctx.step("everyone walks to the container"):
             res = ctx.on_all(lambda m: m.bot.goto_ref(c, 120))
             for n, r in res.items():

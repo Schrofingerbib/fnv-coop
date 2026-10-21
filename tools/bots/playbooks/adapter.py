@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .probe import MissingBridge, Result, hexid
+from .probe import MissingBridge, Result
 
 
 class PlaybookBot:
@@ -56,9 +56,10 @@ class PlaybookBot:
         return Result(True, "", {"note": "no explicit close"})
 
     def unlock(self, ref, key=None, timeout_s=10.0):
-        """UNVERIFIED console primitive: `<ref>.unlock`. The key item is not consumed or checked."""
+        """UNVERIFIED console primitive: `unlock` with `ref` as the calling reference (exec {cmd, ref}; the console has
+        no `<hex>.unlock` form). The key item is not consumed or checked."""
         try:
-            self._b._exec(f"{hexid(ref)}.unlock", "unlock")      # noqa: SLF001 (T6a's checked console call)
+            self._b._exec_on(ref, "unlock", "unlock")      # noqa: SLF001 (T6a's checked console call)
         except Exception as e:  # noqa: BLE001
             return Result(False, f"unlock failed: {e}")
         return Result(not self._b.locked(ref), "still locked after unlock")

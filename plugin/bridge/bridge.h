@@ -3,8 +3,14 @@
 //
 // Wire protocol (v1): one JSON object per line (UTF-8, '\n' terminated) in each direction.
 //   -> {"id":1,"method":"exec","params":{"cmd":"player.getpos x"}}
+//   -> {"id":2,"method":"exec","params":{"cmd":"GetOpenState","ref":"FalloutNV.esm:103E61"}}
 //   <- {"id":1,"result":{...}}   or   {"id":1,"error":{"code":-32602,"message":"..."}}
 // Responses on one connection come back in request order. Multiple connections are allowed.
+//
+// exec {cmd, ref?}: with `ref`, the line runs with that reference as the console's CALLING REFERENCE
+// (NVSEConsoleInterface::RunScriptLine2(cmd, ref)). In game (FalloutNV 1.4.0.525) the console script compiler rejects
+// "<hexFormID>.Command" (Script command "00103E61.GetOpenState" not found) and the EditorID of a non-persistent ref
+// (Invalid reference ...); only "player." works as a prefix. So a line for any other reference names it in `ref`.
 #pragma once
 #include <cstdint>
 #include <memory>
@@ -17,11 +23,34 @@ struct ExecResult {
     std::string output;      // captured console output ("" if capture unavailable)
 };
 
+// The `ref` param of exec: "Plugin.esm:HEX" (HEX = the id inside that plugin, at most 0xFFFFFF; the bridge adds the
+// plugin's load-order index) or a runtime form id "HEX" / "0xHEX" (1 to 8 hex digits).
+struct RefSpec {
+    std::string plugin;      // "" = `id` is a runtime form id
+    uint32_t id = 0;         // plugin set: local id; plugin empty: runtime id (load index << 24 | local id)
+};
+// Parses the text of a `ref` param. Returns false and sets *err for anything that is not one of the forms above.
+bool ParseRefSpec(const std::string& text, RefSpec* out, std::string* err);
+// TESForm::typeID values that are references (can be a calling reference): REFR 0x3A, ACHR 0x3B, ACRE 0x3C.
+bool IsReferenceFormType(int typeId);
+
 // Everything the bridge needs from the game. All methods are called on the main thread, from Pump().
 class Host {
 public:
     virtual ~Host() = default;
     virtual ExecResult Exec(const std::string& consoleLine) = 0;
+    // ---- exec {cmd, ref} ----
+    // Load-order index of a loaded plugin (name compared without case), or -1 when no plugin of that name is loaded.
+    virtual int PluginIndex(const std::string& /*plugin*/) { return -1; }
+    // TESForm::typeID of the loaded form with this runtime id, or -1 when no such form is loaded.
+    virtual int FormType(uint32_t /*runtimeId*/) { return -1; }
+    // Runs consoleLine with the form `runtimeId` as the calling reference. The bridge calls it only after FormType()
+    // returned a reference type for that id.
+    virtual ExecResult ExecOn(const std::string& /*consoleLine*/, uint32_t /*runtimeId*/) {
+        ExecResult r;
+        r.output = "this host cannot run a console line on a reference";
+        return r;
+    }
     // Issue the load; completion is signalled later through Bridge::NotifyGameLoaded().
     virtual bool LoadSave(const std::string& name, std::string& err) = 0;
     // path: in = requested file ("" = host chooses), out = file written

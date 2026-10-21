@@ -40,8 +40,31 @@ Failure reasons: `timeout`, `not_found`, `dead`, `postcondition`, `unsupported`,
 
 Queries: pos, cell, alive, health, inventory_count(item, holder), quest_stage, dialogue_open, door_state, locked.
 
+## Lines for a reference: exec {cmd, ref} (VERIFIED in game, 2026-10-21)
+The game's console does not accept `<hexFormID>.Command`. On FalloutNV.exe 1.4.0.525 the line `00103E61.GetOpenState` got
+`Script command "00103E61.GetOpenState" not found`, and the EditorID of a non-persistent ref got `Invalid reference ...`.
+Only `player.` works as a prefix. So every line for another reference names it in the bridge's `ref` parameter, and the
+bridge runs the line with that reference as the console's calling reference (`RunScriptLine2(cmd, ref)`, see
+docs/CONTRACTS.md):
+- primitives.py returns a `Line(cmd, ref)` for these lines (`open_state`, `locked`, `item_count`, `transfer`,
+  `activate_console`). `P.on(holder, text)` keeps `player.` for the player and puts any other holder in `ref`.
+- `Bot._exec` / `Bot._eval` send a `Line` as `nv.exec(cmd, ref=ref)` / `nv.eval(expr, ref=ref)`. `Bot._exec_on(ref, cmd)`
+  does the same for a raw command. The ref is `Plugin.esm:HEX`, so the bridge resolves it with the game's own load order.
+- Argument refs (for example the destination of `RemoveItemTarget`, the marker of `player.MoveTo`) stay runtime hex ids
+  in the line: the console accepts hex FormID arguments.
+- fake.py behaves like the game: a `<hex>.Func` line fails with `Script command "<hex>.Func" not found`, and
+  `exec(cmd, ref=...)` runs the line on that reference. A bad ref raises the bridge's errors (-32602, -32013).
+- Twins: the fake mutant `exec_ref_ignored` (the host checks the ref, then drops it) and `LegacyBot` in
+  tests/test_bots.py (a bot that still builds `<hex>.Func` lines) must both fail.
+- `Bot.health`: in game (2026-10-21) `world.query` failed for every actor query on Doc Mitchell (`GetActorValue`,
+  `GetDead`, `GetDisabled`: "query failed (unknown fn, ref not loaded or evaluator drifted)") and worked for a door
+  (`GetLocked` -> 0). `eval("GetAV Health", ref=...)` gave 65.0. So `health()` tries `world.query` first and on an RPC
+  error reads `GetAV Health` with the actor as the calling reference (`P.get_health`). The fake's `query_actors=False`
+  models the game. Twins: with that fallback, `health_stuck`, `fire_miss` and `exec_ref_ignored` must still fail
+  `fire(expect_hit=True)`.
+
 ## Unverified grammar (fix in tools/bots/primitives.py only)
-All of primitives.py except `GetStage`. In particular: `player.SetPos/SetAngle/GetAngle`, `EquipItem/UnequipItem/GetEquipped`, `RemoveItemTarget item target count silent` argument order, `Drop`, `GetOpenState` values (1 open, 3 closed), `GetLocked`, the FLAG_DISABLED bit 0x800, Health = actor value 16 for `world.query p1`, angle sign conventions in `heading_deg`, and whether hex refs work as `HEX.Cmd` prefixes and inside `printc` expressions. Update fake.py to the same grammar if you change a string.
+All of primitives.py except `GetStage`. In particular: `player.SetPos/SetAngle/GetAngle`, `EquipItem/UnequipItem/GetEquipped`, `RemoveItemTarget item target count silent` argument order, `Drop`, `GetOpenState` values (1 open, 3 closed), `GetLocked`, the FLAG_DISABLED bit 0x800, Health = actor value 16 for `world.query p1`, angle sign conventions in `heading_deg`, and whether an expression inside `printc` uses the calling reference that exec's `ref` gives it (`eval(expr, ref=...)`). Update fake.py to the same grammar if you change a string.
 Walking is a stepped SetPos: it does not path around walls, so use it inside open areas and teleport otherwise.
 
 ## In-process input driver and bridge methods (plugin/bots, ini `[dev] bots=1`) - BUILT, PARTLY RUN IN GAME
@@ -163,7 +186,7 @@ Still not verified in the game:
 Known limits: terminal state only knows the bot's own picks; VATS limb choice; Reload control id; full inventory enumeration of base-container-only items.
 
 ## Tests
-`tools/bots/tests/test_bots.py`: 24 tests over the fake bridge (virtual clock, milliseconds). Mutation twins in fake.py (`setpos_ignored, angle_ignored, activate_noop, transfer_noop, transfer_dup, equip_noop, drop_noop, fire_miss, health_stuck, dialog_never, ref_info_error, crash, msgbox_stuck, msgbox_ui_only`): each must make the matching action fail. `msgbox_stuck` (the box never closes) and `msgbox_ui_only` (the plugin before the native path) must make `dismiss_messages` fail. The fake's `box_waves` adds engine boxes later in virtual time, and while an engine box is shown the fake player does not move (menu mode). The waves tests press all 10 boxes of the in-game pattern. Their twin (`_press_only_now`, the old loop) leaves 4 boxes, and in proof_input it makes `forward` fail. The fake's `box_closing_s` keeps a pressed box in the closing state for that many seconds. Its twin (`_any_refusal_fatal`, the old loop) fails on the first closing refusal.
+`tools/bots/tests/test_bots.py`: 24 tests over the fake bridge (virtual clock, milliseconds). Mutation twins in fake.py (`setpos_ignored, angle_ignored, activate_noop, transfer_noop, transfer_dup, equip_noop, drop_noop, fire_miss, health_stuck, dialog_never, ref_info_error, crash, msgbox_stuck, msgbox_ui_only, exec_ref_ignored`): each must make the matching action fail. `msgbox_stuck` (the box never closes) and `msgbox_ui_only` (the plugin before the native path) must make `dismiss_messages` fail. The fake's `box_waves` adds engine boxes later in virtual time, and while an engine box is shown the fake player does not move (menu mode). The waves tests press all 10 boxes of the in-game pattern. Their twin (`_press_only_now`, the old loop) leaves 4 boxes, and in proof_input it makes `forward` fail. The fake's `box_closing_s` keeps a pressed box in the closing state for that many seconds. Its twin (`_any_refusal_fatal`, the old loop) fails on the first closing refusal.
 The fake's `always_run` (default True, the New Vegas default) models the always-run toggle. The fake plugin holds Run only when run != always_run, and the fake engine runs when Run held != always_run. Its twin `run_is_key` (Run held for run:true, the plugin before run = speed) makes the proof_input `forward` row FAIL with always-run on (`tools/bots/tests/test_proof.py`).
 The fake uses the same grammar as primitives.py, so it proves the Bot logic, not the real console.
 C++ twins for the native press (`plugin/bots/tests/test_bots.cpp`, NVBOTS_MUTANT): 33 native path never used, 34 vtable check skipped, 35 button index off by one, 36 native path tried before the UI layer, 37 null tile not refused, 38 top-menu gate skipped, 39 closing-box gate skipped, 40 native reply says path "ui", 41 main-thread gate skipped.

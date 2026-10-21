@@ -206,6 +206,20 @@ class ValidatorRejects(unittest.TestCase):
             s["steps"].insert(0, {"id": "c", "op": "console", "cmd": "00104C1C.kill"})
         self.expect(m, "raw FormID")
 
+    def test_reference_call_not_first_in_console_or_expr(self):
+        """'{alias}.Func' must be the first word (it becomes exec's calling reference); one per line."""
+        def m(s):
+            s["steps"].insert(0, {"id": "c", "op": "console", "cmd": "printc \"%g\" ({vcg02}.GetDead)"})
+        self.expect(m, "first word")
+
+        def m2(s):
+            s["steps"].append({"id": "c2", "op": "check", "kind": "expr", "expr": "{vcg02}.GetAV Health + {vcg02}.GetDead",
+                               "value": 1})
+        self.expect(m2, "first word")
+        sc = self.base()
+        sc["steps"].insert(0, {"id": "c", "op": "console", "cmd": "{vcg02}.setav Health 100"})
+        self.assertFalse([e for e in self.errs(sc) if "first word" in e])
+
     def test_unknown_capability_and_player_count(self):
         self.expect(lambda s: s["steps"][1].update(needs=["warp_drive"]), "unknown capability")
         self.expect(lambda s: s["steps"][1].update(on=5), "bad 'on'")
@@ -269,11 +283,17 @@ class Translation(unittest.TestCase):
         sc = load("door_terminal_container_matrix")
         res = scenlib.Resolver(sc, ORDER)
         step = {"id": "x", "op": "lock", "ref": "$docDoor", "level": 50}
-        self.assertEqual(scenlib.step_actions(step, res), [("exec", "00103E61.lock 50")])
+        # a line for a reference names it as exec's calling reference: the game's console has no "<hex>.Func" form
+        self.assertEqual(scenlib.step_actions(step, res), [("exec", "lock 50", "00103E61")])
         self.assertEqual(scenlib.step_actions({"id": "x", "op": "additem", "who": "$dresser", "item": "$stimpak", "count": 3}, res),
-                         [("exec", "00103E37.additem 00015169 3")])
+                         [("exec", "additem 00015169 3", "00103E37")])
+        self.assertEqual(scenlib.step_actions({"id": "x", "op": "additem", "who": "player", "item": "$stimpak", "count": 3}, res),
+                         [("exec", "player.additem 00015169 3")])
         self.assertEqual(scenlib.step_actions({"id": "x", "op": "moveto", "who": "player", "to": "$docDoor"}, res),
                          [("exec", "player.moveto 00103E61")])
+        self.assertEqual(scenlib.step_actions({"id": "x", "op": "recruit", "ref": "$docDoor"}, res),
+                         [("exec", "enable", "00103E61"), ("exec", "moveto player", "00103E61"),
+                          ("exec", "setplayerteammate 1", "00103E61")])
         q = scenlib.Resolver(load("quest_stage_sync"), ORDER)
         self.assertEqual(scenlib.step_actions({"id": "x", "op": "setstage", "quest": "$vcg02", "stage": 10}, q)[0],
                          ("exec", "setstage 0010A214 10"))
@@ -281,16 +301,70 @@ class Translation(unittest.TestCase):
                          [("call", "test.quest.setvar", {"quest": "0010A214", "var": "nGeckosKilled", "value": 2.0})])
         g = scenlib.Resolver(load("vats_hit"), ORDER)
         self.assertEqual(scenlib.step_actions({"id": "x", "op": "console", "cmd": "{gang1}.setav Health 100"}, g),
-                         [("exec", "00104C70.setav Health 100")])
+                         [("exec", "setav Health 100", "00104C70")])
+        self.assertEqual(scenlib.step_actions({"id": "x", "op": "console", "cmd": "{player}.setav Health 100"}, g),
+                         [("exec", "player.setav Health 100")])
+        with self.assertRaises(scenlib.StepError):     # the console cannot run a reference call inside a line
+            scenlib.step_actions({"id": "x", "op": "console", "cmd": "printc \"%g\" ({gang1}.GetDead)"}, g)
 
     def test_check_expressions(self):
         sc = load("goodsprings_fight")
         res = scenlib.Resolver(sc, ORDER)
         e = scenlib.check_expr({"id": "c", "op": "check", "kind": "dead", "ref": "$gang1", "value": 1}, res)
-        self.assertEqual(e[:3], ("00104C70.GetDead", "==", 1))
+        self.assertEqual(e[:3], ("GetDead", "==", 1))
+        self.assertEqual(e[6], "00104C70")          # evaluated with the actor as the calling reference
         res2 = scenlib.Resolver(load("quest_stage_sync"), ORDER)
         e = scenlib.check_expr({"id": "c", "op": "check", "kind": "stage_done", "quest": "$vcg02", "stage": 20, "value": 1}, res2)
-        self.assertEqual(e[0], "GetStageDone 0010A214 20")
+        self.assertEqual((e[0], e[6]), ("GetStageDone 0010A214 20", None))
+        d = scenlib.Resolver(load("door_terminal_container_matrix"), ORDER)
+        e = scenlib.check_expr({"id": "c", "op": "check", "kind": "item_count", "who": "player", "item": "$stimpak", "value": 1}, d)
+        self.assertEqual((e[0], e[6]), ("player.GetItemCount 00015169", None))
+        e = scenlib.check_expr({"id": "c", "op": "check", "kind": "item_count", "who": "$dresser", "item": "$stimpak", "value": 1}, d)
+        self.assertEqual((e[0], e[6]), ("GetItemCount 00015169", "00103E37"))
+        e = scenlib.check_expr({"id": "c", "op": "check", "kind": "distance", "a": "$gang1", "b": "player", "value": 1}, res)
+        self.assertEqual((e[0], e[6]), ("GetDistance player", "00104C70"))
+        e = scenlib.check_expr({"id": "c", "op": "check", "kind": "expr", "expr": "{gang1}.GetAV Health", "value": 1}, res)
+        self.assertEqual((e[0], e[6]), ("GetAV Health", "00104C70"))
+
+    def test_no_console_line_names_a_reference_with_a_hex_prefix(self):
+        """Every action and check of every shipped scenario: no '<hex>.Func' text goes to the console."""
+        import re
+        bad = []
+        for p in scenlib.list_scenarios():
+            sc = scenlib.load_scenario(p)
+            res = scenlib.Resolver(sc, ORDER)
+            for st in scenlib.all_steps(sc):
+                if st["op"] == "check":
+                    texts = [scenlib.check_expr(st, res)[0] or ""]
+                else:
+                    texts = [a[1] for a in scenlib.step_actions(st, res) if a[0] == "exec"]
+                bad += ["%s/%s: %s" % (p.stem, st["id"], t) for t in texts if re.match(r"\s*[0-9A-Fa-f]{8}\.\w", t)]
+        self.assertEqual(bad, [])
+
+    def test_fake_console_rejects_hex_prefixes_like_the_game(self):
+        w, clock, nvs = fakegame.make(2)
+        r = nvs[0].exec("00104C70.kill")
+        self.assertEqual(r, {"ok": False, "output": 'Script command "00104C70.kill" not found'})
+        self.assertNotIn("00104C70", w.dead)
+        with self.assertRaises(RuntimeError):
+            nvs[0].eval("00104C70.GetDead")
+        self.assertEqual(nvs[0].exec("kill", ref="00104C70"), {"ok": True, "output": ""})
+        self.assertEqual(nvs[0].eval("GetDead", ref="00104C70"), 1.0)
+
+    def test_proof_probes_name_the_reference_in_ref(self):
+        w, clock, nvs = fakegame.make(1)
+        prime(w)
+        rows = proof.probe_rows(nvs[0])
+        self.assertEqual([r for r in rows if not r["ok"]], [], "every probe form must run on the game-like fake console")
+        self.assertGreaterEqual(len([r for r in rows if r["ref"]]), 7)
+        self.assertEqual([r for r in rows if r["ref"] and r["expr"].startswith(r["ref"])], [])
+
+    def test_host_that_ignores_the_ref_is_caught(self):
+        """Twin of the bridge: a host that drops exec's ref runs the line with no calling reference."""
+        _, results, _ = run_pair(["goodsprings_fight"], exec_ref_ignored=True)
+        self.assertNotEqual(results[0]["status"], "pass")
+        _, results, _ = run_pair(["goodsprings_fight"])
+        self.assertEqual(results[0]["status"], "pass")
 
     def test_compare_table(self):
         c = scenlib.compare
@@ -372,11 +446,11 @@ class RunnerOnFake(unittest.TestCase):
 
     def test_steps_run_on_the_named_player_only(self):
         w, _, _ = run_pair(["goodsprings_fight"])
-        kills = [(i, t) for i, k, t in w.calls if k == "exec" and t.endswith(".kill")]
-        self.assertIn((1, "00104C77.kill"), kills)      # guest_kills_2
-        self.assertNotIn((0, "00104C77.kill"), kills)
-        self.assertIn((0, "00104C70.kill"), kills)
-        self.assertNotIn((1, "00104C70.kill"), kills)
+        kills = [(i, t) for i, k, t in w.calls if k == "exec" and t.startswith("kill")]
+        self.assertIn((1, "kill @00104C77"), kills)      # guest_kills_2 (exec "kill" with ref 00104C77)
+        self.assertNotIn((0, "kill @00104C77"), kills)
+        self.assertIn((0, "kill @00104C70"), kills)
+        self.assertNotIn((1, "kill @00104C70"), kills)
 
     def test_unavailable_check_times_out_with_a_detail(self):
         w, clock, nvs = fakegame.make(2)
@@ -719,6 +793,8 @@ MUTANTS = {
     "wholedict": "put writes the whole in-memory dict (loses keys of other processes)",
     "noreread": "the plan uses the state read at start, not the file now",
     "inplace": "put writes into the state file itself, no temp file and replace",
+    "hexprefix": "console lines name a reference as '<hex>.Func' again",
+    "refline": "the validator accepts a {alias}.Func call that is not first",
 }
 
 
