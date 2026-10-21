@@ -28,20 +28,20 @@ the existing New Vegas multiplayer mod by the NV:MP team, can run alongside. We 
 ## Roadmap: 10 steps to full co-op
 
 After these ten steps the whole game plays in co-op: story, enemies, combat, loot and the world, for 2 to 4 players.
-Track A is the sync core (maintainer). Track B is in-game testing, split-screen and VATS (contributor).
+A step marked **Claimed** is being worked on right now. Want to take one? Open an issue and it gets claimed for you.
 
-| # | Step | What it means when you play | Who | Status |
-|---|---|---|---|---|
-| 1 | Enemy and NPC sync | One PC runs each enemy's AI and everyone sees a smooth copy. Hits count once, deaths happen once, encounters spawn once, and enemy attacks, flinches and death poses look right on every screen. | A | In progress: code written, final checks running |
-| 2 | Enemy sync in the real game | The two-copy fight, ownership handoff, spawn and corpse-loot tests pass on a real PC, and the feature is switched on by default. | B, then A fixes | Next |
-| 3 | Player avatars | You see your friends as characters that walk, run, aim and animate, without needing NV:MP. | A, B tests | Code written, in-game test next |
-| 4 | Full combat | Real-time VATS for every player, projectiles and explosions, companions in fights, crime and faction hostility. | A and B | VATS planned, the rest in progress |
-| 5 | Loot, items and containers | Shared containers and corpses, item drops and pickups, and no duplicated items. | A | Planned |
-| 6 | World, time and travel | Doors, terminals, switches and traps; time and weather; fast travel, waiting and sleeping by party vote; saving and rejoining. | A | Mostly built, finishing |
-| 7 | Desync check and repair | Every area checks itself every few seconds and fixes any difference it finds. | A | Built for the story, extending to everything |
-| 8 | The whole main story in game | Every main questline swept stage by stage with two game copies, from Goodsprings to the endings. | A and B | Goodsprings: 65 of 104 stages pass |
-| 9 | Every side quest and DLC | All side quests, companions and the four DLCs, played through by two-copy test bots. | A and B | Planned |
-| 10 | Player release 1.0 | Installer, one-click host and join, split-screen on one PC, player guide. | A and B | Split-screen started |
+| # | Step | What it means when you play | Status |
+|---|---|---|---|
+| 1 | Enemy and NPC sync | One PC runs each enemy's AI and everyone sees a smooth copy. Hits count once, deaths happen once, encounters spawn once, and enemy attacks, flinches and death poses look right on every screen. | **Claimed**: code written, final checks running |
+| 2 | Enemy sync in the real game | The two-copy fight, ownership handoff, spawn and corpse-loot tests pass on a real PC, and the feature is switched on by default. | Next |
+| 3 | Player avatars | You see your friends as characters that walk, run, aim and animate, without needing NV:MP. | Code written, in-game test next |
+| 4 | Full combat | Real-time VATS for every player, projectiles and explosions, companions in fights, crime and faction hostility. | Combat code in progress, VATS open |
+| 5 | Loot, items and containers | Shared containers and corpses, item drops and pickups, and no duplicated items. | Open |
+| 6 | World, time and travel | Doors, terminals, switches and traps; time and weather; fast travel, waiting and sleeping by party vote; saving and rejoining. | Mostly built, finishing |
+| 7 | Desync check and repair | Every area checks itself every few seconds and fixes any difference it finds. | Built for the story, extending to everything |
+| 8 | The whole main story in game | Every main questline swept stage by stage with two game copies, from Goodsprings to the endings. | Goodsprings: 65 of 104 stages pass |
+| 9 | Every side quest and DLC | All side quests, companions and the four DLCs, played through by two-copy test bots. | Open |
+| 10 | Player release 1.0 | Installer, one-click host and join, split-screen on one PC, player guide. | **Claimed**: split-screen started |
 
 ## Play in three steps
 
