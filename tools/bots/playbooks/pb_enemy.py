@@ -942,9 +942,11 @@ def goto_or_teleport(ctx: Ctx, m: Machine, ref: str, dist: float) -> Any:
     checks: the sync checks come after. In game 2026-10-21 the host stuck on the slope between GSPG01 and
     GoodspringsPowderGangMarker (1042 units, 290 up) and enemy_spawn failed at step 01 before it checked anything."""
     r = m.bot.goto_ref(ref, dist)
-    if getattr(r, "ok", False) or "stuck" not in str(getattr(r, "reason", "")):
+    reason = str(getattr(r, "reason", ""))
+    # a walk that times out far away is a placement problem too (in game 2026-10-22: the guest still 4774 units from the marker)
+    if getattr(r, "ok", False) or not any(w in reason for w in ("stuck", "timeout")):
         return r
-    note = f"{m.name}: the walk to {ref} was stuck ({getattr(r, 'reason', '')}), teleported there"
+    note = f"{m.name}: the walk to {ref} did not arrive ({reason}), teleported there"
     ctx.notes.append(note)
     ctx.log(note)
     r = m.bot.goto_ref(ref, dist, mode="teleport")

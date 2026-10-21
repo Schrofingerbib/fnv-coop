@@ -1186,11 +1186,12 @@ class SpawnPlacement(unittest.TestCase):
     """In game 2026-10-21: enemy_spawn (spawn_mode host) failed at step 01 because the host's walk to the marker was stuck on a
     slope. Placing the players is not what the test checks, so a stuck walk falls back to a teleport and leaves a note."""
 
-    def run_host_mode(self, blocked, no_fallback=False):
+    def run_host_mode(self, blocked, no_fallback=False, times_out=False):
         self.lines = []
         w, refs = pb_enemy.fake_enemy_spawn(2)
         refs = dict(refs, spawn_mode="host")
         w.walk_blocked = blocked
+        w.walk_times_out = times_out
         if no_fallback:   # twin: the old placement, a plain walk
             orig = pb_enemy.goto_or_teleport
             pb_enemy.goto_or_teleport = lambda ctx, m, ref, dist: m.bot.goto_ref(ref, dist)
@@ -1207,7 +1208,16 @@ class SpawnPlacement(unittest.TestCase):
         r = self.run_host_mode(blocked=True)
         first = r.steps[0]
         self.assertTrue(first.ok, first.reason)
-        self.assertTrue(any("was stuck" in n and "teleported" in n for n in self.lines), self.lines)
+        self.assertTrue(any("did not arrive (stuck" in n and "teleported" in n for n in self.lines), self.lines)
+
+    def test_a_walk_that_times_out_far_away_teleports_too(self):
+        # in game 2026-10-22: "client1 walks to the marker: timeout: 4774 units left (wanted within 300)"
+        r = self.run_host_mode(blocked=False, times_out=True)
+        self.assertTrue(r.steps[0].ok, r.steps[0].reason)
+        self.assertTrue(any("did not arrive (timeout" in n for n in self.lines), self.lines)
+        # twin: the first fallback (stuck only) still fails on a timeout
+        r2 = self.run_host_mode(blocked=False, times_out=True, no_fallback=True)
+        self.assertIn("walks to the marker: timeout", r2.steps[0].reason)
 
     def test_twin_a_plain_walk_fails_step_one(self):
         r = self.run_host_mode(blocked=True, no_fallback=True)

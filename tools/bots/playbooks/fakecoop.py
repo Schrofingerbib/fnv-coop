@@ -172,6 +172,7 @@ class FakeCoop:
         self.loss_every, self.retransmit_ticks = loss_every, retransmit_ticks
         self.walk_speed = walk_speed            # units/s; None: movement is instant and the animation checks have nothing to see
         self.walk_blocked = False               # True: every walk (mode "walk") fails "stuck", as on rough terrain; a teleport works
+        self.walk_times_out = False             # True: every walk fails "timeout: N units left", as on a long way; a teleport works
         self.vt = 0.0                           # virtual seconds, 0.05 per tick
         self.tick_hooks: List[Any] = []
         self._lock = threading.RLock()
@@ -694,6 +695,8 @@ class FakeBot:
             return Result(False, f"{ref} is not loaded on {self.name}")
         if mode == "walk" and self.world.walk_blocked:
             return Result(False, "stuck")
+        if mode == "walk" and self.world.walk_times_out:
+            return Result(False, "timeout: 4774 units left (wanted within 300), no menu is open")
         off = dist * (0.5 + 0.1 * self.idx)     # players stop short of the ref, each a bit differently
         pos = self._ref_pos(ref)
         return self._move((pos[0] + off, pos[1], pos[2]), r["cell"], mode)
