@@ -116,6 +116,7 @@ NEEDS = {
 }
 
 MUTANT = os.environ.get("TEST_ALL_MUTANT", "")
+WINDOWS = sys.platform == "win32"   # MSVC and the build scripts (vcvars, build_l1.cmd) exist on Windows only
 
 # Public export: suites that need your own game install or generated game data skip with a reason instead of failing.
 # Each list holds every file the suite opens (found by reading its loaders and by tracing a run). A partial
@@ -194,6 +195,8 @@ def decide(name: str, slow: bool, tools: tuple, quick: bool, problems: dict):
     if missing:
         shown = ", ".join(missing[:3]) + (f" and {len(missing) - 3} more" if len(missing) > 3 else "")
         return "skip", f"{NEEDS[name][1]}. Missing: {shown}"
+    if not WINDOWS and MUTANT != "no_platform_skip" and any(t in ("cmake", "msvc") for t in required_tools(slow, tools)):
+        return "skip", f"needs the MSVC/CMake toolchain, which is Windows only (this is {sys.platform})"
     reasons = [problems[t] for t in required_tools(slow, tools) if problems.get(t)]
     if reasons:
         return "fail", ". ".join(reasons)
@@ -295,6 +298,8 @@ def select_affected(files=None, base: str = "HEAD") -> list:
 def preflight(quick: bool, names=None) -> dict:
     """Checks only the tools that the suites of this run need (`names`: the suites picked by --affected / --only; default all).
     Prints one line per tool. Returns tool -> problem."""
+    if not WINDOWS and MUTANT != "no_platform_skip":
+        return {}   # decide() skips every suite that needs the toolchain, with the reason; nothing to check here
     users = {}
     for name, _, slow, tools in SUITES:
         if names is not None and name not in names:
