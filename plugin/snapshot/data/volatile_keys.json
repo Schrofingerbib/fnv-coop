@@ -108,6 +108,14 @@
     "reasons": [
      "manual:fight-test"
     ]
+   },
+   {
+    "edid": "CGTutorial",
+    "name": "vatstimer",
+    "owner": "FalloutNV.esm:059C85",
+    "reasons": [
+     "manual:fight-test"
+    ]
    }
   ]
  },

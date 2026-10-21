@@ -280,6 +280,20 @@ class VolatileQuestVars(unittest.TestCase):
              "FalloutNV.esm:1617A2": {"edid": "VERStalkersSouth01", "vars": {"StalkersOn": stalkers_on, "iCount": stalkers_count}}}
         return {"schemaVersion": 1, "meta": {}, "perPlayer": {"0": {}}, "shared": {"quests": q}}
 
+    def test_tutorial_message_timer_is_per_machine_but_its_stages_are_not(self):
+        # in game 2026-10-21/22: CGTutorial VATSTimer host 25 / 22.95 / 17.0 / 5.0, guest 0; completedStages host {2}, guest {2, 70}
+        self.assertIn(("falloutnv.esm:059c85", "vatstimer"), snaplib.load_volatile_vars())
+
+        def snap(timer, stages):
+            q = {"FalloutNV.esm:059C85": {"edid": "CGTutorial", "vars": {"VATSTimer": timer}, "completedStages": stages}}
+            return {"schemaVersion": 1, "meta": {}, "perPlayer": {"0": {}}, "shared": {"quests": q}}
+        self.assertEqual(snaplib.diff(snap(16.999, [2]), snap(0, [2])), [])
+        # the stage difference still counts (story state is never volatile)
+        self.assertEqual([d["path"] for d in snaplib.diff(snap(5.0, [2]), snap(0, [2, 70]))],
+                         ["shared/quests/FalloutNV.esm:059C85/completedStages"])
+        # twin: without the volatile classification the timer differs
+        self.assertEqual(len(snaplib.diff(snap(16.999, [2]), snap(0, [2]), local_split=False)), 1)
+
     def test_fight_run_frame_counter_and_clock_copies_are_per_machine(self):
         for key in (("falloutnv.esm:1572e8", "icounter"), ("falloutnv.esm:10c721", "time"), ("falloutnv.esm:10c721", "fdays")):
             self.assertIn(key, snaplib.load_volatile_vars())
