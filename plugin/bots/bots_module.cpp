@@ -2,7 +2,8 @@
 //   [dev]
 //   bots=1
 // It detours OSInputGlobals::GetControlState (the one function the game asks "is control X down?") so a bot can hold / tap game
-// controls from inside our own process. No SendInput, no desktop events, works with the window minimized. See bot_rpc.h for the
+// controls from inside our own process. bot.vats also detours the VATS attack-button test 0x7EEB50 (armed only by a bot.vats job).
+// No SendInput, no desktop events, works with the window minimized. See bot_rpc.h for the
 // bot.* bridge methods and docs/tools/T6a-actions.md for the in-game proof script.
 #include <Windows.h>
 
@@ -76,6 +77,10 @@ std::string IniPath() {
 
 // ---- live IEngine: raw reads are SEH-guarded, every engine call first needs the pinned prologues to have matched at init ----
 bool g_callsOk = false;
+// bot.vats accept: the detour on the VATS attack-button test 0x7EEB50 answers from this gate (main thread only: the job arms it in
+// OnFrame, VATSMenu::Update calls the detour).
+nvbots::VatsAcceptGate g_accept;
+bool g_acceptHooked = false;
 // The game main thread: written at DeferredInit and on every frame (both run on it). 0 until then, so the native press refuses.
 volatile DWORD g_mainThread = 0;
 
@@ -179,6 +184,57 @@ struct LiveGame : nvbots::IEngine {
         unsigned r = 0;
         return GuardedThis<unsigned>(&r, fn, reinterpret_cast<void*>(menu), id, (unsigned)tile);
     }
+    // ---- bot.vats ----
+    nvbots::Addr32 menuByType(uint32_t id) override {
+        if (!g_callsOk) return 0;
+        unsigned r = 0;
+        __try {
+            r = reinterpret_cast<unsigned(__cdecl*)(int)>(nvbots::addr::GetMenuByType.addr)((int)id);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return 0;
+        }
+        return r;
+    }
+    bool closeTutorial() override {
+        if (!g_callsOk || !onMainThread()) return false;
+        __try {
+            reinterpret_cast<void(__cdecl*)()>(nvbots::addr::TutorialClose.addr)();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+        return true;
+    }
+    // VATSMenu vtable slot 3 = HandleClick(id, tile). The logic layer already checked the vtable. Check it again here together with the
+    // slot content, so this call can only reach the pinned 0x7EECB0 on a VATSMenu, on the main thread.
+    bool vatsMenuClick(nvbots::Addr32 menu, int id) override {
+        if (!g_callsOk || !onMainThread() || !menu) return false;
+        uint32_t vt = 0, fn = 0;
+        if (!rd32(menu, &vt) || vt != nvbots::addr::VatsMenuVtbl) return false;
+        if (!rd32(vt + nvbots::addr::kMenuSlotHandleClick, &fn) || fn != nvbots::addr::VatsMenuHandleClick.addr) return false;
+        unsigned r = 0;
+        return GuardedThis<unsigned>(&r, fn, reinterpret_cast<void*>(menu), id, 0u);
+    }
+    int vatsQueueCount() override {
+        int r = 0;   // fastcall(ECX = list head) with no stack arguments: a thiscall with no arguments
+        return g_callsOk && GuardedThis<int>(&r, nvbots::addr::VatsQueueCount.addr, reinterpret_cast<void*>(nvbots::eng::kVatsCamera)) ? r : -1;
+    }
+    bool vatsExecute() override {
+        if (!g_callsOk || !onMainThread()) return false;
+        __try {
+            reinterpret_cast<void(__stdcall*)()>(nvbots::addr::VatsExecute.addr)();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+        return true;
+    }
+    bool vatsArmAccept(bool on) override {
+        if (!on) { g_accept.disarm(); return true; }
+        if (!g_acceptHooked || !g_callsOk || !onMainThread()) return false;
+        const int n = vatsQueueCount();
+        if (n < 0) return false;
+        g_accept.arm(n);
+        return true;
+    }
     nvbots::Addr32 containerData(nvbots::Addr32 ref) override {
         if (!g_callsOk) return 0;
         unsigned r = 0;
@@ -222,6 +278,16 @@ struct LiveGame : nvbots::IEngine {
     }
 };
 LiveGame g_game;
+
+// The VATS attack-button test 0x7EEB50(slot, held, binding), cdecl. While a bot accept is armed, the slot 1 press edge answers true, so
+// VATSMenu::Update queues the attack through its own path. Every other call goes to the original.
+using Fn_VatsAttackButton = bool(__cdecl*)(int, char, int);
+Fn_VatsAttackButton o_VatsAttackButton = nullptr;
+
+bool __cdecl h_VatsAttackButton(int slot, char held, int binding) {
+    if (g_accept.armed() && g_accept.force(slot, (int)(unsigned char)held, g_game.vatsQueueCount())) return true;
+    return o_VatsAttackButton(slot, held, binding);
+}
 
 // ---- OnDrop: xNVSE's event manager hands a native handler (dropper, droppedRef) when anything is dropped ----
 NVSEInterface* g_nvse = nullptr;
@@ -332,15 +398,28 @@ void InstallHook() {
         g_hooked = true;
     }
     nvcoop::Log("bots: GetControlState hook: %s", nvhooks::statusName(st));
+    // bot.vats accept: only with the engine call pins matched (the detour counts the queue through the pinned 0x5AE380)
+    if (!g_acceptHooked && g_callsOk) {
+        nvhooks::Addr t2 = 0;
+        const nvhooks::PatchStatus s2 = g_reg->acquire(nvbots::addr::VatsAttackButton, reinterpret_cast<nvhooks::Addr>(&h_VatsAttackButton), &t2);
+        if (nvhooks::installed(s2)) {
+            o_VatsAttackButton = reinterpret_cast<Fn_VatsAttackButton>(t2);
+            g_acceptHooked = true;
+        }
+        nvcoop::Log("bots: VATS attack-button hook: %s", nvhooks::statusName(s2));
+    }
 }
 
 void Uninstall() {
     g_in.releaseAll();
     if (g_dropHandler && g_events && g_events->RemoveNativeEventHandler) g_events->RemoveNativeEventHandler("OnDrop", &OnDropEvent);
     g_dropHandler = false;
+    g_accept.disarm();
     g_reg.reset();
     g_hooked = false;
     o_GetControlState = nullptr;
+    g_acceptHooked = false;
+    o_VatsAttackButton = nullptr;
     g_rpc.reset();
     g_inited = false;
 }
@@ -366,7 +445,7 @@ void Init() {
             return g_rpc->handle(name, params, out);
         }, true, 0);
     }
-    nvcoop::Log("bots: enabled (dev), hooked=%d pins=%d runPins=%d", g_hooked ? 1 : 0, g_callsOk ? 1 : 0, g_runPinsOk ? 1 : 0);
+    nvcoop::Log("bots: enabled (dev), hooked=%d vatsAccept=%d pins=%d runPins=%d", g_hooked ? 1 : 0, g_acceptHooked ? 1 : 0, g_callsOk ? 1 : 0, g_runPinsOk ? 1 : 0);
 }
 
 void OnMessage(uint32_t type, void*, uint32_t) {

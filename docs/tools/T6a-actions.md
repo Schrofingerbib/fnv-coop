@@ -85,11 +85,11 @@ Controls 0..9, 12, 14, 16 are proven from call sites; 10, 11 and 13..27 follow t
 | bot.look {yaw,pitch} or {ref} | degrees, same convention as SetAngle |
 | bot.fire {shots,gapMs} | queued Attack pulses; Reload is a tap of ReadyItem (UNVERIFIED which control) |
 | bot.reload / bot.sneak / bot.jump / bot.activate / bot.input | taps and generic hold/release/tap by name or id |
-| bot.menu | {kind,id,vatsMode,dialogState?,dialogReady?} from the menu stack top (0x714F00) and the VATS camera mode |
+| bot.menu | {kind,id,vatsMode,dialogState?,dialogReady?} from the menu stack top (0x714F00) and the VATS camera mode. Id 1059 (0x423) is the tutorial box: kind `tutorial`, also while VATS is active. VATS itself is 1056 (0x420) |
 | bot.dialog / bot.say {info} | list the DialogMenu ListBox choices; pick one by replicating the plain-topic path of HandleClick (0x7624F0) with gates: state 2, click gate, special INFOs refused |
 | bot.menu.press {button} / bot.consent {answer} | answer the message box the UI layer shows (new `ui.answer`); consent: Ready=0, Not yet=1. When the UI layer shows no box and the engine's own MessageMenu (1001) is the top menu, `bot.menu.press` presses that box natively (see "Native message box press" below). The reply has `path` `ui` or `native`. `bot.consent` never uses the native path |
 | bot.inventory {ref?,items?} | totals via 0x4C8F30 (base + delta, equipped included); without items only ExtraContainerChanges entries, partial:true |
-| bot.vats {ref} / test.vats.hit | tick-driven job: tap Vats, cycle targets with Right until VATSMenu's selected ref matches, tap Activate, wait for playback. Limb choice is refused (unsupported) |
+| bot.vats {ref} / test.vats.hit | tick-driven job: tap Vats, close the tutorial box, wait for limb select, select the target with VATSMenu HandleClick(3), queue the attack through the attack-button detour, execute, wait for playback. See "bot.vats: queue and execute" below. Limb choice is refused (unsupported) |
 | bot.fasttravel {marker} | GENUINE fast travel, queued the way the map menu does it (see below); gated on busy menus/VATS, a pending travel, and the engine's own may-travel check 0x93D660. Reply `{genuine:true,queued:true}`; the player moves a few frames later |
 | test.fasttravel {marker} | fallback only: a `MoveTo` teleport that crosses cells; reply `genuine:false`. `Bot.fast_travel` uses it only when `bot.fasttravel` is missing, never after an engine refusal |
 | bot.drops {since?,base?,windowMs?} | what the xNVSE `OnDrop` event reported (native handler, params `[dropper, droppedRef]`): `{seq,drops:[{seq,ref,base,dropper}]}`. Correlated by base form plus a 5 s window. `unsupported` if the handler could not register |
@@ -164,6 +164,40 @@ Limits: only MessageMenu 1001, and only when it is the top menu. Button order is
 In-game status: the press path ran in the game on 2026-10-21 (see "First in-game run" below). The refusal paths (wrong vtable, bad button, closing box, not on the main thread) did not occur in that run. Only the unit tests check them.
 Python: `Bot.dismiss_messages(quiet_s=20, max_s=120, max_n=8, button=0, settle_s=0.3, poll_s=0.5, max_closing=10)` presses `button` while `bot.menu` reports kind `message`, and polls every `poll_s` otherwise. It is done when no box has been shown for `quiet_s` seconds. The boxes come in waves: in the first in-game run (all DLC, a fresh save) 6 boxes came at once, then 2, then 2 more about 16 s later. A press-only-now loop returned after the first wave and the later waves stopped movement in the middle of the proof. It fails with `timeout` when `max_s` passes first and with `postcondition` when a box is still shown after `max_n` presses in a row (a box that does not close). A closing box (menu 1001 is still the top menu, but its current message is gone) refuses the native press with "the message box has no current message (it is closing)". dismiss_messages matches only that text (`MSGBOX_CLOSING` in bot.py), waits `settle_s` and tries again. A retry is not a press. It fails with `postcondition` after more than `max_closing` retries in a row, and the count starts again after each press. Every other refusal still ends it (`rpc_error:...`). data: `{pressed, paths, waited_s, quiet_s, closing}`. `quiet_s=0` gives the old press-only-now behaviour. No proof calls it on its own. Pass `--dismiss-messages` to `proof_input.py` or `proof_glue.py` to clear the boxes before the checks (`--dismiss-quiet-s`, `--dismiss-max-s`). It adds a `dismiss_messages` row with `pressed` and `waited_s`.
 
+### bot.vats: queue and execute (static RE on the 1.4.0.525 exe, nothing run in game)
+Why the first job failed in the game (2026-10-21): the job entered VATS with the Vats control. Then it tapped Right to cycle and
+Activate to accept. VATS never reads those controls. It reads raw keys and the left mouse button only. Also, `bot.menu` said
+kind `vats` with id 1059. Id 1059 is the tutorial box (TutorialMenu). VATS is 1056. VATSMenu::Update does nothing while the
+tutorial box is open.
+
+The job now runs these steps, one tick per frame on the main thread. Each step has a gate. A failed gate stops the job with a reason.
+1. **enter**: the job taps Vats (16). It waits for camera mode != 0. After 3 s it fails with `vats_not_entered`.
+2. **tutorial**: while GetMenuByType(0x423) (0xA09030) is open, the job calls 0x7E8D60 (the tutorial close, cdecl, no arguments).
+   It tries again every 500 ms. After 3 s it fails with `tutorial_box_stays_open`.
+3. **zoom**: the job waits for camera mode 2 (the zoom 1 -> 3 -> 2 ends) and top menu 1056. After 5 s it fails with `vats_not_ready`.
+4. **target**: the job reads the selected target 0x11F21CC. While it is not the wanted reference, the job calls VATSMenu
+   HandleClick(3, nullptr) (next target, vtable slot +0x0C = 0x7EECB0). It clicks at most once per 300 ms and at most 12 times.
+   Then it fails with `target_not_selectable`. The job refuses an object at 0x11DB0D4 whose vtable is not 0x10700D4 (`vats_menu_wrong_type`).
+5. **queue**: the job checks that a body part is selected (VATSMenu+0x100), that its hit chance (+0x28) is above 0, and that AP left
+   (VATSMenu+0xE0) is above 0. The engine checks the exact AP cost itself. A failed check gives `attack_not_queued` with the hit
+   chance and AP in the reason. Then the job arms a one-shot accept. A detour on the attack-button test 0x7EEB50 reads it. While it
+   is armed, the call with slot 1 and held 0 (the left mouse press edge) answers true. All other calls go to the original.
+   VATSMenu::Update then queues the attack with all its own checks. The accept stays armed over frames, because the mouse pick
+   0x7F6AF0 can end a frame first. It disarms when the queue count (0x5AE380, ECX = 0x11F2250) rises. After 3 s the job disarms it
+   and fails with `attack_not_queued (hit chance, AP, queue, camera mode)`. Without the detour the job fails with `accept_hook_missing`.
+6. **execute**: the job calls 0x705780 (VATSCameraData::Accept) only when the queue count is 1 or more. An empty queue makes the
+   engine leave VATS, so the job fails with `queue_empty_at_execute` instead.
+7. **playback**: the job waits for camera mode 4. It is done when the mode is 0 again.
+
+The global limit is 25 s (`timeout (phase ...)`). `bot.status.vats.phase` is one of idle, enter, tutorial, zoom, target, queue,
+execute, playback, done, failed.
+Pins (bots_addrs.h, checked against the unpacked 1.4.0.525 exe by `pins_match_real_exe_if_available` with `BOTS_EXE`):
+hook VatsAttackButton 0x7EEB50 (6 stolen bytes, plain `ret`), calls GetMenuByType, TutorialClose, VatsMenuHandleClick (ret 8),
+VatsQueueCount, VatsExecute, data pins VATSMenu.vtbl[3] = 0x7EECB0 and VATSMenu.vtbl[13] = 0x720100 (GetID, returns 0x420).
+Not verified in the game: all of it. Static open points: that 0x11DB088 is the tutorial menu pointer that 0x7E8D60 tests; that the
+mouse pick 0x7F6AF0 does not end every frame while the cursor is over another body part; and that HandleClick does nothing in
+gamepad mode (PadMode) unless VATSMenu+0x10D is set, so the target cycle can fail with a pad connected.
+
 ### In-game runs (2026-10-21)
 First run.
 Setup: FalloutNV.exe 1.4.0.525 (Steam), all DLC, one minimized copy with the focus guard.
@@ -193,6 +227,7 @@ The fake's `always_run` (default True, the New Vegas default) models the always-
 The fake uses the same grammar as primitives.py, so it proves the Bot logic, not the real console.
 C++ twins for the native press (`plugin/bots/tests/test_bots.cpp`, runtime twins FNVCOOP_MUT=33..41): 33 native path never used, 34 vtable check skipped, 35 button index off by one, 36 native path tried before the UI layer, 37 null tile not refused, 38 top-menu gate skipped, 39 closing-box gate skipped, 40 native reply says path "ui", 41 main-thread gate skipped.
 C++ twins for always-run (`bot.move` run = speed): 42 Run held for run:true whatever the toggle is, 43 a toggle change during a move is not followed, 44 always-run state ignores gamepad mode, 45 always-run state reads player+0x652 (the auto-move byte), 46 an unknown always-run state is treated as on.
+C++ twins for `bot.vats` (the fake engine models the tutorial box, the zoom, the target list, the mouse pick that ends a frame, the AP cost and an undo): 49 the accept is never armed, 50 execute is called with an empty queue, 51 the tutorial box is never closed, 52 the target cycle is skipped, 53 the tutorial box is reported as `vats`, 54 the accept gate forces every slot and the held query, 55 the VATSMenu vtable check is skipped, 56 the hit-chance gate is skipped.
 `tools/bots/tests/test_proof.py` and `test_proof_cli.py`: the two proof scripts over the fake, and their command lines. A bad command line (an empty form value included) must make `main()` return 2 and name the argument before the bridge is opened, without `SystemExit`.
 A missing game, and a game lost in the middle of the run (`ConnectionLost` and `GameCrashed` from the fake), must give 2 without a traceback. `--other-info` in every accepted spelling must make the dialog check catch the fake mutant `dialog_lists_all`.
 A game lost during the `player.IsSneaking` read must also give 2: the sneak FAIL is for a failed read only, so proof_input lets `ConnectionLost` through to the run guard.

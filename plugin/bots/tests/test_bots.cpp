@@ -1,4 +1,6 @@
-// Game-free tests for the bot input driver (T6a). Built once (FNVCOOP_RUNTIME_MUT); run once for real and once per FNVCOOP_MUT=<n> (1..48); every twin MUST fail.
+// Game-free tests for the bot input driver (T6a). Built once (FNVCOOP_RUNTIME_MUT); run once for real and once per FNVCOOP_MUT=<n> (1..56); every twin MUST fail.
+// Twins 49..56 (bot.vats queue / execute, listed in bot_engine.h): 49 accept never armed, 50 execute with an empty queue, 51 tutorial not
+// closed, 52 target cycle skipped, 53 tutorial reported as vats, 54 gate forces every slot, 55 VATSMenu vtable check skipped, 56 hit-chance gate skipped.
 // BOTS_EXE=<reference FalloutNV.exe> additionally compares the pinned prologue with the real image (run_tests.cmd sets it when the file exists).
 #include <cmath>
 #include <cstdio>
@@ -300,6 +302,14 @@ TEST(menu_kinds_and_vats_priority) {
     r.g.topId = 0x3EC;
     r.g.set32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode, 1);
     CHECK(r.call("bot.menu") && r.out.find("\"kind\":\"vats\"") != std::string::npos);
+    r.g.topId = 0x420;
+    CHECK(r.call("bot.menu") && r.out.find("\"kind\":\"vats\"") != std::string::npos && r.out.find("\"id\":1056") != std::string::npos);
+    // 1059 = 0x423 is TutorialMenu, not VATS: a VATS camera mode never hides it (VATS input stops while it is open)
+    r.g.topId = 0x423;
+    CHECK(r.call("bot.menu") && r.out.find("\"kind\":\"tutorial\"") != std::string::npos && r.out.find("\"id\":1059") != std::string::npos);
+    r.g.set32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode, 0);
+    CHECK(r.call("bot.menu") && r.out.find("\"kind\":\"tutorial\"") != std::string::npos);
+    CHECK(std::string(menuKindOf(0x423)) == "tutorial" && std::string(menuKindOf(0x420)) == "vats");
     FakeGame bare;
     GlueRig r2;
     CHECK(!r2.call("bot.menu") && r2.out.find("not ready") != std::string::npos);   // manager pointer missing
@@ -405,39 +415,145 @@ TEST(inventory_empty_container) {
     CHECK(r.call("bot.inventory") && r.out.find("\"items\":[]") != std::string::npos);
 }
 
-static void vatsRun(GlueRig& r, int ticks, uint64_t stepMs = 100) {
-    for (int i = 0; i < ticks; ++i) {
-        r.e.now += stepMs;
+// One game frame per tick: the job ticks (BotRpc::tick), then the fake engine plays the frame with the Vats press edge the job made.
+// Returns the phases seen, in order, without repeats.
+static std::vector<std::string> vatsDrive(GlueRig& r, int maxTicks = 700) {
+    std::vector<std::string> seen;
+    for (int i = 0; i < maxTicks && r.rpc.vats().running(); ++i) {
+        r.e.now += 50;
         r.rpc.tick();
+        const std::string ph = VatsJob::name(r.rpc.vats().phase());
+        if (seen.empty() || seen.back() != ph) seen.push_back(ph);
+        r.g.vatsFrame(r.in.filter(kVats, kPressed, 0) != 0);
     }
+    return seen;
 }
+static bool hasPhase(const std::vector<std::string>& seen, const char* p) {
+    for (const std::string& s : seen)
+        if (s == p) return true;
+    return false;
+}
+static bool reasonHas(GlueRig& r, const char* s) { return r.rpc.vats().reason().find(s) != std::string::npos; }
 
-TEST(vats_job_enters_cycles_to_the_target_accepts_and_finishes) {
+TEST(vats_job_closes_the_tutorial_cycles_queues_and_executes) {
     GlueRig r;
-    r.g.buildMenus();
     r.g.forms["FalloutNV.esm:603"] = 0x60000003;
-    r.g.set32(nvbots::eng::kVatsMenuPtr, FakeGame::kVmenu);
-    r.g.set8(FakeGame::kVmenu + nvbots::eng::kVatsSelValid, 1);
-    r.g.set32(FakeGame::kVmenu + nvbots::eng::kVatsSelRef, 0x60000001);   // a different target is selected first
+    r.g.buildVats({0x60000001, 0x60000002, 0x60000003}, 55.0f, 60.0f, /*tutorial*/ true);
+    r.g.pickFrames = 2;   // the mouse pick ends Update twice: the accept must stay armed over frames
     CHECK(r.call("bot.vats", "{\"ref\":\"FalloutNV.esm:603\"}"));
     CHECK(!r.call("bot.vats", "{\"ref\":\"FalloutNV.esm:603\"}"));   // second start while running is refused
     r.call("bot.status");
     CHECK(r.out.find("\"phase\":\"enter\"") != std::string::npos);
-    int taps[32] = {};
-    int phaseSeen = 0;
-    bool entered = false;
-    for (int i = 0; i < 400 && r.rpc.vats().running(); ++i) {
-        r.e.now += 100;
+    int otherTaps = 0;
+    std::vector<std::string> seen;
+    for (int i = 0; i < 700 && r.rpc.vats().running(); ++i) {
+        r.e.now += 50;
         r.rpc.tick();
+        const std::string ph = VatsJob::name(r.rpc.vats().phase());
+        if (seen.empty() || seen.back() != ph) seen.push_back(ph);
         for (int c = 0; c < kCount; ++c)
-            if (r.in.filter(c, kPressed, 0)) ++taps[c];
-        if (taps[kVats] == 1 && !entered) { entered = true; r.g.set32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode, 1); }   // the game enters VATS
-        if (taps[kRight] == 2) r.g.set32(FakeGame::kVmenu + nvbots::eng::kVatsSelRef, 0x60000003);                              // second cycle lands on the target
-        if (taps[kActivate] == 1) { r.g.set32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode, 4); ++phaseSeen; }
-        if (phaseSeen && r.rpc.vats().phase() == VatsJob::kPlayback) { r.e.now += 2000; r.g.set32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode, 0); }
+            if (c != kVats && r.in.filter(c, kPressed, 0)) ++otherTaps;
+        r.g.vatsFrame(r.in.filter(kVats, kPressed, 0) != 0);
     }
     CHECK(r.rpc.vats().phase() == VatsJob::kDone);
-    CHECK(taps[kVats] == 1 && taps[kRight] == 2 && taps[kActivate] == 1);
+    if (r.rpc.vats().phase() != VatsJob::kDone) std::printf("  reason: %s\n", r.rpc.vats().reason().c_str());
+    CHECK(hasPhase(seen, "tutorial") && hasPhase(seen, "zoom") && hasPhase(seen, "target") && hasPhase(seen, "queue") && hasPhase(seen, "playback"));
+    CHECK(r.g.closeCalls >= 1 && !r.g.tutorialOpen);                              // the tutorial box was closed through 0x7E8D60
+    CHECK(r.g.clicks == 2 && r.rpc.vats().cycles() == 2);                         // two next-target clicks: 1 -> 2 -> 3
+    CHECK(r.g.queuedTargets.size() == 1 && r.g.queuedTargets[0] == 0x60000003);   // the engine queued exactly one attack, on the wanted target
+    CHECK(r.g.arms == 1 && !r.g.gate.armed() && r.g.gate.forced() >= 3);          // armed once, kept over the two picked frames, disarmed
+    CHECK(r.g.wrongForces == 0);
+    CHECK(r.g.execCalls == 1 && r.g.execEmpty == 0);
+    CHECK(otherTaps == 0);                                                        // no Right / Activate taps: VATS never reads them
+    bool armBeforeExec = false, execSeen = false;
+    for (const std::string& c : r.g.calls) {
+        if (c == "arm" && !execSeen) armBeforeExec = true;
+        if (c.rfind("vatsexec", 0) == 0) { execSeen = true; CHECK(c == "vatsexec 1"); }
+    }
+    CHECK(armBeforeExec && execSeen);
+    r.call("bot.status");
+    CHECK(r.out.find("\"phase\":\"done\"") != std::string::npos);
+}
+
+TEST(vats_job_without_tutorial_on_the_default_target) {
+    GlueRig r;
+    r.g.forms["T:1"] = 0x60000001;
+    r.g.buildVats({0x60000001, 0x60000002});
+    CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+    const std::vector<std::string> seen = vatsDrive(r);
+    CHECK(r.rpc.vats().phase() == VatsJob::kDone);
+    CHECK(r.g.closeCalls == 0 && r.g.clicks == 0 && r.g.execCalls == 1);
+    CHECK(r.g.queuedTargets.size() == 1 && r.g.queuedTargets[0] == 0x60000001);
+    CHECK(hasPhase(seen, "zoom") && hasPhase(seen, "playback"));
+}
+
+TEST(vats_job_closes_a_tutorial_box_that_opens_late) {
+    // In game 2026-10-21: the VATS tutorial box (1059) opened after the job had passed its tutorial step, VATSMenu::Update stopped and the
+    // job read a 0 hit chance. A box that opens in a later step must send the job back to the tutorial step.
+    GlueRig r;
+    r.g.forms["T:1"] = 0x60000001;
+    r.g.buildVats({0x60000001, 0x60000002});
+    CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+    bool opened = false;
+    std::vector<std::string> seen;
+    for (int i = 0; i < 700 && r.rpc.vats().running(); ++i) {
+        r.e.now += 50;
+        r.rpc.tick();
+        const std::string ph = VatsJob::name(r.rpc.vats().phase());
+        if (seen.empty() || seen.back() != ph) seen.push_back(ph);
+        if (!opened && (ph == "target" || ph == "queue")) {   // the box appears after the zoom
+            r.g.tutorialOpen = true;
+            r.g.topId = 0x423;
+            opened = true;
+        }
+        r.g.vatsFrame(r.in.filter(kVats, kPressed, 0) != 0);
+    }
+    CHECK(opened);
+    CHECK(r.rpc.vats().phase() == VatsJob::kDone);
+    if (r.rpc.vats().phase() != VatsJob::kDone) std::printf("  reason: %s\n", r.rpc.vats().reason().c_str());
+    CHECK(r.g.closeCalls >= 1 && !r.g.tutorialOpen);
+    CHECK(r.g.queuedTargets.size() == 1 && r.g.execCalls == 1);
+}
+
+TEST(vats_job_refuses_zero_hit_chance_and_zero_ap) {
+    {   // hit chance 0: refused before the accept is armed
+        GlueRig r;
+        r.g.forms["T:1"] = 0x60000001;
+        r.g.buildVats({0x60000001}, 0.0f, 60.0f);
+        CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+        vatsDrive(r);
+        CHECK(r.rpc.vats().phase() == VatsJob::kFailed && reasonHas(r, "attack_not_queued") && reasonHas(r, "hit chance 0.0"));
+        CHECK(r.g.arms == 0 && r.g.execCalls == 0);
+    }
+    {   // no AP left
+        GlueRig r;
+        r.g.forms["T:1"] = 0x60000001;
+        r.g.buildVats({0x60000001}, 55.0f, 0.0f);
+        CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+        vatsDrive(r);
+        CHECK(r.rpc.vats().phase() == VatsJob::kFailed && reasonHas(r, "no AP left"));
+        CHECK(r.g.arms == 0 && r.g.execCalls == 0);
+    }
+    {   // AP left but less than the cost: the engine queues nothing; the job times out, says why, and disarms
+        GlueRig r;
+        r.g.forms["T:1"] = 0x60000001;
+        r.g.buildVats({0x60000001}, 40.0f, 10.0f);
+        CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+        vatsDrive(r);
+        CHECK(r.rpc.vats().phase() == VatsJob::kFailed && reasonHas(r, "attack_not_queued (hit chance 40.0, AP 10.0"));
+        CHECK(r.g.arms == 1 && !r.g.gate.armed() && r.g.execCalls == 0);
+    }
+}
+
+TEST(vats_job_never_executes_an_empty_queue) {
+    GlueRig r;
+    r.g.forms["T:1"] = 0x60000001;
+    r.g.buildVats({0x60000001});
+    r.g.undoAfterQueue = true;   // the queued attack is gone before the execute step
+    CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+    vatsDrive(r);
+    CHECK(r.rpc.vats().phase() == VatsJob::kFailed && reasonHas(r, "queue_empty_at_execute"));
+    CHECK(r.g.execCalls == 0 && r.g.execEmpty == 0);
 }
 
 TEST(vats_job_fails_clearly) {
@@ -446,24 +562,47 @@ TEST(vats_job_fails_clearly) {
         r.g.buildMenus();
         r.g.forms["T:1"] = 0x60000001;
         CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
-        vatsRun(r, 80);
+        vatsDrive(r);
         CHECK(r.rpc.vats().phase() == VatsJob::kFailed && r.rpc.vats().reason().find("vats_not_entered") == 0);
     }
     {   // target never becomes selectable
         GlueRig r;
-        r.g.buildMenus();
         r.g.forms["T:1"] = 0x60000001;
-        r.g.set32(nvbots::eng::kVatsMenuPtr, FakeGame::kVmenu);
-        r.g.set8(FakeGame::kVmenu + nvbots::eng::kVatsSelValid, 1);
-        r.g.set32(FakeGame::kVmenu + nvbots::eng::kVatsSelRef, 0x60000009);
+        r.g.buildVats({0x60000008, 0x60000009});
         CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
-        for (int i = 0; i < 300 && r.rpc.vats().running(); ++i) {
-            r.e.now += 100;
-            r.rpc.tick();
-            if (i == 5) r.g.set32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode, 1);
-        }
+        vatsDrive(r);
         CHECK(r.rpc.vats().phase() == VatsJob::kFailed);
         CHECK(r.rpc.vats().reason().find("target_not_selectable") == 0);
+        CHECK(r.g.clicks == VatsJob::kMaxCycles && r.g.arms == 0 && r.g.execCalls == 0);
+    }
+    {   // the tutorial box does not close
+        GlueRig r;
+        r.g.forms["T:1"] = 0x60000001;
+        r.g.buildVats({0x60000001}, 55.0f, 60.0f, true);
+        r.g.tutorialCloses = false;
+        CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+        vatsDrive(r);
+        CHECK(r.rpc.vats().phase() == VatsJob::kFailed && r.rpc.vats().reason().find("tutorial_box_stays_open") == 0);
+        CHECK(r.g.closeCalls >= 1 && r.g.arms == 0 && r.g.execCalls == 0);
+    }
+    {   // the VATS menu pointer holds another object: no click, no arm
+        GlueRig r;
+        r.g.forms["T:1"] = 0x60000001;
+        r.g.buildVats({0x60000002, 0x60000001}, 55.0f, 60.0f, false, 0x107566C);
+        CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+        vatsDrive(r);
+        CHECK(r.rpc.vats().phase() == VatsJob::kFailed && r.rpc.vats().reason().find("vats_menu_wrong_type") == 0);
+        CHECK(r.g.clicks == 0 && r.g.arms == 0 && r.g.execCalls == 0);
+    }
+    {   // the attack-button detour is not installed
+        GlueRig r;
+        r.g.forms["T:1"] = 0x60000001;
+        r.g.buildVats({0x60000001});
+        r.g.acceptHook = false;
+        CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+        vatsDrive(r);
+        CHECK(r.rpc.vats().phase() == VatsJob::kFailed && r.rpc.vats().reason().find("accept_hook_missing") == 0);
+        CHECK(r.g.execCalls == 0);
     }
     {   // limb choice is explicitly unsupported, an unloaded target and an already-active VATS are refused
         GlueRig r;
@@ -475,6 +614,44 @@ TEST(vats_job_fails_clearly) {
         CHECK(!r.call("bot.vats", "{\"ref\":\"T:1\"}") && r.out.find("already active") != std::string::npos);
         CHECK(r.call("test.vats.hit", "{\"ref\":\"T:1\"}") == false);   // same entry point, same refusal
     }
+}
+
+TEST(vats_accept_gate_forces_only_the_slot_1_press_edge) {
+    VatsAcceptGate g;
+    CHECK(!g.force(1, 0, 0));   // not armed: the original answers
+    g.arm(2);
+    CHECK(!g.force(2, 0, 2) && !g.force(3, 0, 2));   // special-attack slots R / F are never forced
+    CHECK(!g.force(1, 1, 2));                        // nor the held query
+    CHECK(g.force(1, 0, 2) && g.force(1, 0, 2));     // the press edge of slot 1, on every frame until the queue grows
+    CHECK(g.forced() == 2 && g.armed());
+    CHECK(!g.force(1, 0, 3) && !g.armed());          // the queue grew: the gate disarms itself
+    CHECK(!g.force(1, 0, 3));
+    g.arm(0);
+    g.disarm();
+    CHECK(!g.force(1, 0, 0));
+}
+
+TEST(vats_pins_agree) {
+    CHECK(addr::VatsMenuSlotHandleClick.addr == addr::VatsMenuVtbl + addr::kMenuSlotHandleClick);
+    CHECK(addr::VatsMenuSlotHandleClick.value == addr::VatsMenuHandleClick.addr);
+    CHECK(addr::VatsMenuVtbl == 0x10700D4 && addr::VatsMenuHandleClick.addr == 0x7EECB0 && addr::VatsMenuHandleClick.ret == 8);
+    CHECK(addr::VatsMenuSlotGetId.addr == 0x1070108 && addr::VatsMenuSlotGetId.value == 0x720100);
+    CHECK(addr::VatsAttackButton.target == 0x7EEB50 && addr::VatsAttackButton.retBytes == 0 && nvhooks::specIsValid(addr::VatsAttackButton));
+    CHECK(addr::GetMenuByType.addr == 0xA09030 && addr::TutorialClose.addr == 0x7E8D60 && addr::VatsQueueCount.addr == 0x5AE380 &&
+          addr::VatsExecute.addr == 0x705780);
+    // the job's constants are the RE addresses
+    CHECK(eng::kVatsSelTarget == 0x11F21CC && eng::kVatsMenuPtr == 0x11DB0D4 && eng::kVatsMenuPart == 0x100 && eng::kPartHitChance == 0x28 &&
+          eng::kVatsMenuAp == 0xE0 && eng::kMenuIdVats == 0x420 && eng::kMenuIdTutorial == 0x423);
+    int listed = 0;
+    for (const addr::CallPin* c : addr::kAllCalls)
+        listed += c == &addr::GetMenuByType || c == &addr::TutorialClose || c == &addr::VatsMenuHandleClick || c == &addr::VatsQueueCount || c == &addr::VatsExecute;
+    CHECK(listed == 5);
+    int data = 0;
+    for (const addr::DataPin* d : addr::kAllData) data += d == &addr::VatsMenuSlotHandleClick || d == &addr::VatsMenuSlotGetId;
+    CHECK(data == 2);
+    bool hooked = false;
+    for (const nvhooks::HookSpec* h : addr::kAllHooks) hooked = hooked || h == &addr::VatsAttackButton;
+    CHECK(hooked);
 }
 
 TEST(consent_and_press_answer_the_right_button) {
@@ -912,11 +1089,15 @@ TEST(pins_match_real_exe_if_available) {
             if (h->target >= va && h->target < va + (vs > rs ? vs : rs)) {
                 found = true;
                 CHECK(std::memcmp(&d[rp + (h->target - va)], h->expected, h->expectedLen) == 0);
-                // the function must also end in `ret 8` (C2 08 00) somewhere after its prologue: confirms retBytes
-                bool ret8 = false;
-                for (size_t k = 0; k < 0x1D0; ++k)
-                    if (d[rp + (h->target - va) + k] == 0xC2 && d[rp + (h->target - va) + k + 1] == 0x08 && d[rp + (h->target - va) + k + 2] == 0x00) { ret8 = true; break; }
-                CHECK(ret8);
+                // the function must also end in its `ret` (C2 08 00 for retBytes 8, C3 after `mov esp,ebp; pop ebp` for 0) somewhere after
+                // its prologue: confirms retBytes
+                bool retOk = false;
+                const size_t f = rp + (h->target - va);
+                for (size_t k = 0; k < 0x1D0; ++k) {
+                    if (h->retBytes == 8 && d[f + k] == 0xC2 && d[f + k + 1] == 0x08 && d[f + k + 2] == 0x00) { retOk = true; break; }
+                    if (h->retBytes == 0 && d[f + k] == 0x8B && d[f + k + 1] == 0xE5 && d[f + k + 2] == 0x5D && d[f + k + 3] == 0xC3) { retOk = true; break; }
+                }
+                CHECK(retOk);
             }
         }
         CHECK(found);
@@ -988,8 +1169,14 @@ int main() {
     run("dialogue_pick_refuses_when_not_ready_gated_missing_or_special", dialogue_pick_refuses_when_not_ready_gated_missing_or_special);
     run("inventory_reports_totals_not_deltas", inventory_reports_totals_not_deltas);
     run("inventory_empty_container", inventory_empty_container);
-    run("vats_job_enters_cycles_to_the_target_accepts_and_finishes", vats_job_enters_cycles_to_the_target_accepts_and_finishes);
+    run("vats_job_closes_the_tutorial_cycles_queues_and_executes", vats_job_closes_the_tutorial_cycles_queues_and_executes);
+    run("vats_job_without_tutorial_on_the_default_target", vats_job_without_tutorial_on_the_default_target);
+    run("vats_job_closes_a_tutorial_box_that_opens_late", vats_job_closes_a_tutorial_box_that_opens_late);
+    run("vats_job_refuses_zero_hit_chance_and_zero_ap", vats_job_refuses_zero_hit_chance_and_zero_ap);
+    run("vats_job_never_executes_an_empty_queue", vats_job_never_executes_an_empty_queue);
     run("vats_job_fails_clearly", vats_job_fails_clearly);
+    run("vats_accept_gate_forces_only_the_slot_1_press_edge", vats_accept_gate_forces_only_the_slot_1_press_edge);
+    run("vats_pins_agree", vats_pins_agree);
     run("consent_and_press_answer_the_right_button", consent_and_press_answer_the_right_button);
     run("native_message_box_is_pressed_when_the_ui_layer_has_none", native_message_box_is_pressed_when_the_ui_layer_has_none);
     run("native_message_press_refuses_with_a_reason", native_message_press_refuses_with_a_reason);

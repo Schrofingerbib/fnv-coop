@@ -1,6 +1,6 @@
 // Engine addresses for the bot input driver (T6a), checked statically against the reference FalloutNV.exe 1.4.0.525
 // (<reference exe>) by tools/bots/re/verify_pins.py and by tests/test_bots.cpp (BOTS_EXE=<exe>).
-// No other engine function is patched by plugin/bots.
+// plugin/bots patches two engine functions only: GetControlState and the VATS attack-button test (kAllHooks).
 #pragma once
 #include "hook_patch.h"
 
@@ -15,7 +15,15 @@ inline constexpr nvhooks::HookSpec GetControlState = {
 inline constexpr unsigned OSInputGlobalsPtr = 0x11F35CCU;   // *(OSInputGlobals**), from xNVSE GameOSDepend.cpp
 inline constexpr unsigned GamepadModeFlag = 0x11F35C8U;     // byte tested at the top of GetControlState (non-zero: read pad bindings)
 
-inline constexpr const nvhooks::HookSpec* kAllHooks[] = {&GetControlState};
+// The VATS "attack button" test 0x7EEB50(slot, held, vatsMouseBinding): cdecl, returns bool in AL, plain `ret`. Only VATSMenu::Update
+// (0x7EC810) calls it (call sites 0x7ED601, 0x7ED632, 0x7ED660, 0x7ED69C). Slot 1 with held 0 is the left-mouse press edge that queues
+// an attack. bot.vats detours it to answer "pressed" while a bot accept is armed (VatsAcceptGate in bot_engine.h).
+// Prologue: push ebp; mov ebp,esp; sub esp,20h; call 0x4B7210; call 0x4B71D0 ...  We steal the first 6 bytes (3 whole instructions).
+inline constexpr nvhooks::HookSpec VatsAttackButton = {
+    "BotVatsAttackButton", 0x7EEB50U,
+    {0x55, 0x8b, 0xec, 0x83, 0xec, 0x20, 0xe8, 0xb5, 0x86, 0xcc, 0xff, 0xe8, 0x70, 0x86, 0xcc, 0xff}, 16, 6, 0};
+
+inline constexpr const nvhooks::HookSpec* kAllHooks[] = {&GetControlState, &VatsAttackButton};
 
 // ---- engine functions called by plugin/bots (T6a). Prologues pinned from the exe; docs/re/dialogmenu-menus-vats-inventory.md.
 struct CallPin { const char* name; unsigned addr; unsigned char bytes[16]; int ret; };
@@ -68,11 +76,31 @@ inline constexpr unsigned kMenuSlotHandleClick = 0x0CU;   // Menu vtable slot 3 
 // 0 when the tile is not in the list); InterfaceManager+0xE4 (msgBoxButton) = value; run the message callback; 0x7AA530 closes the box
 // (or shows the next queued message). The engine's own Enter / hotkey paths (0x7AA110) do the same: list index -> tile -> HandleClick(7, tile).
 inline constexpr CallPin MsgMenuHandleClick = {"MsgMenuHandleClick", 0x7AA070U, {0x55, 0x8b, 0xec, 0x51, 0x53, 0x89, 0x4d, 0xfc, 0x83, 0x7d, 0x0c, 0x00, 0x75, 0x19, 0x83, 0x7d}, 8};
-inline constexpr const CallPin* kAllCalls[] = {&PlayerCanTravel, &PendingTravelSet, &TravelObjCtor, &HeapAlloc, &TermClick, &GetContainerData, &ItemTotal, &TopMenuId, &LbSelect, &LbSelected, &ItemInfo, &InfoFlag80, &InfoSpecialB, &InfoSpecialC, &DlgItemClick, &LbAfter, &DlgSpeak, &Tick, &MsgMenuHandleClick};
+// ---- bot.vats (static RE on the 1.4.0.525 exe; nothing here has run in the game yet) ----
+// GetMenuByType(id): cdecl(int) -> the TileMenu* of an open menu, 0 when that menu is not open (reads g_tileMenuArray[id - 0x3E9]), plain ret.
+// VATSMenu::Update returns at once while GetMenuByType(0x423) (TutorialMenu) is not 0.
+inline constexpr CallPin GetMenuByType = {"GetMenuByType", 0xA09030U, {0x55, 0x8b, 0xec, 0x51, 0x81, 0x7d, 0x08, 0xe9, 0x03, 0x00, 0x00, 0x7c, 0x31, 0x81, 0x7d, 0x08}, 0};
+// Close the tutorial box: cdecl, no arguments, plain ret. TutorialMenu::HandleClick(3) calls it; it does nothing when 0x11DB088 is 0.
+inline constexpr CallPin TutorialClose = {"TutorialClose", 0x7E8D60U, {0x55, 0x8b, 0xec, 0x83, 0x3d, 0x88, 0xb0, 0x1d, 0x01, 0x00, 0x74, 0x3f, 0x6a, 0x01, 0x68, 0x72}, 0};
+// VATSMenu::HandleClick(tileId, Tile*): thiscall, ret 8 (C2 08 00 at 0x7EF6C7). Tile 3 = next target: writes the target global 0x11F21CC and
+// VATSMenu+0x100. Does nothing while a gamepad is in use (PadMode 0x4B71D0) unless VATSMenu+0x10D is set.
+inline constexpr CallPin VatsMenuHandleClick = {"VatsMenuHandleClick", 0x7EECB0U, {0x55, 0x8b, 0xec, 0x6a, 0xff, 0x68, 0x18, 0xf7, 0xf0, 0x00, 0x64, 0xa1, 0x00, 0x00, 0x00, 0x00}, 8};
+// Count of the nodes with data in a tList: fastcall(ECX = list head), plain ret. The engine calls it with ECX = 0x11F2250 (VATSCameraData,
+// the queued-action list head is embedded at +0) at 0x7EBF36 (mov ecx,11F2250h; call).
+inline constexpr CallPin VatsQueueCount = {"VatsQueueCount", 0x5AE380U, {0x55, 0x8b, 0xec, 0x83, 0xec, 0x0c, 0x89, 0x4d, 0xf4, 0xc7, 0x45, 0xf8, 0x00, 0x00, 0x00, 0x00}, 0};
+// VATSCameraData::Accept (xNVSE EndVATScam): no arguments, plain ret. Calls 0x7EBD50: a non-empty queue starts playback (camera mode 4),
+// an EMPTY queue leaves VATS (mode 0). bot.vats calls it only when the queue count is >= 1.
+inline constexpr CallPin VatsExecute = {"VatsExecute", 0x705780U, {0x55, 0x8b, 0xec, 0x83, 0xec, 0x0c, 0xe8, 0x85, 0x1a, 0xdb, 0xff, 0x85, 0xc0, 0x74, 0x65, 0xe8}, 0};
+inline constexpr unsigned VatsMenuVtbl = 0x10700D4U;   // VATSMenu vftable (RTTI COL 0x1118558); slot 13 (+0x34) GetID 0x720100 returns 0x420
+inline constexpr unsigned kMenuSlotGetId = 0x34U;
+inline constexpr const CallPin* kAllCalls[] = {&PlayerCanTravel, &PendingTravelSet, &TravelObjCtor, &HeapAlloc, &TermClick, &GetContainerData, &ItemTotal, &TopMenuId, &LbSelect, &LbSelected, &ItemInfo, &InfoFlag80, &InfoSpecialB, &InfoSpecialC, &DlgItemClick, &LbAfter, &DlgSpeak, &Tick, &MsgMenuHandleClick,
+                                               &GetMenuByType, &TutorialClose, &VatsMenuHandleClick, &VatsQueueCount, &VatsExecute};
 // ---- data pins: a dword in the exe image that must hold `value` (vtable slots in .rdata). Checked at init with the call pins.
 struct DataPin { const char* name; unsigned addr; unsigned value; };
 inline constexpr DataPin MsgMenuSlotHandleClick = {"MessageMenu.vtbl[3]", MessageMenuVtbl + kMenuSlotHandleClick, 0x7AA070U};
-inline constexpr const DataPin* kAllData[] = {&MsgMenuSlotHandleClick};
+inline constexpr DataPin VatsMenuSlotHandleClick = {"VATSMenu.vtbl[3]", VatsMenuVtbl + kMenuSlotHandleClick, 0x7EECB0U};
+inline constexpr DataPin VatsMenuSlotGetId = {"VATSMenu.vtbl[13]", VatsMenuVtbl + kMenuSlotGetId, 0x720100U};
+inline constexpr const DataPin* kAllData[] = {&MsgMenuSlotHandleClick, &VatsMenuSlotHandleClick, &VatsMenuSlotGetId};
 
 // ---- always-run state, read (never written) by bot.move so that `run` picks the speed, not the key. Static RE on the 1.4.0.525
 // exe. Code pins: 16 bytes of the engine code that uses each address. Nothing is called or patched here.

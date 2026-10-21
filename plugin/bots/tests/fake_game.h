@@ -1,5 +1,6 @@
 // Synthetic game memory + call recorder implementing nvbots::IEngine for the game-free tests.
 #pragma once
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -143,6 +144,106 @@ struct FakeGame : nvbots::IEngine {
     bool msgMenuHandleClick(Addr32 menu, int id, Addr32 tile) override {
         calls.push_back("msgclick " + hex(menu) + " " + std::to_string(id) + " " + hex(tile));
         return clickOk;
+    }
+
+    // ---- bot.vats: the engine side. vatsFrame() plays one game frame: the camera (enter, zoom 1 -> 3 -> 2, playback 4 -> 0) and
+    // VATSMenu::Update (returns at once while TutorialMenu is open; asks the attack-button test, which the live detour answers from the gate).
+    static constexpr Addr32 kVatsPart = 0x35100000, kTutorialTile = 0x35200000;
+    nvbots::VatsAcceptGate gate;     // what the live detour holds
+    bool acceptHook = true;          // the attack-button detour is installed
+    bool tutorialOpen = false, tutorialCloses = true;
+    int pickFrames = 0;              // frames in which the mouse pick 0x7F6AF0 ends Update before the queue path
+    int zoomFrames = 3;              // frames of mode 1, then frames of mode 3, then mode 2
+    int playbackFrames = 4;
+    bool undoAfterQueue = false;     // the engine removes the queued attack on the next frame (an undo)
+    float apCost = 20.0f;
+    std::vector<Addr32> targets;     // the VATS target list in HandleClick(3) order; targets[0] is selected on entry
+    size_t targetIdx = 0;
+    int queue = 0, zoomLeft = 0, playLeft = 0;
+    bool undoPending = false;
+    std::vector<Addr32> queuedTargets;
+    int execCalls = 0, execEmpty = 0, closeCalls = 0, clicks = 0, arms = 0, wrongForces = 0;
+
+    void setf(Addr32 a, float f) { uint32_t v = 0; std::memcpy(&v, &f, 4); set32(a, v); }
+    float getf(Addr32 a) { uint32_t v = get32(a); float f = 0; std::memcpy(&f, &v, 4); return f; }
+    uint32_t vatsMode() { return get32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode); }
+    // Literal addresses from the RE (not the eng:: constants), so a wrong constant cannot pass its own test.
+    void buildVats(const std::vector<Addr32>& tg, float hit = 55.0f, float ap = 60.0f, bool tutorial = false, uint32_t vtbl = 0x10700D4) {
+        buildMenus();
+        targets = tg;
+        targetIdx = 0;
+        set32(0x11DB0D4, kVmenu);
+        set32(kVmenu, vtbl);
+        set32(kVmenu + 0x100, kVatsPart);
+        setf(kVatsPart + 0x28, hit);
+        setf(kVmenu + 0xE0, ap);
+        set32(0x11F21CC, 0);
+        tutorialOpen = tutorial;
+    }
+    void vatsFrame(bool vatsPressed) {
+        uint32_t mode = vatsMode();
+        if (mode == 0) {
+            if (vatsPressed && !targets.empty()) {
+                mode = 1;
+                zoomLeft = 2 * zoomFrames;
+                topId = tutorialOpen ? 0x423 : 0x420;
+                targetIdx = 0;
+                set32(0x11F21CC, targets[0]);
+            }
+        } else if (mode == 1 || mode == 3) {
+            mode = zoomLeft > zoomFrames ? 1 : zoomLeft > 0 ? 3 : 2;
+            if (zoomLeft > 0) --zoomLeft;
+        } else if (mode == 4) {
+            if (playLeft-- <= 0) { mode = 0; queue = 0; topId = 0; }
+        }
+        set32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode, mode);
+        if (mode == 2 && !tutorialOpen) vatsUpdate();
+    }
+    void vatsUpdate() {
+        if (undoPending) { undoPending = false; if (queue > 0) --queue; }
+        if (topId != 0x420) return;
+        const bool p1 = gate.force(1, 0, queue);   // Update asks slot 1 first, then 2 and 3
+        if (!p1 && (gate.force(2, 0, queue) || gate.force(3, 0, queue))) ++wrongForces;
+        if (!p1) return;
+        if (pickFrames > 0) { --pickFrames; return; }
+        const float hit = getf(kVatsPart + 0x28), ap = getf(kVmenu + 0xE0);
+        if (!(hit > 0.0f) || ap < apCost) return;   // the engine plays "UIVATSInsufficientAP" and queues nothing
+        ++queue;
+        setf(kVmenu + 0xE0, ap - apCost);
+        queuedTargets.push_back(get32(0x11F21CC));
+        if (undoAfterQueue) undoPending = true;
+    }
+    Addr32 menuByType(uint32_t id) override {
+        if (id == 0x423) return tutorialOpen ? kTutorialTile : 0;
+        if (id == 0x420) return vatsMode() ? kVmenu : 0;
+        return 0;
+    }
+    bool closeTutorial() override {
+        ++closeCalls;
+        calls.push_back("closetutorial");
+        if (tutorialCloses && tutorialOpen) { tutorialOpen = false; if (vatsMode()) topId = 0x420; }
+        return true;
+    }
+    bool vatsMenuClick(Addr32 menu, int id) override {
+        ++clicks;
+        calls.push_back("vatsclick " + hex(menu) + " " + std::to_string(id));
+        if (!clickOk) return false;
+        if (id == 3 && !targets.empty()) { targetIdx = (targetIdx + 1) % targets.size(); set32(0x11F21CC, targets[targetIdx]); }
+        return true;
+    }
+    int vatsQueueCount() override { return queue; }
+    bool vatsExecute() override {
+        ++execCalls;
+        calls.push_back("vatsexec " + std::to_string(queue));
+        if (queue == 0) { ++execEmpty; set32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode, 0); topId = 0; }
+        else { set32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode, 4); playLeft = playbackFrames; }
+        return true;
+    }
+    bool vatsArmAccept(bool on) override {
+        if (!acceptHook) return false;
+        calls.push_back(on ? "arm" : "disarm");
+        if (on) { ++arms; gate.arm(queue); } else { gate.disarm(); }
+        return true;
     }
 
     // ---- inventory: entries {type, delta}

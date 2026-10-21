@@ -6,6 +6,7 @@
 #pragma once
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -14,7 +15,7 @@
 #include "common/minijson.h"
 
 #include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
-// Runtime twins for this file (13..45), every one must make tests/test_bots.cpp fail:
+// Runtime twins for this file (13..56), every one must make tests/test_bots.cpp fail:
 //  13 dialogue pick ignores the ready state    14 pick matches the wrong list index        15 pick skips the special-topic refusal
 //  16 menu id map has 0x3F1/0x3F0 swapped      17 VATS wins nothing over the menu id       18 inventory counts deltas, not totals
 //  19 vats job never gives up on a bad target  20 pick leaves the click gate untouched     21 consent buttons swapped
@@ -29,6 +30,11 @@
 //  44 always-run state ignores gamepad mode  45 always-run state reads player+0x652 (the auto-move byte)
 // Drop log base match (48):
 //  48 the base form matches as case-sensitive text (the engine's "falloutnv.esm:015169" never equals "FalloutNV.esm:015169")
+// bot.vats queue and execute (49..56):
+//  49 the accept detour is never armed      50 execute is called with an empty queue     51 the tutorial box is never closed
+//  52 the target cycle is skipped           53 the tutorial box (0x423) is reported as "vats"
+//  57 a tutorial box that opens after the tutorial step is ignored
+//  54 the accept gate forces every slot and the held query     55 the VATSMenu vtable check is skipped    56 the hit-chance gate is skipped
 
 namespace nvbots {
 
@@ -40,7 +46,14 @@ constexpr Addr32 kDialogMenuPtr = 0x11D9510, kInfoSpoken = 0x11D9518, kClockObj 
 constexpr uint32_t kDlgState = 0x28, kDlgListBox = 0x70, kDlgPartner = 0x80, kDlgClickGate = 0x10C, kDlgPending = 0x104;
 constexpr uint32_t kItemInfo = 0x18, kItemFlag = 0x25, kFormId = 0x0C;
 constexpr Addr32 kInterfaceMgrPtr = 0x11D8A80, kVatsCamera = 0x11F2250, kVatsMenuPtr = 0x11DB0D4;
-constexpr uint32_t kVatsMode = 8, kVatsSelValid = 0x118, kVatsSelRef = 0x128;
+constexpr uint32_t kVatsMode = 8;
+// bot.vats (static RE of 1.4.0.525, see the VatsJob comment). Camera modes: 0 off, 1 target overview, 3 zoom, 2 limb select, 4 playback.
+constexpr Addr32 kVatsSelTarget = 0x11F21CC;      // Actor* of the selected VATS target (HandleClick 2/3 writes it), 0 = none
+constexpr uint32_t kVatsMenuPart = 0x100;         // VATSMenu+0x100: selected body-part entry of the current target
+constexpr uint32_t kPartHitChance = 0x28;         // body-part entry +0x28: hit chance (float, percent)
+constexpr uint32_t kVatsMenuAp = 0xE0;            // VATSMenu+0xE0: action points left (float)
+constexpr uint32_t kMenuIdVats = 0x420, kMenuIdTutorial = 0x423;
+constexpr int kVatsClickNextTarget = 3;           // VATSMenu::HandleClick tile 3 = next target
 constexpr int kDlgReady = 2;
 constexpr Addr32 kTerminalMenuPtr = 0x11D9334;   // *(TerminalMenu**), set while the terminal menu (id 0x421) is open
 constexpr uint32_t kTermList = 0x68, kTermTerminal = 0xA8, kTermRef = 0xAC;
@@ -93,6 +106,13 @@ struct IEngine {
     // native message box
     virtual bool onMainThread() = 0;                                 // the calling thread is the game main thread
     virtual bool msgMenuHandleClick(Addr32 menu, int id, Addr32 tile) = 0;   // MessageMenu vtable slot 3 (0x7AA070); false = refused or faulted
+    // bot.vats (all main thread; false / 0 / -1 = refused or faulted)
+    virtual Addr32 menuByType(uint32_t id) = 0;                      // 0xA09030: TileMenu* of an open menu, 0 when it is not open
+    virtual bool closeTutorial() = 0;                                // 0x7E8D60 (cdecl, no arguments)
+    virtual bool vatsMenuClick(Addr32 menu, int id) = 0;             // VATSMenu vtable slot 3 (0x7EECB0): HandleClick(id, nullptr)
+    virtual int vatsQueueCount() = 0;                                // 0x5AE380 (ECX = 0x11F2250): queued VATS actions
+    virtual bool vatsExecute() = 0;                                  // 0x705780: start playback of the queue
+    virtual bool vatsArmAccept(bool on) = 0;                         // arm / disarm the attack-button detour (VatsAcceptGate); false = no detour
     // references
     virtual bool resolveRef(const std::string& ref, Addr32* out) = 0;    // "" = the player
     virtual bool resolveForm(const std::string& form, Addr32* out) = 0;
@@ -114,6 +134,7 @@ inline const char* menuKindOf(uint32_t id) {
         case 0x41F: return "hacking";
         case 0x420: return "vats";
         case 0x421: return "terminal";
+        case 0x423: return FNV_MUT(53) ? "vats" : "tutorial";   // TutorialMenu (1059): VATS input stops while it is open
         default: return id ? "other" : "none";
     }
 }
@@ -128,7 +149,8 @@ inline bool menuInfo(IEngine& e, Value* out, std::string* err) {
     if (FNV_MUT(17)) {
         (void)mode;
     } else {
-        if (mode != 0) kind = "vats";
+        // a VATS camera mode makes the kind "vats", but never hides a tutorial box (it blocks every VATS input)
+        if (mode != 0 && (id != eng::kMenuIdTutorial || FNV_MUT(53))) kind = "vats";
     }
     *out = Value::object();
     out->set("kind", kind).set("id", (int64_t)id).set("vatsMode", (int64_t)mode);
@@ -552,84 +574,237 @@ private:
     int64_t seq_ = 0;
 };
 
-// ---- bot.vats / test.vats.hit : a tick-driven job that drives VATS through the input driver ----
-// Control sequence (UNVERIFIED in game): tap Vats -> wait mode != 0 -> cycle targets with Right until the selected ref is the wanted
-// one -> tap Activate (accept) -> wait for playback (mode 4) -> done when mode returns to 0. Limb choice is not implemented.
+// ---- bot.vats: the arm-and-confirm gate of the attack-button detour (0x7EEB50) ----
+// The live module detours 0x7EEB50(slot, held, binding). While the gate is armed, the press-edge query of slot 1 (slot 1, held 0) answers
+// true. VATSMenu::Update then runs its own queue path with all its own checks (target, hit chance, AP cost, sounds, queue text). Every other
+// query goes to the original. The gate disarms itself when the queue count rises above the count at arm time. The mouse pick 0x7F6AF0 can
+// end a frame before the queue path, so the gate stays armed over frames until the count rises or the job disarms it.
+class VatsAcceptGate {
+public:
+    void arm(int queueCount) { armed_ = true; base_ = queueCount; forced_ = 0; }
+    void disarm() { armed_ = false; }
+    bool armed() const { return armed_; }
+    int forced() const { return forced_; }
+    // The detour asks this first. True = answer "pressed" and do not call the original.
+    bool force(int slot, int held, int queueCount) {
+        if (!armed_) return false;
+        if (queueCount > base_) { armed_ = false; return false; }
+        if (!FNV_MUT(54)) {   // twin 54: the gate also forces the other slots and the held query
+            if (slot != 1 || held != 0) return false;
+        }
+        ++forced_;
+        return true;
+    }
+
+private:
+    bool armed_ = false;
+    int base_ = 0, forced_ = 0;
+};
+
+// ---- bot.vats / test.vats.hit : a tick-driven job (main thread, one tick per frame) ----
+// Static RE of 1.4.0.525; nothing here has run in the game yet. VATS never reads the Activate or Right controls (it reads raw keys and the
+// left mouse button), so the job uses the input driver only to enter VATS. The other steps use the engine's own functions:
+//   enter     tap Vats (16), wait for camera mode != 0
+//   tutorial  while GetMenuByType(0x423) (TutorialMenu) is open, close it with 0x7E8D60 (VATSMenu::Update does nothing while it is open)
+//   zoom      wait for camera mode 2 (the 1 -> 3 -> 2 zoom ends) and top menu 0x420
+//   target    while the target global 0x11F21CC is not the wanted ref, VATSMenu::HandleClick(3, nullptr) (next target), up to 12 times
+//   queue     gate: a body part is selected, its hit chance is > 0 and AP left is > 0 (the engine checks the exact cost). Then arm the
+//             attack-button detour. Done when the queue count (0x5AE380) rises.
+//   execute   0x705780, only when the queue count is >= 1 (with an empty queue it leaves VATS)
+//   playback  camera mode 4 seen, done when the mode is 0 again
+// Every failed step stops the job with a reason. Limb choice is not implemented.
 class VatsJob {
 public:
-    enum Phase { kIdle, kEnter, kTarget, kAccept, kPlayback, kDone, kFailed };
+    enum Phase { kIdle, kEnter, kTutorial, kZoom, kTarget, kQueue, kExecute, kPlayback, kDone, kFailed };
+    static constexpr uint64_t kSettleMs = 1500;   // kQueue: how long a 0 hit chance / missing body part may last before it is a failure
+    static constexpr int kMaxCycles = 12;
     bool start(IEngine& e, const std::string& ref, const std::string& limb, uint64_t now, std::string* err) {
         if (!FNV_MUT(22)) {
             if (!limb.empty()) { *err = "unsupported: limb selection in VATS is not implemented"; return false; }
         } else {
             (void)limb;
         }
-        if (phase_ == kEnter || phase_ == kTarget || phase_ == kAccept || phase_ == kPlayback) { *err = "a VATS job is already running"; return false; }
+        if (running()) { *err = "a VATS job is already running"; return false; }
         if (!e.resolveRef(ref, &want_) || !want_) { *err = "target not loaded"; return false; }
         uint32_t mode = 0;
         e.rd32(eng::kVatsCamera + eng::kVatsMode, &mode);
         if (mode != 0) { *err = "VATS is already active"; return false; }
-        phase_ = kEnter; reason_.clear(); t0_ = tPhase_ = now; cycles_ = 0; sawPlayback_ = false; tapped_ = false;
+        phase_ = kEnter; reason_.clear(); t0_ = tPhase_ = tClick_ = tClose_ = now; cycles_ = 0; closeCalls_ = 0;
+        sawPlayback_ = false; tapped_ = false; armed_ = false; queueBase_ = 0; hit_ = ap_ = 0.0f;
         return true;
     }
     // Called every frame while running. `tap(ctrl)` presses a control through the input driver.
     template <class Tap>
     void tick(IEngine& e, uint64_t now, Tap tap) {
-        if (phase_ == kIdle || phase_ == kDone || phase_ == kFailed) return;
+        if (!running()) return;
         uint32_t mode = 0;
         e.rd32(eng::kVatsCamera + eng::kVatsMode, &mode);
-        auto fail = [&](const char* why) { phase_ = kFailed; reason_ = why; };
-        if (now - t0_ > 25000) return fail("timeout");
+        char b[200];
+        if (now - t0_ > 25000) {
+            std::snprintf(b, sizeof b, "timeout (phase %s)", name(phase_));
+            return fail(e, b);
+        }
+        if (phase_ != kEnter && phase_ != kExecute && phase_ != kPlayback && mode == 0) return fail(e, "vats_closed (camera mode 0 before the attack was queued)");
+        // In game 2026-10-21 the VATS tutorial box (1059) opened AFTER the job had passed the tutorial step, and the hit chance then read 0
+        // (VATSMenu::Update does nothing while it is open). So a tutorial box sends the job back to the tutorial step from any later step.
+        if ((phase_ == kZoom || phase_ == kTarget || phase_ == kQueue) && !FNV_MUT(57) && e.menuByType(eng::kMenuIdTutorial)) {
+            if (armed_) disarm(e);
+            armed_ = false;
+            return to(kTutorial, now);
+        }
         switch (phase_) {
             case kEnter:
                 if (!tapped_) { tap(16); tapped_ = true; tPhase_ = now; }
-                else if (mode != 0) { phase_ = kTarget; tPhase_ = now; }
-                else if (now - tPhase_ > 3000) fail("vats_not_entered (no weapon, no target in view, or no AP)");
+                else if (mode != 0) to(kTutorial, now);
+                else if (now - tPhase_ > 3000) fail(e, "vats_not_entered (no weapon, no target in view, or no AP)");
                 break;
-            case kTarget: {
-                if (mode == 4) { phase_ = kPlayback; break; }
-                if (now - tPhase_ < 500) break;
-                if (selected(e) == want_) { tap(5); phase_ = kAccept; tPhase_ = now; break; }
-                if (cycles_ >= 12 && !FNV_MUT(19)   // twin 19: the job never gives up on a bad target
-                    ) return fail("target_not_selectable (cycled all targets)");
-                tap(3); ++cycles_; tPhase_ = now;
+            case kTutorial:
+                if (!e.menuByType(eng::kMenuIdTutorial)) { to(kZoom, now); break; }
+                if (!FNV_MUT(51)) {   // twin 51: the tutorial box is never closed
+                    if (!closeCalls_ || now - tClose_ >= 500) { e.closeTutorial(); ++closeCalls_; tClose_ = now; }
+                }
+                if (now - tPhase_ > 3000) fail(e, "tutorial_box_stays_open (VATS input is blocked while TutorialMenu 1059 is open)");
+                break;
+            case kZoom: {
+                if (e.menuByType(eng::kMenuIdTutorial)) { to(kTutorial, now); break; }
+                const uint32_t top = topMenu(e);
+                if (mode == 2 && top == eng::kMenuIdVats) { to(kTarget, now); break; }
+                if (now - tPhase_ > 5000) {
+                    std::snprintf(b, sizeof b, "vats_not_ready (camera mode %u, top menu %u; need mode 2 and menu 1056)", mode, top);
+                    fail(e, b);
+                }
                 break;
             }
-            case kAccept:
-                if (mode == 4) { phase_ = kPlayback; sawPlayback_ = true; tPhase_ = now; }
-                else if (now - tPhase_ > 3000) fail("accept_had_no_effect");
+            case kTarget: {
+                if (mode == 4) return fail(e, "vats_playback_started_before_the_attack_was_queued");
+                Addr32 menu = 0;
+                if (!vatsMenu(e, &menu)) return;
+                uint32_t sel = 0;
+                e.rd32(eng::kVatsSelTarget, &sel);
+                if (sel == want_ || FNV_MUT(52)) { to(kQueue, now); break; }   // twin 52: the target cycle is skipped
+                if (mode != 2) break;                                         // a zoom to the new target: wait
+                if (cycles_ && now - tClick_ < 300) break;                    // one click per 300 ms, so the menu can update
+                if (cycles_ >= kMaxCycles && !FNV_MUT(19)) {                  // twin 19: the job never gives up on a bad target
+                    std::snprintf(b, sizeof b, "target_not_selectable (cycled %d times, selected %08X, want %08X)", cycles_, sel, want_);
+                    return fail(e, b);
+                }
+                if (!e.vatsMenuClick(menu, eng::kVatsClickNextTarget)) return fail(e, "vats_click_refused (VATSMenu HandleClick pins or vtable did not match)");
+                ++cycles_;
+                tClick_ = now;
                 break;
+            }
+            case kQueue: {
+                if (!armed_) {
+                    if (mode != 2) {
+                        if (mode == 4 || now - tPhase_ > 3000) {
+                            std::snprintf(b, sizeof b, "attack_not_queued (camera mode %u, need 2)", mode);
+                            fail(e, b);
+                        }
+                        break;
+                    }
+                    Addr32 menu = 0;
+                    if (!vatsMenu(e, &menu)) return;
+                    uint32_t part = 0;
+                    e.rd32(menu + eng::kVatsMenuPart, &part);
+                    // the menu fills the body part and its hit chance on its next updates (after a zoom or a closed tutorial box): wait a little
+                    if (!part) { if (now - tPhase_ < kSettleMs) break; return fail(e, "attack_not_queued (no body part is selected)"); }
+                    hit_ = rdf(e, part + eng::kPartHitChance);
+                    ap_ = rdf(e, menu + eng::kVatsMenuAp);
+                    if (!(hit_ > 0.0f) && now - tPhase_ < kSettleMs) break;
+                    if (!(hit_ > 0.0f) && !FNV_MUT(56)) {   // twin 56: the hit-chance gate is skipped
+                        std::snprintf(b, sizeof b, "attack_not_queued (hit chance %.1f, AP %.1f: the engine refuses a 0 hit chance)", hit_, ap_);
+                        return fail(e, b);
+                    }
+                    if (!(ap_ > 0.0f)) {
+                        std::snprintf(b, sizeof b, "attack_not_queued (no AP left: hit chance %.1f, AP %.1f)", hit_, ap_);
+                        return fail(e, b);
+                    }
+                    queueBase_ = e.vatsQueueCount();
+                    if (queueBase_ < 0) return fail(e, "attack_not_queued (the VATS queue count cannot be read)");
+                    if (!FNV_MUT(49)) {   // twin 49: the accept detour is never armed
+                        if (!e.vatsArmAccept(true)) return fail(e, "accept_hook_missing (the VATS attack-button detour is not installed)");
+                    }
+                    armed_ = true;
+                    tPhase_ = now;
+                    break;
+                }
+                const int n = e.vatsQueueCount();
+                if (n > queueBase_) { disarm(e); to(kExecute, now); break; }
+                if (mode == 4 || now - tPhase_ > 3000) {
+                    std::snprintf(b, sizeof b, "attack_not_queued (hit chance %.1f, AP %.1f, queue %d, camera mode %u)", hit_, ap_, n, mode);
+                    fail(e, b);
+                }
+                break;
+            }
+            case kExecute: {
+                const int n = e.vatsQueueCount();
+                if (n < 1 && !FNV_MUT(50)) {   // twin 50: execute is called with an empty queue (that leaves VATS)
+                    std::snprintf(b, sizeof b, "queue_empty_at_execute (queue %d: the queued attack was removed)", n);
+                    return fail(e, b);
+                }
+                if (!e.vatsExecute()) return fail(e, "vats_execute_refused (pins did not match or not on the main thread)");
+                to(kPlayback, now);
+                break;
+            }
             case kPlayback:
                 if (mode == 4) sawPlayback_ = true;
-                if (mode == 0) { if (sawPlayback_) phase_ = kDone; else fail("left_vats_without_playback"); }
+                if (mode == 0) { if (sawPlayback_) phase_ = kDone; else fail(e, "left_vats_without_playback"); }
                 break;
             default: break;
         }
     }
     Phase phase() const { return phase_; }
     const std::string& reason() const { return reason_; }
-    bool running() const { return phase_ == kEnter || phase_ == kTarget || phase_ == kAccept || phase_ == kPlayback; }
+    bool running() const { return phase_ != kIdle && phase_ != kDone && phase_ != kFailed; }
+    int cycles() const { return cycles_; }
     static const char* name(Phase p) {
-        static const char* const n[] = {"idle", "enter", "target", "accept", "playback", "done", "failed"};
+        static const char* const n[] = {"idle", "enter", "tutorial", "zoom", "target", "queue", "execute", "playback", "done", "failed"};
         return n[p];
     }
 
 private:
-    Addr32 selected(IEngine& e) {
-        uint32_t menu = 0, ref = 0;
-        uint8_t ok = 0;
-        if (!e.rd32(eng::kVatsMenuPtr, &menu) || !menu) return 0;
-        e.rd8(menu + eng::kVatsSelValid, &ok);
-        if (!ok) return 0;
-        e.rd32(menu + eng::kVatsSelRef, &ref);
-        return ref;
+    void to(Phase p, uint64_t now) { phase_ = p; tPhase_ = now; }
+    void disarm(IEngine& e) {
+        if (armed_) e.vatsArmAccept(false);
+        armed_ = false;
+    }
+    void fail(IEngine& e, const std::string& why) {
+        disarm(e);
+        phase_ = kFailed;
+        reason_ = why;
+    }
+    uint32_t topMenu(IEngine& e) {
+        uint32_t mgr = 0;
+        return e.rd32(eng::kInterfaceMgrPtr, &mgr) && mgr ? e.topMenuId(mgr) : 0;
+    }
+    static float rdf(IEngine& e, Addr32 a) {
+        uint32_t v = 0;
+        float f = 0.0f;
+        if (!e.rd32(a, &v)) return 0.0f;
+        std::memcpy(&f, &v, sizeof f);
+        return f;
+    }
+    // The VATSMenu object (*0x11DB0D4). Refuses any object whose vtable is not VATSMenu's: HandleClick and the offsets are only known for it.
+    bool vatsMenu(IEngine& e, Addr32* menu) {
+        uint32_t m = 0, vt = 0;
+        if (!e.rd32(eng::kVatsMenuPtr, &m) || !m) { fail(e, "vats_menu_missing (VATSMenu pointer 0x11DB0D4 is null)"); return false; }
+        e.rd32(m, &vt);
+        if (vt != addr::VatsMenuVtbl && !FNV_MUT(55)) {   // twin 55: the VATSMenu vtable check is skipped
+            char b[120];
+            std::snprintf(b, sizeof b, "vats_menu_wrong_type (vtable %08X, want %08X): refused", vt, addr::VatsMenuVtbl);
+            fail(e, b);
+            return false;
+        }
+        *menu = m;
+        return true;
     }
     Phase phase_ = kIdle;
     Addr32 want_ = 0;
     std::string reason_;
-    uint64_t t0_ = 0, tPhase_ = 0;
-    int cycles_ = 0;
-    bool sawPlayback_ = false, tapped_ = false;
+    uint64_t t0_ = 0, tPhase_ = 0, tClick_ = 0, tClose_ = 0;
+    int cycles_ = 0, closeCalls_ = 0, queueBase_ = 0;
+    float hit_ = 0.0f, ap_ = 0.0f;
+    bool sawPlayback_ = false, tapped_ = false, armed_ = false;
 };
 
 }  // namespace nvbots
