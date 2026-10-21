@@ -83,7 +83,11 @@ class DefaultPrefs(unittest.TestCase):
                 found = lowcost.verify()
             except instances.PrefsUnavailable as e:
                 raise AssertionError(f"verify() raised for a read-only report: {e}")
-        self.assertTrue(found["absent"], found)  # the prefs keys are reported as absent instead
+        # every FalloutPrefs.ini key of the profile is reported absent (an absent Fallout.ini key must not satisfy this)
+        prefs_keys = [f"{r.file}:{r.section}:{r.key}" for r in lowcost.PROFILE if r.file == lowcost.PR]
+        self.assertTrue(prefs_keys, "the profile has FalloutPrefs.ini keys")
+        missing = [k for k in prefs_keys if k not in found["absent"]]
+        self.assertEqual(missing, [], found)
 
     def test_verify_report_without_owner_prefs(self):
         self.check_verify_report_without_owner_prefs()

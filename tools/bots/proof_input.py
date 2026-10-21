@@ -8,8 +8,6 @@ Needs nvcoop.ini [dev] bots=1 on the instance. Writes out/T6a/proof_input.json. 
 --door are Plugin.esm:HEX or a bare hex runtime id (an empty value is refused).
 Exit codes: 0 every check passed, 1 a check failed, 2 the proof could not run: a bad command line (refused before the
 bridge is opened), no game on the instance, or the game lost during the run (crash or pipe loss).
-
-Needs nvcoop.ini [dev] bots=1 on the instance. Writes out/T6a/proof_input.json and exits non-zero on any FAIL.
 --dismiss-messages (opt-in, off by default): first clear stray message boxes with Bot.dismiss_messages (button 0 while bot.menu says
 "message"), e.g. the DLC notices a fresh save shows after load. They come in waves (6, then 2, then 2 about 16 s later), so it presses
 until no box has been shown for --dismiss-quiet-s seconds (default 20), at most --dismiss-max-s (default 120). It adds a

@@ -74,8 +74,8 @@ struct DataPin { const char* name; unsigned addr; unsigned value; };
 inline constexpr DataPin MsgMenuSlotHandleClick = {"MessageMenu.vtbl[3]", MessageMenuVtbl + kMenuSlotHandleClick, 0x7AA070U};
 inline constexpr const DataPin* kAllData[] = {&MsgMenuSlotHandleClick};
 
-// ---- always-run state, read (never written) by bot.move so that `run` picks the speed, not the key. Static RE on the Steamless-unpacked
-// 1.4.0.525 image. Code pins: 16 bytes of the engine code that uses each address. Nothing is called or patched here.
+// ---- always-run state, read (never written) by bot.move so that `run` picks the speed, not the key. Static RE on the 1.4.0.525
+// exe. Code pins: 16 bytes of the engine code that uses each address. Nothing is called or patched here.
 // PlayerCharacter::vf2F8 (0x93E860, the player-controls update, this = PlayerCharacter in [ebp-0x18], OSInputGlobals in [ebp-0x1C]):
 //   0x940C7D  GetControlState(10 AlwaysRun, 1 pressed) != 0  ->  0x940C8D  player+0x651 = !player+0x651  (the always-run toggle byte)
 //   0x941A2B  if (!PadMode() 0x4B71D0 && player+0x651) { Run (9) not pressed and not held -> flags |= 0x200 run }
