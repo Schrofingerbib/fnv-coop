@@ -88,10 +88,15 @@ class Thing:
     topics_text: List[str] = field(default_factory=list)   # terminal entry names
     base_id: int = 0                # base form id (0 = same as id); used by dev.countRefs
     topics: List[int] = field(default_factory=list)
+    life: int = 0                   # ref.info lifeState of a living actor: 0 alive, 3 unconscious, 5 restrained, 6 essential unconscious
 
     @property
     def dead(self) -> bool:
         return self.kind == "actor" and self.health <= 0
+
+    @property
+    def life_state(self) -> int:
+        return 2 if self.dead else self.life
 
     @property
     def type_id(self) -> int:
@@ -242,7 +247,7 @@ class FakeBridge:
                 return {"x": p.pos[0], "y": p.pos[1], "z": p.pos[2], "lifeState": 0, "flags": 0, "type": 0x3B, "cell": p.cell}
             if t is None:
                 raise RpcError(-32000, "reference not loaded", method)
-            return {"x": t.pos[0], "y": t.pos[1], "z": t.pos[2], "lifeState": 2 if t.dead else 0,
+            return {"x": t.pos[0], "y": t.pos[1], "z": t.pos[2], "lifeState": t.life_state,
                     "flags": P.FLAG_DISABLED if t.disabled else 0, "type": t.type_id, "cell": t.cell}
         if method == P.M_ACTIVATE:
             t = self._by_ref(params["ref"])

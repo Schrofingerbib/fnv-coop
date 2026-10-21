@@ -50,6 +50,11 @@ TYPE_CONTAINER = 0x1B
 TYPE_DOOR = 0x1C
 FLAG_DISABLED = 0x800          # UNVERIFIED TESForm flag bit for "initially disabled / disabled"
 
+# Actor life state (ref.info lifeState, Actor+0x108): 0 alive, 1 dying, 2 dead, 3 unconscious, 5 restrained, 6 essential unconscious.
+# Actor::IsDead (0x8844F0, called with false) counts 1, 2 and 6 as dead. 3 and 5 are alive: in game (2026-10-21) Doc Mitchell
+# read 5 after SetRestrained 1.
+LIFE_DEAD = frozenset({1, 2, 6})
+
 # GetOpenState return values, UNVERIFIED
 OPEN_STATES = {1: "open", 2: "opening", 3: "closed", 4: "closing"}
 

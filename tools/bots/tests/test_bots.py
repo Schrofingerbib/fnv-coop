@@ -34,6 +34,36 @@ def ref(i):
     return f"FalloutNV.esm:{i:X}"
 
 
+class ZeroOnlyAliveBot(Bot):
+    """Twin: the old alive rule (only life state 0 is alive)."""
+
+    def alive(self, ref=None):
+        return int(self._info(ref)["lifeState"]) == 0
+
+
+class NoEssentialAliveBot(Bot):
+    """Twin: an alive rule that forgets life state 6 (essential unconscious, dead for Actor::IsDead(false))."""
+
+    def alive(self, ref=None):
+        return int(self._info(ref)["lifeState"]) not in (1, 2)
+
+
+def _alive_rule_errors(bot_cls):
+    """-> the life states for which bot_cls.alive disagrees with the engine (0, 3, 5 alive; 1, 2, 6 dead)."""
+    nv, _ = make()
+    b = bot_cls(nv, "alive")
+    t = nv.world.things[RAIDER]
+    errors = []
+    for life, alive in ((0, True), (3, True), (5, True), (1, False), (6, False)):
+        t.life = life
+        if b.alive(ref(RAIDER)) != alive:
+            errors.append(life)
+    t.life, t.health = 0, 0
+    if b.alive(ref(RAIDER)):
+        errors.append(2)
+    return errors
+
+
 class Movement(unittest.TestCase):
     def test_walk_to_coords_and_ref(self):
         nv, b = make()
@@ -94,6 +124,27 @@ class Combat(unittest.TestCase):
         self.assertFalse(b.alive(ref(RAIDER)))
         r = b.fire(ref(RAIDER))
         self.assertEqual(r.reason, "dead")
+
+    def test_alive_follows_the_engine_dead_rule(self):
+        """Actor::IsDead (0x8844F0): life states 1, 2 and 6 are dead. A restrained (5, seen in game after SetRestrained 1)
+        or unconscious (3) actor is alive, and Bot.fire must shoot it, not refuse it as 'dead'."""
+        self.assertEqual(_alive_rule_errors(Bot), [])
+        nv, b = make()
+        t = nv.world.things[RAIDER]
+        t.life = 5
+        r = b.fire(ref(RAIDER), expect_hit=True)
+        self.assertTrue(r.ok, r)
+        self.assertEqual(t.health, 75.0)
+        t.health = 0
+        self.assertFalse(b.alive(ref(RAIDER)))          # dead wins over restrained (ref.info reads 2)
+        self.assertEqual(b.fire(ref(RAIDER)).reason, "dead")
+
+    def test_alive_twins_are_caught(self):
+        self.assertIn(5, _alive_rule_errors(ZeroOnlyAliveBot))       # the old rule: refused the restrained Doc Mitchell in game
+        self.assertEqual(_alive_rule_errors(NoEssentialAliveBot), [6])
+        nv, b = make()
+        nv.world.things[RAIDER].life = 5
+        self.assertEqual(ZeroOnlyAliveBot(nv, "old").fire(ref(RAIDER), expect_hit=True).reason, "dead")
 
     def test_fire_without_bridge_method_cannot_verify(self):
         nv, b = make(bot_methods=False)

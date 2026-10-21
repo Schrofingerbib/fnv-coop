@@ -199,7 +199,8 @@ class Bot:
         return int(self._info(ref)["cell"])
 
     def alive(self, ref: Optional[Ref] = None) -> bool:
-        return int(self._info(ref)["lifeState"]) == 0
+        """Not dead by the engine's own rule (P.LIFE_DEAD): a restrained or unconscious actor is alive."""
+        return int(self._info(ref)["lifeState"]) not in P.LIFE_DEAD
 
     def health(self, ref: Optional[Ref] = None) -> float:
         return float(self.nv.call(P.M_QUERY, {"ref": self._norm(ref)[0], "fn": "GetActorValue", "p1": P.HEALTH_AV})["value"])
