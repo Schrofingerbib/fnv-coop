@@ -218,7 +218,8 @@ class Bot:
         return int(self._info(ref)["cell"])
 
     def alive(self, ref: Optional[Ref] = None) -> bool:
-        return int(self._info(ref)["lifeState"]) == 0
+        """Not dead by the engine's own rule (P.LIFE_DEAD): a restrained or unconscious actor is alive."""
+        return int(self._info(ref)["lifeState"]) not in P.LIFE_DEAD
 
     def health(self, ref: Optional[Ref] = None) -> float:
         """world.query first. In game (2026-10-21) world.query GetActorValue fails for every ref (Track A's own detour on

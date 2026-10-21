@@ -1,9 +1,9 @@
 # T6a-actions: bot action layer (tools/bots/)
 
 Status: Python API, fake bridge, in-process input driver (C++), engine-glue bridge methods, tests and mutation twins done and green (`python -I tools/bots/run_tests.py` prints ALL OK; wired into tools/test_all.py).
-In-game status: one real run so far (2026-10-21). It verified the native message box press and six `proof_input.py` checks: see "First in-game run" below.
-That run also showed the always-run inversion that "Always-run" below fixes. The fix has not run in the game yet.
-Every other console line and engine call is still UNVERIFIED in the game. C++ tests: `plugin\bots\run_tests.cmd` (46 mutants).
+In-game status: two real runs (2026-10-21), see "In-game runs" below. The second run passed `proof_input.py` (PROOF OK):
+hook, forward, back, strafes, turn, stop, jump and sneak. `fire` and `activate` did not run (no `--target` and `--door` given).
+Every other console line and engine call is still UNVERIFIED in the game. C++ tests: `plugin\bots\run_tests.cmd` (47 mutants).
 
 No OS keyboard or mouse input anywhere. Everything goes through nvbridge (`exec`, `ref.info`, `activate.ref`, `world.query`, `ui.dialogopen`, `ui.closedialog`, `state`, `plugins`).
 
@@ -127,7 +127,11 @@ Its `--table` output is the source of the ~170 call sites of `GetControlState` g
 - **Driver.** `run` is now the speed. `alwaysRunState()` (bot_engine.h) reads the byte and the gamepad gate. `bot.move` holds Run only when run != always-run, and the tick re-checks it while the move lasts (a toggle press during a move is followed). The move reply and bot.status give `alwaysRun` (true/false, null when unknown) and the move reply gives `runControl` (Run held or not). Unknown (the player is not loaded, or a pin does not match): Run is held for run:true, the old key meaning.
 - **Pins** (`kRunPins` in bots_addrs.h, code bytes, nothing is called or patched): AlwaysRunEdge 0x940C7D, AlwaysRunFlip 0x940C8D, RunPadGate 0x941A2B, RunAlwaysRead 0x941A3E, PadModeConnected 0x4B71D0, PadModeSetting 0x4B71E0. Init compares them with the running exe. The tests compare them with the reference exe (BOTS_EXE). A game-free test checks that the pinned bytes hold the addresses the reader uses.
 - **Sneak read.** The console has `IsSneaking`. `player.GetSneaking` gave "Unknown variable 'GetSneaking'". proof_input reads `player.IsSneaking` and a failed read is now a FAIL.
-- UNVERIFIED in game: the new run semantics (the lead runs proof_input). Gamepad mode was read statically only.
+- **Verified in game** (second run, 2026-10-21): with always-run on, `run:true` held no Run key (`runControl:false`) and the player ran:
+  forward +610, back -482, strafes +600 / -590 units in 2 s. Only unit-tested: gamepad mode (no pad connected), the unknown-state
+  fallback and a toggle change during a move.
+- **`run` omitted** (review finding on PR #10): `bot.move` without `run` holds no Run key, so the game's toggle picks the speed, as
+  before `run` meant the speed. Test `move_without_run_leaves_the_speed_to_the_game`; twin 47 (an omitted run counts as run:false).
 
 ### Native message box press (static RE on the 1.4.0.525 exe, the press ran in game on 2026-10-21)
 Problem seen in game: with all DLC installed, the engine shows its own message boxes (MessageMenu, menu id 1001) about 5 s after a fresh save loads.
@@ -160,18 +164,26 @@ Limits: only MessageMenu 1001, and only when it is the top menu. Button order is
 In-game status: the press path ran in the game on 2026-10-21 (see "First in-game run" below). The refusal paths (wrong vtable, bad button, closing box, not on the main thread) did not occur in that run. Only the unit tests check them.
 Python: `Bot.dismiss_messages(quiet_s=20, max_s=120, max_n=8, button=0, settle_s=0.3, poll_s=0.5, max_closing=10)` presses `button` while `bot.menu` reports kind `message`, and polls every `poll_s` otherwise. It is done when no box has been shown for `quiet_s` seconds. The boxes come in waves: in the first in-game run (all DLC, a fresh save) 6 boxes came at once, then 2, then 2 more about 16 s later. A press-only-now loop returned after the first wave and the later waves stopped movement in the middle of the proof. It fails with `timeout` when `max_s` passes first and with `postcondition` when a box is still shown after `max_n` presses in a row (a box that does not close). A closing box (menu 1001 is still the top menu, but its current message is gone) refuses the native press with "the message box has no current message (it is closing)". dismiss_messages matches only that text (`MSGBOX_CLOSING` in bot.py), waits `settle_s` and tries again. A retry is not a press. It fails with `postcondition` after more than `max_closing` retries in a row, and the count starts again after each press. Every other refusal still ends it (`rpc_error:...`). data: `{pressed, paths, waited_s, quiet_s, closing}`. `quiet_s=0` gives the old press-only-now behaviour. No proof calls it on its own. Pass `--dismiss-messages` to `proof_input.py` or `proof_glue.py` to clear the boxes before the checks (`--dismiss-quiet-s`, `--dismiss-max-s`). It adds a `dismiss_messages` row with `pressed` and `waited_s`.
 
-### First in-game run (2026-10-21)
+### In-game runs (2026-10-21)
+First run.
 Setup: FalloutNV.exe 1.4.0.525 (Steam), all DLC, one minimized copy with the focus guard.
 What the run verified:
 - After a fresh save loaded, 10 native MessageMenu (1001) boxes appeared in waves of 6, 2 and 2. `bot.menu.press {button:0}` answered `path` `native` for each box.
 - After the presses, `bot.menu` reported kind `none` and the game time advanced.
 - Then `proof_input.py` passed `hook`, `strafe_right`, `strafe_left`, `turn`, `stop` and `jump`.
 
-What the run did not verify:
-- `forward` and `back` walked, because of the always-run inversion. "Always-run" above has the fix (`run` is the speed). The fix has not run in the game yet.
-- `sneak`: `player.GetSneaking` gave "Unknown variable". proof_input now reads `player.IsSneaking` (see "Sneak read" in "Always-run" above).
+What the first run did not verify: `forward` and `back` walked (the always-run inversion), and `sneak` failed (`player.GetSneaking`
+gave "Unknown variable").
+
+Second run, with this branch: `proof_input.py --dismiss-messages` printed PROOF OK (exit 0): forward +610, back -482, strafe_right
++600, strafe_left -590, turn, stop, jump, sneak 0 -> 1 -> 0. The sneak check needed the landing wait (`SETTLE_AFTER_JUMP_S`): within
+about 2 s of a jump the engine applies only one crouch toggle. The forward check also needs open ground: right outside Doc
+Mitchell's door an obstacle cut a forward burst to 180 units.
+
+Still not verified in the game:
 - The refusal paths of the native press (wrong vtable, bad button, closing box, not on the main thread) are only unit-tested (`plugin/bots/tests/test_bots.cpp` and its twins).
-- Every other check of `proof_input.py` and `proof_glue.py` is still unverified in the game.
+- `fire` and `activate` (no `--target` / `--door` given), and every check of `proof_glue.py`. These need ref-targeted console lines,
+  which the bridge `exec` cannot run yet (a `<hex>.Command` line fails in the game).
 
 Known limits: terminal state only knows the bot's own picks; VATS limb choice; Reload control id; full inventory enumeration of base-container-only items.
 
@@ -186,6 +198,7 @@ A missing game, and a game lost in the middle of the run (`ConnectionLost` and `
 A game lost during the `player.IsSneaking` read must also give 2: the sneak FAIL is for a failed read only, so proof_input lets `ConnectionLost` through to the run guard.
 `--info FalloutNV.esm:1800 --other-info FalloutNV.esm:800` must pass on a fake whose NPC offers 1800. A `form_key` table and the load-order refusals (exit 2 before the first check) check the runtime id rule.
 Twins: in-process copies of the scripts with each check removed or with the old code put back (text and suffix matching, the number-only same-INFO check, empty values let through, `ap.error` exits, an unguarded run, low 24 bits compared without the plugin, a sneak check that also catches a lost game).
+proof_input activate: the proof walks back to `--door-dist` units (default 100) from the door first, and a cell change (a load door) also passes. The fake's `activate_reach` (the game's reach is about 150) and `Thing.load_to` (a load door) model the game. Twins: `--door-dist 0` (the door must already be in reach) fails after the movement checks, and the state-only rule fails a load door. An RPC error in the fire or activate check gives a FAIL row. Its twin (no guard) stops the run with the error.
 
 ## For T6b
 FakeBridge.pair() gives two bridges on one World (host and client views are not synchronised by the fake; a playbook that needs sync behaviour must simulate it on top). Agreed API was sent by message; any requested change goes to T6a-actions.
