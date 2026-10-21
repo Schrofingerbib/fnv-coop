@@ -27,6 +27,8 @@
 // Native message box press (33..41; 33, 36 and 40 are in bot_rpc.h):
 //  34 MessageMenu vtable check skipped    35 button index off by one    37 null button tile not refused    38 top-menu gate skipped
 //  39 closing-box gate skipped (no current message)    41 main-thread gate skipped
+// Always-run state for bot.move (42..46; 42, 43 and 46 are in bot_rpc.h):
+//  44 always-run state ignores gamepad mode  45 always-run state reads player+0x652 (the auto-move byte)
 
 namespace nvbots {
 
@@ -42,6 +44,10 @@ constexpr uint32_t kVatsMode = 8, kVatsSelValid = 0x118, kVatsSelRef = 0x128;
 constexpr int kDlgReady = 2;
 constexpr Addr32 kTerminalMenuPtr = 0x11D9334;   // *(TerminalMenu**), set while the terminal menu (id 0x421) is open
 constexpr uint32_t kTermList = 0x68, kTermTerminal = 0xA8, kTermRef = 0xAC;
+// Always-run (the code that uses each one is pinned in bots_addrs.h kRunPins):
+constexpr uint32_t kPlayerAlwaysRun = 0x651;      // PlayerCharacter byte, flipped on the AlwaysRun (10) press edge
+constexpr Addr32 kPadConnected = 0x11D8A84;       // byte: an XInput pad answered this frame
+constexpr Addr32 kDisable360Value = 0x11D8C50;    // value byte of Setting bDisable360Controller:Interface (object 0x11D8C4C, +4)
 // Native MessageMenu (id 0x3E9). The object comes from xNVSE InterfaceManager::GetMenuByType(0x3E9): g_TileMenuArray (NiTArray<TileMenu*>
 // 0x11F3508, data pointer at +4) [id - 0x3E9], then TileMenu::menu (+0x3C). The engine also keeps it in its MessageMenu singleton 0x11DA4F0.
 constexpr Addr32 kTileMenuArrayData = 0x11F350C;
@@ -138,6 +144,28 @@ inline bool menuInfo(IEngine& e, Value* out, std::string* err) {
         out->set("dialogState", (int64_t)st).set("dialogReady", st == (uint32_t)eng::kDlgReady);
     }
     return true;
+}
+
+// ---- always-run state for bot.move ----
+// What the player-controls update (PlayerCharacter::vf2F8, run decision at 0x941A2B) does with the Run control (9):
+//   keyboard mode, always-run on:  Run up = run speed, Run down = walk     (so holding Run for "run" made the player walk)
+//   keyboard mode, always-run off: Run down = run speed, Run up = walk
+//   gamepad mode (a pad answers and bDisable360Controller is 0): the toggle is ignored, Run down = run speed
+// Returns 1 when the engine treats always-run as on, 0 when off (or ignored), -1 when the bytes cannot be read.
+inline int alwaysRunState(IEngine& e) {
+    Addr32 player = 0;
+    uint8_t on = 0, pad = 0, padOff = 0;
+    if (!e.resolveRef("", &player) || !player) return -1;
+#if NVBOTS_MUTANT == 45
+    if (!e.rd8(player + eng::kPlayerAlwaysRun + 1, &on)) return -1;
+#else
+    if (!e.rd8(player + eng::kPlayerAlwaysRun, &on)) return -1;
+#endif
+    if (!e.rd8(eng::kPadConnected, &pad) || !e.rd8(eng::kDisable360Value, &padOff)) return -1;
+#if NVBOTS_MUTANT != 44
+    if (pad && !padOff) return 0;
+#endif
+    return on ? 1 : 0;
 }
 
 // ---- bot.menu.press, native path: press a button of the engine's own message box (MessageMenu, menu id 1001) ----

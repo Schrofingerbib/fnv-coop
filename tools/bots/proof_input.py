@@ -8,20 +8,21 @@ Needs nvcoop.ini [dev] bots=1 on the instance. Writes out/T6a/proof_input.json. 
 --door are Plugin.esm:HEX or a bare hex runtime id (an empty value is refused).
 Exit codes: 0 every check passed, 1 a check failed, 2 the proof could not run: a bad command line (refused before the
 bridge is opened), no game on the instance, or the game lost during the run (crash or pipe loss).
-
-Needs nvcoop.ini [dev] bots=1 on the instance. Writes out/T6a/proof_input.json and exits non-zero on any FAIL.
 --dismiss-messages (opt-in, off by default): first clear stray message boxes with Bot.dismiss_messages (button 0 while bot.menu says
 "message"), e.g. the DLC notices a fresh save shows after load. They come in waves (6, then 2, then 2 about 16 s later), so it presses
 until no box has been shown for --dismiss-quiet-s seconds (default 20), at most --dismiss-max-s (default 120). It adds a
 "dismiss_messages" row with the press count and the seconds it waited.
 Checks (each prints measured values so a failure says what the game did):
   hook      bot.status reports hooked=true and the control-state query counter rises each frame
-  forward   hold Forward+Run for 2 s: the player moves 300..700 units along the facing direction (real locomotion speed)
+  forward   bot.move forward, run:true (run SPEED) for 2 s: the player moves 300..700 units along the facing direction. With the
+            game's always-run on, the driver must NOT hold Run (Run held = walk, about 160 units in 2 s); the row shows the move reply
+            (alwaysRun, runControl)
   back      Backward moves the opposite way; Left/Right strafe perpendicular (proves the yaw convention and control ids 0..3)
   turn      bot.look yaw/pitch read back through GetAngle
   stop      bot.stop: nothing held, the player stops within 0.5 s
   jump      Z rises > 5 units (control 12, an edge-only control: proves the edge is served exactly once)
-  sneak     two taps toggle crouch on then off (edge fires exactly once per tap, or the state would not alternate)
+  sneak     two taps toggle crouch on then off (edge fires exactly once per tap, or the state would not alternate), read with
+            player.IsSneaking (the console has no GetSneaking); a failed read is a FAIL
   fire      with --target: pulses Attack at the target; its health drops (needs an equipped, loaded weapon)
   activate  with --door: look at it and press Activate; the door state changes
 """
@@ -35,10 +36,15 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tools" / "runner"))
 from bots import Bot, FakeBridge, World, proof_args  # noqa: E402
+from bots.bot import ConnectionLost  # noqa: E402
 
 # No argument is required (--target and --door only add checks). FORMS: every dest that holds a form id.
 REQUIRED = {}
 FORMS = ("target", "door")
+
+# The sneak state as a console expression. The game's console has IsSneaking. "player.GetSneaking" gave "Unknown variable" (2026-10-21).
+SNEAK_EXPR = "player.IsSneaking"
+SETTLE_AFTER_JUMP_S = 2.5  # > the ~2 s after a jump in which only one crouch toggle takes effect
 
 
 class Report:
@@ -81,18 +87,20 @@ def run(nv, args) -> Report:
     b.look(yaw=yaw)
     b.wait(0.3)
 
+    moves = []
+
     def burst(forward, strafe, secs=2.0):
         p0 = b.pos()
-        nv.call("bot.move", {"forward": forward, "strafe": strafe, "run": True})
+        moves.append(nv.call("bot.move", {"forward": forward, "strafe": strafe, "run": True}))
         b.wait(secs)
         nv.call("bot.stop")
         b.wait(0.5)
         return rel_move(b, p0, yaw)
 
     f, s = burst(1, 0)
-    r.check("forward", 300 <= f <= 700 and abs(s) < 0.25 * abs(f), along=round(f), side=round(s))
+    r.check("forward", 300 <= f <= 700 and abs(s) < 0.25 * abs(f), along=round(f), side=round(s), move=moves[-1])
     f, s = burst(-1, 0)
-    r.check("back", f < -150 and abs(s) < 0.4 * abs(f), along=round(f), side=round(s))
+    r.check("back", f < -150 and abs(s) < 0.4 * abs(f), along=round(f), side=round(s), move=moves[-1])
     f, s = burst(0, 1)
     r.check("strafe_right", s > 150 and abs(f) < 0.4 * abs(s), along=round(f), side=round(s))
     f, s = burst(0, -1)
@@ -112,16 +120,21 @@ def run(nv, args) -> Report:
 
     j = b.jump()
     r.check("jump", j.ok, reply=str(j))
+    # Land and settle first: within about 2 s of a jump the engine applies only one crouch toggle (first in-game run,
+    # 2026-10-21: the second tap 1.1 s later left the player crouched; two seconds after the jump both taps worked).
+    b.wait(SETTLE_AFTER_JUMP_S)
 
     try:
-        s0 = b._eval("player.GetSneaking")
+        s0 = b._eval(SNEAK_EXPR)
         b.sneak_toggle(); b.wait(0.8)
-        s1 = b._eval("player.GetSneaking")
+        s1 = b._eval(SNEAK_EXPR)
         b.sneak_toggle(); b.wait(0.8)
-        s2 = b._eval("player.GetSneaking")
+        s2 = b._eval(SNEAK_EXPR)
         r.check("sneak", s0 == 0 and s1 != 0 and s2 == 0, before=s0, after_one_tap=s1, after_two_taps=s2)
-    except Exception as e:  # GetSneaking may not exist in this console grammar
-        r.skip("sneak", f"cannot read sneak state: {e}")
+    except ConnectionLost:   # the game is gone (GameCrashed included): proof_args.guarded makes it exit 2, not a sneak FAIL
+        raise
+    except Exception as e:  # the console has IsSneaking, so a failed read is a defect, not a reason to skip
+        r.check("sneak", False, error=f"cannot read {SNEAK_EXPR}: {e}")
 
     if args.target:
         h0 = b.health(args.target)

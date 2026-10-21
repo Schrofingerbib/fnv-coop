@@ -246,6 +246,9 @@ void InstallDropHandler() {
     nvcoop::Log("bots: OnDrop native handler: %s", g_dropHandler ? "registered" : "unavailable (bot.drops unsupported, nearby-ref fallback used)");
 }
 
+// The always-run reads (bot.move run = speed) need only the kRunPins code to match; they never call the engine.
+bool g_runPinsOk = false;
+
 void CheckPins() {
     g_callsOk = true;
     for (const nvbots::addr::CallPin* p : nvbots::addr::kAllCalls) {
@@ -260,6 +263,14 @@ void CheckPins() {
         if (!g_mem.read(d->addr, &got, 4) || got != d->value) {
             nvcoop::Log("bots: data pin %s @%08X holds %08X, want %08X: dialogue/menu/inventory glue disabled", d->name, d->addr, got, d->value);
             g_callsOk = false;
+        }
+    }
+    g_runPinsOk = true;
+    for (const nvbots::addr::CodePin* p : nvbots::addr::kRunPins) {
+        unsigned char got[16] = {};
+        if (!g_mem.read(p->addr, got, 16) || std::memcmp(got, p->bytes, 16) != 0) {
+            nvcoop::Log("bots: always-run pin %s @%08X does not match this exe: bot.move holds Run for run:true (alwaysRun unknown)", p->name, p->addr);
+            g_runPinsOk = false;
         }
     }
 }
@@ -288,6 +299,7 @@ struct LiveEngine : nvbots::IBotEngine {
     }
     bool hooked() override { return g_hooked; }
     nvbots::IEngine* engine() override { return g_callsOk ? &g_game : nullptr; }
+    int alwaysRun() override { return g_runPinsOk ? nvbots::alwaysRunState(g_game) : -1; }   // SEH-guarded byte reads only
     bool pressBox(int button, uint32_t* menuId, std::string* err) override {
         nvcoop::registry::MethodEntry me;
         if (!nvcoop::registry::FindMethod("ui.answer", me)) { *err = "unsupported: hooks_ui (ui.answer) is not loaded"; return false; }
@@ -354,7 +366,7 @@ void Init() {
             return g_rpc->handle(name, params, out);
         }, true, 0);
     }
-    nvcoop::Log("bots: enabled (dev), hooked=%d pins=%d", g_hooked ? 1 : 0, g_callsOk ? 1 : 0);
+    nvcoop::Log("bots: enabled (dev), hooked=%d pins=%d runPins=%d", g_hooked ? 1 : 0, g_callsOk ? 1 : 0, g_runPinsOk ? 1 : 0);
 }
 
 void OnMessage(uint32_t type, void*, uint32_t) {

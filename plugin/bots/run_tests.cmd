@@ -1,6 +1,6 @@
 @echo off
 rem One-command T6a bot-driver tests: standalone build in %TEMP%\nvbots_build, then
-rem   real tests must report "0 failed"; every mutant (NVBOTS_MUTANT=1..41) must report ">0 failed".
+rem   real tests must report "0 failed"; every mutant (NVBOTS_MUTANT=1..46) must report ">0 failed".
 rem BOTS_EXE: set NVCOOP_REF_EXE to a reference FalloutNV.exe image to compare the pinned prologues with it.
 setlocal EnableDelayedExpansion
 set HERE=%~dp0
@@ -23,7 +23,7 @@ type "%BLD%\real.txt"
 findstr /C:" 0 failed" "%BLD%\real.txt" >nul
 set REAL_OK=%ERRORLEVEL%
 set BAD=0
-for /L %%N in (1,1,41) do (
+for /L %%N in (1,1,46) do (
   "%BLD%\bots_tests\nvbots_tests_m%%N.exe" > "%BLD%\mutant%%N.txt"
   set RC=!ERRORLEVEL!
   findstr /R /C:", [1-9][0-9]* failed" "%BLD%\mutant%%N.txt" >nul
@@ -34,5 +34,5 @@ for /L %%N in (1,1,41) do (
 if not "%REAL_RC%"=="0" exit /b 1
 if not "%REAL_OK%"=="0" exit /b 1
 if not "%BAD%"=="0" ( echo T6a bots: a mutant slipped through & exit /b 1 )
-echo T6a bots: real tests pass, all 41 mutants rejected - ALL OK
+echo T6a bots: real tests pass, all 46 mutants rejected - ALL OK
 exit /b 0

@@ -2,8 +2,12 @@
 // real parsing and input logic with a mock. plugin/bots/bots_module.cpp supplies the live engine and registers these methods
 // (dev only, nvcoop.ini [dev] bots=1).
 //
-//   bot.status                                  -> {enabled, hooked, frame, held:[names], shotsLeft}
-//   bot.move {forward,strafe,run?,ms?}          -> {held:[...]}   axes in [-1,1]; ms>0 auto-stops, else until bot.stop
+//   bot.status                                  -> {enabled, hooked, frame, held:[names], shotsLeft, alwaysRun}
+//   bot.move {forward,strafe,run?,ms?}          -> {held:[...], run, runControl, alwaysRun}   axes in [-1,1]; ms>0 auto-stops, else until bot.stop
+//                                                  run = the SPEED (true: run speed, false: walk), whatever the always-run toggle is.
+//                                                  The driver holds Run (9) only when run != always-run, and follows a toggle change
+//                                                  while the move lasts. alwaysRun: true/false = the engine's state, null = unknown
+//                                                  (then Run is held for run:true, the key meaning).
 //   bot.stop                                    -> {}             release every forced control
 //   bot.look {yaw?,pitch?} | {ref}              -> {yaw,pitch}    degrees, same convention as player.SetAngle Z/X; ref = look at it
 //   bot.fire {shots?=1,gapMs?=180,holdMs?=90}   -> {queued}       Attack pulses through the input driver (the real attack path)
@@ -53,7 +57,31 @@ struct IBotEngine {
     virtual IEngine* engine() { return nullptr; }
     virtual bool pressBox(int button, uint32_t* menuId, std::string* err) { (void)button; (void)menuId; *err = "unsupported: no message box answer path"; return false; }
     virtual bool moveTo(const std::string& ref, std::string* err) { (void)ref; *err = "unsupported: moveTo not wired"; return false; }
+    // The engine's always-run state (alwaysRunState in bot_engine.h): 1 on, 0 off or ignored, -1 unknown.
+    virtual int alwaysRun() { return -1; }
 };
+
+// Mutants for this file, every one must make tests/test_bots.cpp fail:
+//  native message box press (33, 36, 40; the others of 33..41 are in bot_engine.h):
+//  33 native path never used    36 native path tried before the UI layer    40 native reply says path "ui"
+//  always-run (42, 43, 46; 44 and 45 are in bot_engine.h):
+//  42 bot.move holds Run for run:true whatever the always-run toggle is (the behaviour the first in-game run measured)
+//  43 a toggle change during a move is not followed     46 an unknown always-run state is treated as on
+
+// The Run control (9) to hold so that the player moves at the wanted speed. alwaysRun: 1 on, 0 off, -1 unknown.
+inline bool runControlFor(bool wantRun, int alwaysRun) {
+#if NVBOTS_MUTANT == 42
+    (void)alwaysRun;
+    return wantRun;
+#elif NVBOTS_MUTANT == 46
+    if (alwaysRun < 0) return !wantRun;
+    return wantRun != (alwaysRun == 1);
+#else
+    if (alwaysRun < 0) return wantRun;   // unknown: the key meaning, and the replies say alwaysRun:null
+    return wantRun != (alwaysRun == 1);
+#endif
+}
+inline Value alwaysRunValue(int alwaysRun) { return alwaysRun < 0 ? Value() : Value(alwaysRun == 1); }
 
 inline const char* const kCtrlNames[kCount] = {
     "Forward", "Backward", "Left", "Right", "Attack", "Activate", "Block", "ReadyItem", "Crouch", "Run", "AlwaysRun", "AutoMove",
@@ -84,7 +112,10 @@ public:
         in_.advanceFrame();
         if (IEngine* g = e_.engine()) vats_.tick(*g, now, [this](int c) { in_.tap(c, 3); });
 #if NVBOTS_MUTANT != 12
-        if (moveUntil_ && now >= moveUntil_) { in_.stopMove(); moveUntil_ = 0; }
+        if (moveUntil_ && now >= moveUntil_) { in_.stopMove(); moveUntil_ = 0; moving_ = false; }
+#endif
+#if NVBOTS_MUTANT != 43
+        if (moving_) followRun();
 #endif
         if (shotsLeft_ > 0 && now >= nextShotAt_) {
             in_.tap(kAttack, holdFrames_);
@@ -105,15 +136,19 @@ public:
         bool ok = true;
         if (method == "bot.status") {
             o.set("enabled", true).set("hooked", e_.hooked()).set("frame", in_.frame()).set("shotsLeft", (int64_t)shotsLeft_);
-            o.set("held", heldList());
+            o.set("held", heldList()).set("alwaysRun", alwaysRunValue(e_.alwaysRun()));
             Value v = Value::object();
             v.set("phase", VatsJob::name(vats_.phase())).set("reason", vats_.reason());
             o.set("vats", v);
         } else if (method == "bot.move") {
             const int64_t ms = p.get("ms").asInt(0);
-            in_.setMove(p.get("forward").asNumber(0), p.get("strafe").asNumber(0), p.get("run").asBool(false));
+            wantRun_ = p.get("run").asBool(false);
+            const int alwaysRun = e_.alwaysRun();
+            const bool runControl = runControlFor(wantRun_, alwaysRun);
+            in_.setMove(p.get("forward").asNumber(0), p.get("strafe").asNumber(0), runControl);
+            moving_ = in_.isHeld(kForward) || in_.isHeld(kBackward) || in_.isHeld(kLeft) || in_.isHeld(kRight);
             moveUntil_ = ms > 0 ? e_.nowMs() + (uint64_t)ms : 0;
-            o.set("held", heldList());
+            o.set("held", heldList()).set("run", wantRun_).set("runControl", runControl).set("alwaysRun", alwaysRunValue(alwaysRun));
         } else if (method == "bot.stop") {
 #if NVBOTS_MUTANT == 10
             in_.stopMove();
@@ -122,6 +157,7 @@ public:
 #endif
             shotsLeft_ = 0;
             moveUntil_ = 0;
+            moving_ = false;
         } else if (method == "bot.look") {
             double yaw = 0, pitch = 0;
             if (p.find("ref")) {
@@ -257,6 +293,13 @@ public:
     static const char* const* names() { return kCtrlNames; }
 
 private:
+    // While a move lasts: the always-run toggle can change (a human key, bot.input tap AlwaysRun), so hold or release Run again.
+    void followRun() {
+        const bool k = runControlFor(wantRun_, e_.alwaysRun());
+        if (k == in_.isHeld(kRun)) return;
+        if (k) in_.hold(kRun);
+        else in_.release(kRun);
+    }
     // bot.menu.press: the UI layer's box first (ui.answer). Only when it has none and the engine's own message box (MessageMenu, id 1001) is
     // the top menu, press that box natively (pressNativeMessageButton in bot_engine.h). The reply says which path answered.
     bool pressMenuButton(int button, Value* o, std::string* out) {
@@ -301,6 +344,7 @@ private:
     ForcedInput& in_;
     uint64_t moveUntil_ = 0, nextShotAt_ = 0, gapMs_ = 180;
     int shotsLeft_ = 0, holdFrames_ = 3;
+    bool moving_ = false, wantRun_ = false;   // a bot.move with an axis held is active; the speed it asked for
     VatsJob vats_;
     DropLog drops_;
     bool dropsLive_ = false;

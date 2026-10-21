@@ -78,16 +78,17 @@ public:
     }
     int64_t frame() const { return frame_; }
 
-    // Digital movement from axes in [-1, 1]. forward > 0 walks forward; strafe > 0 steps right. `run` holds the Run control.
+    // Digital movement from axes in [-1, 1]. forward > 0 walks forward; strafe > 0 steps right. `holdRun` holds the Run control (the KEY:
+    // with the engine's always-run on, Run held means walk; BotRpc picks the key from the wanted speed, see runControlFor in bot_rpc.h).
     // The dead zone keeps small noise from moving the avatar.
-    void setMove(double forward, double strafe, bool run, int frames = -1) {
+    void setMove(double forward, double strafe, bool holdRun, int frames = -1) {
         setAxis(kBackward, kForward, forward, frames);
 #if NVBOTS_MUTANT == 6
         setAxis(kRight, kLeft, strafe, frames);
 #else
         setAxis(kLeft, kRight, strafe, frames);
 #endif
-        if (run) hold(kRun, frames);
+        if (holdRun) hold(kRun, frames);
         else release(kRun);
     }
     void stopMove() {
