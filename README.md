@@ -2,7 +2,7 @@
 
 [![Discord](https://img.shields.io/badge/Discord-chat%20and%20help-5865F2?logo=discord&logoColor=white)](https://discord.gg/EXGB49R82t)
 
-> **Status (October 2026): developer preview, about 35% of the way to full-story co-op.**
+> **Status (October 2026): developer preview, about 40% of the way to full co-op. See the 10-step roadmap below.**
 >
 > | Area | Where it stands |
 > |---|---|
@@ -22,8 +22,26 @@ objectives, dialogue results, reputation and karma identical on every machine.
 
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/cranebeaker)
 
-Avatars, NPC movement and combat are meant to ride on **NV:MP**, the existing New Vegas multiplayer mod by
-the NV:MP team. We do not modify or redistribute it.
+Avatars, enemies and combat get their own sync layer (steps 1 to 4 of the roadmap). Until that ships, **NV:MP**,
+the existing New Vegas multiplayer mod by the NV:MP team, can run alongside. We do not modify or redistribute it.
+
+## Roadmap: 10 steps to full co-op
+
+After these ten steps the whole game plays in co-op: story, enemies, combat, loot and the world, for 2 to 4 players.
+Track A is the sync core (maintainer). Track B is in-game testing, split-screen and VATS (contributor).
+
+| # | Step | What it means when you play | Who | Status |
+|---|---|---|---|---|
+| 1 | Enemy and NPC sync | One PC runs each enemy's AI and everyone sees a smooth copy. Hits count once, deaths happen once, encounters spawn once, and enemy attacks, flinches and death poses look right on every screen. | A | In progress: code written, final checks running |
+| 2 | Enemy sync in the real game | The two-copy fight, ownership handoff, spawn and corpse-loot tests pass on a real PC, and the feature is switched on by default. | B, then A fixes | Next |
+| 3 | Player avatars | You see your friends as characters that walk, run, aim and animate, without needing NV:MP. | A, B tests | Code written, in-game test next |
+| 4 | Full combat | Real-time VATS for every player, projectiles and explosions, companions in fights, crime and faction hostility. | A and B | VATS planned, the rest in progress |
+| 5 | Loot, items and containers | Shared containers and corpses, item drops and pickups, and no duplicated items. | A | Planned |
+| 6 | World, time and travel | Doors, terminals, switches and traps; time and weather; fast travel, waiting and sleeping by party vote; saving and rejoining. | A | Mostly built, finishing |
+| 7 | Desync check and repair | Every area checks itself every few seconds and fixes any difference it finds. | A | Built for the story, extending to everything |
+| 8 | The whole main story in game | Every main questline swept stage by stage with two game copies, from Goodsprings to the endings. | A and B | Goodsprings: 65 of 104 stages pass |
+| 9 | Every side quest and DLC | All side quests, companions and the four DLCs, played through by two-copy test bots. | A and B | Planned |
+| 10 | Player release 1.0 | Installer, one-click host and join, split-screen on one PC, player guide. | A and B | Split-screen started |
 
 ## Play in three steps
 
