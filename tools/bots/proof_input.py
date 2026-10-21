@@ -42,7 +42,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tools" / "runner"))
 from bots import Bot, FakeBridge, World, proof_args  # noqa: E402
-from bots.bot import BridgeError, ConnectionLost  # noqa: E402
+from bots.bot import BridgeError, ConnectionLost, _Fail  # noqa: E402
 
 # No argument is required (--target and --door only add checks). FORMS: every dest that holds a form id.
 REQUIRED = {}
@@ -53,12 +53,24 @@ SNEAK_EXPR = "player.IsSneaking"
 SETTLE_AFTER_JUMP_S = 2.5  # > the ~2 s after a jump in which only one crouch toggle takes effect
 DOOR_DIST = 100.0          # units from the door for the activate check (the game's activation reach is about 150)
 # Errors of the fire and activate checks that give a FAIL row. ConnectionLost (a BridgeError) is re-raised first: a lost game is exit 2.
-CHECK_ERRORS = (BridgeError,)
+# _Fail: a Bot query outside an action (b.pos(ref), b.cell()) raises it when ref.info fails (PR #13 review).
+CHECK_ERRORS = (BridgeError, _Fail)
 
 
 def door_activated(before: str, after: str, cell_before: int, cell_after: int) -> bool:
     """The door state changed, or the player went through a load door (cell change, the open state stays 'closed')."""
     return before != after or cell_before != cell_after
+
+
+def unreadable_after_ok(cell_before: int, cell_after: int) -> bool:
+    """A door state that cannot be read after Activate is 'unloaded' only after a cell change (the old cell may be gone).
+    In the same cell a failed read is a FAIL row, not a state change (PR #13 review)."""
+    return cell_before != cell_after
+
+
+def error_text(e: Exception) -> str:
+    data = getattr(e, "data", None)
+    return f"{type(e).__name__}: {e}" + (f" {data}" if data else "")
 
 
 def walk_back_from(b, nv, ref, dist: float, timeout_s: float = 4.0) -> float:
@@ -169,7 +181,7 @@ def run(nv, args) -> Report:
         except ConnectionLost:
             raise
         except CHECK_ERRORS as e:
-            r.check("fire", False, error=f"{type(e).__name__}: {e}")
+            r.check("fire", False, error=error_text(e))
     else:
         r.skip("fire", "pass --target <ref of a hostile in line of sight> and equip a loaded weapon first")
 
@@ -186,14 +198,16 @@ def run(nv, args) -> Report:
                 after = b.door_state(args.door)
             except ConnectionLost:
                 raise
-            except CHECK_ERRORS:   # the player went through a load door and the old cell may be unloaded
-                after = "unloaded"
+            except CHECK_ERRORS:
+                if not unreadable_after_ok(cell0, cell1):
+                    raise              # same cell: the outer handler writes a FAIL row
+                after = "unloaded"     # the player went through a load door and the old cell may be unloaded
             r.check("activate", a.ok and door_activated(before, after, cell0, cell1), before=before, after=after,
                     cell_before=cell0, cell_after=cell1, door_dist=None if reached is None else round(reached))
         except ConnectionLost:
             raise
         except CHECK_ERRORS as e:
-            r.check("activate", False, error=f"{type(e).__name__}: {e}")
+            r.check("activate", False, error=error_text(e))
     else:
         r.skip("activate", "pass --door <ref of a door>")
     nv.call("bot.stop")

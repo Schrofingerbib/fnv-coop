@@ -73,7 +73,65 @@ class QueryFails(FakeBridge):
         return super().exec(cmd, timeout_ms, **kw)
 
 
+class DoorInfoFails(FakeBridge):
+    """ref.info fails for the door only, so b.pos(door) raises the Bot's _Fail outside an action."""
+
+    def call(self, method, params=None, timeout_s=35.0):
+        if method == "ref.info" and (params or {}).get("ref") == "FalloutNV.esm:601":
+            raise RpcError(-32000, "reference not loaded", method)
+        return super().call(method, params, timeout_s)
+
+
+class SecondStateReadFails(FakeBridge):
+    """The door's GetOpenState line fails from the second read on (a short eval failure, same cell)."""
+    reads = 0
+
+    def exec(self, cmd, timeout_ms=None, **kw):
+        if "GetOpenState" in cmd:
+            self.reads += 1
+            if self.reads >= 2:
+                raise RpcError(-32000, "eval failed", "exec")
+        return super().exec(cmd, timeout_ms, **kw)
+
+
+def activate_row(bridge_cls):
+    w = World()
+    w.add_actor(0x603, (0, 400, 0))
+    w.add_door(0x601, (50, 50, 0))
+    args = argparse.Namespace(target="FalloutNV.esm:603", door="FalloutNV.esm:601", fake=True)
+    return next(r for r in proof.run(bridge_cls(w), args).rows if r["check"] == "activate")
+
+
 class Proof(unittest.TestCase):
+    def test_a_bot_query_failure_in_activate_is_a_fail_row(self):
+        # PR #13 review: b.pos(ref) and b.cell() raise the Bot's _Fail (not a BridgeError) when ref.info fails
+        row = activate_row(DoorInfoFails)
+        self.assertEqual(row["result"], "FAIL", row)
+        self.assertIn("not_found", row["error"])
+        # twin: the first guard (BridgeError only) lets the _Fail escape and stops the run
+        old = proof.CHECK_ERRORS
+        proof.CHECK_ERRORS = (BridgeError,)
+        try:
+            with self.assertRaises(Exception) as c:
+                activate_row(DoorInfoFails)
+            self.assertEqual(type(c.exception).__name__, "_Fail")
+        finally:
+            proof.CHECK_ERRORS = old
+
+    def test_an_unreadable_door_state_in_the_same_cell_is_a_fail(self):
+        # PR #13 review: 'unloaded' is accepted only after a cell change; a failed read in the same cell is not a state change
+        row = activate_row(SecondStateReadFails)
+        self.assertEqual(row["result"], "FAIL", row)
+        self.assertIn("eval failed", row["error"])
+        # twin: the first fallback (any failed read means 'unloaded') turns the failed read into a PASS
+        old = proof.unreadable_after_ok
+        proof.unreadable_after_ok = lambda c0, c1: True
+        try:
+            row = activate_row(SecondStateReadFails)
+        finally:
+            proof.unreadable_after_ok = old
+        self.assertEqual((row["result"], row["after"]), ("PASS", "unloaded"))
+
     def test_activate_walks_back_into_reach_first(self):
         row, nv = run_door()
         self.assertEqual(row["result"], "PASS", row)
