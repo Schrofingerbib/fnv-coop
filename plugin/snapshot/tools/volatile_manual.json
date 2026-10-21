@@ -19,6 +19,21 @@
         "owner": "FalloutNV.esm:0B16D0",
         "name": "bWeaponCheck",
         "reason": "VNPCFollowers load-time companion weapon check flag, set per machine after a load (two-copy fight test 2026-10-21)"
+      },
+      {
+        "owner": "FalloutNV.esm:1572E8",
+        "name": "iCounter",
+        "reason": "vDialogueEDESCRIPT adds 1 every GameMode frame, so each machine has its own count (two-copy enemy_fight 2026-10-21: host 41, guest 40)"
+      },
+      {
+        "owner": "FalloutNV.esm:10C721",
+        "name": "fDays",
+        "reason": "vDialogueGomorrahScript copies GameDaysPassed every frame: a per-machine clock (two-copy enemy_fight 2026-10-21: host 6.333857, guest 6.028465)"
+      },
+      {
+        "owner": "FalloutNV.esm:10C721",
+        "name": "Time",
+        "reason": "vDialogueGomorrahScript sets it to GameDaysPassed: a per-machine clock (two-copy enemy_fight 2026-10-21: host 6.333857, guest 5.959093)"
       }
     ],
     "fields": [],
