@@ -23,7 +23,8 @@
 //   bot.inventory {ref?,items?:[form]}          -> {items:[{item,count}],partial}  totals via the engine's own counting
 //   bot.say {info}                              -> {said,index,nextState}  choose that INFO in the open DialogMenu (state must be ready)
 //   bot.dialog                                  -> {choices:[{idx,info}]}  what the open dialogue offers (moves the selection like a click)
-//   bot.vats {ref,limb?} / test.vats.hit        -> {started}      tick-driven VATS job; progress in bot.status.vats {phase,reason}
+//   bot.vats {ref,limb?} / test.vats.hit        -> {started}      tick-driven VATS job (VatsJob in bot_engine.h); progress in bot.status.vats
+//                                                  {phase,reason}, phase idle|enter|tutorial|zoom|target|queue|execute|playback|done|failed
 //   test.fasttravel {marker}                    -> {genuine:false} MoveTo the marker (a teleport that crosses cells; the real fast-travel engine call is unknown)
 //   bot.fasttravel {marker}                     -> {genuine:true,queued}  the map menu's own travel path (see fastTravel in bot_engine.h); the move happens a few frames later
 //   bot.drops {since?,base?,windowMs?}          -> {seq,drops:[{seq,ref,base,dropper}]}  what the engine's OnDrop event reported (native handler); seq is the log position
