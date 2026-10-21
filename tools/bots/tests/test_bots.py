@@ -145,7 +145,7 @@ class Combat(unittest.TestCase):
     def test_alive_twins_are_caught(self):
         self.assertIn(5, _alive_rule_errors(ZeroOnlyAliveBot))       # the old rule: refused the restrained Doc Mitchell in game
         self.assertEqual(_alive_rule_errors(NoEssentialAliveBot), [6])
-        nv, b = make()
+        nv, _ = make()
         nv.world.things[RAIDER].life = 5
         self.assertEqual(ZeroOnlyAliveBot(nv, "old").fire(ref(RAIDER), expect_hit=True).reason, "dead")
 
