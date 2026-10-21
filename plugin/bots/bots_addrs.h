@@ -1,5 +1,5 @@
-// Pins checked against the reference exe (<reference exe>) by tests/test_bots.cpp (BOTS_EXE=<exe>) and by the pin verifier
-// tools/bots/re/verify_pins.py. The pin verifier is not in the public repo, so only the C++ test can run from a clone.
+// Engine addresses for the bot input driver (T6a), checked statically against the reference FalloutNV.exe 1.4.0.525
+// (<reference exe>) by tools/bots/re/verify_pins.py and by tests/test_bots.cpp (BOTS_EXE=<exe>).
 // No other engine function is patched by plugin/bots.
 #pragma once
 #include "hook_patch.h"

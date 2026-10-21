@@ -5,9 +5,9 @@
 //   hooks     a REAL nvhooks::HookRegistry patch on a function inside the host process (uninstalled and read back on shutdown)
 //   thread    a ManagedThread ticker whose count must keep growing across reloads
 //   socket    a UDP socket handed over as a raw SOCKET (not closed by shutdown, adopted by the next core)
-// Not carried, read fresh by every core at init: [testcore] value= from nvcoop.ini beside this module's own file, the
-// same lookup as IniPath() in the real modules (the loader must have copied the ini into its cache folder).
-// Built once clean and once per TESTCORE_MUTANT=1..9; the host test must fail against every mutant.
+//   config    not carried, read fresh by every core at init: [testcore] value= from nvcoop.ini beside this module's own file, the
+//             same lookup as IniPath() in the real modules (the loader must have copied the ini into its cache folder)
+// Built once; the host test runs it clean and once per FNVCOOP_MUT=1..9 (runtime twins); the host test must fail against every twin.
 #ifndef _M_IX86
 #error "testcore must be built for x86 (the hook patcher writes rel32 jumps)"
 #endif
@@ -33,9 +33,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-#ifndef TESTCORE_MUTANT
-#define TESTCORE_MUTANT 0
-#endif
+#include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
 
 namespace {
 
@@ -164,7 +162,7 @@ void ensureHooks() {
     nvhooks::Addr tramp = 0;
     nvhooks::PatchStatus st = g_reg->acquire(s, reinterpret_cast<nvhooks::Addr>(&Detour), &tramp, reinterpret_cast<nvhooks::Addr*>(&g_orig));
     if (nvhooks::installed(st)) g_orig = reinterpret_cast<Fn>(tramp);
-    if (TESTCORE_MUTANT == 6) g_reg->acquire(s, reinterpret_cast<nvhooks::Addr>(&Detour), &tramp);
+    if (FNV_MUT(6)) g_reg->acquire(s, reinterpret_cast<nvhooks::Addr>(&Detour), &tramp);
     nvhooks::HookSpec s2 = spec2();
     if (s2.target) {
         nvhooks::Addr t2 = 0;
@@ -179,7 +177,7 @@ void startTicker() {
             Sleep(1);
         }
     });
-    if (TESTCORE_MUTANT == 2) {  // a thread nobody tracks or joins
+    if (FNV_MUT(2)) {  // a thread nobody tracks or joins
         g_rawStop = false;
         g_raw = std::thread([] { while (!g_rawStop.load()) Sleep(1); });
         g_raw.detach();
@@ -223,8 +221,8 @@ NVCOOP_RELOAD_STATE(tc_hooks, "tc_hooks", 1, 10,
     /*migrate*/ nullptr,
     /*shutdown*/ [] {
         if (!g_reg) return;
-        if (TESTCORE_MUTANT == 1) return;  // forgot to uninstall
-        if (TESTCORE_MUTANT == 6) {
+        if (FNV_MUT(1)) return;  // forgot to uninstall
+        if (FNV_MUT(6)) {
             nvhooks::HookSpec s = spec();
             g_reg->release(s);  // only one reference dropped
             return;
@@ -237,13 +235,13 @@ NVCOOP_RELOAD_STATE(tc_hooks, "tc_hooks", 1, 10,
 
 NVCOOP_RELOAD_STATE(tc_counter, "tc_counter", 1, 50, nullptr,
     /*save*/ [](nvreload::Writer& w) {
-        if (TESTCORE_MUTANT == 3) return true;  // forgot to write anything
+        if (FNV_MUT(3)) return true;  // forgot to write anything
         w.u64(g_counter);
         w.str(g_label);
         return true;
     },
     /*restore*/ [](uint32_t, nvreload::Reader& r) {
-        if (TESTCORE_MUTANT == 5) {  // reads the fields in the wrong order
+        if (FNV_MUT(5)) {  // reads the fields in the wrong order
             g_label = r.str();
             g_counter = r.u64();
             return true;
@@ -259,7 +257,7 @@ NVCOOP_RELOAD_STATE(tc_thread, "tc_thread", 1, 60, nullptr,
     /*restore*/ [](uint32_t, nvreload::Reader& r) { g_bgBase = r.u64(); startTicker(); return true; },
     nullptr,
     /*shutdown*/ [] {
-        if (TESTCORE_MUTANT == 2) return;  // never stops the raw thread (it is not counted by the probe either)
+        if (FNV_MUT(2)) return;  // never stops the raw thread (it is not counted by the probe either)
         g_ticker.stopAndJoin();
     },
     /*fresh*/ [] { g_bgBase = 0; startTicker(); });
@@ -274,7 +272,7 @@ NVCOOP_RELOAD_STATE(tc_socket, "tc_socket", 1, 70, nullptr,
     },
     nullptr,
     /*shutdown*/ [] {
-        if (TESTCORE_MUTANT == 4 && g_sock != INVALID_SOCKET) closesocket(g_sock);  // closes instead of handing over
+        if (FNV_MUT(4) && g_sock != INVALID_SOCKET) closesocket(g_sock);  // closes instead of handing over
     },
     /*fresh*/ [] { openSocket(); });
 

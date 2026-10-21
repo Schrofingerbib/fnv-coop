@@ -25,8 +25,8 @@ if(FUZZ_FLIGHT AND EXISTS ${SC}/flight/flight.cpp)
   list(APPEND FUZZ_SRC ${CORE} ${SC}/flight/flight.cpp)
   list(APPEND FUZZ_DEFS FNVCOOP_FUZZ_FLIGHT)
 endif()
-# T2a's engine model adapter: opt in with -DFUZZ_EM=ON (run_tests.bat does it when FUZZ_EM=1), so a half-edited model never breaks the default build.
-option(FUZZ_EM "build the em target (synccore/enginemodel)" OFF)
+# T2a's engine model adapter (the "em" target): ON by default now that the model fuzzes clean; -DFUZZ_EM=OFF (FUZZ_EM=0 for the .bat files) builds the mini target only.
+option(FUZZ_EM "build the em target (synccore/enginemodel)" ON)
 if(FUZZ_EM AND EXISTS ${SC}/enginemodel/src/cluster.cpp)
   file(GLOB EM_SRC ${SC}/enginemodel/src/*.cpp)
   if(NOT FUZZ_FLIGHT)
@@ -34,7 +34,7 @@ if(FUZZ_EM AND EXISTS ${SC}/enginemodel/src/cluster.cpp)
       list(APPEND EM_SRC ${SC}/src/${f}.cpp)
     endforeach()
   endif()
-  list(APPEND FUZZ_SRC target_em.cpp ${EM_SRC})
+  list(APPEND FUZZ_SRC target_em.cpp ${EM_SRC} ${SC}/combat/combat.cpp)   # combat-core: the rules the engine model runs
   list(APPEND FUZZ_DEFS FNVCOOP_FUZZ_EM)
 endif()
 

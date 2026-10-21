@@ -1,5 +1,13 @@
 """Recompute capture/apply status of script functions from the CURRENT plugin + synccore source.
 
+Two layers of evidence besides the census text (see tools/coverage/evidence.json, docs/tools/story-capture.md):
+  * lane effect types : `using WorldEffect = std::variant<...>` of plugin/hooks_world/world_effects.h counts as Effect types too (the world lane's
+                        NPC state travels as WorldEffect through the coop runtime), scanned the same way
+  * reviewed evidence : evidence.json lists, per script function, the Effect type(s) / RefCommand op and SOURCE TOKENS (file + regex) that must be
+                        present for the function to count as synced. A reviewed entry replaces the stale census qualifier text; if a token or a
+                        type disappears from the source the function drops back to partial. A reviewed entry may also classify a function as
+                        local (per-machine presentation) with the reason written down.
+
 Static census tables (questlines/systems/census.py `M`, per-lane gaps.json) are hand-maintained and go stale. This
 module reads the source instead:
   * Effect types      : members of `using Effect = std::variant<...>` in synccore/include/fnvcoop/effect.h
@@ -26,6 +34,9 @@ STALE_CLAIMS = ('not hooked', 'block_cmd', 'no engine apply', 'n/a', 'no capture
                 'type only', 'unknown')
 
 SUP, PAR, MIS, LOC = 'supported', 'partial', 'missing', 'local'
+EVIDENCE_FILE = os.path.join('tools', 'coverage', 'evidence.json')
+WORLD_EFFECT_H = os.path.join('plugin', 'hooks_world', 'world_effects.h')
+REF_OPS_CPP = os.path.join('plugin', 'hooks', 'ref_ops.cpp')
 
 
 def effect_types(root=ROOT, text=None):
@@ -39,6 +50,45 @@ def effect_types(root=ROOT, text=None):
     return [t.strip() for t in m.group(1).replace('\n', ' ').split(',') if t.strip()]
 
 
+def world_effect_types(root=ROOT):
+    """Names inside `using WorldEffect = std::variant<...>;` (the world lane's lane-local effects), [] when the header is absent."""
+    p = os.path.join(root, WORLD_EFFECT_H)
+    if not os.path.exists(p):
+        return []
+    text = open(p, encoding='utf-8', errors='replace').read()
+    m = re.search(r'using\s+WorldEffect\s*=\s*std::variant<([^;]*)>\s*;', text, re.S)
+    return [t.strip() for t in m.group(1).replace('\n', ' ').split(',') if t.strip()] if m else []
+
+
+def ref_command_fns(root=ROOT):
+    """Script functions that have a row in plugin/hooks/ref_ops.cpp (kStorySpecs): the RefCommand ops, each with a hooked handler + console apply."""
+    p = os.path.join(root, REF_OPS_CPP)
+    if not os.path.exists(p):
+        return set()
+    text = open(p, encoding='utf-8', errors='replace').read()
+    return set(re.findall(r'\{fnvcoop::kOp\w+,\s*"(\w+)",\s*[SE]_\(', text))
+
+
+def load_evidence(root=ROOT):
+    p = os.path.join(root, EVIDENCE_FILE)
+    if not os.path.exists(p):
+        return {}
+    import json
+    data = json.load(open(p, encoding='utf-8'))
+    out = {}
+    for g in data.get('groups', []):
+        for fn in g.get('fns', []):
+            out[fn.lower()] = g
+    return out
+
+
+def token_ok(root, rel, rx):
+    p = os.path.join(root, rel)
+    if not os.path.exists(p):
+        return False
+    return re.search(rx, open(p, encoding='utf-8', errors='replace').read()) is not None
+
+
 def source_files(root=ROOT):
     files = []
     for g in SRC_GLOBS:
@@ -48,7 +98,7 @@ def source_files(root=ROOT):
 
 def scan_sources(root=ROOT, files=None, types=None):
     """-> {'captured': {T: [files]}, 'applied': {T: [files]}, 'cmd_hooks': set(lowercase names), 'files': n}"""
-    types = types if types is not None else effect_types(root)
+    types = types if types is not None else effect_types(root) + [t for t in world_effect_types(root) if t not in effect_types(root)]
     files = files if files is not None else source_files(root)
     cap, app, cmds = {}, {}, set()
     for f in files:
@@ -71,7 +121,8 @@ def scan_sources(root=ROOT, files=None, types=None):
                         break
         for m in re.finditer(r'\bCmd_(\w+)', txt):
             cmds.add(m.group(1).lower())
-    return {'captured': cap, 'applied': app, 'cmd_hooks': cmds, 'files': len(files), 'types': list(types)}
+    return {'captured': cap, 'applied': app, 'cmd_hooks': cmds, 'files': len(files), 'types': list(types), 'root': root,
+            'evidence': load_evidence(root), 'refcmd_fns': ref_command_fns(root)}
 
 
 def types_in(effect_str, known):
@@ -87,6 +138,9 @@ def live_status(row, src):
     static = row.get('l5_status') or row.get('status') or MIS
     fn = row['fn'].lower()
     known = set(src['types'])
+    ev = src.get('evidence', {}).get(fn)
+    if ev:
+        return _reviewed_status(row, src, ev, static, known)
     ets = FN_EFFECT_OVERRIDE.get(fn) or types_in(row.get('effect'), known)
     if not ets:                                   # census has no Effect for it but the type may exist now (AddNote...)
         by_low = {t.lower(): t for t in known}
@@ -118,5 +172,36 @@ def live_status(row, src):
         status = PAR
     else:
         status = static if static in (PAR, MIS) else MIS
+    out.update(status=status, changed=status != static)
+    return out
+
+
+def _reviewed_status(row, src, ev, static, known):
+    """A function with a reviewed evidence entry. The census qualifier text is not consulted; the source is."""
+    fn = row['fn'].lower()
+    ets = types_in(ev.get('effect'), known)
+    out = {'static': static, 'effect_types': ets or ([ev['effect']] if ev.get('effect') else []), 'captured': None, 'applied': None,
+           'evidence': {'cmd_hook': fn in src['cmd_hooks'], 'reviewed': True}}
+    if ev.get('status') == LOC:
+        # per-machine presentation: the reason is written in evidence.json; the claim is only kept while its tokens are still in the source
+        ok = all(token_ok(src['root'], f, rx) for f, rx in ev.get('local_tokens', []))
+        out.update(status=LOC if ok else static, changed=ok and static != LOC)
+        return out
+    refcmd = 'RefCommand' in (ev.get('effect') or '')
+    cap = all(t in src['captured'] for t in ets if t != 'RefCommand') if ets else True
+    app = all(t in src['applied'] for t in ets) if ets else True
+    if refcmd:
+        in_table = fn in src.get('refcmd_fns', set())
+        cap = cap and in_table
+        app = app and in_table
+    ctoks = ev.get('capture_tokens', [])
+    atoks = ev.get('apply_tokens', [])
+    cap = cap and all(token_ok(src['root'], f, rx) for f, rx in ctoks)
+    app = app and all(token_ok(src['root'], f, rx) for f, rx in atoks)
+    if not (ets or ctoks or atoks):
+        cap = app = False                      # an entry with no checkable evidence proves nothing
+    out['captured'], out['applied'] = cap, app
+    out['evidence'].update(capture_tokens=len(ctoks), apply_tokens=len(atoks))
+    status = SUP if cap and app else PAR if (cap or app) else (static if static in (PAR, MIS) else MIS)
     out.update(status=status, changed=status != static)
     return out

@@ -18,7 +18,7 @@ import re
 import threading
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from . import probe
+from . import fakenpc, probe
 from .core import Comparer, Machine
 from .probe import Result, fullref, hexid
 
@@ -56,11 +56,42 @@ BUGS = {
     "puppet_slides_after_teleport": "right after a teleport a puppet starts gliding on an idle animation",
     "puppet_tpose": "a puppet has no animation running (T-pose)",
     "endgame_ignores_notyet": "a 'Not yet' answer to the endgame confirm does not stop the battle",
+    # ---- enemy / NPC sync (pb_enemy.py, needs FakeCoop(npc_ai=True) or sites) ----
+    "double_damage": "a player's hit on an NPC is applied twice (the attacker's prediction plus the owner's result)",
+    "kill_credit_dup": "every shooter of the killing volley is credited with the kill",
+    "npc_hit_twice": "an NPC's hit on a player is applied twice (owner and victim both apply it)",
+    "npc_pos_stale": "NPC positions never reach the non-owner machines",
+    "npc_no_attack_anim": "the remote copy of an NPC never plays its attack animation",
+    "npc_no_stagger_anim": "the remote copy of an NPC never staggers when it is hit",
+    "npc_death_pose_missing": "the remote copy of a dead NPC keeps an alive animation",
+    "npc_no_draw": "the remote copy of an NPC never draws its weapon",
+    "npc_slides": "the remote copy of a walking NPC glides across the ground on an idle animation",
+    "ai_both": "old and new owner both run the NPC's AI (it shakes, and two machines claim the AI)",
+    "ghost_owner": "after a handoff the former owner keeps simulating its own stale copy of the NPC",
+    "handoff_snap": "the new owner resets the NPC to its spawn point (Reset3D) when it takes it over",
+    "handoff_dup": "the new owner creates a second copy of the NPC when it takes it over",
+    "hp_revive_on_handoff": "the new owner applies a stale full-health state to the NPC when it takes it over",
+    "spawn_pick_differs": "the other machines roll their own leveled pick for an encounter instead of using the owner's",
+    "spawn_ids_differ": "the same spawned NPC has a different net id on the other machines",
+    "respawn_on_return": "an encounter site spawns its NPCs again when a player comes back",
+    "corpse_loot_dup": "the item stays on the corpse after it was taken, so both players get it",
+    "corpse_loot_lost": "a corpse item that is taken leaves the corpse but never arrives in the inventory",
+    "corpse_unsynced": "the other machines never see what a corpse carries",
 }
 
 
 def norm(ref: str) -> str:
     return fullref(ref).split(":")[0].lower() + ":" + hexid(ref)
+
+
+def _ref_number(key: str) -> int:
+    """A stable integer ref id for a world key. Plain keys are their hex id; keys of duplicate or renamed refs get a derived one."""
+    tail = key.split(":")[-1]
+    try:
+        return int(tail, 16)
+    except ValueError:
+        import zlib
+        return 0x40000000 | (zlib.crc32(key.encode("utf-8")) & 0x3FFFFFFF)
 
 
 class FakeNv:
@@ -76,6 +107,8 @@ class FakeNv:
             return self.bot.coop_status()
         if method == "anim.probe":
             return self.bot.anim_probe()
+        if method == "coop.owner":
+            return self.bot.owner_info(params["ref"])
         if method == "events":
             return {"events": [], "next": 0}
         if method == "flight.dump":
@@ -104,6 +137,11 @@ class FakeNv:
                 raise RuntimeError(f"exec: ref '{ref}' is not a loaded form")     # the bridge's -32013
             if cmd.strip().lower() == "setplayerteammate 1" and r["follower_of"] is None:
                 w.set_ref(ref, follower_of=self.bot.idx, owner=self.bot.idx)
+            add = re.match(r"additem (\w+) (\d+)$", cmd.strip(), re.I)
+            if add and self.bot.idx == 0:            # the host adds it; the container change replicates like any other
+                items = dict(r["items"])
+                items[add.group(1).upper()] = items.get(add.group(1).upper(), 0) + int(add.group(2))
+                w.set_ref(ref, items=items)
             return {"ok": True, "output": ""}
         m = re.match(r"setstage (\w+) (\d+)", cmd)
         if m:
@@ -118,7 +156,7 @@ class FakeCoop:
     def __init__(self, n_players: int = 2, bugs: Optional[Set[str]] = None, lag: int = 1,
                  barriers: Optional[Set[Tuple[str, int]]] = None, readychecks: Optional[Set[Tuple[str, int]]] = None,
                  quest_rules: Optional[dict] = None, tether: Optional[dict] = None, flight_dir: str = "", loss_every: int = 0, retransmit_ticks: int = 3,
-                 walk_speed: Optional[float] = None):
+                 walk_speed: Optional[float] = None, npc_ai: bool = False, npc_lag: Optional[float] = None):
         unknown = set(bugs or ()) - set(BUGS)
         if unknown:
             raise ValueError(f"unknown fake bugs {unknown}")
@@ -172,6 +210,17 @@ class FakeCoop:
         self.bots: List[FakeBot] = [FakeBot(self, i) for i in range(n_players)]
         self.dup_n = 0
         self.sites: List[dict] = []
+        # enemy layer (fakenpc.py); all empty and unused unless npc_ai
+        self.npc_ai = npc_ai
+        self.npc_lag = fakenpc.INTERP if npc_lag is None else npc_lag      # seconds a remote copy is behind its owner (link + buffer)
+        self.live: Dict[str, dict] = {}              # NPC ref key -> owner-side live state (pos, anim ...)
+        self.hp_max: Dict[str, int] = {}
+        self.ghost: Dict[str, dict] = {}
+        self.owner_changes: Dict[str, int] = {}
+        self.npc_hit_n = [0] * n_players             # NPC attacks that landed on each player (counted once each)
+        self.hit_n = 0                               # id of the next resolved player hit
+        self.spawn_round = 0
+        self.npc_stats: Dict[str, int] = {}          # what the NPCs did: attacks, draws, staggers (tests: the run was not vacuous)
 
     # ---- building the world ----
     @staticmethod
@@ -186,6 +235,7 @@ class FakeCoop:
         r = self._mkref(ref, kind, pos, cell, **kw)
         k = norm(ref)
         self.truth["refs"][k] = r
+        self.hp_max[k] = r["hp"]
         for v in self.views:
             v["refs"][k] = copy.deepcopy(r)
         return k
@@ -195,17 +245,29 @@ class FakeCoop:
         self.sites.append({"pos": tuple(pos), "cell": cell, "specs": list(specs), "radius": radius, "done": False})
 
     def check_spawns(self) -> None:
-        for site in self.sites:
-            if site["done"]:
-                continue
-            for p in self.players:
-                if p["cell"] == site["cell"] and self.dist(p["pos"], site["pos"]) <= site["radius"]:
-                    site["done"] = True
-                    for ref, kind, pos, kw in site["specs"]:
-                        k = norm(ref)
-                        self.commit({"op": "ref", "ref": k, "f": self._mkref(ref, kind, pos, site["cell"], **dict(kw)),
-                                     "spawn": True})
-                    break
+        with self._lock:          # two players arriving at once must not both trigger the site
+            for si, site in enumerate(self.sites):
+                inside = {s for s, p in enumerate(self.players)
+                          if p["cell"] == site["cell"] and self.dist(p["pos"], site["pos"]) <= site["radius"]}
+                if not inside:
+                    if site["done"]:
+                        site["vacated"] = True            # everybody left: the next arrival is a return
+                    continue
+                came_back = bool(site["done"] and site.get("vacated") and "respawn_on_return" in self.bugs)
+                if site["done"] and not came_back:
+                    continue
+                site["vacated"] = False
+                site["done"] = True
+                self.spawn_round += 1
+                for j, (ref, kind, pos, kw) in enumerate(site["specs"]):
+                    kw = dict(kw)
+                    kw.setdefault("encounter", f"site{si}")
+                    if came_back:                     # the bug: a second roll of the same site under new identities
+                        ref = f"falloutnv.esm:{0xE00000 + 0x100 * self.spawn_round + j:X}"
+                    k = norm(ref)
+                    f = self._mkref(ref, kind, pos, site["cell"], **kw)
+                    self.hp_max[k] = f["hp"]
+                    self.commit({"op": "ref", "ref": k, "f": f, "spawn": True})
 
     def set_player(self, slot: int, pos=None, cell=None, inv=None):
         p = self.players[slot]
@@ -242,6 +304,7 @@ class FakeCoop:
         with self._lock:
             self.vt += 0.05
             self._step_shown()
+            fakenpc.step(self)
             self._tick_core()
             for h in list(self.tick_hooks):
                 h()
@@ -332,6 +395,11 @@ class FakeCoop:
         elif op == "ref":
             f = dict(eff["f"])
             k = eff["ref"]
+            if client and eff.get("spawn"):
+                if "spawn_pick_differs" in b and f.get("encounter"):
+                    f["base"] = str(f.get("base")) + "-CLIENTROLL"
+                if "spawn_ids_differ" in b and f.get("encounter"):
+                    k = k + "-c"
             if client:
                 if "no_container_sync" in b:
                     f.pop("items", None)
@@ -346,6 +414,8 @@ class FakeCoop:
                 if "owner_split" in b:
                     f.pop("owner", None)
                     f.pop("epoch", None)
+                if "corpse_unsynced" in b and "items" in f and f.get("dead", view["refs"].get(k, {}).get("dead")):
+                    f.pop("items", None)
                 if "no_fight_sync" in b and ("hp" in f or "dead" in f):
                     f.pop("hp", None)
                     f.pop("dead", None)
@@ -443,24 +513,62 @@ class FakeCoop:
 
     # ---- ownership ----
     def rebalance_owners(self) -> None:
-        for k, r in self.truth["refs"].items():
-            if r["kind"] not in ("raider", "actor", "companion") or r["dead"]:
-                continue
-            cur = r["owner"]
-            best, bd = cur, self.dist(self.players[cur]["pos"], r["pos"]) if self.players[cur]["cell"] == r["cell"] else 1e9
-            for s in range(self.n):
-                if self.players[s]["cell"] != r["cell"]:
+        with self._lock:
+            for k, r in list(self.truth["refs"].items()):
+                if r["kind"] not in ("raider", "actor", "companion", "creature") or r["dead"]:
                     continue
-                d = self.dist(self.players[s]["pos"], r["pos"])
-                margin = 0 if "flap_owner" in self.bugs else 1500
-                if d + margin < bd:
-                    best, bd = s, d
-            if bd >= 1e9:
-                continue
-            if best != cur:
-                r["epoch"] += 1
-                self.set_ref(k, owner=best, epoch=r["epoch"])
-                self.owner_epochs[k] = r["epoch"]
+                live = self.live.get(k) if self.npc_ai else None
+                where = live["pos"] if live is not None else r["pos"]
+                cur = r["owner"]
+
+                def at(s):          # AI worlds judge by where the characters really are, not where they were told to go
+                    return self.shown[s] if self.npc_ai else self.players[s]["pos"]
+                best, bd = cur, self.dist(at(cur), where) if self.players[cur]["cell"] == r["cell"] else 1e9
+                for s in range(self.n):
+                    if self.players[s]["cell"] != r["cell"]:
+                        continue
+                    d = self.dist(at(s), where)
+                    margin = 0 if "flap_owner" in self.bugs else 1500
+                    if d + margin < bd:
+                        best, bd = s, d
+                if bd >= 1e9:
+                    continue
+                if best != cur:
+                    r["epoch"] += 1
+                    self.set_ref(k, owner=best, epoch=r["epoch"])
+                    self.owner_epochs[k] = r["epoch"]
+                    fakenpc.on_owner_change(self, k, cur, best)
+
+    # ---- combat (enemy layer) ----
+    def resolve_hit(self, k: str, attacker: int, dmg: int, limb=None) -> dict:
+        """The victim's owner resolves one player hit on NPC `k` exactly once. Returns {dealt (health taken), killed}."""
+        with self._lock:
+            r = self.truth["refs"][k]
+            self.hit_n += 1
+            applied = dmg * (2 if "double_damage" in self.bugs else 1)
+            hp = r["hp"] - applied
+            f: Dict[str, Any] = {"hp": max(hp, 0)}
+            if limb:
+                f["last_limb"] = limb
+            killed = hp <= 0
+            if killed:
+                credits = [attacker] if "kill_credit_dup" not in self.bugs else list(range(self.n))
+                f.update(dead=True, deaths=r["deaths"] + 1, killer=attacker, credits=credits)
+                fakenpc.on_death(self, k)
+            dealt = r["hp"] - f["hp"]
+            self.set_ref(k, **f)
+            if not killed:
+                fakenpc.on_player_hit(self, k)
+            return {"dealt": dealt, "killed": killed}
+
+    def npc_hits_player(self, k: str, slot: int) -> None:
+        """NPC `k` (owner side) hit player `slot`: the victim applies the damage once."""
+        p = self.players[slot]
+        p["hp"] -= fakenpc.NPC_DAMAGE * (2 if "npc_hit_twice" in self.bugs else 1)
+        self.npc_hit_n[slot] += 1
+
+    def npc_view(self, k: str, machine: int):
+        return fakenpc.view(self, k, machine)
 
 
 class FakeBot:
@@ -536,10 +644,19 @@ class FakeBot:
                                  weapon_form=0x100 if weapon_out else 0, aiming=False)
                 actors.append(synth.actor_dict(0x14 if own else 0xFF0000 + j, st, True, w.vt * 1000.0))
             for k, r in self.view["refs"].items():
-                if r["kind"] in ("raider", "actor", "companion") and r["enabled"]:
-                    ref = int(k.split(":")[-1], 16)
-                    groups = [(0, G["Death"])] if r["dead"] else [(0, G["Idle"])]
-                    st = synth.State(pos=tuple(r["pos"]), groups=groups, dead=r["dead"], seq_state=1)
+                if r["kind"] in ("raider", "actor", "companion", "creature") and r["enabled"]:
+                    ref = _ref_number(k)
+                    v = w.npc_view(k, me) if (w.npc_ai and r.get("ai")) else None
+                    if v is not None:
+                        a = v["anim"]
+                        groups = {"idle": [(0, G["Idle"])], "run": [(1, G["Forward"]), (0, G["Idle"])],
+                                  "attack": [(0, G["AttackRight"])], "stagger": [(0, G["Stagger"])], "draw": [(0, G["Equip"])],
+                                  "death": [(0, G["Death"])]}[a]
+                        st = synth.State(pos=tuple(v["pos"]), rotz=v["rot"], groups=groups, phase=v["phase"], dead=r["dead"],
+                                         weapon_out=v["weapon_out"], weapon_form=0x300 if v["weapon_out"] else 0, seq_state=1)
+                    else:
+                        groups = [(0, G["Death"])] if r["dead"] else [(0, G["Idle"])]
+                        st = synth.State(pos=tuple(r["pos"]), groups=groups, dead=r["dead"], seq_state=1)
                     actors.append(synth.actor_dict(ref, st, True, w.vt * 1000.0))
         return {"v": 1, "frame": w.tick_n * 3, "t_ms": round(w.vt * 1000.0, 2), "cost_us": 40.0, "actors": actors}
 
@@ -557,13 +674,26 @@ class FakeBot:
         return {"shared": v, "perPlayer": {"inv": dict(self.me["inv"])}}
 
     # --- movement ---
+    def _ref_pos(self, ref):
+        """Where this machine shows the ref: the live (interpolated) position for AI NPCs, else the placed position."""
+        k = norm(ref)
+        r = self.view["refs"].get(k)
+        if r is None:
+            return None
+        if self.world.npc_ai and r.get("ai"):
+            v = self.world.npc_view(k, self.idx)
+            if v is not None:
+                return tuple(v["pos"])
+        return tuple(r["pos"])
+
     def goto_ref(self, ref, dist=150, timeout_s=30):
         self._log("goto_ref", ref)
         r = self.view["refs"].get(norm(ref))
         if r is None:
             return Result(False, f"{ref} is not loaded on {self.name}")
         off = dist * (0.5 + 0.1 * self.idx)     # players stop short of the ref, each a bit differently
-        return self._move((r["pos"][0] + off, r["pos"][1], r["pos"][2]), r["cell"])
+        pos = self._ref_pos(ref)
+        return self._move((pos[0] + off, pos[1], pos[2]), r["cell"])
 
     def goto_pos(self, x, y, z, cell=None, timeout_s=30):
         return self._move((x, y, z), cell or self.me["cell"])
@@ -606,7 +736,7 @@ class FakeBot:
         r = self.view["refs"].get(norm(ref))
         if r is None:
             return Result(False, f"{ref} is not loaded on {self.name}")
-        if r["cell"] != self.me["cell"] or self.world.dist(r["pos"], self.me["pos"]) > 4000:
+        if r["cell"] != self.me["cell"] or self.world.dist(self._ref_pos(ref), self.me["pos"]) > 4000:
             return Result(False, "target is out of range")
         self.me["aim"] = norm(ref)
         return Result(True)
@@ -615,7 +745,7 @@ class FakeBot:
         return Result(True)
 
     def fire(self, n=1, timeout_s=5):
-        return self._hit(25, n)
+        return self._hit(fakenpc.HIT_DAMAGE, n)
 
     def vats_target(self, ref, limb=None, timeout_s=10):
         r = self.aim_at(ref)
@@ -630,24 +760,20 @@ class FakeBot:
             return Result(False, "nothing aimed at")
         if not self.me["equipped"]:
             return Result(False, "no weapon equipped")
-        hits = 0
-        for _ in range(n):
-            r = w.t(k)
-            if r is None or not r["enabled"]:
-                return Result(False, "target is gone", {"hits": hits})
-            if r["dead"]:
-                if "dup_kill" in w.bugs:
-                    w.set_ref(k, deaths=r["deaths"] + 1)
-                return Result(False, "target is already dead", {"hits": hits})
-            hp = r["hp"] - dmg
-            f: Dict[str, Any] = {"hp": max(hp, 0)}
-            if limb:
-                f["last_limb"] = limb
-            if hp <= 0:
-                f.update(dead=True, deaths=r["deaths"] + 1, killer=self.idx)
-            w.set_ref(k, **f)
-            hits += 1
-        return Result(True, "", {"hits": hits})
+        hits = dealt = 0
+        with w._lock:               # a shot is resolved as one step: two shooters at the same instant cannot lose a decrement
+            for _ in range(n):
+                r = w.t(k)
+                if r is None or not r["enabled"]:
+                    return Result(False, "target is gone", {"hits": hits, "dealt": dealt})
+                if r["dead"]:
+                    if "dup_kill" in w.bugs:
+                        w.set_ref(k, deaths=r["deaths"] + 1)
+                    return Result(False, "target is already dead", {"hits": hits, "dealt": dealt})
+                res = w.resolve_hit(k, self.idx, dmg, limb)
+                hits += 1
+                dealt += res["dealt"]
+        return Result(True, "", {"hits": hits, "dealt": dealt})
 
     # --- interaction ---
     def _tgt(self, ref):
@@ -688,15 +814,16 @@ class FakeBot:
 
     def open_container(self, ref, timeout_s=10):
         w = self.world
-        r = w.t(ref)
-        if r is None or r["kind"] not in ("container", "corpse"):
-            return Result(False, "not a container")
-        if r["locked"]:
-            return Result(False, "container is locked")
-        if r["in_use"] not in (None, self.idx):
-            return Result(False, f"container is in use by player {r['in_use']}")
-        r["in_use"] = self.idx
-        return Result(True)
+        with w._lock:               # taking the "in use" lock is one step
+            r = w.t(ref)
+            if r is None or (r["kind"] not in ("container", "corpse") and not r["dead"]):
+                return Result(False, "not a container")
+            if r["locked"]:
+                return Result(False, "container is locked")
+            if r["in_use"] not in (None, self.idx):
+                return Result(False, f"container is in use by player {r['in_use']}")
+            r["in_use"] = self.idx
+            return Result(True)
 
     def close_container(self, ref):
         r = self.world.t(ref)
@@ -706,21 +833,24 @@ class FakeBot:
 
     def take(self, item, count=1, from_ref=None, timeout_s=10):
         w = self.world
-        r = w.t(from_ref)
-        if r is None:
-            return Result(False, "no such container")
-        if r["in_use"] != self.idx:
-            return Result(False, "container is not open")
-        have = r["items"].get(item, 0)
-        if have < count:
-            return Result(False, f"only {have} x {item} left")
-        items = dict(r["items"])
-        items[item] = have - count
-        if items[item] == 0:
-            del items[item]
-        w.set_ref(from_ref, items=items)
-        self.me["inv"][item] = self.me["inv"].get(item, 0) + count
-        return Result(True)
+        with w._lock:
+            r = w.t(from_ref)
+            if r is None:
+                return Result(False, "no such container")
+            if r["in_use"] != self.idx:
+                return Result(False, "container is not open")
+            have = r["items"].get(item, 0)
+            if have < count:
+                return Result(False, f"only {have} x {item} left")
+            items = dict(r["items"])
+            if not (r["dead"] and "corpse_loot_dup" in w.bugs):      # the bug: the corpse keeps what was taken
+                items[item] = have - count
+                if items[item] == 0:
+                    del items[item]
+            w.set_ref(from_ref, items=items)
+            if not (r["dead"] and "corpse_loot_lost" in w.bugs):     # the bug: it leaves the corpse and arrives nowhere
+                self.me["inv"][item] = self.me["inv"].get(item, 0) + count
+            return Result(True)
 
     def put(self, item, count, to_ref, timeout_s=10):
         w = self.world
@@ -972,6 +1102,40 @@ class FakeBot:
 
     def death_count(self, ref):
         return int(self.view["refs"][norm(ref)]["deaths"])
+
+    # --- enemy layer queries (probe.py names) ---
+    def owner_info(self, ref):
+        """The coop.owner answer of this machine for `ref` (same keys as plugin/actors' bridge method)."""
+        w = self.world
+        k = norm(ref)
+        r = self.view["refs"].get(k)
+        if r is None:
+            return {"owner": 255, "epoch": 0, "known": False, "mine": False, "pending": False, "self": self.idx, "ai": False,
+                    "standIn": False, "dead": False, "netId": None}
+        ai = r["owner"] == self.idx and not r["dead"]
+        if "ai_both" in w.bugs and not r["dead"]:
+            ai = True
+        g = w.ghost.get(k)
+        if g is not None and g["machine"] == self.idx:
+            ai = True
+        return {"owner": r["owner"], "epoch": r["epoch"], "known": True, "mine": r["owner"] == self.idx, "pending": False,
+                "self": self.idx, "ai": ai, "standIn": False, "dead": r["dead"], "netId": k}
+
+    def npc_pos(self, ref):
+        p = self._ref_pos(ref)
+        if p is None:
+            raise RuntimeError(f"{ref} is not loaded on {self.name}")
+        return p
+
+    def kill_credits(self, ref):
+        return list(self.view["refs"][norm(ref)].get("credits", []))
+
+    def hits_taken(self):
+        return int(self.world.npc_hit_n[self.idx])
+
+    def encounter_members(self, bases=None):
+        """(net id, base, this machine's ref) of every encounter NPC this machine knows (alive or dead), sorted."""
+        return sorted((k, str(r["base"]), k) for k, r in self.view["refs"].items() if r.get("encounter"))
 
     def quest_stage(self, q):
         st = self.view["quests"].get(hexid(q), {}).get("stages", [])

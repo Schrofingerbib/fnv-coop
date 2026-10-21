@@ -1,4 +1,5 @@
 #include "effect_json.h"
+#include "fnvcoop/refop.h"
 
 #include <cctype>
 #include <cstdio>
@@ -55,7 +56,7 @@ static const char* effectNameLocal(const Effect& e) {
                               "CompleteAllObjectives", "SetLock", "SetFactionRank", "SetPerk", "SwapTexture", "SetFastTravelLock",
                               "FailQuest", "SpawnRef", "DespawnRef", "ObjectState", "RefScriptVar", "RefAddItem", "RefRemoveItem",
                               "RemoveAllItems", "AddTopic", "AddNote", "RemoveNote", "SetMapMarker", "ForceActiveQuest", "RequestSave",
-                              "SetWeather", "SetTimeScale", "AdvanceTime", "RefAngle"};
+                              "SetWeather", "SetTimeScale", "AdvanceTime", "RefAngle", "RefCommand"};
     static_assert(std::variant_size_v<Effect> == sizeof n / sizeof *n, "effect.h gained/lost an Effect: update effectNameLocal + the JSON codec");
     return e.index() < sizeof n / sizeof *n ? n[e.index()] : "?";
 }
@@ -103,6 +104,16 @@ Value effectToJson(const Effect& e) {
     else if (auto* x = std::get_if<RefAngle>(&e)) { T("RefAngle"); o.set("ref", refToStr(x->ref)).set("axis", (int64_t)x->axis).set("degrees", (double)x->degrees); if (x->hasBefore) o.set("before", (double)x->before); }
     else if (auto* x = std::get_if<SpawnRef>(&e)) { T("SpawnRef"); o.set("ref", refToStr(x->ref())).set("base", refToStr(x->base)).set("cell", x->cell.plugin.empty() ? std::string() : refToStr(x->cell)).set("x", (double)x->x).set("y", (double)x->y).set("z", (double)x->z).set("leveled", x->leveled); }
     else if (auto* x = std::get_if<DespawnRef>(&e)) { T("DespawnRef"); o.set("ref", refToStr(x->ref())); if (x->forget) o.set("forget", true); }
+    else if (auto* x = std::get_if<RefCommand>(&e)) {
+        T("RefCommand");
+        const RefOpInfo* oi = refOpInfo(x->op);
+        o.set("op", oi ? oi->name : "?").set("id", (int64_t)x->op);
+        if (!x->ref.plugin.empty()) o.set("ref", refToStr(x->ref));
+        if (!x->a.plugin.empty()) o.set("a", refToStr(x->a));
+        if (!x->b.plugin.empty()) o.set("b", refToStr(x->b));
+        o.set("i", (int64_t)x->i).set("j", (int64_t)x->j).set("k", (int64_t)x->k).set("l", (int64_t)x->l).set("f", (double)x->f).set("to", toStr(x->to));
+        if (!x->s.empty()) o.set("s", x->s);
+    }
     else { T("Unsupported"); o.set("name", effectNameLocal(e)); }  // round-2 session-level effects: not carried by this codec
     return o;
 }
@@ -166,6 +177,22 @@ bool effectFromJson(const Value& v, Effect* out, std::string* err) {
     else if (t == "RequestSave") { *out = RequestSave{(uint8_t)v.get("kind").asInt()}; }
     else if (t == "SetWeather") { if (!needRef(v, "weather", &r, err)) return false; SetWeather sw{r, v.get("force").asBool()}; FormRef bw; if (strToRef(v.get("before").asString(""), &bw)) { sw.hasBefore = true; sw.before = bw; sw.beforeForce = v.get("beforeForce").asBool(); } *out = sw; }
     else if (t == "SetTimeScale") { SetTimeScale ts{(float)v.get("scale").asNumber()}; if (v.get("before").isNumber()) { ts.hasBefore = true; ts.before = (float)v.get("before").asNumber(); } *out = ts; }
+    else if (t == "RefCommand") {
+        int64_t id = v.get("id").asInt(-1);
+        if (id < 1 || id > 0xFFFF || !refOpKnown((uint16_t)id)) { if (err) *err = "RefCommand: unknown op"; return false; }
+        RefCommand rc;
+        rc.op = (uint16_t)id;
+        FormRef f;
+        if (v.get("ref").isString()) { if (!strToRef(v.get("ref").asString(""), &f)) { if (err) *err = "RefCommand: bad ref"; return false; } rc.ref = f; }
+        if (v.get("a").isString()) { if (!strToRef(v.get("a").asString(""), &f)) { if (err) *err = "RefCommand: bad a"; return false; } rc.a = f; }
+        if (v.get("b").isString()) { if (!strToRef(v.get("b").asString(""), &f)) { if (err) *err = "RefCommand: bad b"; return false; } rc.b = f; }
+        rc.i = (int32_t)v.get("i").asInt(); rc.j = (int32_t)v.get("j").asInt(); rc.k = (int32_t)v.get("k").asInt(); rc.l = (int32_t)v.get("l").asInt();
+        rc.f = (float)v.get("f").asNumber();
+        rc.s = v.get("s").asString("");
+        if (rc.s.size() > 255) { if (err) *err = "RefCommand: text too long"; return false; }
+        if (!toRecipient(v.get("to").asString("default"), &rc.to)) { if (err) *err = "RefCommand: bad recipient"; return false; }
+        *out = rc;
+    }
     else if (t == "RefAngle") { if (!needRef(v, "ref", &r, err)) return false; int64_t ax = v.get("axis").asInt(); if (ax < 0 || ax > 2) { if (err) *err = "RefAngle axis out of range"; return false; } RefAngle ra{r, (uint8_t)ax, (float)v.get("degrees").asNumber()}; if (v.get("before").isNumber()) { ra.hasBefore = true; ra.before = (float)v.get("before").asNumber(); } *out = ra; }
     else if (t == "SpawnRef") {
         FormRef base, cell;

@@ -188,3 +188,69 @@ docs/RESUME.md.
 T1a with T1b, T2a with T2b, T3a with T3b, T4a with T4b: agree on interfaces with your partner first, by
 SendMessage, before writing code. Cross-pair: T1 with T2 (trace format, replay entry point), T4b with L7's sweep
 helpers (read only).
+
+## Build speed (2026-10-20): one shared build tree, runtime mutation twins, affected-only tests
+
+Why: about 13 build dirs (`build/*`, `out/*/build*`, `%TEMP%\nv*_build`) each recompiled the same code, and every mutation twin
+was its own compile (`-DNVWORLD_MUT=28` ...). `plugin/hooks_world` alone compiled its sources 43 times (42 twins plus the real
+one, each a core library plus a test exe). A cold build of that one suite took 869 s on this machine (measured, 2-job Ninja,
+shared with other agents), and a full `test_all` took 10+ minutes.
+
+### What exists now
+| Piece | Where | What it does |
+|---|---|---|
+| Shared tree | root `CMakeLists.txt`, tree `build/all` | `add_subdirectory(plugin)` (nvcoop.dll and all plugin lanes, artifacts still in `out/L1`, `out/L10`, `out/T3b` ...) plus `add_subdirectory(synccore)` (core, sim, enginemodel, flight, chaos, live) plus `synccore/fuzz` (EXCLUDE_FROM_ALL, FUZZ_EM=ON). Win32/x86 like the game. |
+| Build driver | `tools/build/build.py` | Sets up MSVC (vcvars), takes the lock `out/locks/build.lock` (mkdir, retries every 15 s, released on success, failure and Ctrl-C, writes `owner.txt` inside), configures when needed, builds `--target ...` (or everything), prints `BUILD-TIME`. Uses `sccache` as compiler launcher when it is on PATH. `-k` reports all compile errors, `--configure-only` needs no lock. |
+| Runtime twins | `tools/mut/fnvcoop_mut.h` | `FNV_MUT(n)` replaces `#if X_MUT == n`. Test code is compiled ONCE with `FNVCOOP_RUNTIME_MUT`; the twin is chosen with env `FNVCOOP_MUT=<n>` (or `--mut n` if the test main calls `fnvcoop_mut::initFromArgs`). In production builds `FNV_MUT(n)` is the constant `false`: nothing in a shipped DLL reads the environment. |
+| Twin runner | `tools/mut/run_twins.py` | Runs the exe once for real (must exit 0, optional output regex), then once per twin with `FNVCOOP_MUT=n` (must be caught: non-zero exit, optionally also a `N failed` line; missing-DLL loader errors never count as caught). Prints `ALL OK`. |
+| Converter | `tools/mut/convert_mut.py` | One-shot helper that rewrites `#if M == n ... #else ... #endif` blocks into `if (FNV_MUT(n)) { ... } else { ... }`. Declarations, `case` labels and class members need a hand edit (the compiler points at them). |
+| Precompiled headers | `tools/build/pch.cmake` (`fnvcoop_pch(target)`) | Heavy std headers for targets with 3+ sources (synccore, coop synccore, hooks core, bots tests). Off automatically with sccache or `-DFNVCOOP_PCH=OFF`. |
+| Affected-only tests | `python -I tools/test_all.py --affected [--list] [--base REF]` | `git diff --name-only <base>` plus untracked files, mapped to suites. A suite owns the directories named in its command line (so a new `SUITES` entry needs no registration); suites that compile C++ also depend on the shared sources (`synccore/src`, `synccore/include`, `plugin/common`, `plugin/hooks`, `tools/mut`, `tools/build`, the CMake files, `third_party`). `docs/` never triggers a run; an unknown path under an unknown root runs everything. `--only SUBSTR` runs by name. |
+| Self-test | `python -I tools/mut/run_tests.py` (suite "build-speed tooling" in test_all) | C++ mechanism test with 3 twins, production build ignores `FNVCOOP_MUT`, runner self-test (survivor, broken real run, crash is not a caught twin), lock test (+ twin), selector test (+ twin). |
+
+### Converted suites (compile count per suite, before -> after)
+| Suite | Twins | Old compiles for twins | Now |
+|---|---|---|---|
+| L12 hooks_world | 42 | 42 core libs x 2 sources + 42 test exes (93 compile units + links) | 2 core libs (prod + `_rt`) + 1 test |
+| T6a bots | 32 | 33 test exes (each: test + hook_patch) | 1 test exe |
+| L11 hooks_ui | 9 + 7 | 10 core libs + 10 tests + 8 net libs + 8 bridge tests | `nvui_core`, `nvui_core_rt`, `nvui_net`, 2 tests |
+| T7 animprobe | 6 | 7 exes | 1 exe |
+| T3b reload | 8 + 7 + 9 | 9 + 8 unit/drain exes + 10 test-core DLLs | 2 exes + 1 DLL |
+| L10 coop | 5 + 2 + 4 peers | 6 core libs + 7 exes | `nvcoop_coop_core`, `_rt`, `coop_tests`, `coop_peer` |
+| T1a plugin flight | 3 | 4 exes | 1 exe |
+
+The old per-suite build dirs are NOT deleted by this change (list in the handoff). Scripts that used them now build in `build/all`.
+
+### Measured (this machine, 2 build jobs, other agents compiling at the same time, so absolute numbers are noisy)
+| What | Before | After |
+|---|---|---|
+| L12 hooks_world, cold build from nothing (same sources, same flags) | 868.8 s, 224 ninja steps, 1.3 GB build dir, x64 tree in `%TEMP%\nvw_build` | 90.3 s, 16 steps, 105 MB, x86 shared tree (about 9.6x faster) |
+| L12 hooks_world, the 42 twin runs | 42 separate exes | 8.6 s for real + 42 twins in one `run_twins.py` call |
+| T6a bots twin runs (32) | 33 exes | 5.2 s for real + 32 twins |
+| Per-twin results of hooks_world (failed-check counts of all 42 twins, old exes vs new runtime twins) | recorded from the old exes | identical, twin by twin (`1 751 checks, 3 failed`, `2 ... 1 failed`, ...) |
+| nvcoop.dll + all plugin targets (`build_l1.cmd`), cold, shared tree | n/a (old tree: 5.6 GB) | 180.6 s, 106 steps |
+| synccore (`run_tests.bat` build part), cold, shared tree | n/a | 158.8 s |
+| A suite whose targets are already built | took the lock and ran ninja (queued behind other agents' compiles) | `build.py` dry-runs ninja first and skips the lock when there is nothing to compile |
+
+Not measured: the full `test_all` (it was not run: other agents are editing at the same time, and the lead runs the gate). Everything above
+was run on the suites that were converted: hooks_world, bots, hooks_ui, animprobe, coop (+ 2-process integration), flight (synccore + plugin),
+the mut self-test, `build_l1.cmd`. All printed ALL OK except one item that is not caused by this change: `unit_perf` in synccore failed its p99 budget
+once while the machine was saturated (23 s run).
+
+### How to add or convert a suite
+1. Put `#include "fnvcoop_mut.h"` in the code under test (add `tools/mut` to its include path) and write `if (FNV_MUT(7)) { broken }`.
+2. Compile the code under test twice only if production also links it: a production lib (no define) and an `_rt` lib / test exe with `FNVCOOP_RUNTIME_MUT`. Never link a production and an `_rt` copy of inline code into one binary. Components linked into the same test binary must use different twin numbers (the flight test links the production coop core for this reason).
+3. In CMake add ONE test exe; register `add_test(NAME x_mutN COMMAND exe)` with `set_tests_properties(... WILL_FAIL TRUE ENVIRONMENT "FNVCOOP_MUT=N")`.
+4. `run_tests.cmd`: `python -I tools\build\build.py --target <exe>` then `python -I tools\mut\run_twins.py --twins 1-N --real-regex ", 0 failed" -- <exe>`.
+5. Plugin lanes are picked up by the `foreach(sub ...)` in `plugin/CMakeLists.txt`; synccore parts by `add_subdirectory` in `synccore/CMakeLists.txt`. Use `EXCLUDE_FROM_ALL` for test-only targets (the `plugin/all` build of `build_l1.cmd` then stays small).
+
+### Rules for everyone building
+- Always go through `tools/build/build.py` (or a `run_tests` that does): it holds the lock only while cmake runs.
+- Do not start a second ninja in `build/all` by hand while someone else builds; the lock exists for that.
+- sccache: not installed here. `scoop install sccache` (not done automatically) is picked up by `build.py` on the next run.
+- `synccore/run_tests.bat` runs ctest with `-j 2` (the timing-sensitive tests `unit_perf`, `soak_*`, `loopback_*` are `RUN_SERIAL`). The other agents'
+  suites that still configure their own tree (`synccore/live/run_tests.cmd` -> `build/live-core`, `plugin/actors` -> `build/actors`,
+  `plugin/avatar` -> `%TEMP%\nvav_build`, `synccore/fuzz` -> `build/T2b-fuzz*`, `plugin/loader` -> `build/T3a`) can move to the shared tree by
+  replacing their cmake/lock lines with `python -I tools\build\build.py --target <targets>`; their targets are already part of `build/all`
+  (actors and avatar are in the `foreach` of `plugin/CMakeLists.txt`, live is added by `synccore/CMakeLists.txt`, fuzz by the root file).
+- Twins that are still compile-time: L5 hooks (`NVHOOKS_MUTANT`, 8 files), the bridge (`NVBRIDGE_MUTANT*`, `NVPNG_MUTANT`), the chaos mirror (`CHAOS_MUTANT`, the header is generated by `tools/chaos/gen_header.py`), nvmp (`SIGSCAN_MUTANT_*`). They are one to four compiles each. Run-time since the merge of the helper's PRs: bots (twins 1..47), the loader (21..32, also used by the reload host test), splitscreen (1..7, suite in the shared tree).

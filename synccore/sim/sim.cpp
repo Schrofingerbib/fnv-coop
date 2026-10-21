@@ -98,7 +98,13 @@ struct WorldView {
         if (spawned != o.spawned || despawned != o.despawned) return "spawned";   // createdCounter is the host's allocation bookkeeping: a client that undid a spawn keeps the higher one
         if (objects != o.objects) return "objects";
         if (refVars != o.refVars) return "refVars";
-        if (refInv != o.refInv) return "refInv";
+        if (refInv != o.refInv) {
+            auto show = [](const RefInv& v) { std::string t = v.cleared ? "[cleared" : "["; for (auto& [i, d] : v.delta) t += " " + std::to_string(i.localId) + "=" + std::to_string(d); return t + "]"; };
+            std::string r = "refInv";
+            for (auto& [k, v] : refInv) { auto it = o.refInv.find(k); if (it == o.refInv.end() || !(it->second == v)) r += " " + std::to_string(k.localId) + " mine" + show(v) + " oracle" + (it == o.refInv.end() ? "[none]" : show(it->second)); }
+            for (auto& [k, v] : o.refInv) if (!refInv.count(k)) r += " " + std::to_string(k.localId) + " mine[none] oracle" + show(v);
+            return r;
+        }
         if (topics != o.topics) {
             std::string r = "topics mine-only:";
             for (auto& k : topics) if (!o.topics.count(k)) r += " " + std::to_string(k.localId);
@@ -243,6 +249,7 @@ private:
     void do_(const SetTimeScale& e) { foldTimeScale(v.timeScale, v.origins, e); }
     void do_(const RefAngle& e) { foldAngle(v.angles, v.angleOrig, e); }
     void do_(const AdvanceTime&) { ++eventsSeen; }
+    void do_(const RefCommand&) { ++eventsSeen; }   // the generator never emits it: synccore/tests/test_refcmd.cpp owns the RefCommand state machine
     void do_(const ForcedDialogue&) { ++eventsSeen; }
     void do_(const BarrierArrive&) {}
     void do_(const BarrierRelease& e) { v.released.insert(e.barrier); }
@@ -526,12 +533,20 @@ Cause genCause(Rng& r) {
 }
 
 
-// Effects kept out of host-load scenarios (a load rewinds the host to an older save; clients must come back to that state), and why:
-//  - BarrierArrive / BarrierRelease: transient rendezvous state, not part of the baseline and never saved.
-//  - SayOnceFlag, CompleteQuest, FailQuest, CompleteAllObjectives, SlideshowEnd: one-way in the engine (no command un-sets them).
+// Effects kept out of host-load scenarios (a load rewinds the host to an older save; clients must come back to that state), and why.
+// Everything NOT listed here is in the scenario and reverts through a pre-image or an exact diff:
+//   SetWeather, SetTimeScale, RefScriptVar, SetMapMarker, SetLock and the lock bit of ObjectState (Origin pre-images in ShadowState::origins),
+//   the open bit of ObjectState (a plain two-way bit), RefAddItem / RefRemoveItem (signed deltas), RemoveAllItems (RefInv::pre, undone by an
+//   undo RemoveAllItems), SpawnRef / DespawnRef (a forget DespawnRef drops a spawn or a tombstone the loaded save never had), RefAngle.
+//  - BarrierArrive / BarrierRelease: transient rendezvous state (who has arrived at a rendezvous right now). It has no baseline entry and is not
+//    in the digest, and a rendezvous belongs to the live session rather than to a save game, so a load has nothing to revert.
+//  - SayOnceFlag: a SayOnce topic flag is one-way in the engine (no command clears "said once"), so a client that set it cannot be reverted.
+//  - CompleteQuest / FailQuest / CompleteAllObjectives: one-way in the engine (a completed or failed quest cannot be un-completed by script).
+//  - SlideshowEnd: one-way in the engine (a played slideshow cannot be un-played).
 //  - AddTopic: one-way in the engine (there is no RemoveTopic).
-//  - ObjectState destroyed / activated-once bits: sticky in the engine (the generator below strips them, the rest of ObjectState is kept).
-//  - Round-3 inventory and spawn effects (indices 33..34, 37..39): see hostLoadExcludedRound3.
+//  - RefCommand: never generated here (synccore/tests/test_refcmd.cpp covers it). Its state ops carry no pre-image, so a host load cannot take one
+//    back from a client (the same limit as the one-way effects above); events have no state.
+//  - ObjectState destroyed / activated-once bits: sticky in the engine (the generator strips them below, the open and lock bits are kept).
 bool hostLoadExcluded(Effect& e) {
     if (std::holds_alternative<BarrierArrive>(e) || std::holds_alternative<BarrierRelease>(e) || std::holds_alternative<SayOnceFlag>(e) ||
         std::holds_alternative<CompleteQuest>(e) || std::holds_alternative<FailQuest>(e) || std::holds_alternative<CompleteAllObjectives>(e) ||

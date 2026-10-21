@@ -20,7 +20,9 @@ import mygames  # noqa: E402
 
 FORBIDDEN = re.compile(r"""Path\.home\(\)\s*/\s*["']Documents["']""")
 # mygames.py itself keeps the home-folder lookup only as the last fallback (no shell folder at all).
-ALLOWED = {Path("tools/runner/mygames.py")}
+# tools/installer/fnv_install.py ships alone in the release zip (no tools/runner next to it), so it carries its own copy of the
+# same lookup: the shell Documents folder (SHGetFolderPathW CSIDL_PERSONAL) first, the home folder only as the last fallback.
+ALLOWED = {Path("tools/runner/mygames.py"), Path("tools/installer/fnv_install.py")}
 
 
 def mutant_documents_dir(resolver=mygames.shell_documents) -> Path:

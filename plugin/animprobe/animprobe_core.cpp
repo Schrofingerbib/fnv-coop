@@ -1,8 +1,6 @@
 #include "animprobe_core.h"
 
-#ifndef ANIMPROBE_MUT
-#define ANIMPROBE_MUT 0
-#endif
+#include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
 
 #include <algorithm>
 #include <cstdio>
@@ -90,11 +88,7 @@ bool ParseRequest(const std::string& paramsJson, Request& out, std::string& err)
     if (const Value* s = p.find("scan_animdata")) out.scanAnimData = s->asBool(false);
     if (const Value* m = p.find("max")) {
         int64_t mx = m->asInt(16);
-#if ANIMPROBE_MUT == 4
-        if (mx < 1) {
-#else
-        if (mx < 1 || mx > kMaxActorsPerProbe) {
-#endif
+        if (FNV_MUT(4) ? (mx < 1) : (mx < 1 || mx > kMaxActorsPerProbe)) {   // twin 4: the upper bound is not checked
             err = "max must be 1.." + std::to_string(kMaxActorsPerProbe);
             return false;
         }
@@ -118,9 +112,9 @@ bool ParseRequest(const std::string& paramsJson, Request& out, std::string& err)
 Value ToJson(const ActorSample& a) {
     Value o = Value::object();
     o.set("ref", HexId(a.ref)).set("base", HexId(a.base));
-#if ANIMPROBE_MUT != 6
-    if (a.isPlayer) o.set("player", true);
-#endif
+    if (!FNV_MUT(6)) {
+        if (a.isPlayer) o.set("player", true);
+    }
     o.set("valid3d", a.valid3d).set("first_person", a.firstPerson).set("dead", a.dead).set("life", a.lifeState);
     o.set("pos", Vec(a.pos)).set("rot", Vec(a.rot)).set("cell", HexId(a.cell));
     if (a.haveAnim) {
@@ -147,11 +141,7 @@ Value ToJson(const ActorSample& a) {
     Value ai = Value::object();
     ai.set("in_combat", a.inCombat).set("combat_target", HexId(a.combatTarget)).set("package", HexId(a.package));
     o.set("ai", ai);
-#if ANIMPROBE_MUT == 5
-    if (false) {
-#else
-    if (!a.bones.empty()) {
-#endif
+    if (FNV_MUT(5) ? false : !a.bones.empty()) {   // twin 5: bones are never emitted
         Value b = Value::object();
         for (const auto& kv : a.bones) b.set(kv.first, Vec(kv.second));
         o.set("bones", b);
@@ -164,15 +154,15 @@ std::vector<int> SelectNearest(const std::vector<float>& distSq, float radius, i
     std::vector<int> idx;
     const float r2 = radius * radius;
     for (int i = 0; i < static_cast<int>(distSq.size()); ++i) {
-#if ANIMPROBE_MUT == 1
-        idx.push_back(i);  // mutant: ignores the radius
-#else
-        if (distSq[i] <= r2) idx.push_back(i);
-#endif
+        if (FNV_MUT(1)) {
+            idx.push_back(i);  // mutant: ignores the radius
+        } else {
+            if (distSq[i] <= r2) idx.push_back(i);
+        }
     }
-#if ANIMPROBE_MUT != 2
-    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return distSq[a] < distSq[b]; });
-#endif
+    if (!FNV_MUT(2)) {
+        std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return distSq[a] < distSq[b]; });
+    }
     if (static_cast<int>(idx.size()) > maxActors) idx.resize(maxActors);
     return idx;
 }
@@ -190,9 +180,9 @@ double CostStats::Percentile(double p) const {
     if (n == 0) return 0;
     std::vector<double> v(us_, us_ + n);
     std::sort(v.begin(), v.end());
-#if ANIMPROBE_MUT == 3
-    p = 1.0;  // mutant: every percentile is the maximum
-#endif
+    if (FNV_MUT(3)) {
+        p = 1.0;  // mutant: every percentile is the maximum
+    }
     int k = static_cast<int>(p * (n - 1) + 0.5);
     if (k < 0) k = 0;
     if (k >= n) k = n - 1;

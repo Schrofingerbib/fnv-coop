@@ -161,6 +161,24 @@ TEST(sim, host_and_client_save_load_scenarios_converge) {
     CHECK(rebases > 50);
 }
 
+// 1000 host-load scenarios (seed % 8 == 1), with every revertible effect in play: weather, time scale, ref script vars, map markers, locks,
+// object state, ref inventories, spawn / despawn. Independent of the join/restart seeds, so a failure here is a host-load revert bug.
+TEST(sim, host_load_seeds_1000_converge) {
+    int n = seedCount(1000);
+    uint64_t loads = 0, rebases = 0; int failed = 0;
+    for (int i = 0; i < n; ++i) {
+        uint64_t seed = 1 + uint64_t(i) * 8;
+        SimConfig c = configForSeed(seed);
+        REQUIRE(c.hostLoads);
+        SimResult r = runSim(c);
+        loads += r.hostLoads; rebases += r.rebases;
+        if (!r.ok) { ++failed; if (failed <= 5) std::printf("    seed %llu: %s\n", (unsigned long long)seed, r.violations[0].c_str()); }
+    }
+    std::printf("    host-load seeds: %d run, %d failed | host loads %llu | client rebases %llu\n", n, failed, (unsigned long long)loads, (unsigned long long)rebases);
+    CHECK(failed == 0);
+    CHECK(loads > uint64_t(n));
+}
+
 TEST(sim, desync_injection_is_healed_across_chaos_seeds) {
     uint64_t inj = 0, mism = 0, rep = 0, reports = 0, n = 0;
     for (uint64_t seed = 2; seed < 1500; seed += 5) {
@@ -182,6 +200,38 @@ TEST(twin, no_epoch_bump) { Mutations m; m.noEpochBump = true; expectDetected(m,
 TEST(twin, angle_preimage_ignored) { Mutations m; m.anglePreimageIgnored = true; expectDetected(m, "angle_preimage_ignored", "angles"); }
 // The host-load pre-images (weather, time scale, ref vars, map markers, locks): without them a rebase cannot undo what the loaded save never held.
 TEST(twin, origins_ignored) { Mutations m; m.originsIgnored = true; expectDetected(m, "origins_ignored", nullptr, 400); }
+// Host-load seeds only (seed % 8 == 1 runs hostLoads), clean run first, then with exactly one effect's revert switched off.
+void expectHostLoadDetected(uint32_t bit, const char* label, int hostLoadSeeds = 120) {
+    auto run = [&](int& failed, uint64_t& loads, std::string& first) {
+        for (int i = 0; i < hostLoadSeeds; ++i) {
+            SimResult r = runSim(configForSeed(1 + uint64_t(i) * 8));
+            loads += r.hostLoads;
+            if (!r.ok) { if (!failed) first = "seed " + std::to_string(1 + i * 8) + ": " + r.violations[0]; ++failed; }
+        }
+    };
+    int cleanFailed = 0, badFailed = 0; uint64_t cleanLoads = 0, badLoads = 0; std::string first, firstBad;
+    run(cleanFailed, cleanLoads, first);
+    CHECK_MSG(cleanFailed == 0, "clean host-load run must pass before the twin means anything: " + first);
+    CHECK(cleanLoads > 20);
+    {
+        Mutations m; m.preimageOff = bit;
+        MutationScope s(m);
+        run(badFailed, badLoads, firstBad);
+    }
+    std::printf("    twin %s: caught on %d/%d host-load seeds  e.g. %s\n", label, badFailed, hostLoadSeeds, firstBad.c_str());
+    CHECK(badFailed > 0);
+}
+
+TEST(twin, hostload_sim_set_weather) { expectHostLoadDetected(kPiWeather, "hostload_sim_set_weather"); }
+TEST(twin, hostload_sim_set_time_scale) { expectHostLoadDetected(kPiTimeScale, "hostload_sim_set_time_scale"); }
+TEST(twin, hostload_sim_ref_script_var) { expectHostLoadDetected(kPiRefVar, "hostload_sim_ref_script_var"); }
+TEST(twin, hostload_sim_set_map_marker) { expectHostLoadDetected(kPiMarker, "hostload_sim_set_map_marker"); }
+// No sim twin for locks: every dump (host baseline, loaded save) lists a lock for every ref, so the exact diff always sets the value and the lock
+// origin is never the only thing that can restore it. The origin revert is pinned by the unit twin hostload_unit_lock (tests/test_hostload.cpp).
+TEST(twin, hostload_sim_object_state_open) { expectHostLoadDetected(kPiObjectState, "hostload_sim_object_state_open"); }
+TEST(twin, hostload_sim_clear_pre_travels) { expectHostLoadDetected(kPiClearPre, "hostload_sim_clear_pre_travels", 400); }
+TEST(twin, hostload_sim_ref_inventory) { expectHostLoadDetected(kPiRefInv, "hostload_sim_ref_inventory"); }
+TEST(twin, hostload_sim_spawn_despawn) { expectHostLoadDetected(kPiSpawn, "hostload_sim_spawn_despawn"); }
 TEST(twin, baseline_skipped) { Mutations m; m.baselineSkipped = true; expectDetected(m, "baseline_skipped"); }
 TEST(twin, guest_runs_quest_scripts) { Mutations m; m.guestRunsQuestScripts = true; expectDetected(m, "guest_runs_quest_scripts"); }
 TEST(twin, no_guest_suppression) { Mutations m; m.noGuestSuppression = true; expectDetected(m, "no_guest_suppression", "ghost"); }

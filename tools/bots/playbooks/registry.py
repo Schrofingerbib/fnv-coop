@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Callable, Dict, NamedTuple, Optional, Tuple
 
-from . import pb_extra, pb_combat, pb_loot, pb_social, pb_story, pb_world
+from . import pb_enemy, pb_extra, pb_combat, pb_loot, pb_social, pb_story, pb_world
 from .core import Playbook
 
 
@@ -30,7 +30,15 @@ REGISTRY: Dict[str, Entry] = {
     "vats_hit": Entry(pb_extra.VatsHitPlaybook, pb_extra.fake_vats, 2),
     "save_load_rejoin": Entry(pb_extra.SaveLoadRejoinPlaybook, pb_extra.fake_saveload, 3),
     "goodsprings_opening": Entry(pb_story.GoodspringsOpeningPlaybook, None, 2, True),
+    # enemy / NPC sync (tools/bots/run_fight.py runs these four in a game)
+    "enemy_fight": Entry(pb_enemy.EnemyFightPlaybook, pb_enemy.fake_enemy_fight, 2),
+    "enemy_handoff": Entry(pb_enemy.EnemyHandoffPlaybook, pb_enemy.fake_enemy_handoff, 2),
+    "enemy_spawn": Entry(pb_enemy.EnemySpawnPlaybook, pb_enemy.fake_enemy_spawn, 2),
+    "corpse_loot_race": Entry(pb_enemy.CorpseLootRacePlaybook, pb_enemy.fake_corpse, 2),
 }
+
+# The four enemy tests, in the order the in-game runner uses
+ENEMY_TESTS = ("enemy_fight", "enemy_handoff", "enemy_spawn", "corpse_loot_race")
 
 # Twins: (playbook, fake bug) pairs where the playbook MUST fail. Used by the tests; also the documentation of coverage.
 TWINS = [
@@ -51,7 +59,21 @@ TWINS = [
     ("vats_hit", "vats_pauses_others"), ("vats_hit", "no_fight_sync"),
     ("save_load_rejoin", "no_rebase"), ("save_load_rejoin", "reward_dup_on_rejoin"), ("save_load_rejoin", "no_stage_sync"),
     ("goodsprings_opening", "no_stage_sync"), ("goodsprings_opening", "no_objective_sync"), ("goodsprings_opening", "pnr_early"),
+    # ---- enemy / NPC sync: every bug below must fail the playbook named with it ----
+    ("enemy_fight", "double_damage"), ("enemy_fight", "kill_credit_dup"), ("enemy_fight", "npc_hit_twice"),
+    ("enemy_fight", "npc_pos_stale"), ("enemy_fight", "npc_no_attack_anim"), ("enemy_fight", "npc_no_stagger_anim"),
+    ("enemy_fight", "npc_death_pose_missing"), ("enemy_fight", "npc_no_draw"), ("enemy_fight", "npc_slides"),
+    ("enemy_fight", "ai_both"), ("enemy_fight", "dup_kill"), ("enemy_fight", "stale_echo"), ("enemy_fight", "no_fight_sync"),
+    ("enemy_handoff", "ghost_owner"), ("enemy_handoff", "handoff_snap"), ("enemy_handoff", "handoff_dup"),
+    ("enemy_handoff", "hp_revive_on_handoff"), ("enemy_handoff", "ai_both"), ("enemy_handoff", "flap_owner"),
+    ("enemy_handoff", "owner_split"), ("enemy_handoff", "double_damage"), ("enemy_handoff", "kill_credit_dup"),
+    ("enemy_spawn", "double_spawn"), ("enemy_spawn", "spawn_pick_differs"), ("enemy_spawn", "spawn_ids_differ"),
+    ("enemy_spawn", "respawn_on_return"),
+    ("corpse_loot_race", "corpse_loot_dup"), ("corpse_loot_race", "corpse_loot_lost"), ("corpse_loot_race", "corpse_unsynced"),
+    ("corpse_loot_race", "kill_credit_dup"), ("corpse_loot_race", "no_fight_sync"),
 ]
+# Twins that only the animation / pose check (T7) can catch: the test runs them with the check on. (puppet_* and npc_* bugs always are.)
+ANIM_BUGS = {"handoff_snap"}
 # counter_noise must be caught by every playbook (the desync counters rose).
 
 

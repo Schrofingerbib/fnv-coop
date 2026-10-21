@@ -1,4 +1,5 @@
-// Game-free tests for the bot input driver (T6a). Built once against the real code and once per NVBOTS_MUTANT=<n> (1..48); every mutant MUST fail.
+// Game-free tests for the bot input driver (T6a). Built once (FNVCOOP_RUNTIME_MUT); run once for real and once per FNVCOOP_MUT=<n> (1..48); every twin MUST fail.
+// BOTS_EXE=<reference FalloutNV.exe> additionally compares the pinned prologue with the real image (run_tests.cmd sets it when the file exists).
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

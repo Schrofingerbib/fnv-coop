@@ -10,20 +10,19 @@
 #include "common/minijson.h"
 #include "flight/flight.h"
 #include "effect_json.h"
+#include "fnvcoop_mut.h"
 
-// Mutation twins (tests build the runtime with these to prove the integration tests can fail):
-//   COOP_MUTANT=1 : client sink is not wired (received effects never reach the world)
-//   COOP_MUTANT=2 : host capture hook not wired (captured txns are never committed)
-//   COOP_MUTANT=3 : host ignores guest actions (onAction never executes)
-//   COOP_MUTANT=4 : client skips setBaselineWorld (joins without a baseline transfer)
-//   COOP_MUTANT=5 : L11 wiring twin; env COOP_UI_MUTANT=n drops one wiring call (1 bridge config, 2 menu resume, 3 mux 0xE5 channel,
-//                   4 SlideshowEnd calls (host + guest), 5 INFO reader install)
-#ifndef COOP_MUTANT
-#define COOP_MUTANT 0
-#endif
-#if COOP_MUTANT == 5
-static bool leaveMut(int n) { const char* e = std::getenv("COOP_LEAVE_MUTANT"); return e && std::atoi(e) == n; }   // twins for leave()/join(): 1 leave keeps the session, 2 join ignores the saved session view
-static bool uiMut(int n) { const char* e = std::getenv("COOP_UI_MUTANT"); return e && std::atoi(e) == n; }
+// Mutation twins: RUNTIME-switchable (tools/mut/fnvcoop_mut.h). The test builds (nvcoop_coop_core_rt) read FNVCOOP_MUT=<n>; the
+// shipped core has them compiled out. They prove the integration tests can fail:
+//   FNVCOOP_MUT=1 : client sink is not wired (received effects never reach the world)
+//   FNVCOOP_MUT=2 : host capture hook not wired (captured txns are never committed)
+//   FNVCOOP_MUT=3 : host ignores guest actions (onAction never executes)
+//   FNVCOOP_MUT=4 : client skips setBaselineWorld (joins without a baseline transfer)
+//   FNVCOOP_MUT=5 : L11 wiring twin; env COOP_UI_MUTANT=n drops one wiring call (1 bridge config, 2 menu resume, 3 mux 0xE5 channel,
+//                   4 SlideshowEnd calls (host + guest), 5 INFO reader install); COOP_LEAVE_MUTANT=n breaks leave()/join()
+#ifdef FNVCOOP_RUNTIME_MUT
+static bool leaveMut(int n) { const char* e = std::getenv("COOP_LEAVE_MUTANT"); return FNV_MUT(5) && e && std::atoi(e) == n; }   // twins for leave()/join(): 1 leave keeps the session, 2 join ignores the saved session view
+static bool uiMut(int n) { const char* e = std::getenv("COOP_UI_MUTANT"); return FNV_MUT(5) && e && std::atoi(e) == n; }
 #else
 static constexpr bool uiMut(int) { return false; }
 static constexpr bool leaveMut(int) { return false; }
@@ -131,12 +130,12 @@ public:
         }
         cur_.effects.push_back(e);
         ApplyResult r;
-#if COOP_MUTANT == 1
-        r.status = "MutantNotWired";
-#else
-        if (rt_.cfg_.applyEnabled && rt_.world_) r = rt_.world_->apply(e, ctx);
-        else r.status = "ApplyDisabled";
-#endif
+        if (FNV_MUT(1)) {
+            r.status = "MutantNotWired";
+        } else {
+            if (rt_.cfg_.applyEnabled && rt_.world_) r = rt_.world_->apply(e, ctx);
+            else r.status = "ApplyDisabled";
+        }
         if (ctx.baseline) ++rt_.counters_.baselineEffects;
         {
             std::string key = std::string(ctx.repair ? "repair " : ctx.baseline ? "baseline " : ctx.seq == 0 ? "snapshot " : "live ") + effectName(e) + ":" + r.status.substr(0, r.status.find(':'));
@@ -198,14 +197,14 @@ void Runtime::onCaptured(EffectTxn&& t) {
         FormRef q;
         if (infoQuest_(t.cause.source, q)) t.cause.source = q;
     }
-#if COOP_MUTANT == 2
-    (void)t;
-    return;
-#else
-    if (!host_) return;
-    uint64_t seq = host_->commit(actionOrigin_ != kNoPlayer ? actionOrigin_ : t.origin, t.cause, std::move(t.effects), t.flags, t.originEpoch, t.originIntent);
-    if (seq) ++counters_.committed; else ++counters_.droppedEmpty;
-#endif
+    if (FNV_MUT(2)) {
+        (void)t;
+        return;
+    } else {
+        if (!host_) return;
+        uint64_t seq = host_->commit(actionOrigin_ != kNoPlayer ? actionOrigin_ : t.origin, t.cause, std::move(t.effects), t.flags, t.originEpoch, t.originIntent);
+        if (seq) ++counters_.committed; else ++counters_.droppedEmpty;
+    }
 }
 
 bool Runtime::makeTransport(bool server, std::string* err) {
@@ -298,16 +297,16 @@ bool Runtime::start(std::string* err) {
         host_->onAction = [this](PlayerId slot, IntentKind kind, const FormRef& ref, uint32_t, uint32_t) {
             ++counters_.actions;
             if (rules_ && rules_->handleAction(slot, kind, ref)) { ++counters_.rulesActions; return; }
-#if COOP_MUTANT == 3
-            (void)slot; (void)kind; (void)ref;   // twin: host ignores guest actions
-#else
-            if (!executor_) return;
-            actionOrigin_ = slot;
-            if (actingHook_) actingHook_(slot, true);
-            executor_(slot, kind, ref);
-            if (actingHook_) actingHook_(slot, false);
-            actionOrigin_ = kNoPlayer;
-#endif
+            if (FNV_MUT(3)) {
+                (void)slot; (void)kind; (void)ref;   // twin: host ignores guest actions
+            } else {
+                if (!executor_) return;
+                actionOrigin_ = slot;
+                if (actingHook_) actingHook_(slot, true);
+                executor_(slot, kind, ref);
+                if (actingHook_) actingHook_(slot, false);
+                actionOrigin_ = kNoPlayer;
+            }
         };
         if (hub_ && cfg_.captureEnabled) {
             if (!sinkInstalled_) {
@@ -326,27 +325,27 @@ bool Runtime::start(std::string* err) {
         IEffectSink* sessionSink = sink_.get();
         if (flight_) { flightS_ = std::make_shared<fnvcoop::flight::RecordingSink>(*sink_, *flight_); sessionSink = flightS_.get(); }
         client_.reset(new ClientSession(*mux_, 0, cfg_.token, *sessionSink, hub_ ? &hub_->echo() : nullptr));
-#if COOP_MUTANT != 4   // twin 4: client never hands its own world to the session -> no baseline transfer
-        if (cfg_.baseline) {
-            if (!dumper_) { lastError_ = "baseline=1 but no world dumper"; if (err) *err = lastError_; return false; }
-            ShadowState c;
-            uint64_t hash = 0;
-            std::string derr;
-            if (!dumper_->dump(&c, &hash, &derr)) { lastError_ = "baseline dump: " + derr; if (err) *err = lastError_; return false; }
-            client_->setBaselineWorld(c, hash);
+        if (!FNV_MUT(4)) { // twin 4: client never hands its own world to the session -> no baseline transfer
+            if (cfg_.baseline) {
+                if (!dumper_) { lastError_ = "baseline=1 but no world dumper"; if (err) *err = lastError_; return false; }
+                ShadowState c;
+                uint64_t hash = 0;
+                std::string derr;
+                if (!dumper_->dump(&c, &hash, &derr)) { lastError_ = "baseline dump: " + derr; if (err) *err = lastError_; return false; }
+                client_->setBaselineWorld(c, hash);
+            }
         }
-#endif
-#if COOP_MUTANT != 4
-        if (dumper_) {   // Rebase / loading a save without a usable sidecar re-dumps the CURRENT world
-            IWorldDumper* d = dumper_;
-            client_->setBaselineProvider([this, d](ShadowState& w, uint64_t& h) {
-                std::string e;
-                bool ok = d->dump(&w, &h, &e);
-                if (ok && flight_) flightWorld_.reset(new ShadowState(w));   // T1a: the real world the desync digest was built from (pre-repair)
-                return ok;
-            });
+        if (!FNV_MUT(4)) {
+            if (dumper_) {   // Rebase / loading a save without a usable sidecar re-dumps the CURRENT world
+                IWorldDumper* d = dumper_;
+                client_->setBaselineProvider([this, d](ShadowState& w, uint64_t& h) {
+                    std::string e;
+                    bool ok = d->dump(&w, &h, &e);
+                    if (ok && flight_) flightWorld_.reset(new ShadowState(w));   // T1a: the real world the desync digest was built from (pre-repair)
+                    return ok;
+                });
+            }
         }
-#endif
         client_->setDigestInterval(cfg_.digestIntervalMs);
         if (cfg_.useWorker) { worker_.reset(new ThreadWorker()); client_->setWorker(worker_.get()); }
         if (cfg_.handshake) {
@@ -383,10 +382,25 @@ bool Runtime::start(std::string* err) {
         if (ui_.installInfoReader && ui_.infoReader && !uiMut(5)) ui_.installInfoReader(ui_.infoReader);   // captured SayTo carries the INFO text
     }
     running_ = true;
+    active_ = this;
+    return true;
+}
+
+bool Runtime::runAsGuest(PlayerId slot, const std::function<void()>& body) {
+    if (!host_ || !body || slot == kNoPlayer) return false;
+    if (actionOrigin_ == slot) { body(); return true; }   // already inside this guest's window (the story-channel executor): no second on / off pair
+    struct Window {   // closes the window even when body() throws (a test fake, never the game)
+        Runtime& rt; PlayerId prev, slot;
+        ~Window() { if (rt.actingHook_) rt.actingHook_(slot, false); rt.actionOrigin_ = prev; }
+    } w{*this, actionOrigin_, slot};
+    actionOrigin_ = slot;
+    if (actingHook_) actingHook_(slot, true);
+    body();
     return true;
 }
 
 void Runtime::stop() {
+    if (active_ == this) active_ = nullptr;
     if (!running_) return;
     if (uiBridged_ && ui_.router) {
         if (nvui::UiRouter* r = ui_.router()) r->bridge() = nvui::Bridge();   // the bridge captures the DialogueNode
@@ -559,7 +573,11 @@ void Runtime::tickDialogue() {
                 for (auto& cv : host_->clients()) if (cv.peer == peer && cv.joined) return cv.slot;
                 return kNoPlayer;
             };
-            dlg_.reset(new fnvcoop_dlg::DialogueNode(mux_.get(), c, dlgHooks_.run, dlgHooks_.sink));
+            fnvcoop_dlg::ResultRunner baseRun = dlgHooks_.run;
+            dlg_.reset(new fnvcoop_dlg::DialogueNode(mux_.get(), c, [this, baseRun](const fnvcoop_dlg::ResultRequest& rq) -> uint64_t {
+                if (runnerOverride_) return runnerOverride_(rq);
+                return baseRun ? baseRun(rq) : 0;
+            }, dlgHooks_.sink));
             syncCompanions();
         }
         std::set<PlayerId> joinedNow;
@@ -887,7 +905,7 @@ std::string Runtime::logJson(size_t maxEntries) const {
 
 std::string Runtime::statusJson() const {
     Value o = Value::object();
-    o.set("role", roleName(cfg_.role)).set("enabled", cfg_.enable).set("running", running_).set("left", left_).set("mutant", (int64_t)COOP_MUTANT)
+    o.set("role", roleName(cfg_.role)).set("enabled", cfg_.enable).set("running", running_).set("left", left_).set("mutant", (int64_t)(FNV_MUT_ANY() ? 1 : 0))
         .set("port", (int64_t)boundPort()).set("error", lastError_);
     Value c = Value::object();
     c.set("frames", (int64_t)counters_.frames).set("captured", (int64_t)counters_.captured).set("committed", (int64_t)counters_.committed)

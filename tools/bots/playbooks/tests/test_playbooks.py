@@ -14,6 +14,7 @@ What is proven:
 """
 from __future__ import annotations
 
+import atexit
 import copy
 import gzip
 import json
@@ -30,6 +31,9 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
 from playbooks import (chaos_adapter, core, fakecoop, goodsprings_plan as GP, pb_story, probe,  # noqa: E402
                        registry, scenario_adapter)
 
+# The *_s budgets are VIRTUAL seconds of the fake world since 2026-10-21 (playbooks/clocks.py; floor 5 s): they used to be real seconds, which failed
+# six clean playbooks on a busy PC (Track A inbox). The numbers are unchanged; what they measure is no longer CPU time. Real desyncs still fail
+# (tests below: lag, no_retransmit, repair_after_quiet, owner_split ...) and tests/test_enemy.py has the twin for the old behaviour.
 OPTS = {"fast": True, "anim": False, "ui_s": 0.2, "barrier_s": 0.2, "stage_s": 0.2, "handoff_s": 0.2, "spawn_s": 0.2, "settle_s": 0.3, "settle_poll_s": 0.0, "repo_root": REPO}
 _PLAN = None
 
@@ -49,9 +53,10 @@ def run(name, bugs=(), n=None, lag=1, opts=None, outdir=None, **world_kw):
     else:
         w, refs = e.fake(n, set(bugs), lag=lag, **world_kw)
     d = outdir or tempfile.mkdtemp(prefix="t6b-")
+    atexit.register(shutil.rmtree, d, True)      # the run directories (snapshots, anim dumps) used to pile up in %TEMP% by the thousand
     w.flight_dir = os.path.join(d, "flight")
     o = dict(OPTS)
-    if any(b.startswith("puppet_") for b in bugs):
+    if any(b.startswith(("puppet_", "npc_")) or b in registry.ANIM_BUGS for b in bugs):     # twins only the animation check can see
         o["anim"] = True
     o.update(opts or {})
     pb = registry.make(name, REPO, plan() if e.needs_plan else None)

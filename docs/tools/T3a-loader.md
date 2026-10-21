@@ -134,8 +134,13 @@ Wired into `tools/test_all.py` as "T3a loader" (compiles, so skipped by `--quick
 - Process exit does not unload the core (same as the monolith). `CoreHost::Unload` exists for tests.
 
 ## Update 2026-10-20 (T3-reload)
-- Canonical build, split build, `plugin\loader\run_tests.cmd` (177 checks, 4 mutants) and `plugin\reload\run_tests.cmd` (1622 checks, unit mutants 1-8, host mutants 1-9) are green.
+- Canonical build, split build, `plugin\loader\run_tests.cmd` (215 checks, 12 run-time twins, FNVCOOP_MUT=21..32) and `plugin\reload\run_tests.cmd` (registry, drain and host-process tests with run-time twins, prints ALL OK) are green as of the last update below.
 - The in-flight detour drain and the crash filter removal are in T3b-state.md. The core's full split build is no longer a blocker.
+
+## Update 2026-10-20 (reload-drain)
+- The core swap now waits until no thread is inside a detour of the old core: `BeforeUnload` (plugin/reload/reload_glue.cpp) takes the hooks off, calls `nvreload::waitDrained` (plugin/reload/reload_drain.cpp) over the core image and the hook trampolines, and refuses the reload (hooks put back, old core keeps running, clear log line with timeout, limit, thread and where it was found) when the timeout (default 2000 ms, env `NVRELOAD_DRAIN_MS`) passes. The loader side needs no change: a refused `BeforeUnload` already makes `CoreHost::Reload` keep the current generation. Details, tests and twins: T3b-state.md.
+- Still open: the hot-reload transport (ENet host moved into the loader so sessions survive a reload). Not started; peers reconnect after a reload. Estimated more than 2 days, dev-only, low priority.
+- Nothing here has run in the game. All proof is game-free (fake detours, a test core DLL and worker threads).
 
 ## Update 2026-10-20 (split-mode config)
 - Bug (found by code reading, not seen in a game run): in split mode the core runs from `nvcoop_cache\`, but its
@@ -144,8 +149,8 @@ Wired into `tools/test_all.py` as "T3a loader" (compiles, so skipped by `--quick
   `tools/runner/reload_proof.py` then reports the session check as skipped.
 - Fix: the loader copies the config files into the cache before each load (see "What it is"). The fix is in
   `plugin/loader` only. No module code changed: the modules still read beside their own module.
-- `plugin\loader\run_tests.cmd` (200 checks, 8 mutants) and `plugin\reload\run_tests.cmd` (1723 host checks, host
-  mutants 1-9, loader twins `noconfig` and `configonce`) are green. Not run in the game.
+- `plugin\loader\run_tests.cmd` (200 checks, 8 twins) and `plugin\reload\run_tests.cmd` (1723 host checks, host
+  twins 1-9, loader twins `noconfig` and `configonce`) are green. Not run in the game.
 
 ## Update 2026-10-20 (split-mode config, review fixes)
 - `nvcoop_volatile_keys.txt` is now a config name. `plugin/snapshot/src/baseline_nvse.cpp` is in the core and reads
@@ -155,5 +160,16 @@ Wired into `tools/test_all.py` as "T3a loader" (compiles, so skipped by `--quick
   differ when `[loader] core=` has a folder part.
 - The config copy retries only `ERROR_SHARING_VIOLATION` and `ERROR_LOCK_VIOLATION`, and does not wait after the
   last try. Before, every error but "not found" cost 10 x 50 ms per file on each load.
-- `plugin\loader\run_tests.cmd` (215 checks, 12 mutants) and `plugin\reload\run_tests.cmd` (1723 host checks) are
+- `plugin\loader\run_tests.cmd` (215 checks, 12 twins) and `plugin\reload\run_tests.cmd` (1723 host checks) are
   green. Not run in the game.
+
+## Update 2026-10-21 (merge of the helper's PRs)
+- The loader twins are now RUN-TIME twins like the other suites (tools/mut/fnvcoop_mut.h): `loader_host.cpp` uses `FNV_MUT(21..32)`
+  (NOCOPY 21, NOPURGE 22, NOVETO 23, NOROLLBACK 24, NOCONFIG 25, CONFIGONCE 26, NOPRUNE 27, NOATTRS 28, NOVOLATILE 29,
+  COREDIRCONFIG 30, RETRYALL 31, NORETRY 32; the list is at the top of the file). The numbers start at 21 so they do not collide with
+  the test core's twins 1..14 when the reload host test runs both. The test exe is compiled once (`nvloader_host_rt` in
+  plugin/loader/CMakeLists.txt, FNVCOOP_RUNTIME_MUT); the production `nvloader_host` never reads the environment.
+- `plugin\loader\run_tests.cmd`: 215 checks, the real run plus twins 21-32 through tools/mut/run_twins.py (`--jobs 1`: the twins share one
+  scratch folder). `plugin\reload\run_tests.cmd`: 1727 host checks; host twins 1-9, loader twins 25 and 26 (each must fail with
+  "read the ini" / "read nvcoop.ini"). Not run in the game.
+

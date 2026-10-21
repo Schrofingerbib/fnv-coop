@@ -28,6 +28,9 @@ file(GLOB COOP_SYNCCORE_SRC CONFIGURE_DEPENDS ${COOP_REPO}/synccore/src/*.cpp)  
 add_library(nvcoop_coop_synccore STATIC ${COOP_SYNCCORE_SRC} ${COOP_REPO}/synccore/flight/flight.cpp)   # + T1a flight recorder
 target_include_directories(nvcoop_coop_synccore PUBLIC ${COOP_REPO}/synccore/include ${COOP_REPO}/synccore)
 coop_flags(nvcoop_coop_synccore)
+if(COMMAND fnvcoop_pch)
+  fnvcoop_pch(nvcoop_coop_synccore)
+endif()
 # vendored ENet 1.3.18 (L4's third_party/enet), same sources as synccore's enet_static
 set(COOP_ENET ${COOP_REPO}/third_party/enet)
 add_library(nvcoop_coop_enet STATIC ${COOP_ENET}/callbacks.c ${COOP_ENET}/compress.c ${COOP_ENET}/host.c ${COOP_ENET}/list.c
@@ -47,9 +50,9 @@ else()
   set(COOP_HOOKS_LIB nvcoop_coop_hooks)
 endif()
 
-# ---- L11 hooks_ui router (game-free): the plugin build already has it (nvui_core_m0); standalone builds compile ui_core.cpp ----
-if(TARGET nvui_core_m0)
-  set(COOP_UI_LIB nvui_core_m0)
+# ---- L11 hooks_ui router (game-free): the plugin build already has it (nvui_core); standalone builds compile ui_core.cpp ----
+if(TARGET nvui_core)
+  set(COOP_UI_LIB nvui_core)
 else()
   add_library(nvcoop_coop_uicore STATIC ${COOP_DIR}/../hooks_ui/ui_core.cpp)
   target_include_directories(nvcoop_coop_uicore PUBLIC ${COOP_DIR}/../hooks_ui ${COOP_DIR}/.. ${COOP_DIR}/../dialogue/include ${COOP_REPO}/synccore/include)
@@ -57,36 +60,26 @@ else()
   set(COOP_UI_LIB nvcoop_coop_uicore)
 endif()
 
-# ---- runtime + transport; _mut1 / _mut2 are mutation twins (see coop_runtime.cpp) ----
-foreach(v "" _mut1 _mut2 _mut3 _mut4 _mut5)
+# ---- runtime + transport. Mutation twins are RUNTIME-switchable (tools/mut/fnvcoop_mut.h, see coop_runtime.cpp): nvcoop_coop_core is the
+# production lib (twins compiled out, linked into nvcoop.dll); nvcoop_coop_core_rt carries FNVCOOP_RUNTIME_MUT and is what the tests and
+# fake peers use. FNVCOOP_MUT=1..4 breaks one wiring call, FNVCOOP_MUT=5 + COOP_UI_MUTANT/COOP_LEAVE_MUTANT=n the L11 / leave twins. ----
+foreach(v "" _rt)
   add_library(nvcoop_coop_core${v} STATIC ${COOP_DIR}/udp_transport.cpp ${COOP_DIR}/coop_runtime.cpp)
-  target_include_directories(nvcoop_coop_core${v} PUBLIC ${COOP_DIR} ${COOP_DIR}/.. ${COOP_DIR}/../dialogue/include)
+  target_include_directories(nvcoop_coop_core${v} PUBLIC ${COOP_DIR} ${COOP_DIR}/.. ${COOP_DIR}/../dialogue/include ${COOP_REPO}/tools/mut)
   target_link_libraries(nvcoop_coop_core${v} PUBLIC nvcoop_coop_synccore ${COOP_HOOKS_LIB} ${COOP_UI_LIB} ws2_32)
   coop_flags(nvcoop_coop_core${v})
 endforeach()
-target_compile_definitions(nvcoop_coop_core_mut1 PRIVATE COOP_MUTANT=1)
-target_compile_definitions(nvcoop_coop_core_mut2 PRIVATE COOP_MUTANT=2)
-target_compile_definitions(nvcoop_coop_core_mut3 PRIVATE COOP_MUTANT=3)
-target_compile_definitions(nvcoop_coop_core_mut4 PRIVATE COOP_MUTANT=4)
-target_compile_definitions(nvcoop_coop_core_mut5 PRIVATE COOP_MUTANT=5)
+target_compile_definitions(nvcoop_coop_core_rt PUBLIC FNVCOOP_RUNTIME_MUT)
 
 # ---- tests + fake peers (not shipped in the plugin) ----
 set(COOP_TEST_TARGETS)
 add_executable(coop_tests ${COOP_DIR}/tests/test_coop.cpp)
-target_link_libraries(coop_tests PRIVATE nvcoop_coop_core)
+target_link_libraries(coop_tests PRIVATE nvcoop_coop_core_rt)
 list(APPEND COOP_TEST_TARGETS coop_tests)
-# L11 wiring twin: the same tests against the runtime with one wiring call dropped (COOP_UI_MUTANT=1..5); `coop_tests_ui_mut --ui` must FAIL for each
-add_executable(coop_tests_ui_mut ${COOP_DIR}/tests/test_coop.cpp)
-target_link_libraries(coop_tests_ui_mut PRIVATE nvcoop_coop_core_mut5)
-list(APPEND COOP_TEST_TARGETS coop_tests_ui_mut)
-foreach(pair "coop_peer:" "coop_peer_mut_sink:_mut1" "coop_peer_mut_commit:_mut2" "coop_peer_mut_action:_mut3" "coop_peer_mut_baseline:_mut4")
-  string(REPLACE ":" ";" parts "${pair}")
-  list(GET parts 0 exe)
-  list(GET parts 1 lib)
-  add_executable(${exe} ${COOP_DIR}/tests/coop_peer.cpp)
-  target_link_libraries(${exe} PRIVATE nvcoop_coop_core${lib})
-  list(APPEND COOP_TEST_TARGETS ${exe})
-endforeach()
+# the fake peer: tests/test_integration.py starts it with FNVCOOP_MUT=1..4 for the mutant-peer scenarios
+add_executable(coop_peer ${COOP_DIR}/tests/coop_peer.cpp)
+target_link_libraries(coop_peer PRIVATE nvcoop_coop_core_rt)
+list(APPEND COOP_TEST_TARGETS coop_peer)
 foreach(t ${COOP_TEST_TARGETS})
   coop_flags(${t})
   if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_LIST_DIR)

@@ -1,0 +1,114 @@
+#include "npc_anim_sampler.h"
+
+#include <cmath>
+
+#include "anim_groups.h"
+#include "avatar/loco.h"      // locomotion codes + direction convention: the single definition shared with the player puppets
+#include "fnvcoop_mut.h"
+
+namespace nvcoop::actors::anim {
+
+namespace {
+constexpr uint32_t kBitWalk = 1u << 7, kBitRun = 1u << 8;
+}
+
+bool NpcAnimSampler::debounce(Flag& f, bool raw) {
+    uint32_t need = FNV_MUT(1) ? 1u : (cfg_.flickerSamples ? cfg_.flickerSamples : 1u);   // twin 1: no debouncing, every flicker is published
+    if (!f.init) { f.init = true; f.value = raw; f.pending = raw; f.same = 0; return f.value; }
+    if (raw == f.value) { if (f.pending != f.value) ++stats_.flickersAbsorbed; f.pending = f.value; f.same = 0; return f.value; }
+    if (raw == f.pending) ++f.same; else { f.pending = raw; f.same = 1; }
+    if (f.same >= need) { f.value = raw; f.same = 0; }
+    return f.value;
+}
+
+bool NpcAnimSampler::last(NetId id, live::AnimState& out) const {
+    auto it = st_.find(id);
+    if (it == st_.end() || !it->second.haveLast) return false;
+    out = it->second.last;
+    return true;
+}
+
+bool NpcAnimSampler::sample(NetId id, live::ActorSnapshot& snap, uint32_t nowMs) {
+    ++stats_.samples;
+    NpcReads r;
+    if (!eng_.Read(id, r) || !r.valid) { ++stats_.unreadable; return false; }
+    State& s = st_[id];
+    live::AnimState a;   // starts neutral: every field is decided below
+
+    if (r.dead) {
+        // Death is a pose: nothing moves, nothing plays. (The declaration itself is the reliable MDeath; the corpse pose is a separate event.)
+        a.dead = true;
+        if (FNV_MUT(4)) {   // twin 4: a dead actor keeps publishing its last locomotion and action
+            a.locomotion = s.haveLast ? s.last.locomotion : 0;
+            a.action = s.haveLast ? s.last.action : 0;
+            a.actionSeq = s.haveLast ? s.last.actionSeq : 0;
+        } else {
+            a.actionSeq = s.actionSeq;   // the counter is kept so a resurrect continues it
+        }
+        a.ragdoll = r.ragdoll;
+        s.last = a; s.haveLast = true; s.curAction = 0; s.holding = false;
+        snap.anim = a;
+        return true;
+    }
+
+    // ---- stance flags (debounced) ----
+    a.weaponDrawn = r.creature ? false : debounce(s.weaponOut, r.weaponOut);
+    a.aim = r.creature ? false : debounce(s.aiming, r.aiming);
+    a.knocked = FNV_MUT(7) ? false : debounce(s.knocked, r.knocked);   // twin 7: a knockdown is never published
+    a.swim = debounce(s.swimming, r.swimming);
+    a.talk = debounce(s.talking, r.talking);
+    a.sneak = !r.creature && (r.sneaking || (r.moveFlagsKnown && (r.moveFlags & (1u << 9)) != 0));
+    a.ragdoll = r.ragdoll;
+    a.jump = (r.inAir || std::fabs(snap.vel.z) > cfg_.fallVz) && !a.swim && !a.knocked && !r.ragdoll;
+
+    // ---- locomotion code from velocity + facing (+ the mover's walk / run bits when the backend can read them) ----
+    {
+        avatar::LocalRead lr;
+        lr.vel = {snap.vel.x, snap.vel.y, snap.vel.z};
+        lr.yaw = snap.rot.y;
+        lr.haveMoveFlags = r.moveFlagsKnown;
+        lr.moverRun = (r.moveFlags & kBitRun) != 0;
+        lr.moverWalk = (r.moveFlags & kBitWalk) != 0;
+        avatar::SpeedBands bands;
+        bands.standMax = cfg_.standMax; bands.runEnter = cfg_.runEnter; bands.runExit = cfg_.runExit;
+        uint8_t code = avatar::CaptureLoco(lr, bands);
+        if (FNV_MUT(6) && code != avatar::kLocoIdle) code = avatar::MakeLoco(avatar::LocoIsRun(code), 0);   // twin 6: strafing and backing up are published as forward
+        if (a.knocked || r.ragdoll) code = avatar::kLocoIdle;
+        a.locomotion = code;
+        s.haveLoco = true;
+    }
+
+    // ---- one-shot action ----
+    const bool rawIsAction = r.actionGroup > 0 && isActionGroup(r.actionGroup);
+    bool started = false;
+    if (rawIsAction) {
+        const bool newGroup = r.actionGroup != s.rawAction;
+        const bool restarted = !newGroup && r.actionPlayMs >= 0 && s.rawPlayMs >= 0 && r.actionPlayMs + cfg_.restartBackstepMs < s.rawPlayMs;
+        if (FNV_MUT(5)) started = true;                         // twin 5: every sample while it plays counts as a new event (the attack is replayed over and over)
+        else started = newGroup || (restarted && !FNV_MUT(3));   // twin 3: a restart of the same group is not an event (two swings look like one)
+        if (started) {
+            if (restarted) ++stats_.actionsRestarted;
+            ++stats_.actionsStarted;
+            s.actionSeq = static_cast<uint8_t>(s.actionSeq + 1);
+            s.curAction = r.actionGroup;
+            s.heldUntil = nowMs + (FNV_MUT(2) ? 0u : cfg_.actionHoldMs);   // twin 2: not held, the event lives only as long as the engine's sequence
+            s.holding = true;
+        } else {
+            // still the same sequence: keep it alive in the stream until the hold after its end runs out
+            s.heldUntil = nowMs + (FNV_MUT(2) ? 0u : cfg_.actionHoldMs);
+        }
+    }
+    s.rawAction = rawIsAction ? r.actionGroup : -1;
+    s.rawPlayMs = rawIsAction ? r.actionPlayMs : -1;
+    if (s.holding && !rawIsAction && static_cast<int32_t>(s.heldUntil - nowMs) <= 0) { s.holding = false; s.curAction = 0; }
+    a.action = static_cast<uint8_t>(s.holding ? s.curAction : 0);
+    a.actionSeq = s.actionSeq;
+    a.reload = isReloadGroup(a.action) || (rawIsAction && isReloadGroup(r.actionGroup));
+    a.block = !FNV_MUT(8) && (a.action == kGroupBlockIdle || (rawIsAction && r.actionGroup == kGroupBlockIdle));   // twin 8: blocking is never published
+
+    s.last = a; s.haveLast = true;
+    snap.anim = a;
+    return true;
+}
+
+}  // namespace nvcoop::actors::anim

@@ -9,7 +9,7 @@
 // Edge rules: toggles such as Crouch fire on the edge, so an edge must reach the game exactly ONCE. The first frame in which the
 // game asks for an edge fixes the frame the edge is served in; every query in that frame sees it, later frames never do.
 //
-// Mutants (NVBOTS_MUTANT=n) are compiled into the tests' twin builds; every one must make the tests fail:
+// Mutants (FNVCOOP_MUT=n at run time, test builds only) switch on a broken variant; every one must make the tests fail:
 //   1 press edge served on every frame while held   2 held override ignored          3 releaseAll leaves controls held
 //   4 tap never releases                            5 out-of-range control forced    6 strafe axes swapped
 //   7 timed hold (ms) never expires                 8 release edge never served
@@ -17,9 +17,7 @@
 #include <array>
 #include <cstdint>
 
-#ifndef NVBOTS_MUTANT
-#define NVBOTS_MUTANT 0
-#endif
+#include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
 
 namespace nvbots {
 
@@ -40,11 +38,11 @@ public:
             Slot& s = s_[c];
             if (s.pressServed >= 0 && s.pressServed < frame_) { s.pressPending = false; s.pressServed = -1; }
             if (s.relServed >= 0 && s.relServed < frame_) { s.relPending = false; s.relServed = -1; }
-            #if NVBOTS_MUTANT == 7
-            if (false) {}
-#else
-            if (s.held && s.framesLeft > 0 && --s.framesLeft == 0) releaseSlot(s);
-#endif
+            if (FNV_MUT(7)) {
+                if (false) {}
+            } else {
+                if (s.held && s.framesLeft > 0 && --s.framesLeft == 0) releaseSlot(s);
+            }
         }
     }
 
@@ -55,19 +53,19 @@ public:
         s.framesLeft = frames > 0 ? frames : -1;
     }
     void tap(int c, int frames = 3) {
-#if NVBOTS_MUTANT == 4
-        hold(c, -1);
-#else
-        hold(c, frames < 1 ? 1 : frames);
-#endif
+        if (FNV_MUT(4)) {
+            hold(c, -1);
+        } else {
+            hold(c, frames < 1 ? 1 : frames);
+        }
     }
     void release(int c) {
         if (ok(c)) releaseSlot(s_[c]);
     }
     void releaseAll() {
-#if NVBOTS_MUTANT == 3
-        return;
-#endif
+        if (FNV_MUT(3)) {
+            return;
+        }
         for (int c = 0; c < kCount; ++c) releaseSlot(s_[c]);
     }
     bool isHeld(int c) const { return ok(c) && s_[c].held; }
@@ -83,11 +81,11 @@ public:
     // The dead zone keeps small noise from moving the avatar.
     void setMove(double forward, double strafe, bool holdRun, int frames = -1) {
         setAxis(kBackward, kForward, forward, frames);
-#if NVBOTS_MUTANT == 6
-        setAxis(kRight, kLeft, strafe, frames);
-#else
-        setAxis(kLeft, kRight, strafe, frames);
-#endif
+        if (FNV_MUT(6)) {
+            setAxis(kRight, kLeft, strafe, frames);
+        } else {
+            setAxis(kLeft, kRight, strafe, frames);
+        }
         if (holdRun) hold(kRun, frames);
         else release(kRun);
     }
@@ -97,21 +95,21 @@ public:
 
     // The detour: what the game should see for (ctrl, state), given what the real devices said.
     int filter(int c, int state, int real) {
-#if NVBOTS_MUTANT == 5
-        if (c >= kCount) return 1;
-#endif
+        if (FNV_MUT(5)) {
+            if (c >= kCount) return 1;
+        }
         if (!ok(c)) return real;
         Slot& s = s_[c];
         if (state == kHeld) {
-#if NVBOTS_MUTANT == 2
-            return real;
-#endif
+            if (FNV_MUT(2)) {
+                return real;
+            }
             return s.held ? 1 : real;
         }
         if (state == kPressed) {
-#if NVBOTS_MUTANT == 1
-            if (s.held) return 1;
-#endif
+            if (FNV_MUT(1)) {
+                if (s.held) return 1;
+            }
             if (s.pressPending) {
                 if (s.pressServed < 0) s.pressServed = frame_;
                 if (s.pressServed == frame_) return 1;
@@ -119,9 +117,9 @@ public:
             return s.held ? 0 : real;   // while we hold a control the real device's edges are hidden
         }
         if (state == kReleased) {
-#if NVBOTS_MUTANT == 8
-            return real;
-#endif
+            if (FNV_MUT(8)) {
+                return real;
+            }
             if (s.relPending) {
                 if (s.relServed < 0) s.relServed = frame_;
                 if (s.relServed == frame_) return 1;

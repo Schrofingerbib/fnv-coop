@@ -68,3 +68,10 @@ class Thresholds:
 
 
 DEFAULT = Thresholds()
+
+# Thresholds for the enemy playbooks (tools/bots/playbooks/pb_enemy.py). An attack swing, a stagger and a weapon draw last about 350 to
+# 700 ms, so a remote copy that never plays one must show up after 250 ms; DEFAULT waits 400 ms (right for walking and aiming) and would
+# miss a short stagger. Unmeasured first guess like everything in this file (tests: tools/bots/playbooks/tests/test_enemy.py).
+FIGHT = DEFAULT.with_(state_grace_ms=250.0)
+
+PROFILES = {"default": DEFAULT, "fight": FIGHT}

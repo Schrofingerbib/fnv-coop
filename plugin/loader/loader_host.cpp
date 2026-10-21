@@ -15,19 +15,22 @@
 #include "common/nvcoop_api.h"
 #include "common/registry.h"
 
-// Mutation twins (see tests): each one breaks exactly one safety rule and the tests must notice.
-//   NVLOADER_MUTANT_NOCOPY    load the core in place (the build can no longer overwrite it)
-//   NVLOADER_MUTANT_NOPURGE   leave the old core's bridge methods registered after unload
-//   NVLOADER_MUTANT_NOVETO    unload even when the core vetoes
-//   NVLOADER_MUTANT_NOROLLBACK stay dead when the new core fails to load
-//   NVLOADER_MUTANT_NOCONFIG  do not copy nvcoop.ini / nvcoop_*.json into the cache (the core finds no config)
-//   NVLOADER_MUTANT_CONFIGONCE copy the config only at the first load (edits made before a reload are lost)
-//   NVLOADER_MUTANT_NOPRUNE   keep a cache copy whose source file was deleted (the core reads a removed file)
-//   NVLOADER_MUTANT_NOATTRS   leave a read-only cache copy read-only (the next copy over it fails)
-//   NVLOADER_MUTANT_NOVOLATILE leave nvcoop_volatile_keys.txt out of the config names (the snapshot filter finds no keys)
-//   NVLOADER_MUTANT_COREDIRCONFIG take the config from the core's folder also when gameDir is set (core= with a folder part)
-//   NVLOADER_MUTANT_RETRYALL  retry every config copy error but "not found", and wait after the last try (the old loop)
-//   NVLOADER_MUTANT_NORETRY   retry no config copy error (a file that an editor holds open for a moment is not copied)
+#include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
+
+// Runtime mutation twins (FNVCOOP_MUT=<n>, test builds only): each one breaks exactly one safety rule and the tests must notice.
+// The numbers start at 21 so they never collide with the test core's twins 1..14 when the host test (plugin/reload) runs both.
+//   21 NOCOPY    load the core in place (the build can no longer overwrite it)
+//   22 NOPURGE   leave the old core's bridge methods registered after unload
+//   23 NOVETO    unload even when the core vetoes
+//   24 NOROLLBACK stay dead when the new core fails to load
+//   25 NOCONFIG  do not copy nvcoop.ini / nvcoop_*.json into the cache (the core finds no config)
+//   26 CONFIGONCE copy the config only at the first load (edits made before a reload are lost)
+//   27 NOPRUNE   keep a cache copy whose source file was deleted (the core reads a removed file)
+//   28 NOATTRS   leave a read-only cache copy read-only (the next copy over it fails)
+//   29 NOVOLATILE leave nvcoop_volatile_keys.txt out of the config names (the snapshot filter finds no keys)
+//   30 COREDIRCONFIG take the config from the core's folder also when gameDir is set (core= with a folder part)
+//   31 RETRYALL  retry every config copy error but "not found", and wait after the last try (the old loop)
+//   32 NORETRY   retry no config copy error (a file that an editor holds open for a moment is not copied)
 
 namespace nvcoop::loader {
 namespace {
@@ -98,22 +101,14 @@ bool ConfigNamesIn(const std::string& dir, std::vector<std::string>& out) {
 }
 // CopyFile and DeleteFile both fail on a read-only file; a copy of a read-only source is read-only too.
 void MakeWritable(const std::string& path) {
-#ifndef NVLOADER_MUTANT_NOATTRS
-    SetFileAttributesA(path.c_str(), FILE_ATTRIBUTE_NORMAL);
-#else
-    (void)path;
-#endif
+    if (!FNV_MUT(28)) SetFileAttributesA(path.c_str(), FILE_ATTRIBUTE_NORMAL);
 }
 
 // A config copy error that can clear by itself: an editor or a tool has the file open or locked at this moment.
 // Every other error (access denied, a folder in the way, a bad path) stays, so a retry only adds delay.
-[[maybe_unused]] bool CopyErrorIsTransient(DWORD e) {
-#ifdef NVLOADER_MUTANT_NORETRY
-    (void)e;
-    return false;
-#else
+bool CopyErrorIsTransient(DWORD e) {
+    if (FNV_MUT(32)) return false;
     return e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION;
-#endif
 }
 constexpr int kConfigCopyTries = 10;        // at most 9 waits, so a transient error gets about 450 ms to clear
 constexpr DWORD kConfigCopyWaitMs = 50;
@@ -121,16 +116,16 @@ constexpr DWORD kConfigCopyWaitMs = 50;
 // Copies one config file over its cache copy. On failure `err` is the last error of CopyFile.
 bool CopyConfigFile(const std::string& from, const std::string& to, DWORD& err) {
     err = 0;
-#ifdef NVLOADER_MUTANT_RETRYALL
-    for (int i = 0; i < kConfigCopyTries; ++i) {
-        MakeWritable(to);
-        if (CopyFileA(from.c_str(), to.c_str(), FALSE)) return true;
-        err = GetLastError();
-        if (err == ERROR_FILE_NOT_FOUND) return false;
-        Sleep(kConfigCopyWaitMs);
+    if (FNV_MUT(31)) {
+        for (int i = 0; i < kConfigCopyTries; ++i) {
+            MakeWritable(to);
+            if (CopyFileA(from.c_str(), to.c_str(), FALSE)) return true;
+            err = GetLastError();
+            if (err == ERROR_FILE_NOT_FOUND) return false;
+            Sleep(kConfigCopyWaitMs);
+        }
+        return false;
     }
-    return false;
-#else
     for (int i = 1;; ++i) {
         MakeWritable(to);
         if (CopyFileA(from.c_str(), to.c_str(), FALSE)) return true;
@@ -138,7 +133,6 @@ bool CopyConfigFile(const std::string& from, const std::string& to, DWORD& err) 
         if (!CopyErrorIsTransient(err) || i >= kConfigCopyTries) return false;   // no wait after the last try
         Sleep(kConfigCopyWaitMs);
     }
-#endif
 }
 
 void SetStr(void* h, const char* text) { *static_cast<std::string*>(h) = text ? text : ""; }
@@ -237,9 +231,7 @@ void ApiRequestReload(const char* reason) {
 }
 
 void PurgeCoreRegistrations(CoreHost& h) {
-#ifndef NVLOADER_MUTANT_NOPURGE
-    nvcoop::UnregisterMethodsByOwner(kOwnerCore);
-#endif
+    if (!FNV_MUT(22)) nvcoop::UnregisterMethodsByOwner(kOwnerCore);
     h.stateFn = nullptr;
     nvcoop::SetStateProvider(nullptr);
 }
@@ -255,9 +247,9 @@ CoreHost* Current() { return g_current; }
 bool IsCoreConfigFile(const std::string& fileName) {
     const std::string n = Lower(fileName);
     if (n == "nvcoop.ini" || n == "nvcoop_consent_messages.txt") return true;
-#ifndef NVLOADER_MUTANT_NOVOLATILE
-    if (n == "nvcoop_volatile_keys.txt") return true;
-#endif
+    if (!FNV_MUT(29)) {
+        if (n == "nvcoop_volatile_keys.txt") return true;
+    }
     return n.size() >= 12 && n.compare(0, 7, "nvcoop_") == 0 && n.compare(n.size() - 5, 5, ".json") == 0;
 }
 
@@ -266,13 +258,13 @@ CoreHost::CoreHost(HostEnv env) : env_(std::move(env)) {
     if (!env_.cacheDir.empty() && env_.cacheDir.back() != '\\' && env_.cacheDir.back() != '/') env_.cacheDir += '\\';
     // The config belongs to the loader's folder (main.cpp reads the loader's own nvcoop.ini there), not to the core's
     // folder: the two differ when [loader] core= has a folder part. Without a game folder (tests) use the core's folder.
-#ifndef NVLOADER_MUTANT_COREDIRCONFIG
-    if (env_.configDir.empty() && !env_.gameDir.empty()) {
-        std::string game = env_.gameDir;
-        WithSlash(game);
-        env_.configDir = game + "Data\\NVSE\\Plugins\\";
+    if (!FNV_MUT(30)) {
+        if (env_.configDir.empty() && !env_.gameDir.empty()) {
+            std::string game = env_.gameDir;
+            WithSlash(game);
+            env_.configDir = game + "Data\\NVSE\\Plugins\\";
+        }
     }
-#endif
     if (env_.configDir.empty()) env_.configDir = DirOf(env_.corePath);
     if (env_.configDir.empty()) env_.configDir = ".\\";
     WithSlash(env_.configDir);
@@ -302,15 +294,13 @@ void CoreHost::CleanStaleCache() {
 // file, and that file is the cache copy. Mirror the loader folder's current config files into the cache folder before
 // each LoadLibrary: copy (overwrite) every present file, delete cache copies whose source is gone, skip missing files.
 // Only a sharing or lock violation is retried (see CopyConfigFile); any other copy error is logged at once.
-#ifdef NVLOADER_MUTANT_NOCONFIG
-void CoreHost::SyncConfig() { configFiles_.clear(); }
-#else
 void CoreHost::SyncConfig() {
-#ifdef NVLOADER_MUTANT_CONFIGONCE
-    static bool once = false;
-    if (once) return;
-    once = true;
-#endif
+    if (FNV_MUT(25)) { configFiles_.clear(); return; }
+    if (FNV_MUT(26)) {
+        static bool once = false;
+        if (once) return;
+        once = true;
+    }
     const std::string& src = env_.configDir;
     const std::string& dst = env_.cacheDir;
     configFiles_.clear();
@@ -320,16 +310,16 @@ void CoreHost::SyncConfig() {
         nvcoop::Log("loader: cannot list config files in %s (error %lu); the cache keeps its older copies", src.c_str(), GetLastError());
         return;
     }
-#ifndef NVLOADER_MUTANT_NOPRUNE
-    ConfigNamesIn(dst, have);
-    for (const std::string& h : have) {
-        const std::string key = Lower(h);
-        if (std::none_of(want.begin(), want.end(), [&](const std::string& w) { return Lower(w) == key; })) {
-            MakeWritable(dst + h);
-            DeleteFileA((dst + h).c_str());
+    if (!FNV_MUT(27)) {
+        ConfigNamesIn(dst, have);
+        for (const std::string& h : have) {
+            const std::string key = Lower(h);
+            if (std::none_of(want.begin(), want.end(), [&](const std::string& w) { return Lower(w) == key; })) {
+                MakeWritable(dst + h);
+                DeleteFileA((dst + h).c_str());
+            }
         }
     }
-#endif
     std::string list;
     for (const std::string& name : want) {
         const std::string from = src + name, to = dst + name;
@@ -346,7 +336,6 @@ void CoreHost::SyncConfig() {
     }
     nvcoop::Log("loader: %u config file(s) copied to the cache:%s", static_cast<unsigned>(configFiles_.size()), list.c_str());
 }
-#endif
 
 std::string CoreHost::MakeCachePath(uint32_t seq) const {
     char b[64];
@@ -377,33 +366,28 @@ void CoreHost::FillApi(uint32_t generation, bool isReload) {
 bool CoreHost::LoadCoreFrom(const std::string& sourcePath, bool isReload, uint32_t generation, LoadedCore& out,
                             std::string& err) {
     CreateDirectoryA(env_.cacheDir.c_str(), nullptr);
-#ifdef NVLOADER_MUTANT_NOCOPY
     std::string cache = sourcePath;
-#else
-    std::string cache = MakeCachePath(static_cast<uint32_t>(++g_seq));
-    // The linker may still be finishing the file; retry the copy for up to ~2 s.
-    bool copied = false;
-    for (int i = 0; i < 20 && !copied; ++i) {
-        copied = CopyFileA(sourcePath.c_str(), cache.c_str(), FALSE) != 0;
-        if (!copied) Sleep(100);
+    if (!FNV_MUT(21)) {
+        cache = MakeCachePath(static_cast<uint32_t>(++g_seq));
+        // The linker may still be finishing the file; retry the copy for up to ~2 s.
+        bool copied = false;
+        for (int i = 0; i < 20 && !copied; ++i) {
+            copied = CopyFileA(sourcePath.c_str(), cache.c_str(), FALSE) != 0;
+            if (!copied) Sleep(100);
+        }
+        if (!copied) { err = "cannot copy core '" + sourcePath + "' to cache (error " + std::to_string(GetLastError()) + ")"; return false; }
     }
-    if (!copied) { err = "cannot copy core '" + sourcePath + "' to cache (error " + std::to_string(GetLastError()) + ")"; return false; }
-#endif
     SyncConfig();   // every load, reload and rollback: the core's modules read their config at onLoad
     HMODULE m = LoadLibraryExA(cache.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!m) {
         err = "LoadLibrary failed for core (error " + std::to_string(GetLastError()) + ")";
-#ifndef NVLOADER_MUTANT_NOCOPY
-        DeleteFileA(cache.c_str());
-#endif
+        if (!FNV_MUT(21)) DeleteFileA(cache.c_str());
         return false;
     }
     auto fail = [&](const std::string& why) {
         err = why;
         FreeLibrary(m);
-#ifndef NVLOADER_MUTANT_NOCOPY
-        DeleteFileA(cache.c_str());
-#endif
+        if (!FNV_MUT(21)) DeleteFileA(cache.c_str());
         return false;
     };
     auto init = reinterpret_cast<NvCoreInitFn>(GetProcAddress(m, NVCORE_INIT_EXPORT));
@@ -504,9 +488,7 @@ ReloadResult CoreHost::Reload(const char* reason) {
     ++depth_;
     try { ready = cur_.core.before_unload(); } catch (...) { ready = 0; }
     --depth_;
-#ifdef NVLOADER_MUTANT_NOVETO
-    ready = 1;
-#endif
+    if (FNV_MUT(23)) ready = 1;
     if (!ready) {
         oldGate->open = true;
         res.error = "core vetoed the unload (see nvcoop.log); old core stays loaded";
@@ -549,22 +531,22 @@ ReloadResult CoreHost::Reload(const char* reason) {
     }
     nvcoop::Log("loader: reload failed: %s", err.c_str());
     res.error = err;
-#ifndef NVLOADER_MUTANT_NOROLLBACK
-    { std::lock_guard<std::mutex> g(blobMu); blobs = blobSnapshot; }
-    LoadedCore back;
-    std::string err2;
-    if (LoadCoreFrom(prev.cachePath, true, generation_, back, err2)) {
-        cur_ = back;
-        cachePath_ = back.cachePath;
-        loaded_ = true;
-        if (prev.cachePath != back.cachePath) DeleteFileA(prev.cachePath.c_str());
-        res.rolledBack = true;
-        res.generation = generation_;
-        res.msLoad = MsSince(t1);
-        return finish(res);
+    if (!FNV_MUT(24)) {
+        { std::lock_guard<std::mutex> g(blobMu); blobs = blobSnapshot; }
+        LoadedCore back;
+        std::string err2;
+        if (LoadCoreFrom(prev.cachePath, true, generation_, back, err2)) {
+            cur_ = back;
+            cachePath_ = back.cachePath;
+            loaded_ = true;
+            if (prev.cachePath != back.cachePath) DeleteFileA(prev.cachePath.c_str());
+            res.rolledBack = true;
+            res.generation = generation_;
+            res.msLoad = MsSince(t1);
+            return finish(res);
+        }
+        res.error += "; rollback also failed: " + err2;
     }
-    res.error += "; rollback also failed: " + err2;
-#endif
     res.coreDead = true;
     res.generation = 0;
     return finish(res);

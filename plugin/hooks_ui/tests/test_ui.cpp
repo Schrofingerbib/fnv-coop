@@ -1,4 +1,4 @@
-// Unit tests for hooks_ui (game-free). Built once against the real core and once per NVUI_MUTANT=<n>; every mutant MUST fail.
+// Unit tests for hooks_ui (game-free). Built once (FNVCOOP_RUNTIME_MUT); run once for real and once per FNVCOOP_MUT=<n>; every twin MUST fail.
 //   1 origin ignored            2 menu resume not one-shot     3 button off-by-one       4 condition view uses host slot
 //   5 NPC-to-NPC lines captured 6 synchronous resume dropped   7 sticky origin forever   8 host DialogMenu opens for a remote actor
 //   9 slides recorded out of order
@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "fnvcoop_mut.h"
 #include "../ui_addrs.h"
 #include "../ui_core.h"
 
@@ -502,7 +503,7 @@ TEST(pins_match_real_exe_if_available) {
 }
 
 int main() {
-    std::printf("hooks_ui tests (NVUI_MUTANT=%d)\n", NVUI_MUTANT);
+    std::printf("hooks_ui tests (FNVCOOP_MUT=%d)\n", fnvcoop_mut::current());
     run("origin_scope_wins_and_nests", origin_scope_wins_and_nests);
     run("origin_activation_and_sticky_expire", origin_activation_and_sticky_expire);
     run("box_for_host_origin_stays_local", box_for_host_origin_stays_local);

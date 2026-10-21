@@ -68,6 +68,16 @@ non-persistent ref got `Invalid reference ...`. Only `player.` works as a prefix
 
 ## Shared types (L4 owns): `synccore/include/fnvcoop/`
 - `FormRef { std::string plugin; uint32_t localId; }` - never raw load-order FormIDs on the wire.
-- `Effect` variant: SetStage, SetObjective, SetGlobal, EnableRef, DisableRef, AddItem, RemoveItem, ModActorValue, ModReputation, ModKarma, StartQuest, StopQuest, MoveRef, KillActor, ResurrectActor.
+- `Effect` variant: SetStage, SetObjective, SetGlobal, EnableRef, DisableRef, AddItem, RemoveItem, ModActorValue, ModReputation, ModKarma, StartQuest, StopQuest, MoveRef, KillActor, ResurrectActor (the first 15; the current list is generated into docs/protocol.md section 6). `RefCommand` (docs/protocol.md section 21, op ids in `synccore/include/fnvcoop/refop.h`) is the generic "script command on a reference" effect; new script commands get an op there instead of a new Effect type.
 - `EffectTxn { uint64 seq; PlayerId origin; Cause cause; std::vector<Effect> effects; }` - one result-script run = one txn.
 - `Recipient` routing for player-targeted effects per owner policy (rewards → all players; karma/rep → shared).
+
+## Combat rules (combat-core owns `synccore/combat/`)
+- `synccore/combat/combat.h`: `HitEvent`, `HitValidator` (run by the VICTIM's owner), `LimbState`, `DeathLedger`/`DeathDecl`, `ProjectileRegistry` (visual-only copies), `ExplosionLedger`/`planExplosionHits`, kill XP, `HostilityBook`. Game-free; engine questions go through `ICombatWorld`. Docs: `docs/tools/combat-core.md`. Engine glue (`plugin/combat/`) uses these types and does not redefine the rules.
+
+## Area desync rules (area-desync owns `synccore/areadigest/` and `plugin/areadigest/`)
+- `synccore/areadigest/areadigest.h`: `Item`, `IAreaSource` (one per category: actors, containers, objects), `IStorySource`, `AreaSync` (digest, targeted diff, heal), `RollingRate` / counters. Game-free;
+  engine questions go through `IAreaSource` / `IActorFacade`. Docs: `docs/tools/area-desync.md`, wire: `docs/protocol.md` section 17 (first byte 0xDA).
+- Authority of an item: the owner of the actor (as the host's ownership view says), the host for everything else. A heal never touches the owner's copy, never kills or revives an
+  actor (the actor module and the story layer own those), and carries the target's item version and the owner epoch.
+- Heals per category per minute are exported to the flight recorder (`FlightRecorder::healCounters`, marker kind 8) and to `areadigest.status`; tests assert 0 (`tools/areadigest/dashboard.py`).

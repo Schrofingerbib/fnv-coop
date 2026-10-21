@@ -16,7 +16,28 @@ float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : 
 
 void Machine::refreshAi(NetId id) {
     ActorState* a = world_.findActor(id);
-    if (a) a->aiOn = view_.ownerOf(id) == cfg_.self && !handingOff_.count(id) && !a->dead && a->enabled;
+    if (a) a->aiOn = drivesAi(*a);
+}
+
+bool Machine::drivesAi(const ActorState& a) const {
+    return view_.ownerOf(a.id) == cfg_.self && !handingOff_.count(a.id) && !awaitOld_.count(a.id) && !a.dead && a.enabled;
+}
+
+void Machine::releaseAiHold(NetId id) {
+    if (!awaitOld_.erase(id)) return;
+    lastMoveMs_[id] = now_; settledAt_[id] = 0;   // our copy may be newer than what guests hold: announce it once it settles
+    refreshAi(id);
+}
+
+void Machine::releaseHoldsFrom(PlayerId prev) {
+    std::vector<NetId> ids;
+    for (auto& kv : awaitOld_) if (kv.second.first == prev) ids.push_back(kv.first);
+    for (NetId id : ids) releaseAiHold(id);
+}
+
+void Machine::breach(const std::string& name, const std::string& detail) {
+    ++stats_.breaches;
+    if (breaches_.size() < 32) breaches_.push_back(name + ": machine " + std::to_string(cfg_.self) + " at " + std::to_string(now_) + " ms: " + detail);
 }
 
 void Machine::refreshAiFlags() {
@@ -50,6 +71,7 @@ bool Machine::onPose(const Envelope& e, const MPose& m) {
     PlayerState& p = world_.player(m.slot);
     if (m.seq <= p.poseSeq) return false;
     p.slot = m.slot; p.present = m.present; p.poseSeq = m.seq;
+    if (!m.present) releaseHoldsFrom(m.slot);
     if (m.present) { p.cell = m.cell; p.pos = m.pos; p.yaw = m.yaw; }
     return true;
 }
@@ -109,7 +131,8 @@ void Machine::aiStep(ActorState& a, uint32_t dtMs) {
                 lastAttackMs_[a.id] = now_;
                 MHit h;
                 h.hitId = nextId(); h.attackerIsPlayer = false; h.attacker = a.id; h.victimIsPlayer = true; h.victim = tgt->slot;
-                h.damage = cfg_.npcDamage; h.impact = tgt->pos; h.weaponRange = cfg_.meleeRange;
+                h.damage = cfg_.npcDamage; h.weaponRange = cfg_.meleeRange;   // (a melee swing has no impact point to check)
+                h.firedAt = static_cast<uint32_t>(now_); h.attackerEpoch = view_.epochOf(a.id);
                 sendHit(h, tgt->slot);
             }
         }
@@ -160,6 +183,21 @@ bool Machine::onActorSnap(const Envelope& e, const MActorSnap& m) {
     if (obs_) obs_->onActorUpdate(cfg_.self, now_, m.id, e.src, m.epoch, v);
     if (v != UpdateVerdict::Accept) {
         ++stats_.snapshotsDropped;
+        if (v == UpdateVerdict::StaleEpoch && m.final) {   // the old owner's last word, after a forced commit: its AI has stopped, ours may start
+            auto w = awaitOld_.find(m.id);
+            if (w != awaitOld_.end() && w->second.first == e.src) releaseAiHold(m.id);
+            else if (isHost() && !engineFaults().staleFinalNotForwarded) {
+                // The new owner is another guest: only the host sees this message (the broadcast of a stale state is not relayed), and without
+                // it the new owner would keep its AI off until the safety timeout. Pass it to the new owner alone; it releases only for the
+                // previous owner it is waiting for, everybody else ignores a stale epoch as before.
+                const PlayerId owner = view_.ownerOf(m.id);
+                if (owner != cfg_.self && owner != e.src && owner != kNoPlayer && owner < kMaxSlots) {
+                    Envelope fwd = e;
+                    fwd.dest = owner;
+                    relay(fwd);
+                }
+            }
+        }
         if (rejectLog_.size() < 64) rejectLog_.push_back(std::string("snap ") + std::to_string(m.id) + " from " + std::to_string(e.src) + ": " + toString(v));
         if (v == UpdateVerdict::FutureEpoch && isHost()) {   // the sender is ahead of us or we are behind: tell it the truth
             OwnMsg cur;
@@ -202,25 +240,55 @@ void Machine::makeCorpse(ActorState& a, const LootList& loot) {
     for (auto& e : loot) c.items[e.first] += e.second;
 }
 
-void Machine::applyDamage(ActorState& a, int32_t damage, Limb limb, bool) {
-    a.health -= damage;
-    if (limb != Limb::Torso && damage >= 25) a.limbMask = static_cast<uint8_t>(a.limbMask | (1u << static_cast<unsigned>(limb)));
-    bool kill = a.health <= 0;
-    if (kill && a.named && !engineFaults().namedActorKillable) { a.health = 1; kill = false; }   // essential: only the story may kill
+void Machine::applyDamage(ActorState& a, const combat::HitEvent& h) {
+    // Only the owner changes an actor's health (the caller has judged the hit); anything else is a bug the oracle must see.
+    if (view_.ownerOf(a.id) != cfg_.self) breach("damage_applied_by_non_owner", "actor " + std::to_string(a.id) + " damaged on a machine that does not own it");
+    combat::VictimVitals v;
+    v.health = a.health; v.maxHealth = a.maxHealth;
+    v.dead = a.dead && !engineFaults().deathNotIdempotent;   // (the fault: a corpse can be hit and die again)
+    v.named = a.named && !engineFaults().namedActorKillable;  // essential: only the story may kill it
+    v.limbs.crippled = a.limbMask;
+    for (unsigned i = 0; i < combat::kLimbCount; ++i) v.limbs.damage[i] = a.limbDmg[i];
+    const bool wasDead = a.dead;
+    const combat::DamageOutcome o = combat::applyHit(v, h, rules_);
+    if (!o.applied) return;
+    a.health = v.health; a.limbMask = v.limbs.crippled;
+    for (unsigned i = 0; i < combat::kLimbCount; ++i) a.limbDmg[i] = v.limbs.damage[i];
+    if (o.newlyCrippled) ++stats_.limbsCrippled;
+    const bool kill = o.died;
+    if (kill && a.named) breach("story_npc_killed", "named actor " + std::to_string(a.id) + " was killed in combat");
+    if (kill && wasDead) breach("death_declared_twice", "actor " + std::to_string(a.id) + " was declared dead a second time");
     OwnerEpoch epoch = 0;
     view_.mayPublish(a.id, epoch);
     MActorEvent ev;
-    ev.id = a.id; ev.epoch = epoch; ev.eventId = nextId(); ev.health = a.health; ev.limbMask = a.limbMask;
+    ev.id = a.id; ev.epoch = epoch; ev.eventId = nextId(); ev.health = a.health;
+    ev.limbMask = engineFaults().limbNotSynced ? 0 : a.limbMask;   // (the fault: the crippled limbs stay a secret of the owner)
+    for (unsigned i = 0; i < combat::kLimbCount; ++i) ev.limbDmg[i] = a.limbDmg[i];
+    // What the owner publishes is what it knows; a digest repair that later patches the difference would hide the bug from every convergence check.
+    if (ev.limbMask != a.limbMask) breach("limbs_not_published", "actor " + std::to_string(a.id) + " is crippled (mask " + std::to_string(a.limbMask) + ") but the event says " + std::to_string(ev.limbMask));
     ev.seq = ++a.snapSeq; ev.cell = a.cell; ev.pos = a.pos; ev.yaw = a.yaw;
+    ev.killerKind = static_cast<uint8_t>(h.attacker.kind); ev.killerId = h.attacker.id;
     if (kill) {
-        a.health = 0; a.dead = true;
-        ev.kind = ActorEventKind::Death; ev.dead = true; ev.health = 0;
-        ev.loot = rollLoot(rng_);
-        makeCorpse(a, ev.loot);
+        combat::DeathDecl d;
+        d.deathId = ev.eventId; d.who = combat::Entity::actor(a.id); d.source = combat::DeathSource::Owner; d.declarer = cfg_.self; d.epoch = epoch;
+        d.killer = h.attacker; d.limbMask = a.limbMask; d.cell = a.cell; d.where = {a.pos.x, a.pos.y, a.pos.z}; d.tick = static_cast<uint32_t>(now_);
+        const combat::DeathVerdict dv = deaths_.judge(d, cfg_.self, isHost(), *cview_);
+        if (dv.accept || engineFaults().deathNotIdempotent) {
+            ++stats_.deathsDeclared;
+            a.health = 0; a.dead = true;
+            ev.kind = ActorEventKind::Death; ev.dead = true; ev.health = 0;
+            ev.loot = rollLoot(rng_);
+            makeCorpse(a, ev.loot);
+            creditKill(ev);
+        } else {
+            ++stats_.deathsRefused;
+            a.health = std::max<int32_t>(a.health, 1);
+            ev.health = a.health;
+        }
     }
     applied_.insert(kTagEvent | ev.eventId);
     sendBody(ev, kNoPlayer);
-    if (kill && isHost()) onActorDiedHost(a.id);
+    if (ev.dead && isHost()) onActorDiedHost(a.id);
 }
 
 bool Machine::onActorEvent(const Envelope& e, const MActorEvent& m) {
@@ -237,14 +305,29 @@ bool Machine::onActorEvent(const Envelope& e, const MActorEvent& m) {
         return false;
     }
     if (!applyOnce(kTagEvent | m.eventId)) { ++stats_.eventsDuplicate; return false; }
+    if (m.dead) {   // a death is declared once: the ledger refuses a second declaration, a replay, and a story NPC killed by combat
+        combat::DeathDecl d;
+        d.deathId = m.eventId; d.who = combat::Entity::actor(m.id); d.source = combat::DeathSource::Owner; d.declarer = e.src; d.epoch = m.epoch;
+        d.killer = combat::Entity{static_cast<combat::EntityKind>(m.killerKind <= 2 ? m.killerKind : 0), m.killerId};
+        d.limbMask = m.limbMask; d.cell = m.cell; d.where = {m.pos.x, m.pos.y, m.pos.z};
+        const combat::DeathVerdict dv = deaths_.judge(d, e.src, e.src == kHostPlayer, *cview_);
+        if (!dv.accept && !engineFaults().deathNotIdempotent) {
+            ++stats_.deathsRefused;
+            if (rejectLog_.size() < 64) rejectLog_.push_back(std::string("death of ") + std::to_string(m.id) + " from " + std::to_string(e.src) + ": " + combat::toString(dv.reason));
+            return false;
+        }
+    }
+    if (m.dead && a->dead) breach("death_declared_twice", "actor " + std::to_string(m.id) + " was declared dead a second time (event from p" + std::to_string(e.src) + ")");   // only reachable with the fault
     a->health = m.health; a->limbMask = m.limbMask;
+    for (unsigned i = 0; i < combat::kLimbCount; ++i) a->limbDmg[i] = m.limbDmg[i];
     if (m.seq > a->snapSeq) { a->snapSeq = m.seq; a->cell = m.cell; a->pos = m.pos; a->yaw = m.yaw; }
     ++stats_.eventsApplied;
     if (m.dead) {
         a->dead = true; a->health = 0;
         LootList loot = m.loot;
-        if (engineFaults().lootPerMachine) loot = rollLoot(rng_);
+        if (engineFaults().lootPerMachine) { loot = rollLoot(rng_); breach("loot_rolled_again", "corpse " + std::to_string(a->id) + " loot rolled on a machine that is not its owner"); }
         makeCorpse(*a, loot);
+        creditKill(m);
         if (isHost()) diedAfterRelay_.push_back(a->id);   // untrack only after the event itself went out (ordering: event, then Release)
     }
     return true;
@@ -260,25 +343,6 @@ void Machine::sendHit(const MHit& h, PlayerId dest) {
         return;
     }
     sendBody(h, dest);
-}
-
-bool Machine::validateHit(const MHit& h, const ActorState& victim, PlayerId from, std::string& why) {
-    if (engineFaults().hitNoValidation) return true;
-    if (victim.dead) { why = "victim already dead"; return false; }
-    if (h.damage <= 0 || h.damage > cfg_.maxDamage) { why = "damage out of bounds"; return false; }
-    if (h.weaponRange > cfg_.maxWeaponRange) { why = "weapon range out of bounds"; return false; }
-    if (!h.attackerIsPlayer) { why = "npc attacker against an npc"; return false; }
-    if (h.attacker != from || h.attacker >= kMaxSlots) { why = "attacker is not the sender"; return false; }
-    const PlayerState& p = world_.player(static_cast<PlayerId>(h.attacker));
-    if (!p.present || p.dead) { why = "attacker absent or dead"; return false; }
-    if (!world_.adjacent(p.cell, victim.cell)) { why = "attacker in another cell"; return false; }
-    if (distance(p.pos, victim.pos) > h.weaponRange + cfg_.rangeSlack) { why = "out of weapon range"; return false; }
-    if (!(h.impact == Vec3{}) && distance(h.impact, victim.pos) > cfg_.impactSlack) { why = "impact point not near victim"; return false; }
-    auto& q = hitTimes_[static_cast<PlayerId>(h.attacker)];
-    while (!q.empty() && q.front() + 1000 <= now_) q.pop_front();
-    if (q.size() >= cfg_.maxHitsPerSec) { why = "hit rate"; return false; }
-    q.push_back(now_);
-    return true;
 }
 
 void Machine::onHit(const Envelope& e, MHit h) {
@@ -299,35 +363,41 @@ void Machine::onHit(const Envelope& e, MHit h) {
     ActorState* a = world_.findActor(h.victim);
     if (!a) return;
     const PlayerId owner = view_.ownerOf(h.victim);
-    if (owner != cfg_.self && !engineFaults().hitAppliedByNonOwner) {
-        ++stats_.hitsRejected;
-        if (rejectLog_.size() < 64) rejectLog_.push_back("hit on " + std::to_string(h.victim) + ": not the owner");
-        return;
+    PlayerId judgeAs = cfg_.self;
+    if (owner != cfg_.self && engineFaults().hitAppliedByNonOwner) {
+        breach("non_owner_hit_applied", "hit on actor " + std::to_string(h.victim) + " applied by a machine that is not its owner (owner p" + std::to_string(owner) + ")");
+        judgeAs = owner;   // the fault: this machine takes the hit as if it owned the victim
     }
-    if (handingOff_.count(h.victim)) {   // already giving this actor away: its new owner decides, not us
-        ++stats_.hitsRejected;
-        if (rejectLog_.size() < 64) rejectLog_.push_back("hit on " + std::to_string(h.victim) + ": handoff in progress");
-        return;
+    const combat::HitEvent he = toHitEvent(h);
+    combat::HitVerdict v;
+    if (engineFaults().hitNoValidation) {
+        // the fault: nothing is checked. Run the real checks on a copy anyway so the oracle can see a forged hit take effect.
+        combat::HitValidator probe = hits_;
+        const combat::HitVerdict real = probe.judge(he, e.src, judgeAs, now_, *cview_);
+        if (!real.apply) breach("forged_hit_applied", "hit on actor " + std::to_string(h.victim) + " from " + std::to_string(e.src) + " applied although it failed validation (" + real.detail + ")");
+        v.apply = true;
+    } else {
+        v = hits_.judge(he, e.src, judgeAs, now_, *cview_);
     }
-    std::string why;
-    if (!validateHit(h, *a, e.src, why)) {
+    if (!v.apply) {
         ++stats_.hitsRejected;
-        if (rejectLog_.size() < 64) rejectLog_.push_back("hit on " + std::to_string(h.victim) + ": " + why);
+        if (rejectLog_.size() < 64) rejectLog_.push_back("hit on " + std::to_string(h.victim) + ": " + combat::toString(v.reason));
         return;
     }
     ++stats_.hitsApplied;
-    applyDamage(*a, h.damage, h.limb, true);
+    applyDamage(*a, he);
 }
 
 void Machine::applyHitToSelf(const Envelope& e, const MHit& h) {
     PlayerState& me = world_.player(cfg_.self);
     if (h.victim != cfg_.self || me.dead) return;
     if (!engineFaults().hitNoValidation) {
-        if (h.damage <= 0 || h.damage > cfg_.maxDamage) { ++stats_.hitsRejected; return; }
-        if (!h.attackerIsPlayer) {
-            const ActorState* npc = world_.findActor(h.attacker);
-            if (!npc || npc->dead || view_.ownerOf(npc->id) != e.src) { ++stats_.hitsRejected; return; }   // only the npc's owner may report it
-            if (npc->cell != me.cell || distance(npc->pos, me.pos) > cfg_.meleeRange + cfg_.rangeSlack + 400.0f) { ++stats_.hitsRejected; return; }
+        // the player's own machine applies the damage the NPC's owner (or the shooter's machine) reports, after the same checks
+        const combat::HitVerdict v = hits_.judge(toHitEvent(h), e.src, cfg_.self, now_, *cview_);
+        if (!v.apply) {
+            ++stats_.hitsRejected;
+            if (rejectLog_.size() < 64) rejectLog_.push_back("hit on player " + std::to_string(h.victim) + ": " + combat::toString(v.reason));
+            return;
         }
     }
     me.health -= h.damage;

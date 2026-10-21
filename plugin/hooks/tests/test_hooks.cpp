@@ -354,6 +354,32 @@ TEST(reload_suspend_resume_keeps_trampolines_and_release_still_restores) {
     CHECK(m.image == pristine && m.heap.empty() && tamperedCount() == t0);
 }
 
+TEST(trampoline_lookup_names_the_original_code_of_installed_hooks_only) {
+    // dll-wiring: world.query calls an evaluator that our own detour patched THROUGH its trampoline (plugin/hooks_world/world_query.cpp)
+    FakeMemory m;
+    HookSpec a = makeSpec(0x00400100), b = makeSpec(0x00400200, 5);
+    m.place(a);
+    m.place(b);
+    HookRegistry reg(m);
+    Addr ta = 0, tb = 0;
+    CHECK(reg.trampolineOf(a.target) == 0);   // nothing installed yet
+    CHECK(reg.acquire(a, 1, &ta) == PatchStatus::Ok);
+    CHECK(reg.acquire(b, 2, &tb) == PatchStatus::Ok);
+    CHECK(ta != 0 && tb != 0 && ta != tb && ta != a.target && tb != b.target);
+    CHECK(reg.trampolineOf(a.target) == ta && reg.trampolineOf(b.target) == tb);
+    CHECK(reg.trampolineOf(a.target + 4) == 0);                              // an address inside the function is not an entry
+    CHECK(trampolineOfAny(a.target) == ta && trampolineOfAny(b.target) == tb);   // process-wide
+    CHECK(trampolineOfAny(0x00400300) == 0);
+    auto code = m.bytes(tb, b.stolen);
+    CHECK(std::memcmp(code.data(), b.expected, b.stolen) == 0);               // the trampoline begins with the original bytes
+    CHECK(reg.suspendAll() == 0);                                             // reload drain: original bytes are back at the entry, the trampoline stays valid
+    CHECK(reg.trampolineOf(a.target) == ta);
+    CHECK(reg.resumeAll() == 0);
+    CHECK(reg.release(a) == PatchStatus::Restored);
+    CHECK(reg.trampolineOf(a.target) == 0 && trampolineOfAny(a.target) == 0);
+    CHECK(reg.trampolineOf(b.target) == tb);
+}
+
 TEST(reload_suspend_leaves_chained_hooks_alone_and_process_wide_helpers_see_every_registry) {
     FakeMemory m1, m2;
     HookSpec a = makeSpec(0x00400100);
@@ -1239,6 +1265,7 @@ int main() {
     run("reload_restore_failure_is_reported_and_never_hangs", reload_restore_failure_is_reported_and_never_hangs);
     run("reload_preflight_finds_chained_hooks_without_touching_anything", reload_preflight_finds_chained_hooks_without_touching_anything);
     run("reload_suspend_resume_keeps_trampolines_and_release_still_restores", reload_suspend_resume_keeps_trampolines_and_release_still_restores);
+    run("trampoline_lookup_names_the_original_code_of_installed_hooks_only", trampoline_lookup_names_the_original_code_of_installed_hooks_only);
     run("reload_suspend_leaves_chained_hooks_alone_and_process_wide_helpers_see_every_registry", reload_suspend_leaves_chained_hooks_alone_and_process_wide_helpers_see_every_registry);
     run("reload_tampered_hook_is_counted_so_the_loader_can_refuse_to_unload", reload_tampered_hook_is_counted_so_the_loader_can_refuse_to_unload);
     run("engine_address_table_is_sane", engine_address_table_is_sane);

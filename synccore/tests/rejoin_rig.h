@@ -68,14 +68,17 @@ struct Rig {
     std::vector<uint64_t> dlgRuns;                          // seq returned by the dialogue ResultRunner, in call order
     std::vector<std::pair<dlg::ConvId, dlg::Phase>> dlgRunKeys;
     bool withDialogue = false;
+    bool hostBaseline = true;   // false: a host running without a world baseline (plugin baseline=0); clients join with plain snapshots
 
-    explicit Rig(uint64_t seed, bool dialogue = false, uint32_t dlgLatency = 40, HostSession::Options hostOpt = HostSession::Options())
-        : story(seed * 7 + 1), dnet(seed * 7 + 2), host(*story.endpoint(0), SharePolicy(), hostOpt), withDialogue(dialogue) {
+    explicit Rig(uint64_t seed, bool dialogue = false, uint32_t dlgLatency = 40, HostSession::Options hostOpt = HostSession::Options(),
+                 bool withHostBaseline = true)
+        : story(seed * 7 + 1), dnet(seed * 7 + 2), host(*story.endpoint(0), SharePolicy(), hostOpt), withDialogue(dialogue),
+          hostBaseline(withHostBaseline) {
         LinkParams lp; lp.minLatencyMs = storyLatMin; lp.maxLatencyMs = storyLatMax; lp.loss = 0.03; lp.duplicate = 0.01;
         story.setLink(lp);
         LinkParams dp; dp.minLatencyMs = dp.maxLatencyMs = dlgLatency; dp.duplicate = 0.02;   // reliable + ordered, like ENet channel 0
         dnet.setLink(dp);
-        host.setWorldBaseline(world(20), 5);
+        if (hostBaseline) host.setWorldBaseline(world(20), 5);
         if (dialogue) {
             dlg::DialogueNode::Config c; c.self = 0; c.isHost = true;
             c.peerOfSlot = [](PlayerId p) { return PeerId(p); };
@@ -115,7 +118,7 @@ struct Rig {
     void join(size_t i, const ShadowState* dump = nullptr) {
         C& c = *cl[i];
         if (dump) c.dump = *dump;
-        c.cs->setBaselineWorld(c.dump, 5);
+        if (hostBaseline) c.cs->setBaselineWorld(c.dump, 5);
         c.cs->connect(now, c.cs->lastSession() + 1);
     }
     void joinOnly(size_t i) { join(i); }

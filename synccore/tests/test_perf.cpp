@@ -13,6 +13,7 @@
 #include "fnvcoop/rules.h"
 #include "fnvcoop/session.h"
 #include "minitest.h"
+#include "perf_guard.h"
 
 using namespace fnvcoop;
 using Clock = std::chrono::steady_clock;
@@ -55,26 +56,48 @@ double machineFactor() {
 }
 double budgetScale() { return scale() * machineFactor(); }
 
-// Gate mode only: a timing test that fails is repeated (up to 3 attempts); it must fail every attempt to count. Other lanes compile
-// concurrently on the development machine and a single noisy attempt says nothing about the code. Strict mode never retries.
+// Load-robust budgets (perf_guard.h, proven on a simulated machine in test_perfguard.cpp). Every perf body takes a perfguard::Budget:
+//   b.k        multiplies every throughput budget (percentiles, medians): how much slower than the quiet reference this machine is RIGHT NOW
+//   b.slackUs  is ADDED to every worst-frame (max) budget: the longest scheduler stall the probe saw (a preempted thread loses whole time
+//              slices, which has nothing to do with CPU speed)
+// A failing body is retried with a fresh probe (6 attempts on a saturated machine, 3 on a quiet one) and must fail every attempt to count;
+// a real regression is several times over budget on a quiet machine as well, so it still fails.
+perfguard::Env realProbe() {
+    perfguard::Env e;
+    e.factor = calibrateUs() / kCalibrationReferenceUs;
+    e.stallUs = perfguard::longestStallUs(15, 4);
+    return e;
+}
+perfguard::Guard& guard() {
+    static perfguard::Guard g = [] {
+        perfguard::Guard x;
+        x.cfg.scale = scale();
+        x.cfg.strict = strict();
+        x.probe = realProbe;
+        x.sleepMs = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        return x;
+    }();
+    return g;
+}
+const perfguard::Budget* g_currentBudget = nullptr;   // the budget of the attempt that is running (Stat::gate reads it)
 template <class F> void withRetries(F&& body) {
-    const int attempts = strict() ? 1 : 3;
-    for (int a = 0; a < attempts; ++a) {
-        int failuresBefore = minitest::state().failures;
-        body();
-        if (minitest::state().failures == failuresBefore || a == attempts - 1) return;
-        minitest::state().failures = failuresBefore;
-        std::printf("    (timing budget missed on attempt %d - retrying, the machine may be busy)\n", a + 1);
-    }
+    guard().run([&](const perfguard::Budget& b) {
+        g_currentBudget = &b;
+        body(b);
+        g_currentBudget = nullptr;
+    });
 }
 FormRef Q(uint32_t i) { return FormRef("falloutnv.esm", i); }
 
 bool strict();
 struct Stat {
     double p50 = 0, p90 = 0, p99 = 0, max = 0;
-    // The value budgets are compared against: p99 in strict mode, p90 in the gate (a few scheduler preemptions must not fail it).
-    double gate() const { return strict() ? p99 : p90; }
+    // The value budgets are compared against: p99 in strict mode, p90 in the gate (a few scheduler preemptions must not fail it), and the
+    // median while the machine is saturated (see perfguard::Budget::medianGate).
+    double gate() const;
 };
+
+inline double Stat::gate() const { return strict() ? p99 : (g_currentBudget && g_currentBudget->medianGate) ? p50 : p90; }
 
 template <class F> Stat measure(int iters, F&& f) {
     std::vector<double> us(static_cast<size_t>(iters));
@@ -145,10 +168,10 @@ std::vector<Effect> typicalTxn(int i) {
 }
 }  // namespace
 
-static void perf_per_frame_costs_of_the_session_layer_fit_the_budget_body();
+static void perf_per_frame_costs_of_the_session_layer_fit_the_budget_body(const perfguard::Budget&);
 TEST(perf, per_frame_costs_of_the_session_layer_fit_the_budget) { withRetries(perf_per_frame_costs_of_the_session_layer_fit_the_budget_body); }
-static void perf_per_frame_costs_of_the_session_layer_fit_the_budget_body() {
-    const double k = budgetScale();
+static void perf_per_frame_costs_of_the_session_layer_fit_the_budget_body(const perfguard::Budget& budget) {
+    const double k = budget.k;
     {   // host frame with nothing happening, 3 clients (4 players)
         Party p(3);
         Stat s = best(5000, [&](int) { p.now += 33; p.host.tick(p.now); });
@@ -184,10 +207,10 @@ static void perf_per_frame_costs_of_the_session_layer_fit_the_budget_body() {
     }
 }
 
-static void perf_heavy_operations_with_an_8k_entry_world_are_cheap_or_offloadable_body();
+static void perf_heavy_operations_with_an_8k_entry_world_are_cheap_or_offloadable_body(const perfguard::Budget&);
 TEST(perf, heavy_operations_with_an_8k_entry_world_are_cheap_or_offloadable) { withRetries(perf_heavy_operations_with_an_8k_entry_world_are_cheap_or_offloadable_body); }
-static void perf_heavy_operations_with_an_8k_entry_world_are_cheap_or_offloadable_body() {
-    const double k = budgetScale();
+static void perf_heavy_operations_with_an_8k_entry_world_are_cheap_or_offloadable_body(const perfguard::Budget& budget) {
+    const double k = budget.k;
     ShadowState w = bigWorld(1700);    // ~8.3k entries
     {
         Stat s = best(40, [&](int) { auto e = baselineEntries(w); volatile size_t n = e.size(); (void)n; });
@@ -232,10 +255,10 @@ static void perf_heavy_operations_with_an_8k_entry_world_are_cheap_or_offloadabl
     }
 }
 
-static void perf_rules_engine_and_filter_overhead_per_commit_body();
+static void perf_rules_engine_and_filter_overhead_per_commit_body(const perfguard::Budget&);
 TEST(perf, rules_engine_and_filter_overhead_per_commit) { withRetries(perf_rules_engine_and_filter_overhead_per_commit_body); }
-static void perf_rules_engine_and_filter_overhead_per_commit_body() {
-    const double k = budgetScale();
+static void perf_rules_engine_and_filter_overhead_per_commit_body(const perfguard::Budget& budget) {
+    const double k = budget.k;
     RulesDb db;
     std::string err;
     if (std::string(FNVCOOP_RULES_JSON).empty() || !db.loadFile(FNVCOOP_RULES_JSON, &err)) { CHECK_MSG(false, "rules.json: " + err); return; }
@@ -302,10 +325,10 @@ Stat joinAndDigestFrames(IWorker* w, bool* converged) {
 }
 }  // namespace
 
-static void perf_join_and_digest_frames_stay_cheap_on_the_main_thread_with_a_worker_body();
+static void perf_join_and_digest_frames_stay_cheap_on_the_main_thread_with_a_worker_body(const perfguard::Budget&);
 TEST(perf, join_and_digest_frames_stay_cheap_on_the_main_thread_with_a_worker) { withRetries(perf_join_and_digest_frames_stay_cheap_on_the_main_thread_with_a_worker_body); }
-static void perf_join_and_digest_frames_stay_cheap_on_the_main_thread_with_a_worker_body() {
-    const double k = budgetScale();
+static void perf_join_and_digest_frames_stay_cheap_on_the_main_thread_with_a_worker_body(const perfguard::Budget& budget) {
+    const double k = budget.k;
     bool okInline = false, okThreaded = false;
     Stat in = joinAndDigestFrames(nullptr, &okInline);
     Stat th;
@@ -320,9 +343,9 @@ static void perf_join_and_digest_frames_stay_cheap_on_the_main_thread_with_a_wor
     CHECK(okThreaded);
     CHECK(th.p50 < 300 * k);        // a typical frame is tiny; digest frames pay for the two snapshot copies (provider dump, host state)
     CHECK(th.gate() < 2500 * k);       // the frames that start a digest or the join: the snapshot copies stay on the main thread
-    CHECK(th.max < 5000 * k);       // worst frame (the provider dump / state snapshot copies stay on the main thread)
-    CHECK(in.max < 15000 * k);      // without a worker everything still fits in a few frames' worth
-    CHECK(th.max < in.max * 1.5 + 500 * k);   // and offloading does not make it worse (slack: both numbers are noisy under load)
+    CHECK(th.max < 5000 * k + budget.slackUs);       // worst frame (the provider dump / state snapshot copies stay on the main thread)
+    CHECK(in.max < 15000 * k + budget.slackUs);      // without a worker everything still fits in a few frames' worth
+    CHECK(th.max < in.max * 1.5 + 500 * k + budget.slackUs);   // and offloading does not make it worse (slack: both numbers are noisy under load)
 }
 
 TEST(perf, run_async_orders_results_and_survives_a_dying_session) {
@@ -358,13 +381,15 @@ TEST(perf, run_async_orders_results_and_survives_a_dying_session) {
     CHECK(true);
 }
 
-TEST(twin, unit_slow_digest) {
+static void twin_unit_slow_digest_body(const perfguard::Budget& budget);
+TEST(twin, unit_slow_digest) { withRetries(twin_unit_slow_digest_body); }
+static void twin_unit_slow_digest_body(const perfguard::Budget& budget) {
     // Relative, so it is immune to machine speed and contention: the old per-entry hashing is several times slower than the fast path
     // measured in the same process, which is far beyond noise.
     ShadowState w = bigWorld(1700);
     auto median = [&] { return best(30, [&](int) { auto sh = shardHashesOf(w); volatile size_t n = sh.size(); (void)n; }).p50; };
     double fast = median();
-    CHECK(fast < 1200 * budgetScale());     // the optimized path fits its (calibrated) budget
+    CHECK(fast < 1200 * budget.k);     // the optimized path fits its (calibrated) budget
     Mutations m; m.slowHashing = true;
     MutationScope sc(m);
     double slow = median();
@@ -374,6 +399,9 @@ TEST(twin, unit_slow_digest) {
 
 TEST(perf, calibration_reference_is_sane) {
     double us = calibrateUs();
-    std::printf("    calibration loop: %.0f us (reference %.0f us, machine factor %.2f%s)\n", us, kCalibrationReferenceUs, machineFactor(), strict() ? ", STRICT" : "");
+    perfguard::Env e = realProbe();
+    perfguard::Budget b = guard().budgetFor(e, 0);
+    std::printf("    calibration loop: %.0f us (reference %.0f us, machine factor %.2f%s); longest scheduler stall %.0f us; budgets x%.2f, +%.0f us on worst frames%s\n", us,
+                kCalibrationReferenceUs, machineFactor(), strict() ? ", STRICT" : "", e.stallUs, b.k, b.slackUs, b.saturated ? " (machine looks saturated)" : "");
     CHECK(us > 0);
 }

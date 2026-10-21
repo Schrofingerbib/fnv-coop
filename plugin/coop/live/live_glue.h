@@ -1,0 +1,50 @@
+// The live layer inside nvcoop.dll (dll-wiring). What main.cpp and coop_module.cpp call. No game header in here.
+//
+//   glueConfigure(ini)   NVSEPlugin_Load, BEFORE any module's onLoad: reads [live] (switches, all OFF by default) and [actors] (tuning of the real
+//                        actor port) and hands the result to the lanes (actors::engine::configure ...), so a lane that installs hooks at
+//                        load time already sees whether it is switched on.
+//   glueLoad()           coop module onLoad: builds the hub and the enabled services, registers the bridge method coop.live.
+//   glueFrame(rt, now)   every frame, AFTER Runtime::frame() (which polls the mux): session lifecycle, channel routing, ticks.
+//   glueMessage(...)     NVSE messages: PreLoadGame / PostLoadGame / SaveGame / ExitToMainMenu / ExitGame.
+//   glueShutdown()       hot reload / unload: ends the session part of every service.
+#pragma once
+#include <cstdint>
+#include <functional>
+#include <string>
+#include <vector>
+
+#include "fnvcoop/effect.h"
+#include "live_switches.h"
+
+namespace nvcoop::coop { class Runtime; }
+namespace fnvcoop { struct SpawnRef; }
+
+namespace nvcoop::livewire {
+
+void glueConfigure(const std::string& iniPath);
+void glueLoad();
+void glueFrame(nvcoop::coop::Runtime* rt, uint64_t nowMs);
+void glueMessage(uint32_t nvseMessageType, void* data, uint32_t len);
+void glueShutdown();
+
+const LiveSwitches& glueSwitches();
+// Engine ref of the puppet that stands for a remote player slot (the ghost-ref map of the acting-player design); 0 = none / avatars off.
+uint32_t glueAvatarRef(uint8_t slot);
+// The shared ini getter (environment NVCOOP_<SECTION>_<KEY> first, then the ini file); usable by every lane glue.
+IniGetter glueIni();
+
+// Story effects as this machine applies them (coop_module's EngineWorld::apply, BEFORE the applier runs): KillActor / ResurrectActor /
+// CompanionOwner reach the ownership service. No-op without a session.
+void glueOnEffect(const fnvcoop::Effect& e);
+// A save the plugin itself triggers (the bridge's saveGame): before it, stand-in / leveled-pick clones and player puppets are taken out of the world so
+// the .fos does not contain them; after it, puppets may respawn. (A save the player starts has no known pre-save hook; the load-time purge covers it.)
+void glueBeforeSave();
+void glueAfterSave();
+
+// plugin/spawn: coop_module hands over the WorldApplier (makes this machine's own copy of a spawn it did not roll).
+void glueSetSpawnApplier(std::function<bool(const fnvcoop::SpawnRef&)> f);
+// The host's spawn-site table travels with its save (<save>.fnvspawn); empty when spawns are off or this is a client.
+std::vector<uint8_t> glueSpawnSidecar();
+void glueSpawnSidecarLoaded(const std::vector<uint8_t>& bytes);
+
+}  // namespace nvcoop::livewire

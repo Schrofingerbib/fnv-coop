@@ -1,54 +1,27 @@
 @echo off
-rem Build (x86, Ninja) and run the reload state tests + mutation twins. Prints ALL OK on success.
-rem   1. registry unit tests (real must pass; NVRELOAD_MUTANT 1..8 must each fail)
-rem   2. host-process test: 100 unload/reload cycles of a real test core (real must pass; TESTCORE_MUTANT 1..9 must each fail)
-rem   3. the same host test against loader twins noconfig / configonce (config not copied to the cache): each must fail
-rem Usage: plugin\reload\run_tests.cmd [clean]
-setlocal EnableDelayedExpansion
-set "CMAKE_TOOLCHAIN_FILE="
-set "ANDROID_NDK_HOME="
-set "CXX="
-set "CC="
-set "CMAKE_BUILD_PARALLEL_LEVEL=2"
-set "HERE=%~dp0"
-set "REPO=%HERE%..\.."
-set "PATH=C:\Program Files (x86)\Microsoft Visual Studio\Installer;%PATH%"
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars32.bat" >nul || exit /b 1
-set "PATH=C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
-set "BLD=%REPO%\build\T3b"
-if /i "%1"=="clean" rmdir /s /q "%BLD%" 2>nul
-cmake -S "%HERE%." -B "%BLD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=cl >nul || (echo CONFIGURE FAILED & exit /b 1)
-cmake --build "%BLD%" || (echo BUILD FAILED & exit /b 1)
+rem One-command T3b reload tests (x86), using the SHARED build tree (build\all, tools\build\build.py: build lock + MSVC env):
+rem   1. registry unit tests  (nvreload_unit):      real must pass; twins FNVCOOP_MUT=1..8 must each fail
+rem   2. drain unit tests     (nvreload_drain):     real must pass; twins 7,8,10..14 must each fail
+rem        (7 no drain, 8 instruction pointer only, 10 timeout counts as success, 11 ignore list not honoured,
+rem         12 only the first thread inspected, 13 no waiting, 14 JSON not escaped)
+rem   3. host-process test (nvreload_host_test + nvtestcore.dll): 100 unload/reload cycles with worker threads inside a hooked
+rem        detour, a refused reload while a thread is stuck inside a detour, a refused reload for a chained hook;
+rem        real must pass; twins 1..9 must each fail (7 and 8 are the drain twins, 9 = hook write guard not wired)
+rem   4. the same host test with the loader twins 25 noconfig / 26 configonce (config not copied to the cache): each must fail
+rem Twins are switched at RUN time (FNVCOOP_MUT), nothing is recompiled per twin. Prints ALL OK on success.
+rem The host test is slow on a loaded machine (minutes per run), hence the long per-run timeout and only 2 parallel jobs.
+setlocal
+for %%I in ("%~dp0..\..") do set "REPO=%%~fI"
+if not defined PYTHON set "PYTHON=python"
 set "OUT=%REPO%\out\T3b"
-set "SCR=%REPO%\out\T3b\tmp"
+set "SCR=%OUT%\tmp"
 if not exist "%SCR%" mkdir "%SCR%"
-
-"%OUT%\nvreload_unit_m0.exe" > "%SCR%\unit_real.txt"
-set RC=!ERRORLEVEL!
-type "%SCR%\unit_real.txt"
-if not "!RC!"=="0" (echo UNIT TESTS FAILED & exit /b 1)
-findstr /C:", 0 failed" "%SCR%\unit_real.txt" >nul || (echo UNIT TESTS: no zero-failed line & exit /b 1)
-for %%N in (1 2 3 4 5 6 7 8) do (
-  "%OUT%\nvreload_unit_m%%N.exe" >nul 2>&1
-  if not errorlevel 1 (echo UNIT MUTANT %%N SURVIVED & exit /b 1)
-  echo unit mutant %%N caught
-)
-
-"%OUT%\nvreload_host_test.exe" "%OUT%\nvtestcore_m0.dll" "%SCR%\host_real" > "%SCR%\host_real.txt"
-set RC=!ERRORLEVEL!
-type "%SCR%\host_real.txt"
-if not "!RC!"=="0" (echo HOST TEST FAILED & exit /b 1)
-findstr /C:", 0 failed" "%SCR%\host_real.txt" >nul || (echo HOST TEST: no zero-failed line & exit /b 1)
-for %%N in (1 2 3 4 5 6 7 8 9) do (
-  "%OUT%\nvreload_host_test.exe" "%OUT%\nvtestcore_m%%N.dll" "%SCR%\host_m%%N" >nul 2>&1
-  if not errorlevel 1 (echo HOST MUTANT %%N SURVIVED & exit /b 1)
-  echo host mutant %%N caught
-)
-for %%M in (noconfig configonce) do (
-  "%OUT%\nvreload_host_test_%%M.exe" "%OUT%\nvtestcore_m0.dll" "%SCR%\host_%%M" > "%SCR%\host_%%M.txt" 2>&1
-  if not errorlevel 1 (echo HOST LOADER MUTANT %%M SURVIVED & exit /b 1)
-  findstr /C:"read the ini" /C:"read nvcoop.ini" "%SCR%\host_%%M.txt" >nul || (echo HOST LOADER MUTANT %%M failed for another reason & exit /b 1)
-  echo host loader mutant %%M caught
-)
+"%PYTHON%" -I "%REPO%\tools\build\build.py" --target nvreload_unit nvreload_drain nvreload_host_test nvtestcore --label "T3b reload" || (echo BUILD FAILED & exit /b 1)
+"%PYTHON%" -I "%REPO%\tools\mut\run_twins.py" --label "T3b registry" --twins 1-8 --real-regex ", 0 failed" --caught-regex ", [1-9][0-9]* failed" -- "%OUT%\nvreload_unit.exe" || exit /b 1
+"%PYTHON%" -I "%REPO%\tools\mut\run_twins.py" --label "T3b drain" --twins 7,8,10-14 --real-regex ", 0 failed" --caught-regex ", [1-9][0-9]* failed" -- "%OUT%\nvreload_drain.exe" || exit /b 1
+"%PYTHON%" -I "%REPO%\tools\mut\run_twins.py" --label "T3b host" --twins 1-9 --real-regex ", 0 failed" --timeout 1200 --jobs 2 -- "%OUT%\nvreload_host_test.exe" "%OUT%\nvtestcore.dll" "%SCR%\host_{n}" || exit /b 1
+rem Loader twins 25 (noconfig) and 26 (configonce) of plugin/loader/loader_host.cpp: the same host test, real core, config not copied to the
+rem cache. Each must fail BECAUSE the core read no (or a stale) ini, not for another reason.
+"%PYTHON%" -I "%REPO%\tools\mut\run_twins.py" --label "T3b host loader" --twins 25,26 --real-regex ", 0 failed" --caught-regex "read (the ini|nvcoop\.ini)" --timeout 1200 --jobs 2 -- "%OUT%\nvreload_host_test.exe" "%OUT%\nvtestcore.dll" "%SCR%\host_{n}" || exit /b 1
 echo ALL OK
-endlocal
+exit /b 0

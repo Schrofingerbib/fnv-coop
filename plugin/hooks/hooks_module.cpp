@@ -84,6 +84,8 @@ void InitHooks() {
     std::string r = role;
     g_role = (r == "client" || r == "guest") ? nvhooks::Role::Guest : r == "gateonly" ? nvhooks::Role::Client : nvhooks::Role::Host;
     g_hub.addSink([](fnvcoop::EffectTxn&& t) { g_txns.push_back(nvhooks::txnToJson(t)); });
+    // story-capture (docs/tools/story-capture.md): ~75 more script commands become RefCommand effects. OFF unless [hooks] story_capture=1.
+    nvhooks::setStoryCapture(GetPrivateProfileIntA("hooks", "story_capture", 0, IniPath().c_str()) != 0);
     g_report = nvhooks::Init(g_hub, g_role);
     LoadGuestLocalRun();
     g_applier.reset(new nvhooks::RemoteApplier(g_hub, nvhooks::resolver()));
@@ -530,6 +532,7 @@ void OnMessage(uint32_t type, void*, uint32_t) {
 
 // Per main-loop frame (outside any script): close capture scopes whose end() never ran.
 void OnFrame() {
+    if (g_inited) nvhooks::RemoteApplier::tickAll();   // parked MoveRefs whose destination cell has loaded since (about once a second)
     if (g_inited && g_hub.enabled()) {
         size_t n = g_hub.reapStale();
         if (n) nvcoop::Log("hooks: reaped %zu stale capture scope(s)", n);

@@ -287,3 +287,63 @@ TEST(twin, rejoin_no_reward_ids) {
     std::string why;
     CHECK(!restartBaselineRejoinNoDuplicates(1, &why));
 }
+
+// =====================================================================================================================
+// Same restart against a host running without a world baseline (plugin baseline=0), on a client without a world dumper: the
+// session asks for a rebase and the app rejoins through the plain snapshot path with an empty shadow. The snapshot's ledger must
+// not hand over the rewards the save already holds (was 207 vs 107 caps).
+// =====================================================================================================================
+namespace {
+bool restartPlainRejoinNoDuplicates(uint64_t seed, std::string* why) {
+    auto fail = [&](const char* w) { if (why) *why = w; return false; };
+    Rig r(seed, false, 40, HostSession::Options(), /*withHostBaseline=*/false);
+    r.addClient(1); r.addClient(2);
+    r.joinAll(); r.run(1500);
+    if (!r.allLive()) return fail("not live");
+    for (uint32_t i = 0; i < 3; ++i) r.reward(0x500 + i);
+    r.run(500);
+    Cause c; c.kind = CauseKind::Intent;
+    r.cl[1]->cs->submitIntent(c, {SetGlobal{Q(0x3002), 7.f}});     // in flight at save time: the sidecar is not resumable
+    Bytes mySave = r.cl[1]->cs->saveState();
+    if (r.cl[1]->cs->canSaveState()) return fail("test setup: the sidecar should be unclean");
+    r.reward(0x503); r.reward(0x504);                               // after the save: not in the player's save game
+    r.run(500);
+    r.drop(1);
+    r.cl[1]->sink.items.clear();
+    r.cl[1]->sink.trail.clear();
+    r.cl[1]->cs->setBaselineProvider(nullptr);                      // this app cannot dump its world
+    r.story.setConnected(r.cl[1]->peer, true);
+    if (!r.cl[1]->cs->onLocalSaveLoaded(r.now, &mySave)) return fail("load refused");
+    if (!r.cl[1]->cs->rebaseRequired()) return fail("test setup: expected a rebase request without a provider");
+    r.cl[1]->cs->connect(r.now, r.cl[1]->cs->lastSession() + 1);   // the app restarts the join itself
+    r.run(4000);
+    if (!r.allLive()) {
+        auto& cs = *r.cl[1]->cs;
+        if (why) *why = "not live after restart: joined=" + std::to_string(cs.joined()) + " rejected=" + std::to_string(cs.rejected()) +
+                        " reason=" + std::to_string(cs.rejectReason()) + " baselineActive=" + std::to_string(cs.baselineActive()) +
+                        " applied=" + std::to_string(cs.applied()) + " head=" + std::to_string(r.host.log().head());
+        return false;
+    }
+    if (r.cl[1]->cs->state() != r.host.state()) return fail("diverged");
+    auto& it = r.cl[1]->sink.items;
+    for (uint32_t i = 0; i < 3; ++i) if (it[0x500 + i] != 0) return fail("a reward the save already holds was delivered again");
+    if (it[0x503] != 1 || it[0x504] != 1) return fail("a reward after the save was not delivered exactly once");
+    for (auto& kv : it) if (kv.second > 1) return fail("duplicate reward after plain rejoin");
+    r.reward(0x505); r.run(600);
+    if (it[0x505] != 1) return fail("new reward not delivered exactly once");
+    return true;
+}
+}  // namespace
+
+TEST(rejoin, plain_rejoin_after_an_unresumable_sidecar_delivers_only_missing_rewards) {
+    for (uint64_t seed = 1; seed <= 5; ++seed) {
+        std::string why;
+        CHECK_MSG(restartPlainRejoinNoDuplicates(seed, &why), "seed " + std::to_string(seed) + ": " + why);
+    }
+}
+TEST(twin, plain_rejoin_no_reward_ids) {
+    MutationScope m([] { Mutations x; x.noRewardIds = true; return x; }());
+    std::string why;
+    CHECK(!restartPlainRejoinNoDuplicates(1, &why));
+    CHECK_MSG(why.find("reward") != std::string::npos, "the twin must be caught by the reward check, not by the test setup: " + why);
+}

@@ -1,0 +1,1488 @@
+// Game-free tests of the player puppet driver (plugin/avatar), on a fake game that reproduces the engine behaviours the
+// puppet traps come from (testing/fake_engine.h). Every trap in docs/tools/avatar.md has a test here, and every trap
+// handler has a runtime-switchable mutation twin (avatar_faults.h): the whole suite is run once per twin and must fail.
+//
+//   avatar_tests              run the suite and every twin; prints "... ALL OK" when the suite passes and every twin is killed
+//   avatar_tests --no-twins   suite only
+//   avatar_tests --twin NAME  suite with one fault switched on (exit code 1 = killed, 0 = survived)
+//   avatar_tests --list-twins
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <string>
+#include <vector>
+
+#include "anim_planner.h"
+#include "avatar_faults.h"
+#include "avatar_groups.h"
+#include "live_bridge.h"
+#include "avatar_api.h"
+#include "loco.h"
+#include "puppet_hits.h"
+#include "puppet_manager.h"
+#include "script_engine.h"
+#include "testing/fake_engine.h"
+
+using namespace nvcoop::avatar;
+
+static int g_fail = 0, g_checks = 0;
+static bool g_quiet = false;
+static const char* g_test = "";
+#define CHECK(c)                                                                      \
+    do {                                                                              \
+        ++g_checks;                                                                   \
+        if (!(c)) {                                                                   \
+            ++g_fail;                                                                 \
+            if (!g_quiet) std::printf("  FAIL [%s] %s:%d  %s\n", g_test, __FILE__, __LINE__, #c); \
+        }                                                                             \
+    } while (0)
+
+// ---- rig ------------------------------------------------------------------------------------------------------------
+
+static constexpr CellId kCellA = 0x10, kCellB = 0x20, kExtA = 0x100, kExtB = 0x101;
+
+static Config MakeCfg() {
+    Config c;
+    c.localSlot = 0;
+    c.templates = {{1, false, 0x1000}, {1, true, 0x1001}};
+    c.defaultTemplate = 0x1002;
+    return c;
+}
+
+static Appearance App(bool female = false) {
+    Appearance a;
+    a.race = 1;
+    a.female = female;
+    a.name = "Courier";
+    return a;
+}
+
+static PuppetPose MkPose(CellId cell, float x, float y, float z = 0, float yaw = 0, uint8_t loco = kLocoIdle, Vec3 vel = Vec3{}) {
+    PuppetPose p;
+    p.valid = true;
+    p.cell = cell;
+    p.pos = Vec3{x, y, z};
+    p.rot = Vec3{0, yaw, 0};
+    p.vel = vel;
+    p.anim.loco = loco;
+    return p;
+}
+
+struct Rig {
+    FakePuppetEngine eng;
+    Config cfg;
+    PuppetManager pm;
+    uint32_t now = 1000;
+    bool autoPose = true;
+    std::map<Slot, PuppetPose> cur;
+
+    explicit Rig(const std::function<void(Config&)>& tweak = nullptr) : cfg(Make(tweak)), pm(eng, cfg) {
+        eng.loadedCells = {kCellA, kCellB, kExtA, kExtB};
+        eng.exterior = {kExtA, kExtB};
+    }
+    static Config Make(const std::function<void(Config&)>& tweak) {
+        Config c = MakeCfg();
+        if (tweak) tweak(c);
+        return c;
+    }
+    void Pose(Slot s, const PuppetPose& p) {
+        cur[s] = p;
+        pm.SetPose(s, p);
+    }
+    void Add(Slot s, const PuppetPose& p, bool female = false) {
+        pm.AddPlayer(s, App(female));
+        Pose(s, p);
+    }
+    void Step(uint32_t ms = 50) {
+        eng.Frame();
+        if (autoPose)
+            for (auto& kv : cur) pm.SetPose(kv.first, kv.second);
+        pm.Tick(now);
+        now += ms;
+    }
+    void Run(uint32_t ms, uint32_t step = 50) {
+        for (uint32_t t = 0; t < ms; t += step) Step(step);
+    }
+    bool UntilDriving(Slot s, int maxSteps = 100) {
+        for (int i = 0; i < maxSteps && pm.PhaseOf(s) != Phase::Driving; ++i) Step();
+        return pm.PhaseOf(s) == Phase::Driving;
+    }
+    // The puppet's fake ref; a blank, non-existing ref when there is none, so a broken twin fails checks instead of crashing.
+    FakePuppetEngine::FakeRef* F(Slot s) {
+        static FakePuppetEngine::FakeRef none;
+        none = FakePuppetEngine::FakeRef{};
+        auto* f = eng.Get(pm.RefOf(s));
+        return f ? f : &none;
+    }
+    int Group(Slot s) { auto* f = F(s); return f ? f->group : -1; }
+};
+
+static std::vector<int> GroupSeq(const Rig& r) {
+    std::vector<int> v;
+    for (auto& g : r.eng.groupLog)
+        if (v.empty() || v.back() != g.second) v.push_back(g.second);
+    return v;
+}
+
+// ---- planner / loco unit tests --------------------------------------------------------------------------------------
+
+struct PlanRig {
+    AnimPlanner p;
+    uint32_t t = 0;
+    PlanOut Step(PlanInput in, uint32_t ms = 50) {
+        in.nowMs = t;
+        PlanOut o = p.Plan(in);
+        t += ms;
+        return o;
+    }
+    PlanOut Hold(PlanInput in, uint32_t ms) {
+        PlanOut o;
+        for (uint32_t i = 0; i < ms; i += 50) o = Step(in);
+        return o;
+    }
+};
+static PlanInput PIn(uint8_t loco, Vec3 vel = Vec3{}, float yaw = 0) {
+    PlanInput i;
+    i.anim.loco = loco;
+    i.vel = vel;
+    i.yaw = yaw;
+    return i;
+}
+
+static void t_loco_basics() {
+    g_test = "loco_basics";
+    LocalRead r;
+    r.vel = Vec3{0, 10, 0};
+    CHECK(CaptureLoco(r) == kLocoIdle);
+    r.vel = Vec3{0, 100, 0};
+    CHECK(CaptureLoco(r) == kLocoWalkFwd);
+    r.vel = Vec3{0, 300, 0};
+    CHECK(CaptureLoco(r) == kLocoRunFwd);
+    r.vel = Vec3{0, -100, 0};
+    CHECK(CaptureLoco(r) == kLocoWalkBack);
+    r.vel = Vec3{100, 0, 0};
+    CHECK(CaptureLoco(r) == kLocoWalkRight);   // yaw 0 faces +Y, +X is to the right
+    r.vel = Vec3{-100, 0, 0};
+    CHECK(CaptureLoco(r) == kLocoWalkLeft);
+    r.yaw = kPi * 0.5f;                       // facing +X: +X is forward
+    r.vel = Vec3{100, 0, 0};
+    CHECK(CaptureLoco(r) == kLocoWalkFwd);
+    r.yaw = kPi;                              // facing -Y
+    r.vel = Vec3{0, -100, 0};
+    CHECK(CaptureLoco(r) == kLocoWalkFwd);
+    r.yaw = 0;
+    r.vel = Vec3{0, 100, 0};
+    r.haveMoveFlags = true;
+    r.moverRun = true;
+    CHECK(CaptureLoco(r) == kLocoRunFwd);     // the mover flags decide walk vs run when known
+    r.moverRun = false;
+    r.moverWalk = true;
+    CHECK(CaptureLoco(r) == kLocoWalkFwd);
+
+    // direction hysteresis near the 45 degree edge
+    float a47 = 47.0f * kPi / 180.0f;
+    Vec3 v{std::sin(a47) * 100.f, std::cos(a47) * 100.f, 0};
+    CHECK(DirectionOf(v, 0, -1) == 3);        // fresh: right
+    CHECK(DirectionOf(v, 0, 0) == 0);         // was forward: stays forward
+    float a60 = 60.0f * kPi / 180.0f;
+    Vec3 v2{std::sin(a60) * 100.f, std::cos(a60) * 100.f, 0};
+    CHECK(DirectionOf(v2, 0, 0) == 3);        // clearly right now
+    CHECK(DirectionOf(Vec3{0, -100, 0}, 0, -1) == 1);
+    CHECK(std::fabs(WrapRad(7.0f) - (7.0f - kTwoPi)) < 1e-5f);
+    CHECK(WrapRad(-kPi) > 0);                 // (-pi, pi]
+    CHECK(WrapRad(std::nanf("")) == 0);
+    for (uint8_t l = 1; l <= kLocoMax; ++l) CHECK(LocoIsMoving(l) && GroupForLoco(l) != kGrpIdle && IsLocomotionGroup(GroupForLoco(l)));
+    CHECK(GroupForLoco(kLocoIdle) == kGrpIdle);
+    CHECK(LocoDir(kLocoRunLeft) == 2 && LocoDir(kLocoWalkBack) == 1 && LocoDir(kLocoIdle) == -1);
+}
+
+static void t_planner_groups() {
+    g_test = "planner_groups";
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoIdle), 200).group == kGrpIdle); }
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoWalkFwd, Vec3{0, 120, 0}), 200).group == kGrpForward); }
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoRunFwd, Vec3{0, 300, 0}), 200).group == kGrpFastForward); }
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoWalkBack, Vec3{0, -100, 0}), 200).group == kGrpBackward); }
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoWalkLeft, Vec3{-100, 0, 0}), 200).group == kGrpLeft); }
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoRunRight, Vec3{300, 0, 0}), 200).group == kGrpFastRight); }
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoRunBack, Vec3{0, -300, 0}), 200).group == kGrpFastBackward); }
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoRunLeft, Vec3{-300, 0, 0}), 200).group == kGrpFastLeft); }
+
+    // reload beats locomotion
+    { PlanRig p; PlanInput i = PIn(kLocoIdle); i.anim.reload = true; CHECK(p.Hold(i, 100).group == kGrpReloadA); }
+    // aim stances and pitch
+    {
+        PlanRig p;
+        PlanInput i = PIn(kLocoIdle);
+        i.anim.weaponDrawn = true;
+        p.Hold(i, 600);
+        CHECK(p.Hold(i, 100).group == kGrpAim);
+        i.pitch = 0.5f;
+        CHECK(p.Step(i).group == kGrpAimUp);
+        i.pitch = -0.5f;
+        CHECK(p.Step(i).group == kGrpAimDown);
+        i.anim.aim = true;
+        CHECK(p.Step(i).group == kGrpAimISDown);
+        i.pitch = 0.5f;
+        CHECK(p.Step(i).group == kGrpAimISUp);
+        i.pitch = 0;
+        CHECK(p.Step(i).group == kGrpAimIS);
+    }
+    // draw and holster play their transition, then settle
+    {
+        PlanRig p;
+        PlanInput i = PIn(kLocoIdle);
+        p.Hold(i, 200);
+        i.anim.weaponDrawn = true;
+        CHECK(p.Step(i).group == kGrpEquip);
+        CHECK(p.Hold(i, 600).group == kGrpAim);
+        i.anim.weaponDrawn = false;
+        CHECK(p.Step(i).group == kGrpUnequip);
+        CHECK(p.Hold(i, 600).group == kGrpIdle);
+    }
+    // sneak and the drawn flag are passed through
+    { PlanRig p; PlanInput i = PIn(kLocoWalkFwd, Vec3{0, 100, 0}); i.anim.sneak = true; i.anim.weaponDrawn = true; PlanOut o = p.Step(i); CHECK(o.sneak && o.weaponDrawn); }
+}
+
+static void t_speed_matching_planner() {
+    g_test = "speed_matching_planner";
+    // idle code with real speed: corrected only after the debounce (no flicker), then walking in the right direction
+    {
+        PlanRig p;
+        PlanInput i = PIn(kLocoIdle, Vec3{0, 150, 0});
+        CHECK(p.Step(i).group == kGrpIdle);   // t=0: debounce starts
+        CHECK(p.Step(i).group == kGrpIdle);   // 50
+        CHECK(p.Step(i).group == kGrpIdle);   // 100
+        PlanOut o;
+        for (int k = 0; k < 4; ++k) o = p.Step(i);   // 150..300
+        CHECK(o.group == kGrpForward && o.speedCorrected);
+    }
+    // direction of the correction comes from the velocity relative to the facing
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoIdle, Vec3{150, 0, 0}, 0), 400).group == kGrpRight); }
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoIdle, Vec3{150, 0, 0}, kPi * 0.5f), 400).group == kGrpForward); }
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoIdle, Vec3{0, -150, 0}, 0), 400).group == kGrpBackward); }
+    // run code but walking speed: legs must not outrun the ground
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoRunFwd, Vec3{0, 110, 0}), 400).group == kGrpForward); }
+    // walk code but running speed
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoWalkFwd, Vec3{0, 400, 0}), 400).group == kGrpFastForward); }
+    // a moving code with no velocity (running into a wall) is kept as the owner shows it
+    { PlanRig p; CHECK(p.Hold(PIn(kLocoRunFwd, Vec3{}), 600).group == kGrpFastForward); }
+    // hysteresis: speeds between runExit and runEnter keep whatever it was doing
+    {
+        PlanRig p;
+        PlanOut o;
+        for (int k = 0; k < 20; ++k) o = p.Step(PIn(kLocoRunFwd, Vec3{0, k % 2 ? 200.f : 225.f, 0}));
+        CHECK(o.group == kGrpFastForward);
+        PlanRig q;
+        for (int k = 0; k < 20; ++k) o = q.Step(PIn(kLocoWalkFwd, Vec3{0, k % 2 ? 200.f : 225.f, 0}));
+        CHECK(o.group == kGrpForward);
+    }
+    // jump: start, loop, land, back to the ground pose; forward variants when moving
+    {
+        PlanRig p;
+        PlanInput i = PIn(kLocoIdle);
+        p.Hold(i, 200);
+        i.anim.jump = true;
+        CHECK(p.Step(i).group == kGrpJumpStart);
+        CHECK(p.Hold(i, 400).group == kGrpJumpLoop);
+        i.anim.jump = false;
+        CHECK(p.Step(i).group == kGrpJumpLand);
+        CHECK(p.Hold(i, 500).group == kGrpIdle);
+        PlanRig q;
+        PlanInput m = PIn(kLocoRunFwd, Vec3{0, 300, 0});
+        q.Hold(m, 200);
+        m.anim.jump = true;
+        q.Step(m);
+        CHECK(q.Hold(m, 400).group == kGrpJumpLoopForward);
+        m.anim.jump = false;
+        CHECK(q.Step(m).group == kGrpJumpLandForward);
+    }
+    // frozen: never a moving pose
+    {
+        PlanRig p;
+        PlanInput i = PIn(kLocoRunFwd, Vec3{0, 300, 0});
+        p.Hold(i, 300);
+        i.frozen = true;
+        CHECK(p.Step(i).group == kGrpIdle);
+    }
+}
+
+// ---- trap tests on the manager --------------------------------------------------------------------------------------
+
+// Trap: a restrained / just-spawned actor refuses commands until its 3D exists.
+static void t_spawn_waits_for_3d() {
+    g_test = "spawn_waits_for_3d";
+    Rig r;
+    r.eng.load3DFrames = 4;
+    r.Add(1, MkPose(kCellA, 100, 200, 30, 0.5f));
+    r.Run(1500);
+    CHECK(r.pm.PhaseOf(1) == Phase::Driving);
+    CHECK(r.eng.refusedNo3D == 0);
+    CHECK(r.eng.violations.empty());
+    CHECK(r.eng.spawnCalls == 1);
+    auto* f = r.F(1);
+    CHECK(f && f->restrained && f->nonCombatant && f->appearanceApplied);
+    CHECK(f && std::fabs(f->pos.x - 100) < 0.01f && std::fabs(f->pos.z - 30) < 0.01f);
+    CHECK(f && f->base == 0x1000);
+    // restraint is the first command after the spawn, before any position or animation write
+    size_t iRestrain = 0, iPos = 0, iGroup = 0;
+    for (size_t i = 0; i < r.eng.trace.size(); ++i) {
+        if (!iRestrain && r.eng.trace[i] == "Restrain") iRestrain = i + 1;
+        if (!iPos && r.eng.trace[i] == "SetPos") iPos = i + 1;
+        if (!iGroup && r.eng.trace[i].rfind("PlayGroup", 0) == 0) iGroup = i + 1;
+    }
+    CHECK(iRestrain && iPos && iGroup && iRestrain < iPos && iRestrain < iGroup);
+}
+
+// Trap: the actor's AI takes a loose actor over (walks home, fights, sits down) -> restraint must be re-asserted.
+static void t_restraint_reasserted() {
+    g_test = "restraint_reasserted";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    CHECK(r.UntilDriving(1));
+    r.Run(300);
+    RefId ref = r.pm.RefOf(1);
+    r.eng.Unrestrain(ref);
+    r.Run(600);
+    CHECK(r.eng.IsRestrained(ref));
+    CHECK(r.pm.stats().restrainReasserts == 1);
+}
+
+// Trap: animation is reset by menus (Pip-Boy, dialogue): re-assert at once when the menu closes, and jump to the latest pose.
+static void t_anim_after_menu() {
+    g_test = "anim_after_menu";
+    Rig r;
+    r.eng.reportsCurrentGroup = false;   // no readback: only the menu event can know
+    r.Add(1, MkPose(kCellA, 100, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0}));
+    r.Run(2000);
+    CHECK(r.Group(1) == kGrpForward);
+    r.eng.SetMenu(true);
+    r.Step();
+    unsigned w = r.eng.Writes();
+    r.Run(300);
+    CHECK(r.eng.Writes() == w);          // nothing is sent into a paused / menu state
+    r.eng.SetMenu(false);                // closing the menu resets the animation silently
+    CHECK(r.Group(1) == kGrpIdle);
+    r.Step();
+    CHECK(r.Group(1) == kGrpForward);    // replayed on the first Tick after the menu closed
+}
+
+// Trap: the menu left the puppet near, but not at, where it should be; it is moved to the latest pose immediately.
+static void t_post_menu_snap() {
+    g_test = "post_menu_snap";
+    Rig r([](Config& c) { c.posHeartbeatMs = 1000000; });   // the periodic re-send must not hide a missing post-menu snap
+    r.eng.menuDisplacement = Vec3{100, 0, 0};   // below the drift limit, so only the menu event can fix it at once
+    r.Add(1, MkPose(kCellA, 1000, 2000));
+    r.Run(2000);
+    r.eng.SetMenu(true);
+    r.Run(200);
+    r.eng.SetMenu(false);
+    CHECK(std::fabs(r.F(1)->pos.x - 1100) < 0.01f);
+    r.Step();
+    CHECK(std::fabs(r.F(1)->pos.x - 1000) < 0.01f);
+}
+
+// Trap: the engine forgets the group without any event and cannot say what plays: the heartbeat re-issues it.
+static void t_anim_heartbeat() {
+    g_test = "anim_heartbeat";
+    Rig r;
+    r.eng.reportsCurrentGroup = false;
+    r.Add(1, MkPose(kCellA, 100, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0}));
+    r.Run(1500);
+    r.eng.SilentGroupReset(r.pm.RefOf(1));
+    r.Run(r.cfg.animHeartbeatMs + 300);
+    CHECK(r.Group(1) == kGrpForward);
+    // with readback the mismatch is found much sooner
+    Rig q;
+    q.Add(1, MkPose(kCellA, 100, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0}));
+    q.Run(1500);
+    q.eng.SilentGroupReset(q.pm.RefOf(1));
+    q.Run(q.cfg.animMismatchMs + 200);
+    CHECK(q.Group(1) == kGrpForward);
+    // groups that end on their own (equip, jump start, reload) are not "re-asserted" when the engine returns to idle
+    Rig o;
+    PuppetPose p = MkPose(kCellA, 100, 200);
+    p.anim.reload = true;
+    o.Add(1, p);
+    o.Run(1000);
+    unsigned before = o.eng.playGroupCalls;
+    o.eng.SilentGroupReset(o.pm.RefOf(1));
+    o.Run(800);
+    CHECK(o.eng.playGroupCalls == before);
+}
+
+// Trap: slide. Owner code says idle but the velocity says walking: legs must follow the ground speed.
+static void t_no_slide_manager() {
+    g_test = "no_slide";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200, 0, 0, kLocoIdle, Vec3{0, 150, 0}));
+    r.Run(600);
+    CHECK(r.Group(1) == kGrpForward);
+    r.Pose(1, MkPose(kCellA, 100, 200, 0, 0, kLocoRunFwd, Vec3{0, 100, 0}));
+    r.Run(600);
+    CHECK(r.Group(1) == kGrpForward);        // run legs at walking speed would skate
+    r.Pose(1, MkPose(kCellA, 100, 200, 0, 0, kLocoWalkFwd, Vec3{0, 400, 0}));
+    r.Run(600);
+    CHECK(r.Group(1) == kGrpFastForward);
+    r.Pose(1, MkPose(kCellA, 100, 200, 0, 0, kLocoRunFwd, Vec3{}));
+    r.Run(600);
+    CHECK(r.Group(1) == kGrpFastForward);    // running on the spot against a wall stays as shown
+}
+
+// Trap: the remote stops sending (alt-tab, lag): a dry buffer must stop the legs at once, never run in place.
+static void t_frozen_and_stale() {
+    g_test = "frozen_and_stale";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200, 0, 0, kLocoRunFwd, Vec3{0, 300, 0}));
+    r.Run(600);
+    CHECK(r.Group(1) == kGrpFastForward);
+    PuppetPose fz = MkPose(kCellA, 100, 200, 0, 0, kLocoRunFwd, Vec3{0, 300, 0});
+    fz.frozen = true;
+    r.Pose(1, fz);
+    r.Run(150);
+    CHECK(r.Group(1) == kGrpIdle);
+    CHECK(r.pm.stats().staleFrozen == 1);
+    // and a pose that simply stops arriving
+    Rig s;
+    s.autoPose = false;
+    s.Add(1, MkPose(kCellA, 100, 200, 0, 0, kLocoRunFwd, Vec3{0, 300, 0}));
+    s.Run(1000);
+    CHECK(s.Group(1) == kGrpFastForward);
+    s.Run(s.cfg.staleMs + 500);
+    CHECK(s.Group(1) == kGrpIdle);
+}
+
+static void t_jump_sequence() {
+    g_test = "jump_sequence";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.Run(500);
+    PuppetPose j = MkPose(kCellA, 100, 200, 40);
+    j.anim.jump = true;
+    r.Pose(1, j);
+    r.Run(700);
+    r.Pose(1, MkPose(kCellA, 100, 200, 0));
+    r.Run(900);
+    std::vector<int> seq = GroupSeq(r);
+    std::vector<int> want = {kGrpIdle, kGrpJumpStart, kGrpJumpLoop, kGrpJumpLand, kGrpIdle};
+    CHECK(seq == want);
+}
+
+// Trap: drawing a weapon the puppet does not hold yet (T-pose, fists out). Weapon is drawn only once equipped.
+static void t_weapon_draw_after_equip() {
+    g_test = "weapon_draw_after_equip";
+    Rig r;
+    r.eng.weaponItems = {0x600};
+    PuppetPose p = MkPose(kCellA, 100, 200);
+    p.anim.weaponDrawn = true;
+    r.Add(1, p);
+    r.pm.SetEquipment(1, {{0x600, true}});
+    CHECK(r.UntilDriving(1));
+    r.Step();
+    CHECK(r.eng.drawOnCalls == 0);
+    CHECK(r.Group(1) != kGrpAim && r.Group(1) != kGrpEquip);
+    r.Run(3000);
+    CHECK(r.F(1)->worn.count(0x600) == 1);
+    CHECK(r.eng.drawOnCalls >= 1);
+    CHECK(r.F(1)->drawn);
+    CHECK(r.eng.violations.empty());
+    CHECK(r.Group(1) == kGrpAim);
+}
+
+// Trap (VaultMP list): own the item first; extras off; slot replacement; weapon last.
+static void t_equipment_converges() {
+    g_test = "equipment_converges";
+    Rig r;
+    r.eng.defaultOutfit = {0x500};
+    r.eng.slotOf = {{0x500, 1}, {0x510, 1}, {0x600, 2}};
+    r.eng.weaponItems = {0x600};
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.pm.SetEquipment(1, {{0x600, true}, {0x510, false}});
+    r.Run(6000);
+    auto* f = r.F(1);
+    CHECK(f && f->worn == (std::set<FormId>{0x510, 0x600}));
+    CHECK(r.pm.EquipConverged(1));
+    CHECK(r.eng.addCalls == 2);
+    CHECK(r.pm.stats().equipGaveUp == 0);
+    // armor is on before the weapon
+    // change the wanted set later: converges again
+    r.pm.SetEquipment(1, {{0x520, false}});
+    r.Run(6000);
+    f = r.F(1);
+    CHECK(f && f->worn == (std::set<FormId>{0x520}));
+    CHECK(r.pm.EquipConverged(1));
+}
+
+static void t_equipment_backoff_giveup() {
+    g_test = "equipment_backoff_giveup";
+    Rig r;
+    r.eng.equipFailuresLeft = 100000;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.pm.SetEquipment(1, {{0x510, false}});
+    r.Run(15000);
+    CHECK(r.pm.stats().equipFailures <= 8);
+    CHECK(r.pm.stats().equipGaveUp == 1);
+    CHECK(!r.pm.EquipConverged(1));
+    // a changed wanted set clears the give-up
+    r.eng.equipFailuresLeft = 0;
+    r.pm.SetEquipment(1, {{0x511, false}});
+    r.Run(4000);
+    CHECK(r.F(1)->worn.count(0x511) == 1);
+}
+
+// Trap: the actor's AI puts the default outfit back on again and again: break the fight with RemoveItem.
+static void t_equipment_flap_guard() {
+    g_test = "equipment_flap_guard";
+    Rig r;
+    r.eng.defaultOutfit = {0x500};
+    r.eng.aiReequipLeft[0x500] = 100000;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.pm.SetEquipment(1, {{0x510, false}});
+    r.Run(8000);
+    auto* f = r.F(1);
+    CHECK(f && f->worn == (std::set<FormId>{0x510}));
+    CHECK(r.pm.stats().equipFlapRemovals >= 1);
+    CHECK(r.pm.EquipConverged(1));
+}
+
+static void t_local_slot_and_limits() {
+    g_test = "local_slot_and_limits";
+    Rig r;
+    CHECK(!r.pm.AddPlayer(0, App()));
+    CHECK(r.pm.stats().rejectedLocalSlot == 1);
+    r.Pose(0, MkPose(kCellA, 1, 1));
+    r.Run(1000);
+    CHECK(r.eng.spawnCalls == 0 && r.eng.LiveCount() == 0);
+    CHECK(r.pm.AddPlayer(1, App()) && r.pm.AddPlayer(2, App()) && r.pm.AddPlayer(3, App()));
+    CHECK(!r.pm.AddPlayer(4, App()));   // 4 players = 3 puppets
+    CHECK(r.pm.Count() == 3);
+}
+
+// Trap: reconnect / double join must leave exactly one puppet per slot.
+static void t_duplicate_slot() {
+    g_test = "duplicate_slot";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    CHECK(r.UntilDriving(1));
+    RefId first = r.pm.RefOf(1);
+    r.Add(1, MkPose(kCellA, 300, 400));   // the player reconnected
+    r.Run(1500);
+    CHECK(r.eng.LiveCount() == 1);
+    CHECK(r.pm.RefOf(1) != 0 && r.pm.RefOf(1) != first);
+    CHECK(!r.pm.SlotOf(first).has_value());
+    CHECK(r.pm.stats().replacedDuplicates == 1);
+}
+
+static void t_remove_player() {
+    g_test = "remove_player";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.Add(2, MkPose(kCellA, 300, 200));
+    r.Run(1500);
+    RefId a = r.pm.RefOf(1);
+    CHECK(r.eng.LiveCount() == 2);
+    r.pm.RemovePlayer(1);
+    CHECK(r.eng.LiveCount() == 1);
+    CHECK(r.pm.RefOf(1) == 0 && !r.pm.SlotOf(a).has_value());
+    CHECK(r.pm.RefOf(2) != 0);
+    r.Run(1000);
+    CHECK(r.eng.LiveCount() == 1);
+}
+
+// Trap: the ref is gone (cell unloaded) or its id was reused by something else: never command it, respawn instead.
+static void t_stale_and_reused_refs() {
+    g_test = "stale_and_reused_refs";
+    {
+        Rig r;
+        r.Add(1, MkPose(kCellA, 100, 200));
+        CHECK(r.UntilDriving(1));
+        RefId ref = r.pm.RefOf(1);
+        r.eng.KillRef(ref);
+        r.Run(1500);
+        CHECK(r.eng.violations.empty());
+        CHECK(r.pm.RefOf(1) != 0 && r.pm.RefOf(1) != ref);
+        CHECK(r.eng.LiveCount() == 1);
+        CHECK(r.pm.stats().refLost == 1);
+    }
+    {
+        Rig r;
+        r.eng.reuseRefIds = true;
+        r.Add(1, MkPose(kCellA, 100, 200));
+        CHECK(r.UntilDriving(1));
+        RefId ref = r.pm.RefOf(1);
+        r.eng.KillRef(ref);
+        r.eng.HijackId(ref);   // the engine hands the id to an unrelated object
+        r.Run(1500);
+        CHECK(r.eng.commandsOnForeign == 0);
+        CHECK(r.eng.violations.empty());
+        CHECK(r.pm.RefOf(1) != ref);
+        CHECK(r.eng.Get(ref) && r.eng.Get(ref)->base == 0xDEAD && r.eng.Get(ref)->exists);   // untouched
+    }
+}
+
+// Trap: the remote is in a cell this machine has not loaded: no puppet floating in the void; it comes back with the cell.
+static void t_park_when_cell_unloaded() {
+    g_test = "park_when_cell_unloaded";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.Run(1500);
+    CHECK(r.eng.LiveCount() == 1);
+    r.eng.loadedCells.erase(kCellA);
+    r.Run(300);
+    CHECK(r.eng.LiveCount() == 1);       // grace period: a one-frame hiccup does not delete it
+    r.Run(500);
+    CHECK(r.eng.LiveCount() == 0);
+    CHECK(r.pm.stats().parked == 1);
+    CHECK(r.eng.violations.empty());
+    r.Run(1000);
+    CHECK(r.eng.LiveCount() == 0 && r.eng.spawnCalls == 1);   // not respawned into an unloaded cell
+    r.eng.loadedCells.insert(kCellA);
+    r.Run(1500);
+    CHECK(r.eng.LiveCount() == 1 && r.pm.stats().unparked == 1);
+    CHECK(std::fabs(r.F(1)->pos.x - 100) < 0.01f);
+}
+
+// Trap: interior to interior (or any other space): SetPos would leave the actor in the old cell. MoveToCell, then the
+// rebuilt 3D loses the restraint and the animation, which must come back.
+static void t_cross_cell_move() {
+    g_test = "cross_cell_move";
+    Rig r;
+    r.eng.cellOfPos = [](const Vec3& p) { return p.x >= 10000 ? kCellB : kCellA; };
+    r.Add(1, MkPose(kCellA, 100, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0}));
+    r.Run(1500);
+    CHECK(r.F(1)->cell == kCellA);
+    r.Pose(1, MkPose(kCellB, 20000, 300, 0, 1.0f, kLocoWalkFwd, Vec3{0, 120, 0}));
+    r.Run(1500);
+    CHECK(r.eng.violations.empty());
+    CHECK(r.eng.moveToCellCalls == 1);
+    CHECK(r.F(1)->cell == kCellB);
+    CHECK(r.F(1)->restrained);
+    CHECK(r.pm.PhaseOf(1) == Phase::Driving);
+    CHECK(std::fabs(r.F(1)->pos.x - 20000) < 0.01f);
+    CHECK(r.Group(1) == kGrpForward);
+    CHECK(r.eng.refusedNo3D == 0);
+    CHECK(r.pm.stats().teleports >= 1);
+}
+
+// Exterior neighbours share a worldspace: a plain SetPos is enough, no 3D rebuild, no flicker.
+static void t_exterior_border() {
+    g_test = "exterior_border";
+    Rig r;
+    r.Add(1, MkPose(kExtA, 100, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0}));
+    r.Run(1500);
+    r.Pose(1, MkPose(kExtB, 4200, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0}));
+    r.Step();
+    CHECK(r.pm.PhaseOf(1) == Phase::Driving);
+    r.Run(500);
+    CHECK(r.eng.moveToCellCalls == 0);
+    CHECK(std::fabs(r.F(1)->pos.x - 4200) < 0.01f);
+    CHECK(r.pm.PhaseOf(1) == Phase::Driving);
+}
+
+// Trap: cell reload rebuilds the 3D without a gap: the generation changes and the pose / animation must be re-sent.
+static void t_rebuild_3d_reasserts() {
+    g_test = "rebuild_3d_reasserts";
+    Rig r;
+    r.eng.reportsCurrentGroup = false;
+    r.Add(1, MkPose(kCellA, 100, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0}));
+    r.Run(1500);
+    CHECK(r.Group(1) == kGrpForward);
+    r.eng.Rebuild3DInstant(r.pm.RefOf(1));
+    CHECK(r.Group(1) == kGrpIdle);
+    r.Step();
+    CHECK(r.Group(1) == kGrpForward);
+}
+
+// Trap: never saved. The save writer must find no puppet; they come back afterwards.
+static void t_save_despawns() {
+    g_test = "save_despawns";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.Add(2, MkPose(kCellA, 300, 200));
+    r.Run(1500);
+    CHECK(r.eng.LiveCount() == 2);
+    r.pm.OnSaveBegin();
+    r.Run(400);   // frames while the save is being written
+    CHECK(r.eng.SaveImage().empty());
+    CHECK(r.pm.stats().saveDespawns == 2);
+    r.pm.OnSaveEnd();
+    r.Run(1500);
+    CHECK(r.eng.LiveCount() == 2);
+    CHECK(r.pm.PhaseOf(1) == Phase::Driving && r.pm.PhaseOf(2) == Phase::Driving);
+}
+
+// Trap: purged on load. Orphans from an old save are deleted, our puppets are rebuilt, and nothing is sent into the old world.
+static void t_load_purges_orphans() {
+    g_test = "load_purges_orphans";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.Run(1500);
+    std::vector<RefId> image = r.eng.SaveImage();   // a save that (wrongly) contains the puppet, e.g. after a crash
+    CHECK(image.size() == 1);
+    r.pm.OnLoadBegin();
+    unsigned w = r.eng.Writes();
+    r.Run(200);
+    CHECK(r.eng.Writes() == w);                     // nothing is sent while the world is torn down
+    CHECK(r.pm.RefOf(1) == 0);
+    r.eng.Load({image[0], image[0]});               // the old save brings back two puppets
+    r.pm.OnLoadEnd();
+    CHECK(r.pm.PurgePending());
+    r.Run(1500);
+    CHECK(r.pm.stats().purged == 2);
+    CHECK(r.eng.LiveCount() == 1);                  // only the fresh puppet
+    CHECK(r.pm.PhaseOf(1) == Phase::Driving);
+    CHECK(r.eng.violations.empty());
+
+    // a load the game did not announce: the world epoch is the backstop
+    Rig q;
+    q.Add(1, MkPose(kCellA, 100, 200));
+    q.Run(1500);
+    q.eng.Load(q.eng.SaveImage());
+    q.Run(1500);
+    CHECK(q.eng.LiveCount() == 1);
+    CHECK(q.pm.stats().purged == 1);
+    CHECK(q.eng.violations.empty());
+}
+
+static void t_first_tick_purge() {
+    g_test = "first_tick_purge";
+    Rig r;
+    r.eng.PlantOrphan(kCellA, Vec3{});
+    r.eng.PlantOrphan(kCellA, Vec3{});
+    r.Run(200);
+    CHECK(r.eng.LiveCount() == 0);
+    CHECK(r.pm.stats().purged == 2);
+    // not while the game is not ready
+    Rig q;
+    q.eng.worldReady = false;
+    q.eng.PlantOrphan(kCellA, Vec3{});
+    q.Add(1, MkPose(kCellA, 1, 1));
+    q.Run(500);
+    CHECK(q.eng.LiveCount() == 1 && q.eng.Writes() == 0 && q.eng.spawnCalls == 0);
+    q.eng.worldReady = true;
+    q.Run(500);
+    CHECK(q.eng.LiveCount() == 1 && q.pm.stats().purged == 1);   // the orphan is gone, the puppet is the one left
+}
+
+static void t_spawn_retry() {
+    g_test = "spawn_retry";
+    Rig r;
+    r.eng.spawnFailuresLeft = 3;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.Run(800);
+    CHECK(r.eng.spawnCalls <= 3);              // backoff 500, 1000, 2000: not one attempt per frame
+    r.Run(6000);
+    CHECK(r.pm.PhaseOf(1) == Phase::Driving);
+    CHECK(r.pm.stats().spawnFailures == 3 && r.eng.spawnCalls == 4);
+
+    Rig q;
+    q.eng.spawnFailuresLeft = 1000000;
+    q.Add(1, MkPose(kCellA, 100, 200));
+    q.Run(120000, 100);
+    CHECK(q.pm.PhaseOf(1) == Phase::Failed);
+    CHECK(q.eng.spawnCalls == q.cfg.maxSpawnAttempts);
+
+    // no template at all
+    Rig t([](Config& c) { c.templates.clear(); c.defaultTemplate = 0; });
+    t.Add(1, MkPose(kCellA, 1, 1));
+    t.Run(300);
+    CHECK(t.pm.PhaseOf(1) == Phase::Failed && t.eng.spawnCalls == 0);
+
+    // a spawned ref that never gets 3D is replaced
+    Rig s;
+    s.eng.load3DFrames = 100000;
+    s.Add(1, MkPose(kCellA, 100, 200));
+    s.Run(s.cfg.load3DTimeoutMs + 1500);
+    CHECK(s.pm.stats().load3DTimeouts >= 1);
+    CHECK(s.eng.LiveCount() <= 1);
+}
+
+static void t_template_choice() {
+    g_test = "template_choice";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 1, 1), false);
+    r.Add(2, MkPose(kCellA, 2, 2), true);
+    Appearance odd = App();
+    odd.race = 99;
+    r.pm.AddPlayer(3, odd);
+    r.Pose(3, MkPose(kCellA, 3, 3));
+    r.Run(2000);
+    CHECK(r.F(1) && r.F(1)->base == 0x1000);
+    CHECK(r.F(2) && r.F(2)->base == 0x1001);
+    CHECK(r.F(3) && r.F(3)->base == 0x1002);   // fallback template
+    CHECK(r.F(1)->appearance.name == "Courier");
+}
+
+static void t_no_pose_no_spawn() {
+    g_test = "no_pose_no_spawn";
+    Rig r;
+    r.pm.AddPlayer(1, App());
+    r.Run(1000);
+    CHECK(r.eng.spawnCalls == 0);
+    r.Pose(1, MkPose(kCellA, 5, 5));
+    r.Run(1000);
+    CHECK(r.eng.spawnCalls == 1);
+}
+
+// Trap: heading. Wrap to (-pi, pi], never send pitch, no SetAngle storm at the +-pi seam.
+static void t_yaw_handling() {
+    g_test = "yaw_handling";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200, 0, 7.0f));
+    r.Run(1000);
+    CHECK(!r.eng.yawLog.empty());
+    for (float y : r.eng.yawLog) CHECK(y > -kPi - 1e-4f && y <= kPi + 1e-4f);
+    CHECK(!r.eng.yawLog.empty() && std::fabs(r.eng.yawLog.back() - (7.0f - kTwoPi)) < 1e-3f);
+
+    Rig q;
+    q.Add(1, MkPose(kCellA, 100, 200, 0, kPi - 0.001f));
+    q.Run(500);
+    unsigned base = q.eng.setYawCalls;
+    for (int i = 0; i < 20; ++i) {
+        q.Pose(1, MkPose(kCellA, 100, 200, 0, (i % 2) ? kPi - 0.001f : -kPi + 0.001f));   // same direction, across the seam
+        q.Step();
+    }
+    CHECK(q.eng.setYawCalls - base <= 1);
+
+    // pitch tilts a body: it is never sent as an angle
+    Rig p;
+    PuppetPose pitched = MkPose(kCellA, 100, 200, 0, 0.3f);
+    pitched.rot.x = 0.9f;
+    pitched.rot.z = 0.4f;
+    p.Add(1, pitched);
+    p.Run(1000);
+    CHECK(!p.eng.yawLog.empty());
+    for (float y : p.eng.yawLog) CHECK(std::fabs(y - 0.3f) < 1e-4f);
+}
+
+static void t_position_rate() {
+    g_test = "position_rate";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.Run(3000);
+    // unchanged pose: heartbeat only (about once a second), not once per frame
+    unsigned c0 = r.eng.setPosCalls;
+    r.Run(3000);
+    CHECK(r.eng.setPosCalls - c0 >= 2 && r.eng.setPosCalls - c0 <= 4);
+    // sub-epsilon wobble is ignored
+    unsigned c1 = r.eng.setPosCalls;
+    for (int i = 0; i < 20; ++i) {
+        r.Pose(1, MkPose(kCellA, 100 + (i % 2) * 0.2f, 200));
+        r.Step();
+    }
+    CHECK(r.eng.setPosCalls - c1 <= 1);
+    // real movement is applied every frame
+    unsigned c2 = r.eng.setPosCalls;
+    for (int i = 0; i < 10; ++i) {
+        r.Pose(1, MkPose(kCellA, 100 + 10.0f * (i + 1), 200));
+        r.Step();
+    }
+    CHECK(r.eng.setPosCalls - c2 == 10);
+    CHECK(std::fabs(r.F(1)->pos.x - 200) < 0.01f);
+}
+
+// A snap (teleport) is applied at once, even if tiny, and the animation is re-sent.
+static void t_snap_and_drift() {
+    g_test = "snap_and_drift";
+    Rig r;
+    r.eng.reportsCurrentGroup = false;
+    r.Add(1, MkPose(kCellA, 100, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0}));
+    r.Run(1500);
+    PuppetPose s = MkPose(kCellA, 100.1f, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0});
+    s.snapped = true;
+    unsigned c = r.eng.setPosCalls;
+    r.Pose(1, s);
+    r.Step();
+    CHECK(r.eng.setPosCalls == c + 1);
+    CHECK(r.pm.stats().teleports >= 1);
+    // physics (or the AI) pushed the puppet 2+ m away: noticed and corrected, counted
+    r.Pose(1, MkPose(kCellA, 100, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0}));
+    r.Run(200);
+    r.F(1)->pos.x += 200;
+    uint64_t d0 = r.pm.stats().drift;
+    r.Step();
+    CHECK(r.pm.stats().drift == d0 + 1);
+    CHECK(std::fabs(r.F(1)->pos.x - 100) < 0.01f);
+    CellId ac = 0;
+    Vec3 ap;
+    CHECK(r.pm.ActualPose(1, ac, ap) && ac == kCellA && std::fabs(ap.x - 100) < 0.01f);
+}
+
+static void t_group_refused_retries() {
+    g_test = "group_refused_retries";
+    Rig r;
+    r.eng.playGroupRefusalsLeft = 3;
+    r.Add(1, MkPose(kCellA, 100, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0}));
+    r.Run(1500);
+    CHECK(r.pm.stats().groupRefused == 3);
+    CHECK(r.Group(1) == kGrpForward);
+}
+
+// Engine call budget: no Tick may issue more than maxEngineCalls writes, and nobody starves.
+static void t_call_budget() {
+    g_test = "call_budget";
+    Rig r([](Config& c) { c.maxEngineCalls = 4; });
+    for (Slot s = 1; s <= 3; ++s) {
+        r.Add(s, MkPose(kCellA, 100.f * s, 200, 0, 0.1f * s, kLocoRunFwd, Vec3{0, 300, 0}));
+        r.pm.SetEquipment(s, {{0x510u + s, false}});
+    }
+    unsigned worst = 0;
+    for (int i = 0; i < 160; ++i) {
+        unsigned w = r.eng.Writes();
+        r.Step();
+        worst = std::max(worst, r.eng.Writes() - w);
+    }
+    CHECK(worst <= 4);
+    CHECK(r.pm.stats().budgetDeferred > 0);
+    for (Slot s = 1; s <= 3; ++s) {
+        CHECK(r.pm.PhaseOf(s) == Phase::Driving);
+        CHECK(r.pm.EquipConverged(s));
+        CHECK(r.Group(s) == kGrpFastForward);
+    }
+}
+
+// The ghost-ref map used by the acting-player design.
+static void t_ref_map() {
+    g_test = "ref_map";
+    Rig r;
+    CHECK(r.pm.RefOf(1) == 0);
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.Add(2, MkPose(kCellA, 300, 200));
+    r.Run(1500);
+    RefId a = r.pm.RefOf(1), b = r.pm.RefOf(2);
+    CHECK(a && b && a != b);
+    CHECK(r.pm.SlotOf(a).value_or(99) == 1 && r.pm.SlotOf(b).value_or(99) == 2);
+    CHECK(!r.pm.SlotOf(0).has_value() && !r.pm.SlotOf(0xFFFFu).has_value());
+    // after a despawn (save), the map has no entry for a ref that no longer exists
+    r.pm.OnSaveBegin();
+    CHECK(r.pm.RefOf(1) == 0 && r.pm.RefOf(2) == 0);
+    CHECK(!r.pm.SlotOf(a).has_value() && !r.pm.SlotOf(b).has_value());
+    r.pm.OnSaveEnd();
+    r.Run(1500);
+    CHECK(r.pm.RefOf(1) != 0);
+    std::string js = r.pm.StatusJson();
+    CHECK(js.find("\"slot\":1") != std::string::npos && js.find("\"phase\":\"Driving\"") != std::string::npos);
+    // the keys tools/avatar/proof_puppet.py bounds (STATS_SPEC) must all be reported
+    for (const char* k : {"spawnFailures", "refLost", "restrainReasserts", "groupRefused", "drift", "equipGaveUp", "load3DTimeouts"})
+        CHECK(js.find(std::string("\"") + k + "\":") != std::string::npos);
+}
+
+// ---- script backend: exact text ---------------------------------------------------------------------------------------
+
+struct FakeRunner : IScriptRunner {
+    struct Line { RefId ctx; std::string text; };
+    std::vector<Line> lines;
+    bool ok = true;
+    double queryValue = 0;
+    RefId placed = 0xFF001234;
+    bool Exec(RefId ctx, const std::string& line) override { lines.push_back({ctx, line}); return ok; }
+    bool Query(RefId ctx, const std::string& line, double& out) override { lines.push_back({ctx, "?" + line}); out = queryValue; return ok; }
+    RefId PlaceAtMe(FormId base, CellId cell, const Vec3& pos, float yawDeg) override {
+        char b[160];
+        std::snprintf(b, sizeof b, "PlaceAtMe %08X cell=%X %.1f,%.1f,%.1f yaw=%.2f", (unsigned)base, (unsigned)cell, pos.x, pos.y, pos.z, yawDeg);
+        lines.push_back({0, b});
+        return placed;
+    }
+    std::string Joined() const {
+        std::string s;
+        for (auto& l : lines) s += (s.empty() ? "" : " | ") + l.text;
+        return s;
+    }
+};
+struct FakeReads : IEngineReads {
+    RefId anchor = 0x00ABCDEF;
+    bool WorldReady() override { return true; }
+    uint32_t WorldEpoch() override { return 1; }
+    bool MenuOpen() override { return false; }
+    bool CellLoaded(CellId) override { return true; }
+    bool SameSpace(CellId, CellId) override { return false; }
+    bool IsValid(RefId) override { return true; }
+    bool Has3D(RefId) override { return true; }
+    uint32_t Generation3D(RefId) override { return 1; }
+    std::vector<RefId> FindTaggedPuppets() override { return {}; }
+    bool GetPose(RefId, CellId&, Vec3&) override { return false; }
+    int CurrentGroup(RefId) override { return -1; }
+    bool GetEquipped(RefId, std::vector<FormId>&) override { return false; }
+    int ItemCount(RefId, FormId) override { return 0; }
+    RefId AnchorRef(CellId, Vec3& p) override { p = Vec3{}; return anchor; }
+};
+
+static void t_script_backend() {
+    g_test = "script_backend";
+    FakeRunner run;
+    FakeReads rd;
+    ScriptPuppetEngine e(run, rd);
+    const RefId R = 0xFF000A01;
+    CHECK(e.SetPos(R, Vec3{12.5f, -3.0004f, 100}));
+    CHECK(run.Joined() == "SetPos X 12.500 | SetPos Y -3.000 | SetPos Z 100.000");
+    CHECK(run.lines[0].ctx == R);
+    run.lines.clear();
+    CHECK(e.SetYaw(R, kPi * 0.5f));
+    CHECK(run.Joined() == "SetAngle Z 90.000");
+    run.lines.clear();
+    CHECK(e.SetYaw(R, 7.0f));
+    CHECK(run.lines.size() == 1 && run.lines[0].text.rfind("SetAngle Z ", 0) == 0);
+    double deg = std::atof(run.lines[0].text.c_str() + 11);
+    CHECK(deg > -180.0 && deg <= 180.0 && std::fabs(deg - (7.0 - 6.283185307) * 57.29578) < 0.01);
+    run.lines.clear();
+    CHECK(e.PlayGroup(R, kGrpFastForward, 1) && e.PlayGroup(R, kGrpIdle, 0));
+    CHECK(run.Joined() == "PlayGroup FastForward 1 | PlayGroup Idle 0");
+    run.lines.clear();
+    CHECK(!e.PlayGroup(R, 9999, 1));        // never guess a group name
+    CHECK(run.lines.empty());
+    CHECK(e.SetRestrained(R, true) && e.SetRestrained(R, false) && e.SetSneak(R, true) && e.SetAlert(R, false));
+    CHECK(run.Joined() == "SetRestrained 1 | SetRestrained 0 | SetForceSneak 1 | SetAlert 0");
+    run.lines.clear();
+    CHECK(e.MakeNonCombatant(R));
+    CHECK(run.Joined() == "SetGhost 1 | SetIgnoreFriendlyHits 1");
+    run.lines.clear();
+    CHECK(e.AddItem(R, 0x000A1B2C, 1) && e.RemoveItem(R, 0x000A1B2C, 2) && e.EquipItem(R, 0x00001234) && e.UnequipItem(R, 0x00001234));
+    CHECK(run.Joined() == "AddItem 000A1B2C 1 1 | RemoveItem 000A1B2C 2 1 | EquipItem 00001234 1 1 | UnequipItem 00001234 0 1");
+    run.lines.clear();
+    CHECK(!e.AddItem(R, 5, 0) && run.lines.empty());
+    e.Delete(R);
+    CHECK(run.Joined() == "Disable | MarkForDelete");
+    run.lines.clear();
+    CHECK(e.MoveToCell(R, 0x20, Vec3{1, 2, 3}, 0));
+    CHECK(run.Joined() == "MoveToMarker 00ABCDEF 0 0 0");
+    run.lines.clear();
+    rd.anchor = 0;
+    CHECK(!e.MoveToCell(R, 0x20, Vec3{}, 0) && run.lines.empty());
+    RefId sp = e.Spawn(0x1000, 0x10, Vec3{1, 2, 3}, kPi);
+    CHECK(sp == 0xFF001234 && run.Joined() == "PlaceAtMe 00001000 cell=10 1.0,2.0,3.0 yaw=180.00");
+    run.lines.clear();
+    run.queryValue = 1;
+    CHECK(e.IsRestrained(R) && e.IsWeaponDrawn(R));
+    run.queryValue = 0;
+    CHECK(!e.IsRestrained(R));
+    CHECK(run.lines[0].text == "?GetRestrained" && run.lines[1].text == "?IsWeaponOut");
+    run.ok = false;
+    CHECK(!e.SetPos(R, Vec3{}) && !e.PlayGroup(R, 0, 1) && !e.IsRestrained(R));
+    CHECK(!e.SetWeaponDrawn(R, true));   // unsupported by design
+    CHECK(FormatNumber(-0.0001) == "0.000" && FormatNumber(1e12) == "1000000000000.000" && FormatNumber(std::nan("")) == "0.000");
+    CHECK(FormatForm(0x1A) == "0000001A");
+}
+
+// The manager works unchanged on top of the script backend (smoke: it produces only whitelisted command text).
+static void t_manager_on_script_backend() {
+    g_test = "manager_on_script_backend";
+    struct Runner : FakeRunner {};
+    struct Reads : FakeReads {
+        int tick = 0;
+        bool Has3D(RefId) override { return ++tick > 2; }
+    };
+    Runner run;
+    Reads rd;
+    ScriptPuppetEngine e(run, rd);
+    Config cfg = MakeCfg();
+    PuppetManager pm(e, cfg);
+    pm.AddPlayer(1, App());
+    PuppetPose p = MkPose(kCellA, 100, 200, 0, 0.2f, kLocoRunFwd, Vec3{0, 300, 0});
+    for (uint32_t t = 1000; t < 3000; t += 50) {
+        pm.SetPose(1, p);
+        pm.Tick(t);
+    }
+    CHECK(pm.PhaseOf(1) == Phase::Driving);
+    static const char* ok[] = {"SetPos ", "SetAngle ", "PlayGroup ", "SetRestrained ", "SetGhost ", "SetIgnoreFriendlyHits ", "SetForceSneak ",
+                               "PlaceAtMe ", "?GetRestrained"};
+    for (auto& l : run.lines) {
+        bool good = false;
+        for (const char* o : ok)
+            if (l.text.rfind(o, 0) == 0) good = true;
+        CHECK(good);
+    }
+    CHECK(run.Joined().find("PlayGroup FastForward 1") != std::string::npos);
+}
+
+// ---- live layer bridge -----------------------------------------------------------------------------------------------
+
+static void t_live_bridge() {
+    g_test = "live_bridge";
+    namespace live = ::fnvcoop::live;
+    live::InterpOut o;
+    o.state = live::InterpState::Interpolating;
+    o.cell = 0x77;
+    o.pos = {1, 2, 3};
+    o.rot = {0.1f, 0.2f, 0.3f};
+    o.vel = {4, 5, 6};
+    o.anim.locomotion = kLocoRunLeft;
+    o.anim.sneak = true;
+    o.anim.weaponDrawn = true;
+    o.anim.jump = true;
+    o.anim.reload = true;
+    o.anim.aim = true;
+    PuppetPose p = FromInterp(o);
+    CHECK(p.valid && !p.frozen && !p.snapped && p.cell == 0x77);
+    CHECK(p.pos.y == 2 && p.rot.y == 0.2f && p.vel.z == 6);
+    CHECK(p.anim.loco == kLocoRunLeft && p.anim.sneak && p.anim.weaponDrawn && p.anim.jump && p.anim.reload && p.anim.aim);
+    o.state = live::InterpState::Holding;
+    CHECK(FromInterp(o).frozen);
+    o.state = live::InterpState::Empty;
+    CHECK(FromInterp(o).frozen && !FromInterp(o).valid);
+    o.state = live::InterpState::Snapped;
+    o.snapped = false;
+    CHECK(FromInterp(o).snapped);
+    o.state = live::InterpState::Interpolating;
+    o.snapped = true;
+    CHECK(FromInterp(o).snapped);
+    // sender side: the locomotion code comes from the velocity / mover flags
+    LocalRead rd;
+    rd.haveMoveFlags = true;
+    rd.moverRun = true;
+    Anim a;
+    a.weaponDrawn = true;
+    live::ActorSnapshot s = MakeLocalSnapshot(7, 3, 11, 5000, 0x55, Vec3{1, 2, 3}, Vec3{0, 1.5f, 0}, Vec3{300, 0, 0}, a, &rd);
+    CHECK(s.netId == 7 && s.ownerEpoch == 3 && s.seq == 11 && s.tick == 5000 && s.cell == 0x55);
+    CHECK(s.anim.locomotion == kLocoRunFwd);
+    CHECK(s.anim.weaponDrawn);
+    // round trip of the anim flags
+    Anim b;
+    b.loco = 3; b.sneak = true; b.reload = true;
+    Anim c = FromLive(ToLive(b));
+    CHECK(c.loco == 3 && c.sneak && c.reload && !c.jump && !c.aim && !c.weaponDrawn);
+}
+
+// ---- weapon modifications, look updates, hit-target health, the ghost-ref API, the hit router ---------------------------------
+
+static void t_weapon_mods_applied() {
+    g_test = "weapon_mods_applied";
+    Rig r;
+    r.eng.weaponItems = {0x600};
+    r.eng.slotOf = {{0x600, 2}};
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.pm.SetEquipment(1, {EquipEntry{0x600, true, 0x05}});   // mods 1 and 3
+    r.Run(8000);
+    auto* f = r.F(1);
+    CHECK(f && f->worn.count(0x600) == 1);
+    CHECK(f && f->mods[0x600] == 0x05);
+    CHECK(r.eng.modLog.size() == 2 && r.eng.modLog[0].second == 1 && r.eng.modLog[1].second == 3);   // one slot per write, in order
+    CHECK(r.pm.EquipConverged(1));
+    CHECK(r.pm.stats().modOps == 2 && r.pm.stats().modFailures == 0);
+    // the mods change later (same weapon): the new mod goes on, the weapon is not equipped again
+    const unsigned equips = r.eng.equipCalls;
+    r.pm.SetEquipment(1, {EquipEntry{0x600, true, 0x07}});
+    r.Run(4000);
+    CHECK(r.F(1)->mods[0x600] == 0x07);
+    CHECK(r.eng.equipCalls == equips);
+    CHECK(r.pm.EquipConverged(1));
+}
+
+static void t_weapon_mods_refused_gives_up() {
+    g_test = "weapon_mods_refused_gives_up";
+    Rig r;
+    r.eng.weaponItems = {0x600};
+    r.eng.modsAccepted = false;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.pm.SetEquipment(1, {EquipEntry{0x600, true, 0x01}});
+    r.Run(30000);
+    CHECK(r.F(1)->worn.count(0x600) == 1);        // the weapon itself is on
+    CHECK(r.eng.modCalls <= 8);                   // equipMaxFails = 6 tries, then nothing: the mods are cosmetic
+    CHECK(r.pm.stats().modGaveUp == 1);
+    // a changed wanted set clears the give-up
+    r.eng.modsAccepted = true;
+    r.pm.SetEquipment(1, {EquipEntry{0x600, true, 0x03}});
+    r.Run(4000);
+    CHECK(r.F(1)->mods[0x600] == 0x03);
+}
+
+static void t_weapon_mods_unverifiable_asked_once() {
+    g_test = "weapon_mods_unverifiable_asked_once";
+    Rig r;
+    r.eng.weaponItems = {0x600};
+    r.eng.modsReadable = false;                   // the engine cannot tell which mods the weapon has
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.pm.SetEquipment(1, {EquipEntry{0x600, true, 0x03}});
+    r.Run(10000);
+    CHECK(r.eng.modCalls == 2);                   // once per slot, not every interval
+    CHECK(r.pm.EquipConverged(1));
+}
+
+static void t_appearance_update() {
+    g_test = "appearance_update";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.Run(1500);
+    const RefId ref = r.pm.RefOf(1);
+    CHECK(ref != 0);
+    const unsigned spawns = r.eng.spawnCalls;
+    Appearance a = App();
+    a.hair = 0x1234;
+    a.height = 1100;
+    CHECK(r.pm.SetAppearance(1, a));
+    r.Run(500);
+    CHECK(r.pm.RefOf(1) == ref && r.eng.spawnCalls == spawns);    // same race and sex: the same puppet, updated in place
+    CHECK(r.F(1)->appearance.hair == 0x1234 && r.F(1)->appearance.height == 1100);
+    CHECK(r.pm.stats().appearanceUpdates == 1);
+    // another sex needs another template NPC: a new puppet, the worn items follow
+    r.pm.SetEquipment(1, {{0x510, false}});
+    r.Run(3000);
+    Appearance f = a;
+    f.female = true;
+    CHECK(r.pm.SetAppearance(1, f));
+    r.Run(4000);
+    CHECK(r.pm.RefOf(1) != 0 && r.pm.RefOf(1) != ref);
+    CHECK(r.F(1)->base == 0x1001);
+    CHECK(r.F(1)->worn.count(0x510) == 1);
+    CHECK(!r.pm.SetAppearance(5, a));                              // unknown slot
+}
+
+static void t_puppet_hit_target_health() {
+    g_test = "puppet_hit_target_health";
+    Rig r;
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.Run(1500);
+    const RefId ref = r.pm.RefOf(1);
+    CHECK(ref != 0);
+    r.Run(6000);                                                   // a puppet is hit by enemies: it is topped up every healMs (2 s)
+    CHECK(r.eng.resetHealthCalls >= 2 && r.eng.resetHealthCalls <= 4);
+    CHECK(r.pm.stats().heals == r.eng.resetHealthCalls);
+    r.F(1)->dead = true;                                           // a burst killed it anyway
+    r.Run(3000);
+    CHECK(r.pm.stats().puppetDeaths == 1);
+    CHECK(r.pm.RefOf(1) != 0 && r.pm.RefOf(1) != ref);             // replaced by a fresh puppet, the corpse is deleted
+    CHECK(!r.F(1)->dead);
+    bool deleted = false;
+    for (RefId d : r.eng.deletedRefs) deleted = deleted || d == ref;
+    CHECK(deleted);
+}
+
+// A directory that lies: it lists the local slot and the player's own reference as puppets. The API must not repeat the lie.
+struct BadDir : IPuppetDirectory {
+    Slot LocalSlot() const override { return 0; }
+    std::vector<std::pair<Slot, RefId>> Live() const override { return {{Slot(0), RefId(0x1234)}, {Slot(1), RefId(0x1111)}, {Slot(3), kLocalPlayerRefId}}; }
+};
+struct DirReg {
+    explicit DirReg(const IPuppetDirectory* d) { setPuppetDirectory(d); }
+    ~DirReg() { setPuppetDirectory(nullptr); }
+};
+
+static void t_api_map() {
+    g_test = "api_map";
+    {
+        Rig r;
+        ManagerDirectory dir(r.pm, 0);
+        DirReg reg(&dir);
+        CHECK(puppetRefOf(1) == 0 && puppetCount() == 0);
+        r.Add(1, MkPose(kCellA, 100, 200));
+        r.Add(2, MkPose(kCellA, 300, 200));
+        r.Run(1500);
+        const RefId a = puppetRefOf(1), b = puppetRefOf(2);
+        CHECK(a && b && a != b && puppetCount() == 2);
+        Slot s = 99;
+        CHECK(slotOfPuppet(a, s) && s == 1);
+        CHECK(slotOfPuppet(b).value_or(99) == 2);
+        CHECK(!slotOfPuppet(0).has_value() && !slotOfPuppet(0xDEAD).has_value());
+        CHECK(isPuppet(a) && !isPuppet(kLocalPlayerRefId));
+        CHECK(puppetRefOf(0) == 0);                                // the local slot has no puppet
+        CHECK(actingRefOf(0) == kLocalPlayerRefId);                // ... the player's own reference acts for it
+        CHECK(actingRefOf(1) == a && actingRefOf(2) == b && actingRefOf(5) == 0);
+        Slot as = 99;
+        CHECK(slotOfActingRef(kLocalPlayerRefId, as) && as == 0);
+        CHECK(slotOfActingRef(b, as) && as == 2);
+        CHECK(!slotOfActingRef(0, as) && !slotOfActingRef(0xDEAD, as));
+        int n = 0;
+        forEachPuppet([&](Slot, RefId) { ++n; });
+        CHECK(n == 2);
+        // a puppet that is gone answers "none", never a stale id
+        r.pm.OnSaveBegin();
+        CHECK(puppetRefOf(1) == 0 && !isPuppet(a) && puppetCount() == 0 && actingRefOf(1) == 0);
+        r.pm.OnSaveEnd();
+        r.Run(2000);
+        CHECK(puppetRefOf(1) != 0);
+    }
+    CHECK(puppetRefOf(1) == 0 && actingRefOf(0) == 0 && !isPuppet(0x1111));   // no directory registered: everything answers none
+    BadDir bad;
+    DirReg reg(&bad);
+    CHECK(puppetRefOf(0) == 0);                                    // the lie about the local slot is filtered
+    CHECK(puppetRefOf(1) == 0x1111);
+    CHECK(!isPuppet(kLocalPlayerRefId));                           // the real player is never a puppet
+    CHECK(actingRefOf(0) == kLocalPlayerRefId);
+}
+
+struct FakeHitPort : IPuppetHitPort {
+    std::vector<std::pair<Slot, PuppetHit>> got;
+    bool accept = true;
+    HitAction act = HitAction::Clamp;
+    bool Forward(Slot s, const PuppetHit& h, HitAction& a) override {
+        got.emplace_back(s, h);
+        a = act;
+        return accept;
+    }
+};
+
+static void t_hit_router() {
+    g_test = "hit_router";
+    Rig r;
+    ManagerDirectory dir(r.pm, 0);
+    DirReg reg(&dir);
+    r.Add(1, MkPose(kCellA, 100, 200));
+    r.Run(1500);
+    const RefId a = puppetRefOf(1);
+    CHECK(a != 0);
+    PuppetHitRouter rt;
+    FakeHitPort port;
+    rt.SetPort(&port);
+    PuppetHit h;
+    h.victimRef = a;
+    h.attackerRef = 0x777;
+    h.healthDmg = 12;
+    h.hitLocation = 3;
+    HitOutcome o = rt.OnHit(h);
+    CHECK(o.route == HitRoute::Forwarded && o.action == HitAction::Clamp && o.victimSlot == 1);
+    CHECK(port.got.size() == 1 && port.got[0].first == 1 && port.got[0].second.healthDmg == 12 && port.got[0].second.attackerRef == 0x777);
+    h.victimRef = 0x4242;                                          // not ours: untouched, the engine applies it
+    o = rt.OnHit(h);
+    CHECK(o.route == HitRoute::NotAPuppet && o.action == HitAction::Proceed && port.got.size() == 1);
+    h.victimRef = kLocalPlayerRefId;                               // the real player is not a puppet
+    o = rt.OnHit(h);
+    CHECK(o.route == HitRoute::NotAPuppet && port.got.size() == 1);
+    h.victimRef = a;
+    h.healthDmg = 0;                                               // no damage: nothing to report
+    o = rt.OnHit(h);
+    CHECK(o.route == HitRoute::Ignored && port.got.size() == 1);
+    h.healthDmg = 5;
+    port.accept = false;                                           // the port could not carry it: the stand-in still must not fall over
+    o = rt.OnHit(h);
+    CHECK(o.route == HitRoute::PortRefused && o.action == HitAction::Clamp);
+    rt.SetPort(nullptr);                                           // combat layer off
+    o = rt.OnHit(h);
+    CHECK(o.route == HitRoute::NoPort && o.action == HitAction::Clamp);
+    port.accept = true;
+    port.act = HitAction::Neutralize;
+    rt.SetPort(&port);
+    o = rt.OnHit(h);
+    CHECK(o.route == HitRoute::Forwarded && o.action == HitAction::Neutralize);
+    r.pm.OnSaveBegin();                                            // the puppet is gone: a stale ref is not a puppet any more
+    o = rt.OnHit(h);
+    CHECK(o.route == HitRoute::NotAPuppet);
+    CHECK(rt.stats().forwarded == 2 && rt.stats().clamped == 3 && rt.stats().neutralized == 1);
+    CHECK(rt.StatusJson().find("\"forwarded\":2") != std::string::npos);
+}
+
+// ---- the suite and the twins ------------------------------------------------------------------------------------------
+
+static bool g_verbose = false;
+#define RUN(f)                                \
+    do {                                      \
+        if (g_verbose) {                      \
+            std::printf("  > %s\n", #f);      \
+            std::fflush(stdout);              \
+        }                                     \
+        f();                                  \
+    } while (0)
+
+static void RunSuite() {
+    RUN(t_loco_basics);
+    RUN(t_planner_groups);
+    RUN(t_speed_matching_planner);
+    RUN(t_spawn_waits_for_3d);
+    RUN(t_restraint_reasserted);
+    RUN(t_anim_after_menu);
+    RUN(t_post_menu_snap);
+    RUN(t_anim_heartbeat);
+    RUN(t_no_slide_manager);
+    RUN(t_frozen_and_stale);
+    RUN(t_jump_sequence);
+    RUN(t_weapon_draw_after_equip);
+    RUN(t_equipment_converges);
+    RUN(t_equipment_backoff_giveup);
+    RUN(t_equipment_flap_guard);
+    RUN(t_local_slot_and_limits);
+    RUN(t_duplicate_slot);
+    RUN(t_remove_player);
+    RUN(t_stale_and_reused_refs);
+    RUN(t_park_when_cell_unloaded);
+    RUN(t_cross_cell_move);
+    RUN(t_exterior_border);
+    RUN(t_rebuild_3d_reasserts);
+    RUN(t_save_despawns);
+    RUN(t_load_purges_orphans);
+    RUN(t_first_tick_purge);
+    RUN(t_spawn_retry);
+    RUN(t_template_choice);
+    RUN(t_no_pose_no_spawn);
+    RUN(t_yaw_handling);
+    RUN(t_position_rate);
+    RUN(t_snap_and_drift);
+    RUN(t_group_refused_retries);
+    RUN(t_call_budget);
+    RUN(t_ref_map);
+    RUN(t_script_backend);
+    RUN(t_manager_on_script_backend);
+    RUN(t_live_bridge);
+    RUN(t_weapon_mods_applied);
+    RUN(t_weapon_mods_refused_gives_up);
+    RUN(t_weapon_mods_unverifiable_asked_once);
+    RUN(t_appearance_update);
+    RUN(t_puppet_hit_target_health);
+    RUN(t_api_map);
+    RUN(t_hit_router);
+}
+
+struct Twin {
+    const char* name;
+    void (*set)(AvatarFaults&);
+};
+#define TWIN(n) {#n, [](AvatarFaults& f) { f.n = true; }}
+static const Twin kTwins[] = {
+    TWIN(noRestrainReassert), TWIN(noMenuReassert), TWIN(noWait3D), TWIN(trustLocoCode), TWIN(no3DGenReassert),
+    TWIN(saveKeepsPuppets), TWIN(noLoadPurge), TWIN(usesPitchAsYaw), TWIN(noEquipAddFirst), TWIN(noEquipBackoff),
+    TWIN(noEquipFlapGuard), TWIN(weaponDrawBeforeEquip), TWIN(allowLocalSlot), TWIN(duplicateSlotSpawns), TWIN(noStaleRefCheck),
+    TWIN(neverPark), TWIN(crossCellSetPos), TWIN(frozenKeepsRunning), TWIN(noYawNormalize), TWIN(noAnimHeartbeat),
+    TWIN(noJumpLand), TWIN(ignoreBudget), TWIN(staleMapEntries), TWIN(noPostMenuSnap), TWIN(noSaveWait),
+    TWIN(noWeaponMods), TWIN(modsIgnoredInSet), TWIN(modsRetryForever), TWIN(appearanceUpdateRespawns), TWIN(noPuppetHeal),
+    TWIN(noPuppetDeathRespawn), TWIN(apiLocalGetsPuppet), TWIN(apiPlayerIsPuppet), TWIN(apiActingNeedsPuppet), TWIN(hitsForwardEmpty),
+    TWIN(puppetHitProceeds),
+};
+
+int main(int argc, char** argv) {
+    bool twins = true;
+    const char* only = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--no-twins")) twins = false;
+        else if (!std::strcmp(argv[i], "--verbose")) g_verbose = true;
+        else if (!std::strcmp(argv[i], "--twin") && i + 1 < argc) only = argv[++i];
+        else if (!std::strcmp(argv[i], "--list-twins")) {
+            for (const Twin& t : kTwins) std::printf("%s\n", t.name);
+            return 0;
+        }
+    }
+    if (only) {
+        for (const Twin& t : kTwins)
+            if (!std::strcmp(t.name, only)) {
+                AvatarFaults f;
+                t.set(f);
+                AvatarFaultScope scope(f);
+                g_quiet = true;
+                RunSuite();
+                std::printf("twin %s: %d failed checks -> %s\n", only, g_fail, g_fail ? "killed" : "SURVIVED");
+                return g_fail ? 1 : 0;
+            }
+        std::printf("unknown twin %s\n", only);
+        return 2;
+    }
+
+    RunSuite();
+    std::printf("avatar: %d checks, %d failed\n", g_checks, g_fail);
+    int realFail = g_fail;
+    if (realFail) return 1;
+    if (!twins) {
+        std::printf("avatar: suite passes (twins skipped)\n");
+        return 0;
+    }
+    int survivors = 0;
+    g_quiet = true;
+    for (const Twin& t : kTwins) {
+        AvatarFaults f;
+        t.set(f);
+        AvatarFaultScope scope(f);
+        g_fail = 0;
+        RunSuite();
+        std::printf("  twin %-24s %s (%d failed checks)\n", t.name, g_fail ? "killed" : "SURVIVED", g_fail);
+        if (!g_fail) ++survivors;
+    }
+    std::printf("avatar: %zu twins, %d survived\n", sizeof(kTwins) / sizeof(kTwins[0]), survivors);
+    if (survivors) return 1;
+    std::printf("avatar: %d checks, 0 failed, all %zu twins killed - ALL OK\n", g_checks, sizeof(kTwins) / sizeof(kTwins[0]));
+    return 0;
+}

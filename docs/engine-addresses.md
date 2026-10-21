@@ -167,6 +167,7 @@ one emits the txn.
 | `0x573170` | `TESObjectREFR::Activate(activator, u8, u32, u32)` thiscall, `ret 0x10` | 4 stack args at every call site (e.g. 0x5B5B18: `push 1; push 0; push 0; push activator`); body ends in a jump table. Hooked as an observer on Role::Guest (`setActivateObserver`) |
 All calling conventions of hooked functions are now pinned at compile time (`PIN_F`/`PIN_C` static_asserts compare each detour's stack bytes with `HookSpec::retBytes` from `tests/retbytes.json`).
 
+## 8. Added in round 11 (condition evaluators, EnableFastTravel; prologue-verified on the reference image)
 
 Condition evaluators are the 4th column of the script command table (`command_table.json`: opcode, execute, parse, **eval**, ...). Signature
 (read from the prologues and the caller `Condition::Evaluate` 0x681600): `bool eval(TESObjectREFR* thisObj, void* param1, void* param2, double* result)`,
@@ -185,3 +186,22 @@ and indexes the eval table at `0x11908F8 + 0x28*idx` (handler at +0x10).
 | `0x5D13E0` | `Cmd_EnableFastTravel` | V | hooked (capture -> SetFastTravelLock), stolen 6 |
 | `0x5C09C0` | `Cmd_SetAngle` | V | NOT hooked yet: needs a rotation Effect type from L4 |
 | `0x5CCB20` | MoveTo worker `(thisObj, marker, offX, offY, offZ)`, cdecl | M | called by `Cmd_MoveToMarker` 0x5CCF50 after ExtractArgs; destination = marker position + offsets |
+
+## 9. Hit path (combat-hooks, 2026-10-21; derivation in docs/re/hit-path.md, constants in `plugin/combat/combat_addrs.h`)
+
+| address | function | conf | note |
+|---|---|---|---|
+| `0x89A760` | ApplyHitData `thiscall(Actor* victim, ActorHitData*, bool)`, `ret 8` | M (name), V (bytes) | the engine's hit funnel; aligned-frame prologue `53 8B DC 83 EC 08 83 E4 F0 ...` (not hookable by the entry patcher); six `E8` callers 0x87C4DA 0x89A738 0x8B91E1 0x9B0503 0x9C1E96 0x9CBDE8, no other reference; reads `healthDmg [hit+0x14]` once. Call sites redirected by plugin/combat |
+| `0x899CB0` | hit builder `ret 0x10`, standard prologue | M | allocates the 0x64-byte ActorHitData, constructs it, calls ApplyHitData at 0x89A738 |
+| `0x9B4D90` | `ActorHitData::ctor` thiscall(this) -> this | V | `55 8B EC 51 89 4D FC 8B 4D FC 83 C1 38 E8 1E C8`; initialises every field; 0x9B4EC0 is the copy constructor |
+| `0x1196DAC` | body-part category table (4-byte stride) | V | hitLocation 0..14 -> 2,1,1,3,3,4,4,5,5,5,5,5,5,1,6 (torso, head, left arm, right arm, legs, none) |
+
+## 10. Story-capture command handlers (2026-10-21; `plugin/hooks/story_addrs.h`, generated, see docs/tools/story-capture.md)
+
+74 script command handlers (73 ops of the `RefCommand` effect plus `Cmd_ForceActiveQuest`) hooked at their entry; four more ops (`StartCombat`, `StopCombat`, `Activate`, `ModFactionRank`) reuse the detours of the main table (`engine_addrs.h`). All are `bool __cdecl(pi, sd, thisObj, contObj, script, ev, res, opc)`, `ret`
+(retBytes 0), conf V: the address is the `execute` column of the engine command table (`plugin/hooks/tools/re/command_table.json`), the first 16 bytes and the instruction-aligned stolen length
+(5 to 11, never across a branch) come from a reference exe by `tools/re/pro.py`'s method and live in `plugin/hooks/tests/story_prologues_dump.txt`. Each command's parameter list (ParamInfo type id,
+optional flag, `needsParent`) is in `plugin/hooks/data/story_cmd_params.json`. Data tables read from the image: animation group names `g_animGroupInfos` 0x11977D8 (stride 0x24, 245 entries,
+the PlayGroup parameter is the index) and critical stage names `g_criticalStageNames` 0x119BBB0 (5 entries). Left out: `Cmd_ReleaseWeatherOverride` 0x5B76D0 (its prologue is
+`push ebp; mov ebp, esp; call 0x46DD00`, a rel32 call inside the stolen bytes, which the patcher refuses). The four ownership commands (0x5B57E0, 0x5D6D10, 0x5D17F0, 0x5C7660) are hooked by the
+world-time lane (`plugin/hooks_world/world_owner_addrs.h`), not here.

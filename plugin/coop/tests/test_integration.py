@@ -42,10 +42,21 @@ TOPIC = {
 }
 
 
+# Mutation twins are RUNTIME-switchable (tools/mut/fnvcoop_mut.h): the "mutant peer" names below are aliases of the one coop_peer.exe
+# started with FNVCOOP_MUT=<n>; nothing is rebuilt per twin.
+MUT_PEERS = {"coop_peer_mut_sink.exe": 1, "coop_peer_mut_commit.exe": 2, "coop_peer_mut_action.exe": 3, "coop_peer_mut_baseline.exe": 4}
+
+
 class Peer:
     def __init__(self, exe, *args):
-        self.p = subprocess.Popen([str(BIN / exe), *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT, text=True, encoding="utf-8", bufsize=1)
+        env = dict(os.environ)
+        env.pop("FNVCOOP_MUT", None)
+        real = exe
+        if exe in MUT_PEERS:
+            real = "coop_peer.exe"
+            env["FNVCOOP_MUT"] = str(MUT_PEERS[exe])
+        self.p = subprocess.Popen([str(BIN / real), *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True, encoding="utf-8", bufsize=1, env=env)
         self.q = queue.Queue()
         self.txns = []
         self.log = []          # every output line (stdout+stderr merged), kept for diagnostics
@@ -244,8 +255,7 @@ class TestIntegration(unittest.TestCase):
         for f in OUT_BIN.glob("coop_peer*.exe"):
             shutil.copy2(f, cls._tmp)
         BIN = Path(cls._tmp)
-        for exe in ("coop_peer.exe", "coop_peer_mut_sink.exe", "coop_peer_mut_commit.exe", "coop_peer_mut_action.exe",
-                    "coop_peer_mut_baseline.exe"):
+        for exe in ("coop_peer.exe",):   # the mutant peers are this same exe with FNVCOOP_MUT set (MUT_PEERS)
             if not (BIN / exe).exists():
                 raise unittest.SkipTest("missing %s (run plugin\\coop\\build_coop.cmd)" % exe)
 

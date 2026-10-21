@@ -88,6 +88,9 @@ public:
     int resumeAll();
     // Appends [trampoline, trampoline+size) of every installed hook (threads may still be executing inside them).
     void collectTrampolines(std::vector<std::pair<Addr, size_t>>* out) const;
+    // Address to CALL for the original function of an installed hook on `target` (its trampoline: the stolen bytes + a jump back).
+    // 0 = no hook of this registry on that target. A suspended hook (original bytes back at the entry) still answers: the trampoline is valid.
+    Addr trampolineOf(Addr target) const;
 
 private:
     struct Installed {
@@ -118,6 +121,9 @@ void setWriteGuard(WriteGuardBegin begin, WriteGuardEnd end);
 int suspendAllHooks();
 int resumeAllHooks();
 void collectAllTrampolines(std::vector<std::pair<Addr, size_t>>* out);
+// trampolineOf over every live HookRegistry in this module (L5, L11, L12 each own one). 0 = not hooked by us.
+// Use it to call an engine function that one of OUR detours has patched without going through the detour (queries, diagnostics).
+Addr trampolineOfAny(Addr target);
 
 // Validate a spec without touching memory (rule 2).
 bool specIsValid(const HookSpec& s, std::string* why = nullptr);

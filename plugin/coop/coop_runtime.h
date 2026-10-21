@@ -131,7 +131,15 @@ public:
     // `player` inside the target's script block to that guest. The hook is called (slot, true) before and (slot, false) after the executor.
     void setActingHook(std::function<void(fnvcoop::PlayerId slot, bool on)> f) { actingHook_ = std::move(f); }
     fnvcoop::PlayerId actingSlot() const { return actionOrigin_; }   // kNoPlayer outside an executor call
+    // plugin/intents: run `body` as the acting guest `slot` exactly like the story-channel executor does (txn origin forced to the slot, the
+    // acting hook on/off around it). Nesting-safe. Host only: returns false (body not run) without a host session.
+    bool runAsGuest(fnvcoop::PlayerId slot, const std::function<void()>& body);
+    // The runtime a plugin module that is not coop_module should talk to: the most recently started one, null after stop() / destruction.
+    static Runtime* active() { return active_; }
     void enableDialogue(DialogueHooks h) { dlgHooks_ = std::move(h); dlgEnabled_ = true; }  // before start()
+    // plugin/intents: replaces the host's dialogue ResultRunner (coop_module installs a stub that runs nothing) at any time, also after the DialogueNode
+    // was built (the node calls through the Runtime). Empty = back to DialogueHooks::run.
+    void setDialogueRunner(fnvcoop_dlg::ResultRunner r) { runnerOverride_ = std::move(r); }
     // Host with baseline=1: the exact dump handed to setWorldBaseline (null otherwise). Engine state drifts (timers),
     // so exports for tests must use THIS copy, not a fresh dump.
     const fnvcoop::ShadowState* usedBaseline(uint64_t* hash) const { if (hash) *hash = usedHash_; return usedBaseline_.get(); }
@@ -311,6 +319,8 @@ private:
     std::shared_ptr<fnvcoop::IEffectSink> flightS_;    // RecordingSink over sink_
     uint64_t flightIdentAt_ = 0, flightSeenSeq_ = ~0ull, flightSeenAt_ = 0, flightDetailAt_ = 0, flightDigestAt_ = 0, flightDigestSeq_ = ~0ull, flightHostMismatch_ = 0, flightClientRepairs_ = 0;
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+    static inline Runtime* active_ = nullptr;   // see active()
+    fnvcoop_dlg::ResultRunner runnerOverride_;  // see setDialogueRunner()
 };
 
 }  // namespace nvcoop::coop

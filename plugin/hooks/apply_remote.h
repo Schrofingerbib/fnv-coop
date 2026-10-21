@@ -21,17 +21,22 @@
 //   MoveRef           | cell == marker REFR: console `MoveTo <marker> x y z` run ON <ref> via setExecLine (x/y/z = offsets) | M
 //   KillActor         | console `KillActor` run ON <actor>                                      | M
 //   ResurrectActor    | console `ResurrectActor 0` run ON <actor>                               | M
+//   RefCommand        | the engine's own console command of the op, run ON the calling reference (ref_ops.h); AI orders only on the machine that
+//                     | runs the actor's AI (setRemoteDrivenQuery); Activate only on activators / doors                                     | M
+//   ForceActiveQuest  | console `ForceActiveQuest <quest>`                                                                                  | M
 //
 // Every apply runs under an EchoGuard (so the hooks do not re-capture it) and a ScriptGate.
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 #include "apply_lines.h"
 #include "capture_hub.h"
 #include "engine_hooks.h"
 #include "fnvcoop/effect.h"
+#include "move_queue.h"
 
 namespace nvhooks {
 
@@ -40,7 +45,10 @@ const char* applyStatusName(ApplyStatus s);
 
 class RemoteApplier {
 public:
-    RemoteApplier(CaptureHub& hub, FormResolver& res) : hub_(hub), res_(res) {}
+    RemoteApplier(CaptureHub& hub, FormResolver& res);
+    ~RemoteApplier();
+    RemoteApplier(const RemoteApplier&) = delete;
+    RemoteApplier& operator=(const RemoteApplier&) = delete;
     // Applies one effect (caller decides recipient filtering via applyTxn or by itself).
     ApplyStatus apply(const fnvcoop::Effect& e);
     // Applies all effects in order. localSlot filters player-targeted effects by Recipient. Returns count applied.
@@ -59,9 +67,21 @@ public:
     ApplyStatus applyForce(const fnvcoop::Effect& e);
     // TEST ONLY (mutation twin): apply without closing the ScriptGate, so result scripts run again on the replica.
     void setUseGate(bool on) { useGate_ = on; }
+    // Actor ownership: true = this machine does NOT run the AI of that reference (its pose comes from snapshots). RefCommand AI orders
+    // (StartCombat, EvaluatePackage, ...) are then left to the machine that does. Unset = every order is performed here.
+    void setRemoteDrivenQuery(std::function<bool(uint32_t refID)> f) { remoteDriven_ = std::move(f); }
+    // The same for every applier of the process that has no query of its own (coop_module.cpp creates its applier privately).
+    static void setDefaultRemoteDrivenQuery(std::function<bool(uint32_t refID)> f);
+    // Moves that wait for their destination cell to load (a MoveRef to a cell with no loaded reference to anchor on). tickPending() retries them;
+    // tickAll() does that for every applier of the process, at most once a second (hooks_module.cpp calls it every frame).
+    size_t pendingMoves() const { return moves_.size(); }
+    size_t tickPending();
+    static size_t tickAll();
 
 private:
     bool forMe(const fnvcoop::Recipient& r, fnvcoop::PlayerId origin, fnvcoop::PlayerId me) const;
+    ApplyStatus applyMove(const fnvcoop::MoveRef& x, const ExecFn& exec, bool park, std::unique_ptr<ScriptGate>* gate);
+    ApplyStatus applyRefCommand(const fnvcoop::RefCommand& x, const ExecFn& exec, std::unique_ptr<ScriptGate>* gate);
     CaptureHub& hub_;
     FormResolver& res_;
     std::string err_;
@@ -69,6 +89,8 @@ private:
     fnvcoop::PlayerId localSlot_ = 0;
     FastTravelLocks travelLocks_;
     std::function<bool(const std::string&, uint32_t)> exec_;  // (console command, calling reference refID)
+    std::function<bool(uint32_t)> remoteDriven_;
+    MoveQueue moves_;
 };
 
 }  // namespace nvhooks

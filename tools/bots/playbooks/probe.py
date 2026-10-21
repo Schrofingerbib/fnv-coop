@@ -315,3 +315,81 @@ def session_join(bot) -> Result:
     if _has(bot, "session_join"):
         return bot.session_join()
     return _rpc(bot, "coop.join", timeout_s=60)
+
+
+# ---- enemy / NPC sync probes (pb_enemy.py) ----------------------------------------------------
+# Fakes implement these as bot methods. In a game: coop.owner exists in the plugin (plugin/actors); coop.combat is REQUESTED from the
+# combat hooks (docs/tools/enemy-tests.md, "Bridge methods the enemy tests use"): until it exists the checks that need it are
+# skipped with a note (Ctx.optional), never faked.
+def owner_info(bot, ref: str) -> Dict[str, Any]:
+    """The coop.owner answer of THIS machine for `ref`: {owner, epoch, known, mine, pending, self, ai, standIn, dead, netId}."""
+    if _has(bot, "owner_info"):
+        return bot.owner_info(ref)
+    r = _rpc(bot, "coop.owner", {"ref": fullref(ref)})
+    if not r.ok:
+        raise MissingBridge(r.reason)
+    res = r.data["result"]
+    if res.get("unsupported"):
+        raise MissingBridge("coop.owner is unsupported in this build: " + str(res.get("reason", "")))
+    return res
+
+
+def actor_pos(bot, ref: str) -> Tuple[float, float, float]:
+    """Where THIS machine shows actor `ref` (x, y, z)."""
+    if _has(bot, "npc_pos"):
+        return tuple(float(x) for x in bot.npc_pos(ref))      # type: ignore[return-value]
+    if _has(bot, "pos"):
+        try:
+            return tuple(float(x) for x in bot.pos(ref))      # type: ignore[return-value]  (T6a Bot.pos(ref): world.refInfo)
+        except TypeError:
+            pass
+    return tuple(float(_eval_ref(bot, ref, f"GetPos {a}")) for a in "XYZ")      # type: ignore[return-value]
+
+
+def _combat(bot, ref: Optional[str]) -> Dict[str, Any]:
+    p: Dict[str, Any] = {"ref": fullref(ref)} if ref else {"self": True}
+    r = _rpc(bot, "coop.combat", p)
+    if not r.ok:
+        raise MissingBridge(r.reason)
+    return r.data["result"]
+
+
+def death_count(bot, ref: str) -> int:
+    """How many times THIS machine applied a death to `ref` (must be 1 once it is dead). NEEDS coop.combat {ref} -> {deaths}."""
+    if _has(bot, "death_count"):
+        return int(bot.death_count(ref))
+    return int(_combat(bot, ref)["deaths"])
+
+
+def kill_credits(bot, ref: str) -> list:
+    """Slots credited with the kill of `ref` on THIS machine (must be exactly one). NEEDS coop.combat {ref} -> {credited:[slot...]}."""
+    if _has(bot, "kill_credits"):
+        return list(bot.kill_credits(ref))
+    return list(_combat(bot, ref)["credited"])
+
+
+def hits_taken(bot) -> int:
+    """NPC hits that landed on THIS machine's player (counted once each). NEEDS coop.combat {self:true} -> {hitsTaken}."""
+    if _has(bot, "hits_taken"):
+        return int(bot.hits_taken())
+    return int(_combat(bot, None)["hitsTaken"])
+
+
+def encounter_members(bot, bases) -> list:
+    """Sorted (net id, base, ref) of the encounter NPCs THIS machine knows, for the base forms in `bases`; `ref` is this machine's own
+    runtime reference (it differs per machine for created NPCs). In a game: dev.refsOf per base, mapped to net ids with coop.owner;
+    a member without a net id has net id None and is left out of the one-by-one checks."""
+    if _has(bot, "encounter_members"):
+        return list(bot.encounter_members(bases))
+    out = []
+    for b in bases:
+        refs = bot.refs_of(b) if _has(bot, "refs_of") else None
+        if refs is None:
+            raise MissingBridge("bridge method dev.refsOf is not implemented in this build")
+        for rr in refs:
+            try:
+                nid = owner_info(bot, rr).get("netId")
+            except MissingBridge:
+                nid = None
+            out.append((str(nid) if nid is not None else None, str(b), str(rr)))
+    return sorted(out, key=lambda x: (x[0] is None, str(x[0]), x[1], x[2]))

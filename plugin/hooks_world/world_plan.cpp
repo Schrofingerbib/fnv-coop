@@ -1,5 +1,7 @@
 #include "world_plan.h"
 
+#include "apply_lines.h"
+
 namespace nvworld {
 
 using fnvcoop::FormRef;
@@ -16,7 +18,8 @@ const char* planStatusName(PlanStatus s) {
 
 bool handlesEffect(const fnvcoop::Effect& e) {
     return std::holds_alternative<fnvcoop::SpawnRef>(e) || std::holds_alternative<fnvcoop::DespawnRef>(e) ||
-           std::holds_alternative<fnvcoop::RefScriptVar>(e);
+           std::holds_alternative<fnvcoop::RefScriptVar>(e) || std::holds_alternative<fnvcoop::ObjectState>(e) ||
+           std::holds_alternative<fnvcoop::AdvanceTime>(e) || std::holds_alternative<fnvcoop::RequestSave>(e);
 }
 
 namespace {
@@ -55,9 +58,9 @@ Plan createStep(PlanEnv& env, const fnvcoop::SpawnRef& s) {
 Plan planEffect(const fnvcoop::Effect& e, PlanEnv& env) {
     if (auto* x = std::get_if<fnvcoop::SpawnRef>(&e)) {
         bool ready = env.cellReady ? env.cellReady(x->cell) : true;
-#if NVWORLD_MUT == 25
-        ready = true;  // MUTANT: never queues, creates into the wrong (unloaded) cell
-#endif
+        if (FNV_MUT(25)) {
+            ready = true;  // MUTANT: never queues, creates into the wrong (unloaded) cell
+        }
         SpawnAction a = env.ledger.onSpawn(*x, ready);
         if (a == SpawnAction::Duplicate) return Plan{};  // replay: already have it
         if (a == SpawnAction::Queued) {
@@ -77,11 +80,11 @@ Plan planEffect(const fnvcoop::Effect& e, PlanEnv& env) {
             case DespawnAction::DeleteLocal: {
                 Step st;
                 st.kind = StepKind::ConsoleOnRef;
-#if NVWORLD_MUT == 23
-                st.refID = x->id;  // MUTANT: host id used on the client instead of the local object
-#else
-                st.refID = r.localRefID;
-#endif
+                if (FNV_MUT(23)) {
+                    st.refID = x->id;  // MUTANT: host id used on the client instead of the local object
+                } else {
+                    st.refID = r.localRefID;
+                }
                 st.line = markForDeleteLine();
                 p.steps.push_back(st);
                 return p;
@@ -96,13 +99,48 @@ Plan planEffect(const fnvcoop::Effect& e, PlanEnv& env) {
         Step st;
         st.kind = StepKind::SetRefVar;
         st.refID = id;
-#if NVWORLD_MUT == 22
-        st.varIndex = (uint16_t)(x->index + 1);  // MUTANT
-#else
-        st.varIndex = x->index;
-#endif
+        if (FNV_MUT(22)) {
+            st.varIndex = (uint16_t)(x->index + 1);  // MUTANT
+        } else {
+            st.varIndex = x->index;
+        }
         st.varValue = x->value;
         p.steps.push_back(st);
+        return p;
+    }
+    if (auto* x = std::get_if<fnvcoop::ObjectState>(&e)) {
+        uint32_t id = 0;
+        if (!exists(env, x->ref, &id)) return missing(x->ref);
+        Plan p;
+        auto line = [&](const std::string& l) {
+            Step st;
+            st.kind = StepKind::ConsoleOnRef;
+            st.refID = id;
+            st.line = l;
+            p.steps.push_back(st);
+        };
+        // same order and same console forms as L5's RemoteApplier used: lock, open state, destroyed
+        if (x->mask & fnvcoop::kObjLock) line(x->locked ? nvhooks::lockCmd(x->level) : nvhooks::unlockCmd());
+        if ((x->mask & fnvcoop::kObjOpen) && !FNV_MUT(49)) line(nvhooks::setOpenStateCmd(x->open));   // MUTANT 49: the open bit is ignored
+        if (x->mask & fnvcoop::kObjDestroyed) line(nvhooks::setDestroyedCmd(x->destroyed));
+        return p;
+    }
+    if (auto* x = std::get_if<fnvcoop::AdvanceTime>(&e)) {
+        Plan p;
+        Step st;
+        st.kind = StepKind::AdvanceClock;
+        st.minutes = x->minutes;
+        p.steps.push_back(st);
+        return p;
+    }
+    if (std::holds_alternative<fnvcoop::RequestSave>(e)) {
+        Plan p;   // nothing to do on a client: a scripted autosave / ForceSave is the host's business (steps stay empty => Ok)
+        if (FNV_MUT(50)) {   // MUTANT 50: the client would save too
+            Step st;
+            st.kind = StepKind::ConsoleGlobal;
+            st.line = "Autosave";
+            p.steps.push_back(st);
+        }
         return p;
     }
     Plan p;
@@ -147,11 +185,7 @@ Plan planWorldEffect(const WorldEffect& e, PlanEnv& env) {
     if (auto* x = std::get_if<SetEssential>(&e)) {
         uint32_t id = 0;
         if (!exists(env, x->actor, &id)) return missing(x->actor);
-#if NVWORLD_MUT == 24
-        if (false)  // MUTANT: ref-only essential applied to the base form
-#else
-        if (x->refOnly)
-#endif
+        if (FNV_MUT(24) ? false : x->refOnly)  // MUTANT 24: ref-only essential applied to the base form
             return onRef(x->actor, setEssentialLine(*x, id));
         Step st;
         st.kind = StepKind::ConsoleGlobal;
@@ -170,6 +204,31 @@ Plan planWorldEffect(const WorldEffect& e, PlanEnv& env) {
         return p;
     }
     if (auto* x = std::get_if<SetIgnoreCrime>(&e)) return onRef(x->actor, ignoreCrimeLine(x->on));
+    if (auto* x = std::get_if<SetOwner>(&e)) {
+        if (x->clear) return onRef(x->ref, clearOwnershipLine());
+        uint32_t owner = 0;
+        if (!x->owner.plugin.empty() && !exists(env, x->owner, &owner)) return missing(x->owner);
+        return onRef(x->ref, setOwnershipLine(owner));
+    }
+    if (auto* x = std::get_if<SetCellOwner>(&e)) {
+        uint32_t cell = 0, owner = 0;
+        if (!exists(env, x->cell, &cell)) return missing(x->cell);
+        if (!exists(env, x->owner, &owner)) return missing(x->owner);
+        Step st;
+        st.kind = StepKind::ConsoleGlobal;
+        st.line = setCellOwnershipLine(cell, owner);
+        p.steps.push_back(st);
+        return p;
+    }
+    if (auto* x = std::get_if<SetCellPublic>(&e)) {
+        uint32_t cell = 0;
+        if (!exists(env, x->cell, &cell)) return missing(x->cell);
+        Step st;
+        st.kind = StepKind::ConsoleGlobal;
+        st.line = setCellPublicFlagLine(cell, x->on);
+        p.steps.push_back(st);
+        return p;
+    }
     if (auto* x = std::get_if<SetFactionPlayerEnemy>(&e)) {
         uint32_t f = 0;
         if (!exists(env, x->faction, &f)) return missing(x->faction);
@@ -220,19 +279,19 @@ Outcome applyRouted(const fnvcoop::Effect& e, PlanEnv& env, const RunPlan& run, 
         return Outcome::Ok;
     }
     Outcome o = handlesEffect(e) ? runPlan(planEffect(e, env), run) : (other ? other(e) : Outcome::Other);
-#if NVWORLD_MUT != 37
-    if (o != Outcome::Ok && retriable(e, o)) {  // MUTANT 37: a form that is not loaded yet is simply lost
-        HeldEffect h;
-        h.fx = e;
-        h.attempts = attempts;
-        env.ledger.deferred().hold(std::move(h));
-        return Outcome::Ok;
+    if (!FNV_MUT(37)) {
+        if (o != Outcome::Ok && retriable(e, o)) {  // MUTANT 37: a form that is not loaded yet is simply lost
+            HeldEffect h;
+            h.fx = e;
+            h.attempts = attempts;
+            env.ledger.deferred().hold(std::move(h));
+            return Outcome::Ok;
+        }
     }
-#endif
-#if NVWORLD_MUT != 42
-    if (o == Outcome::Ok && std::holds_alternative<fnvcoop::SpawnRef>(e))  // MUTANT 42: follow-ups wait for the next tick
-        flushDeferred(env, run, other, false);
-#endif  // the object exists now: its follow-ups can run
+    if (!FNV_MUT(42)) {
+        if (o == Outcome::Ok && std::holds_alternative<fnvcoop::SpawnRef>(e))  // MUTANT 42: follow-ups wait for the next tick
+            flushDeferred(env, run, other, false);
+    } // the object exists now: its follow-ups can run
     return o;
 }
 

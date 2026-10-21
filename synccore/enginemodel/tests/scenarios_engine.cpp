@@ -28,8 +28,15 @@ struct Check {
 
 // Settles the cluster and reports every violation the oracles found.
 bool finish(Cluster& c, Check& k, bool allowRepairs = false) {
-    if (!allowRepairs && c.totalRepairs() > 0) k.expect(false, "digest repairs were needed (" + std::to_string(c.totalRepairs()) + "): something diverged and was patched");
+    // A repair means something diverged and was patched after the fact. Count the ones made while settling too: the digests compare exactly, so
+    // a divergence that used to hide below a digest bucket is patched during settling and would otherwise pass unnoticed.
     const bool quiet = c.quiesce(30000);
+    if (!allowRepairs && c.totalRepairs() > 0) {
+        std::string log;
+        const auto& rl = c.host().repairLog();
+        for (size_t i = 0; i < rl.size() && i < 3; ++i) log += " [" + rl[i] + "]";
+        k.expect(false, "digest repairs were needed (" + std::to_string(c.totalRepairs()) + "): something diverged and was patched:" + log);
+    }
     c.checkAlways();
     c.checkQuiescent();
     k.expect(quiet, "cluster never became quiet");
@@ -275,6 +282,13 @@ bool spawnOnce(uint64_t seed, std::string* why) {
     for (auto& kv : c.host().world().sites()) if (kv.second.spawnCount > 0) ++spawned;
     k.expect(spawned > 0, "no encounter spawned");
     for (auto& kv : c.host().world().sites()) k.expect(kv.second.spawnCount <= 1, "site " + std::to_string(kv.first) + " spawned " + std::to_string(kv.second.spawnCount) + " times");
+    // the leveled pick is made once, by the host: every machine must hold the host's choice right after the spawn, not after a digest repair
+    for (int p = 1; p < 3; ++p)
+        for (auto& kv : c.host().world().actors()) {
+            if (!kv.second.created) continue;
+            const ActorState* o = c.machine(static_cast<PlayerId>(p)).world().findActor(kv.first);
+            k.expect(o && o->pick == kv.second.pick, "machine " + std::to_string(p) + " holds a different leveled pick for created actor " + std::to_string(kv.first));
+        }
     return finish(c, k);
 }
 
@@ -287,7 +301,9 @@ bool containerMatrix(uint64_t seed, std::string* why) {
     if (!cont) { note(why, "no container"); return false; }
     const CellId cell = c.host().world().containers().at(cont).cell;
     auto total = [&] {
-        int64_t n = c.host().world().containers().at(cont).items[kAmmo];
+        const auto& held = c.host().world().containers().at(cont).items;   // (find, not operator[]: reading must not add a zero entry to the host's container and change its digest)
+        const auto have = held.find(kAmmo);
+        int64_t n = have == held.end() ? 0 : have->second;
         for (int p = 0; p < 2; ++p) n += c.machine(static_cast<PlayerId>(p)).inventoryCount(kAmmo);
         return n;
     };

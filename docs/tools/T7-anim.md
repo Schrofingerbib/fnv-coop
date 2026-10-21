@@ -31,6 +31,7 @@ Measured now (game-free): encoding 16 actors x 16 bones to JSON takes about 0.95
 Engine reads are unknown until measured: `anim.stats` reports them; `tools/animcheck/cli.py collect` prints them after a run. `bones:false` skips the skeleton walk.
 
 ### Offsets: verified vs not
+`python -I tools/animcheck/verify_engine.py` (read-only, FalloutNV 1.4.0.525 reference) proves: vtable addresses; BaseProcess/HighProcess slots
 0x52, 0x6E, 0x9F, 0xF9, 0xFA, 0x101, 0x103, 0x115 and the fields they read; Actor `baseProcess` +0x68, life state +0x108; Actor slot 0x10B = GetCombatTarget;
 refID +0xC; NiNode children data/count +0xA0/+0xA6; NiAVObject world translate at **+0x8C** (xNVSE's `NiAVObject` struct puts it at 0x88: wrong, we use raw offsets);
 BSAnimGroupSequence `last` +0x34, size 0x78; PlayerMover/ActorMover slot 8.
@@ -62,3 +63,9 @@ Flight trace: findings are exported as Marker records (`nvfr_export.py`, uses `t
 2. Run with `scan_animdata:true` once; the offsets should be 0xE0.. in steps of 4 (plus 0x100).
 3. Walk in first person with a puppet on the other machine and run `analyze --avatar`.
 4. Tune `config.py` thresholds from the clean run.
+
+## NPC fight assertions (enemy-anim, 2026-10-21)
+`tools/animcheck/npc.py` adds `analyze_npc` / `check_fight` / `FIGHT_ASSERTS` on top of `analyze`: the eight glitch detectors asserted zero, one-shot
+events (attack, hit reaction, reload) matched between owner and copy, weapon never drawn, and corpse resting places. Tests `tests/test_npc*.py`, runner
+`python -I tools/animcheck/run_npc_tests.py` (14 twins). The in-game proof script is `tools/animcheck/npc_proof.py`. Details and thresholds:
+`docs/tools/enemy-anim.md`.

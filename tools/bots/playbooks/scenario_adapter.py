@@ -84,6 +84,40 @@ def _m_spawn(f, repo):
     return {"marker": f["gangMarker"], "base": f["gangBase"]}
 
 
+def _base_of(repo: str, ref: str) -> Optional[str]:
+    """The base form of a placed reference, from out/questdata/forms.json.gz."""
+    import gzip
+    p = os.path.join(repo, "out", "questdata", "forms.json.gz")
+    if p not in _BASES:
+        with gzip.open(p, "rt", encoding="utf-8") as fh:
+            _BASES[p] = {k: v.get("base") for k, v in json.load(fh).items() if v.get("base")}
+    return _BASES[p].get(ref)
+
+
+_BASES: Dict[str, Dict[str, str]] = {}
+
+
+def _hostiles(f, repo):
+    hs = [f["gang1"], f["gang2"], f["gecko1"], f["gecko2"]]
+    return {"hostiles": hs, "hostile_base_of": {h: _base_of(repo, h) for h in hs}}
+
+
+def _m_enemy_fight(f, repo):
+    return _hostiles(f, repo)
+
+
+def _m_enemy_handoff(f, repo):
+    return dict(_hostiles(f, repo), far_pos={"ref": f["novac"], "dist": 400}, near_pos={"ref": f["gangMarker"], "dist": 300})
+
+
+def _m_enemy_spawn(f, repo):
+    return {"marker": f["gangMarker"], "base": f["gangBase"], "count": 3, "spawn_mode": "host"}
+
+
+def _m_corpse(f, repo):
+    return {"victim": f["gang1"], "item": f["stimpak"], "item_count": 3, "hostile_base_of": {f["gang1"]: _base_of(repo, f["gang1"])}}
+
+
 def _m_vats(f, repo):
     return {"target": f["gang1"], "limb": "Head"}
 
@@ -110,6 +144,10 @@ MAPPERS: Dict[str, Tuple[Optional[str], Optional[Callable]]] = {
     "pnr_vote_guest_declines": ("pnr_vote_guest_declines", _m_pnr),
     "dialogue_spectator": ("dialogue_spectator", _m_dialogue),
     "goodsprings_opening": ("goodsprings_opening", None),
+    "enemy_fight": ("goodsprings_enemies", _m_enemy_fight),
+    "enemy_handoff": ("goodsprings_enemies", _m_enemy_handoff),
+    "enemy_spawn": ("goodsprings_enemies", _m_enemy_spawn),
+    "corpse_loot_race": ("goodsprings_enemies", _m_corpse),
 }
 
 

@@ -14,6 +14,7 @@ enum class StepKind : uint8_t {
     ConsoleGlobal,  // run `line` with no calling reference
     CreateSpawn,    // create `baseID` at `spawn` (cell/pos); the glue then calls SpawnLedger::onCreated(spawn.ref, newRefID)
     SetRefVar,      // write script variable `varIndex` of ref `refID`
+    AdvanceClock,   // the host's wait / sleep reached this machine: `minutes` of game time (the world-time module owns the clock)
 };
 struct Step {
     StepKind kind = StepKind::ConsoleGlobal;
@@ -23,6 +24,7 @@ struct Step {
     uint32_t baseID = 0, cellID = 0;
     uint16_t varIndex = 0;
     double varValue = 0;
+    uint32_t minutes = 0;
 };
 
 enum class PlanStatus : uint8_t { Ok, FormMissing, Queued, Unsupported };
@@ -40,7 +42,8 @@ struct PlanEnv {
     std::function<bool(const fnvcoop::FormRef& cell)> cellReady;
 };
 
-// Effects of this lane: SpawnRef, DespawnRef, RefScriptVar. Anything else: Unsupported (L5's RemoteApplier owns it).
+// Effects of this lane: SpawnRef, DespawnRef, RefScriptVar, ObjectState (world-time lane: observed on its way in), AdvanceTime (the clock),
+// RequestSave (acknowledged and ignored: only the host's save is the world). Anything else: Unsupported (L5's RemoteApplier owns it).
 Plan planEffect(const fnvcoop::Effect& e, PlanEnv& env);
 Plan planWorldEffect(const WorldEffect& e, PlanEnv& env);
 // Spawns that were queued for a cell that has loaded since: one Plan per spawn, in arrival order.

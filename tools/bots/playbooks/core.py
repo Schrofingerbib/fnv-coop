@@ -25,6 +25,8 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from . import clocks
+
 
 class StepFailure(Exception):
     """A step did not do what the playbook expected. `reason` is shown to the human."""
@@ -70,6 +72,8 @@ COUNTER_PATHS = {
     "digestMismatch": ("desyncs", "digests", "mismatch"),
     "repairs": ("desyncs", "digests", "repairs"),
     "effectsRepaired": ("desyncs", "digests", "effectsRepaired"),
+    # area desync digests (synccore/areadigest, bridge areadigest.status merged into the status by statuses()): keys healed on that machine
+    "areaHeals": ("areadigest", "heals", "total"),
     "badMessages": ("host", "badMessages"),
     # any side
     "applyFailed": ("counters", "applyFailed"),
@@ -79,8 +83,8 @@ COUNTER_PATHS = {
     "duplicatesDropped": ("client", "duplicatesDropped"),
 }
 # These must not rise during a step. Others are informational (duplicates are normal on a lossy link).
-REPAIR_COUNTERS = ("digestMismatch", "repairs", "effectsRepaired")
-MUST_NOT_RISE = ("digestMismatch", "repairs", "effectsRepaired", "badMessages", "applyFailed", "rebases")
+REPAIR_COUNTERS = ("digestMismatch", "repairs", "effectsRepaired", "areaHeals")
+MUST_NOT_RISE = ("digestMismatch", "repairs", "effectsRepaired", "areaHeals", "badMessages", "applyFailed", "rebases")
 
 
 def read_counters(status: dict) -> Dict[str, int]:
@@ -161,7 +165,11 @@ class Ctx:
         self.notes: List[str] = []
         self.anim = None                # AnimWatch when the playbook has T7 animation checks switched on
         self.absent: set = set()        # names of machines that left the session (excluded from settle/compare/queries)
-        self._t_start = time.monotonic()
+        # How long a wait may take is measured on `self.clock`: the fake world's virtual time for fake runs (immune to machine load),
+        # wall time scaled by the measured load for live runs (see clocks.py).
+        self.clock = clocks.make_clock(machines, self.opts)
+        self.load = self.opts.get("load_meter") or clocks.LoadMeter()
+        self._t_start = self.clock.now()
         self._repairs_at_start = 0
 
     # ---- who ----
@@ -218,6 +226,43 @@ class Ctx:
             with self.anim.teleporting(grace_ms):
                 yield
 
+    @contextlib.contextmanager
+    def sampling(self, fn: Callable[[], Any], period_s: float = 0.2):
+        """Call fn() about every `period_s` of game time while the block runs, e.g. to watch NPCs during a blocking walk. Fake worlds:
+        from the world's tick (virtual time); games: from a thread (wall time). Errors inside fn are noted, never raised."""
+        def safe():
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001
+                self.notes.append(f"sampler: {type(e).__name__}: {e}")
+        world = getattr(self.clock, "world", None)
+        if self.clock.kind == "sim" and world is not None:
+            last = [self.clock.now() - period_s]
+
+            def hook():
+                if self.clock.now() - last[0] >= period_s - 1e-9:
+                    last[0] = self.clock.now()
+                    safe()
+            world.tick_hooks.append(hook)
+            try:
+                yield
+            finally:
+                if hook in world.tick_hooks:
+                    world.tick_hooks.remove(hook)
+            return
+        stop = threading.Event()
+
+        def loop():
+            while not stop.wait(period_s):
+                safe()
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            t.join(timeout=5)
+
     def equip_all(self) -> None:
         """Everyone equips refs['weapon']. Without that ref the scenario is trusted to have armed the players."""
         w = self.refs.get("weapon")
@@ -269,15 +314,41 @@ class Ctx:
             self.notes.append(f"{label} skipped: {e}")
             return default
 
+    # ---- time: how long a wait may take (see clocks.py) ----
+    def budget(self, timeout_s: float) -> float:
+        """The wait budget in this run's seconds. Fake worlds: virtual seconds, never less than SIM_MIN_WAIT_S, so the verdict does not
+        depend on how busy the PC is. Live games: wall seconds times the measured machine load. Only waits are scaled."""
+        if self.clock.kind == "sim":
+            return max(float(timeout_s), clocks.SIM_MIN_WAIT_S)
+        scale = self.load.factor() if self.opts.get("load_scale", True) else 1.0
+        return float(timeout_s) * scale
+
+    def _unit(self) -> str:
+        return "s" if self.clock.kind != "sim" else " simulated s"
+
+    def _stalled(self, now: float, state: list) -> None:
+        """A wait on the simulated clock must see it move; a frozen clock would otherwise spin until the wall-clock watchdog."""
+        if state and state[0] == now:
+            state[1] += 1
+            if state[1] > int(self.opts.get("stall_polls", 400)):
+                raise StepFailure("the simulated clock stopped advancing while waiting (nobody ticks the fake world)", "check")
+        else:
+            state[:] = [now, 0]
+
     def wait_until(self, label: str, pred: Callable[[], bool], timeout_s: float = 10.0, poll_s: float = 0.1) -> None:
-        end = time.monotonic() + timeout_s
+        budget = self.budget(timeout_s)
+        end = self.clock.now() + budget
+        stall: list = []
         while True:
             self._tick()
             if pred():
                 return
-            if time.monotonic() >= end:
-                raise StepFailure(f"timed out after {timeout_s:g}s waiting for: {label}", "check")
-            time.sleep(0 if self.opts.get("fast") else poll_s)
+            now = self.clock.now()
+            if now >= end:
+                raise StepFailure(f"timed out after {budget:g}{self._unit()} waiting for: {label}", "check")
+            if self.clock.kind == "sim":
+                self._stalled(now, stall)
+            self.clock.sleep(0 if self.opts.get("fast") else poll_s)
 
     def pause(self, seconds: float) -> None:
         """Let the game run for a while (fake worlds: a few ticks instead of real time)."""
@@ -286,10 +357,28 @@ class Ctx:
             for _ in range(n):
                 self._tick()
             return
-        end = time.monotonic() + seconds
-        while time.monotonic() < end:
+        end = self.clock.now() + seconds
+        while self.clock.now() < end:
             self._tick()
-            time.sleep(0.1)
+            self.clock.sleep(0.1)
+
+    def advance(self, seconds: float) -> None:
+        """Let `seconds` of game time pass (fake worlds: exactly that much virtual time, so NPC AI really runs; live: real time).
+        pause() in a fast fake run ticks only 3 times, which is right for settling but moves no NPC."""
+        if self.clock.kind == "sim":
+            end = self.clock.now() + seconds
+            guard = 0
+            while self.clock.now() < end:
+                before = self.clock.now()
+                self._tick()
+                guard = guard + 1 if self.clock.now() == before else 0
+                if guard > 50:
+                    raise StepFailure("the simulated clock stopped advancing (nobody ticks the fake world)", "check")
+            return
+        end = self.clock.now() + seconds
+        while self.clock.now() < end:
+            self._tick()
+            self.clock.sleep(0.1)
 
     def _tick(self) -> None:
         """Poll statuses once (this also drives fake worlds forward)."""
@@ -298,14 +387,37 @@ class Ctx:
 
     # ---- settle, compare, counters ----
     def statuses(self) -> Dict[str, dict]:
-        return {m.name: m.bot.coop_status() for m in self.present}
+        out = {m.name: m.bot.coop_status() for m in self.present}
+        self._attach_area_status(out)
+        return out
+
+    def _attach_area_status(self, out: Dict[str, dict]) -> None:
+        """Merge the bridge method areadigest.status into each machine's status (as status["areadigest"]) so the heal counters are one of the
+        desync counters (docs/tools/area-desync.md). A bot without a bridge, or a game without the module, is asked once and then left alone."""
+        for m in self.present:
+            bot = m.bot
+            call = getattr(getattr(bot, "nv", None), "call", None)
+            st = out.get(m.name)
+            if call is None or not isinstance(st, dict) or getattr(bot, "_area_unsupported", False):
+                continue
+            try:
+                a = call("areadigest.status")
+            except Exception:                       # noqa: BLE001  (method unknown, bridge hiccup: not a test failure)
+                try:
+                    bot._area_unsupported = True
+                except Exception:                   # noqa: BLE001
+                    pass
+                continue
+            if isinstance(a, dict) and a.get("enabled"):
+                st["areadigest"] = a
 
     def settle(self, timeout_s: Optional[float] = None) -> None:
         """Wait until every client has applied the host's last sequence number and stays equal for 2 polls."""
-        timeout_s = self.opts["settle_s"] if timeout_s is None else timeout_s
-        end = time.monotonic() + timeout_s
+        timeout_s = self.budget(self.opts["settle_s"] if timeout_s is None else timeout_s)
+        end = self.clock.now() + timeout_s
         stable = 0
         last = {}
+        stall: list = []
         while True:
             st = self.statuses()
             host_seq = last_seq(st[self.host.name])
@@ -319,10 +431,13 @@ class Ctx:
             else:
                 stable = 0
             last = seqs
-            if time.monotonic() >= end:
-                raise StepFailure(f"machines did not converge within {timeout_s:g}s: lastSeq per machine {seqs}, "
+            now = self.clock.now()
+            if now >= end:
+                raise StepFailure(f"machines did not converge within {timeout_s:g}{self._unit()}: lastSeq per machine {seqs}, "
                                   f"host allSynced={host_ok}", "settle")
-            time.sleep(self.opts["settle_poll_s"])
+            if self.clock.kind == "sim":
+                self._stalled(now, stall)
+            self.clock.sleep(self.opts["settle_poll_s"])
 
     def _read_all_counters(self) -> Dict[str, Dict[str, int]]:
         return {n: read_counters(s) for n, s in self.statuses().items()}
@@ -351,7 +466,7 @@ class Ctx:
         if budget is None:
             return
         total = sum(c["repairs"] for c in self._read_all_counters().values()) - self._repairs_at_start
-        minutes = max((time.monotonic() - self._t_start) / 60.0, 1.0)
+        minutes = max((self.clock.now() - self._t_start) / 60.0, 1.0)
         rate = total / minutes
         if rate > budget:
             raise StepFailure(f"repairs per minute {rate:.2f} exceed the {self.opts.get('chaos')} budget {budget} "
@@ -492,6 +607,7 @@ class Playbook:
     allow_repairs = False
     anim = False                    # True: T7 animation/pose assertions run at the end (needs [dev] animprobe=1)
     anim_npcs = True                # also assert the NPC counters (compared > 0 ...)
+    anim_profile = "default"        # animcheck thresholds: "default", or "fight" (tools/animcheck/config.py FIGHT: attacks/staggers are short)
 
     def run(self, ctx: Ctx) -> None:
         raise NotImplementedError
@@ -528,7 +644,11 @@ def run_playbook(pb: Playbook, machines: List[Machine], comparer: Optional[Compa
     watch = None
     if pb.anim and o.get("anim", True):
         from .animwatch import AnimWatch
-        watch = ctx.anim = AnimWatch(ctx, hz=o.get("anim_hz", 20.0), outdir=os.path.join(outdir, "anim"), npcs=pb.anim_npcs)
+        # The raw probe replies (JSONL, tens of MB for a minute of virtual fight) are written for live runs, where they are the evidence for
+        # tools/animcheck; fake runs keep them in memory only unless opts["anim_dump"] (a few hundred test runs filled a disk on 2026-10-21).
+        dump = ctx.clock.kind != "sim" or bool(o.get("anim_dump"))
+        watch = ctx.anim = AnimWatch(ctx, hz=o.get("anim_hz", 20.0), outdir=os.path.join(outdir, "anim") if dump else None,
+                                     npcs=pb.anim_npcs, profile=pb.anim_profile)
         watch.start()
     try:
         pb.run(ctx)

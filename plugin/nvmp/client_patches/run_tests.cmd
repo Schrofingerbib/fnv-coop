@@ -10,7 +10,7 @@ if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" set
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x86 >nul 2>&1
 if errorlevel 1 (echo vcvarsall failed & exit /b 2)
 pushd "%HERE%"
-set CL_COMMON=/nologo /std:c++17 /EHsc /W4 /O1 /MT /D_CRT_SECURE_NO_WARNINGS /Fo"%OUT%\\"
+set CL_COMMON=/nologo /std:c++17 /EHsc /W4 /O1 /MT /D_CRT_SECURE_NO_WARNINGS /I..\..\..\tools\mut /Fo"%OUT%\\"
 set SRC=tests\test_client_patches.cpp client_patcher.cpp players.cpp client_patches_module.cpp ..\patches.cpp ..\sigscan.cpp ..\..\common\nvcoop_api.cpp ..\..\reload\reload_state.cpp
 set PSRC=tests\test_players.cpp players.cpp ..\sigscan.cpp
 

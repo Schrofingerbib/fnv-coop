@@ -4,6 +4,7 @@
 
 #include <Windows.h>
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -22,6 +23,8 @@
 #include "GameExtraData.h"
 #include "effect_json.h"
 #include "engine_addrs.h"
+#include "ref_ops.h"
+#include "story_addrs.h"
 
 using namespace fnvcoop;
 
@@ -449,6 +452,72 @@ Fn_Cmd o_AddItem, o_RemoveItem, o_RewardXP, o_Kill, o_Resurrect, o_MoveTo, o_Mod
         return CMD_FWD(o_##name);                                            \
     }
 
+// ---- story capture: the generic RefCommand hooks (ref_ops.h) --------------------------------------------------------------------------
+bool g_storyOn = false;
+// One detour for every story command. Arguments are decoded BEFORE the original runs (a command may delete what it was given), the command is
+// recorded after it succeeded. With story capture off the three shared handlers (StartCombat, StopCombat, Activate) behave as they always did.
+bool storyCmd(const RefOpSpec* s, Fn_Cmd o, void* pi, void* sd, void* thisObj, void* contObj, void* script, void* ev, double* res, UInt32* opc) {
+    if (blockedNow()) return true;
+    if (!g_storyOn || !s || !capturing()) return CMD_FWD(o);
+    uint32_t raw[kMaxStoryArgs] = {};
+    char text[kMaxStoryArgs][kStoryTextMax] = {};   // a text parameter is copied into a buffer (xNVSE: char name[256]; ExtractArgs(..., &name))
+    const size_t n = std::strlen(s->sig);
+    void* out[kMaxStoryArgs];
+    for (int k = 0; k < kMaxStoryArgs; ++k) out[k] = (static_cast<size_t>(k) < n && s->sig[k] == 's') ? static_cast<void*>(text[k]) : static_cast<void*>(&raw[k]);
+    UInt32 off = *opc;  // ExtractArgs advances the offset: work on a copy so the real call sees the original
+    // kMaxStoryArgs output pointers whatever the command takes: ExtractArgs fills only as many as the command has parameters
+    const bool parsed = n == 0 || extractArgs()(pi, sd, &off, thisObj, contObj, script, ev, out[0], out[1], out[2], out[3], out[4], out[5]);
+    RefCommand rc;
+    bool have = false;
+    if (parsed) {
+        ArgValue av[kMaxStoryArgs];
+        for (size_t k = 0; k < n && k < static_cast<size_t>(kMaxStoryArgs); ++k) {
+            switch (s->sig[k]) {
+                case 'o': av[k].form = raw[k] ? refIdOf(reinterpret_cast<void*>(static_cast<uintptr_t>(raw[k]))) : 0; break;
+                case 'f': std::memcpy(&av[k].f, &raw[k], sizeof(float)); break;
+                case 's': text[k][kStoryTextMax - 1] = 0; av[k].s = text[k]; break;
+                default: av[k].i = static_cast<int32_t>(raw[k]); break;
+            }
+        }
+        have = buildRefCommand(*s, refIdOf(thisObj), av, [](uint32_t id, FormRef* out) { return g_res && g_res->toRef(id, out); }, &rc);
+        // a command on anything but the player (actor, container, list, quest) concerns every machine; one on the player follows the reward rule of the policy
+        if (have && rc.to.mode == Recipient::Default && !isPlayer(thisObj)) rc.to = Recipient::all();
+    }
+    const bool ok = CMD_FWD(o);
+    if (ok && have && capturing()) g_hub->record(rc);
+    else if (ok && parsed) ++g_unmapped.storyDropped;
+    return ok;
+}
+// ForceActiveQuest <quest>: an existing Effect type (the journal focus of the acting player).
+Fn_Cmd o_ForceActiveQuest;
+bool __cdecl h_ForceActiveQuest(void* pi, void* sd, void* thisObj, void* contObj, void* script, void* ev, double* res, UInt32* opc) {
+    if (blockedNow()) return true;
+    TESForm* q = nullptr;
+    FormRef qr;
+    UInt32 off = *opc;
+    const bool have = capturing() && extractArgs()(pi, sd, &off, thisObj, contObj, script, ev, &q) && q && formRef(q, &qr);
+    const bool ok = CMD_FWD(o_ForceActiveQuest);
+    if (ok && have) g_hub->record(ForceActiveQuest{qr, Recipient::dflt()});   // the host policy narrows it to the acting player
+    return ok;
+}
+template <size_t N>
+struct StoryDet {
+    static inline Fn_Cmd orig = nullptr;
+    static bool __cdecl det(void* pi, void* sd, void* thisObj, void* contObj, void* script, void* ev, double* res, UInt32* opc) {
+        return storyCmd(&kStorySpecs[N], orig, pi, sd, thisObj, contObj, script, ev, res, opc);
+    }
+};
+constexpr size_t kStoryN = fnvcoop::kOpCount_ - 1;   // one spec per op (checked at Init and by the unit tests)
+struct StoryEntry {
+    const RefOpSpec* spec;
+    void* detour;
+    void* origOut;
+};
+template <size_t... I>
+std::array<StoryEntry, sizeof...(I)> makeStoryEntries(std::index_sequence<I...>) {
+    return {{StoryEntry{&kStorySpecs[I], reinterpret_cast<void*>(&StoryDet<I>::det), reinterpret_cast<void*>(&StoryDet<I>::orig)}...}};
+}
+
 // AddScriptPackage / RemoveScriptPackage: observer (L12 world state) called after the original succeeded, host capturing only.
 ScriptPackageObserver g_pkgObs;
 bool pkgCmd(Fn_Cmd o, bool add, CMD_ARGS) {
@@ -466,9 +535,11 @@ bool pkgCmd(Fn_Cmd o, bool add, CMD_ARGS) {
 }
 bool __cdecl h_AddScriptPackage(CMD_ARGS) { return pkgCmd(o_AddScriptPackage, true, pi, sd, thisObj, contObj, script, ev, res, opc); }
 bool __cdecl h_RemoveScriptPackage(CMD_ARGS) { return pkgCmd(o_RemoveScriptPackage, false, pi, sd, thisObj, contObj, script, ev, res, opc); }
-BLOCK_CMD(StartCombat)
-BLOCK_CMD(StopCombat)
-BLOCK_CMD(ActivateCmd)
+bool __cdecl h_ModFactionRank(CMD_ARGS) { return storyCmd(storySpecFor(kOpModFactionRank), o_ModFactionRank, pi, sd, thisObj, contObj, script, ev, res, opc); }
+// StartCombat / StopCombat / Activate: blocked on a guest's local script as before; with story capture on they are also recorded.
+bool __cdecl h_StartCombat(CMD_ARGS) { return storyCmd(storySpecFor(kOpStartCombat), o_StartCombat, pi, sd, thisObj, contObj, script, ev, res, opc); }
+bool __cdecl h_StopCombat(CMD_ARGS) { return storyCmd(storySpecFor(kOpStopCombat), o_StopCombat, pi, sd, thisObj, contObj, script, ev, res, opc); }
+bool __cdecl h_ActivateCmd(CMD_ARGS) { return storyCmd(storySpecFor(kOpActivate), o_ActivateCmd, pi, sd, thisObj, contObj, script, ev, res, opc); }
 
 // ---- command-level captures for the census backlog (ExtractArgs re-parses the same script data on a COPY of the offset) ----
 template <class... Out>
@@ -498,7 +569,7 @@ bool factionCmd(Fn_Cmd o, int kind /*0 set/add, 1 remove*/, CMD_ARGS) {
 bool __cdecl h_SetFactionRank(CMD_ARGS) { return factionCmd(o_SetFactionRank, 0, pi, sd, thisObj, contObj, script, ev, res, opc); }
 bool __cdecl h_AddToFaction(CMD_ARGS) { return factionCmd(o_AddToFaction, 0, pi, sd, thisObj, contObj, script, ev, res, opc); }
 bool __cdecl h_RemoveFromFaction(CMD_ARGS) { return factionCmd(o_RemoveFromFaction, 1, pi, sd, thisObj, contObj, script, ev, res, opc); }
-BLOCK_CMD(ModFactionRank)  // delta-style: no Effect yet (needs the resulting rank)
+// ModFactionRank is a DELTA: recorded as the command itself (RefCommand ModFactionRank) when story capture is on, see h_ModFactionRank below storyCmd
 
 // Perks (player): AddPerk / RemovePerk (perk, alt) -> SetPerk{perk, rank 1 | 0}
 bool perkCmd(Fn_Cmd o, bool add, CMD_ARGS) {
@@ -1121,6 +1192,28 @@ InitReport Init(CaptureHub& h, Role role, FormResolver* res) {
         }
         rep.hooks.push_back({e.spec->name, st});
     }
+    if (g_storyOn && role != Role::Client) {   // story-capture: the RefCommand hooks + ForceActiveQuest (the three shared handlers are in kEntries)
+        auto install = [&](const HookSpec& spec, void* detour, void* origOut) {
+            Addr tramp = 0;
+            PatchStatus st = g_reg->acquire(spec, reinterpret_cast<Addr>(detour), &tramp, reinterpret_cast<Addr*>(origOut));
+            if (installed(st)) {
+                *reinterpret_cast<void**>(origOut) = reinterpret_cast<void*>(tramp);
+                ++rep.ok;
+            } else {
+                ++rep.failed;
+            }
+            rep.hooks.push_back({spec.name, st});
+        };
+        if (kStorySpecCount == kStoryN) {
+            static const auto kStory = makeStoryEntries(std::make_index_sequence<kStoryN>{});
+            for (const StoryEntry& e : kStory)
+                if (!(e.spec->flags & kRoSharedHook)) install(*e.spec->hook, e.detour, e.origOut);
+        } else {
+            ++rep.failed;   // the op table and the spec table drifted apart: install nothing rather than the wrong detours
+            rep.hooks.push_back({"story specs", PatchStatus::BadSpec});
+        }
+        install(story_addr::Cmd_ForceActiveQuest, reinterpret_cast<void*>(&h_ForceActiveQuest), reinterpret_cast<void*>(&o_ForceActiveQuest));
+    }
     return rep;
 }
 
@@ -1138,6 +1231,9 @@ std::function<bool(const std::string&, uint32_t)> g_consoleExec;
 bool g_controlsLocked = false;
 }  // namespace
 void setConsoleExec(std::function<bool(const std::string&, uint32_t)> f) { g_consoleExec = std::move(f); }
+std::function<bool(const std::string&, uint32_t)> consoleExec() { return g_consoleExec; }
+void setStoryCapture(bool on) { g_storyOn = on; }
+bool storyCaptureEnabled() { return g_storyOn; }
 bool playerControlsLocked() { return g_controlsLocked; }
 void SetPlayerControlsLocked(bool locked) {
     if (locked == g_controlsLocked || !g_consoleExec) return;

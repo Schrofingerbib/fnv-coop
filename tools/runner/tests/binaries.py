@@ -27,7 +27,7 @@ def get(name: str) -> Path:
         raise unittest.SkipTest("NVCOOP_NO_CPP=1")
     src = OUT / f"{name}.exe"
     if not src.exists():
-        raise FileNotFoundError(f"{src} missing - run tools\runner\build_l1.cmd (set NVCOOP_NO_CPP=1 to skip C++ tests explicitly)")
+        raise FileNotFoundError(f"{src} missing - run tools\\runner\\build_l1.cmd (set NVCOOP_NO_CPP=1 to skip C++ tests explicitly)")
     dst = tmpdir() / src.name
     if not dst.exists():
         shutil.copy2(src, dst)

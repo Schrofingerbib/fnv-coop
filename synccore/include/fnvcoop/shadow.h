@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 #include "fnvcoop/effect.h"
+#include "fnvcoop/refop.h"
 
 namespace fnvcoop {
 
@@ -230,6 +231,15 @@ inline bool foldRefClear(std::map<FormRef, RefInv>& invs, const RemoveAllItems& 
     return true;
 }
 
+// State entries of the generic RefCommand: (group, ref, a, b) with the slots the op does not key on left empty (refop.h).
+using RefOpKey = std::tuple<uint16_t, FormRef, FormRef, FormRef>;
+inline RefOpKey refOpKeyOf(const RefCommand& c) {
+    const RefOpInfo* i = refOpInfo(c.op);
+    const uint16_t g = i ? i->group : c.op;
+    const uint8_t k = i ? i->key : 0;
+    return RefOpKey{g, (k & kKeyRef) ? c.ref : FormRef(), (k & kKeyA) ? c.a : FormRef(), (k & kKeyB) ? c.b : FormRef()};
+}
+
 class ShadowState {
 public:
     mutable BucketCache bucketCache;
@@ -269,6 +279,7 @@ public:
     std::map<std::pair<FormRef, uint8_t>, float> angles;      // SetAngle per (ref, axis), degrees; only axes that differ from their original
     std::map<std::pair<FormRef, uint8_t>, float> angleOrig;   // the original (pre-image) of every axis in `angles`, when known
     OriginMap origins;                                        // pre-images of weather, time scale, ref script vars, map markers and locks
+    std::map<RefOpKey, RefCommand> refOps;                    // RefCommand state ops: the last command per key (no pre-image: a rebase cannot take one back)
 
     // Fold one committed txn. `me` = the local slot (kNoPlayer for the host's own bookkeeping);
     // `out` (optional) receives the post-merge effects the local world must actually perform:

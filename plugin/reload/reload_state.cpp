@@ -14,22 +14,20 @@
 #include <windows.h>
 #endif
 
+#include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
+
 namespace nvreload {
 
-// NVRELOAD_MUTANT builds re-introduce the classic reload bugs; the unit tests and the host harness must catch each one.
-#ifdef NVRELOAD_MUTANT
-constexpr bool kMutSaveFailureIgnored = (NVRELOAD_MUTANT == 1);   // a failing save no longer vetoes the reload
-constexpr bool kMutNoCrcCheck = (NVRELOAD_MUTANT == 2);           // corrupt payloads are fed to restore()
-constexpr bool kMutIgnoreVersion = (NVRELOAD_MUTANT == 3);        // an old layout is read as the current one
-constexpr bool kMutShutdownForwardOrder = (NVRELOAD_MUTANT == 4); // shutdown runs in registration order instead of reverse
-constexpr bool kMutNoLeakProbes = (NVRELOAD_MUTANT == 5);         // leak probes are never read
-constexpr bool kMutThreadNotJoined = (NVRELOAD_MUTANT == 6);      // ManagedThread detaches instead of joining
-constexpr bool kMutThrowStopsShutdown = (NVRELOAD_MUTANT == 7);   // one throwing shutdown skips the rest
-constexpr bool kMutPreflightIgnored = (NVRELOAD_MUTANT == 8);     // canUnload refusals are logged but do not veto
-#else
-constexpr bool kMutSaveFailureIgnored = false, kMutNoCrcCheck = false, kMutIgnoreVersion = false, kMutShutdownForwardOrder = false,
-               kMutNoLeakProbes = false, kMutThreadNotJoined = false, kMutThrowStopsShutdown = false, kMutPreflightIgnored = false;
-#endif
+// FNVCOOP_MUT=<n> twins re-introduce the classic reload bugs; the unit tests and the host harness must catch each one.
+// (twin numbers 1..8 = FNVCOOP_MUT at run time, see tools/mut/fnvcoop_mut.h; compiled out of production builds)
+#define kMutSaveFailureIgnored FNV_MUT(1)   // a failing save no longer vetoes the reload
+#define kMutNoCrcCheck FNV_MUT(2)           // corrupt payloads are fed to restore()
+#define kMutIgnoreVersion FNV_MUT(3)        // an old layout is read as the current one
+#define kMutShutdownForwardOrder FNV_MUT(4) // shutdown runs in registration order instead of reverse
+#define kMutNoLeakProbes FNV_MUT(5)         // leak probes are never read
+#define kMutThreadNotJoined FNV_MUT(6)      // ManagedThread detaches instead of joining
+#define kMutThrowStopsShutdown FNV_MUT(7)   // one throwing shutdown skips the rest
+#define kMutPreflightIgnored FNV_MUT(8)     // canUnload refusals are logged but do not veto
 
 // ---- bytes ---------------------------------------------------------------------------------------------------------
 void Writer::f64(double v) {

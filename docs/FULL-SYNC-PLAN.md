@@ -164,6 +164,8 @@ Hard rules that hold everywhere:
   key is logged as a bug with both values. Rubber-banding rules: actor more than 2 m off, smooth; more than 10 m
   or a different cell, snap.
 - **Observe:** a desync dashboard in the test tooling counts heals per category per minute; target 0 in tests.
+- **Status (2026-10-21):** written and unit-tested game-free, not yet run in a game and not yet wired into the frame loop: docs/tools/area-desync.md
+  (`synccore/areadigest`, `plugin/areadigest`, `tools/areadigest/dashboard.py`).
 
 ## 5. Build order (milestones)
 1. **Live-layer spike (about 1 week):** prove on our exe that a restrained puppet moves smoothly from a 100 ms

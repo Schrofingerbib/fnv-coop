@@ -65,7 +65,7 @@ test fail; the run scripts check this.
 
 ## Open items
 
-- `pluginlightun_tests.cmd` now also runs `tests/check_runtime_traces.py` on the desync traces the runtime test keeps
+- `plugin\flight\run_tests.cmd` now also runs `tests/check_runtime_traces.py` on the desync traces the runtime test keeps
   (`FNVCOOP_FLIGHT_KEEP=1`): the analyzer must name bucket 72, key aa650f118b7cb748, host 0 vs client 77. The runtime test waits up
   to 15 s for the client's desync dump (a fixed 300 ms pause failed about half the runs on a loaded PC).
 - Full `build_l1.cmd` could not be confirmed at the end: it stopped on compile errors in other agents' files

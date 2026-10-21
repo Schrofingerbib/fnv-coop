@@ -44,9 +44,14 @@ RECORD (16-byte header + payload), repeated to end of file
 | 5 | TxnApplied | one record per applied effect: `u64 seq`, `u32 epoch`, `u8 origin`, `u32 index`, `u8 appliedFlags` (1 fromSnapshot, 2 repair, 4 baseline, 8 catchUp), `u8 cause`, `u8 effectTag`, `u64 hash` |
 | 6 | Ownership | `u8 op` (0 grant, 1 transfer, 2 release, 3 rejectedStale, 4 rejectedEcho, 5 rejectedNonOwner), `u64 actor`, `u32 epoch`, `u8 fromOwner` (255 none), `u8 toOwner` (255 none), `u8 reason`, `u64 txnId` |
 | 7 | Digest | `u8 category` (0 story, 1 actors, 2 containers, 3 objects, 4 other), `u32 epoch`, `u64 seq`, `u64 hash`, `u32 itemCount`, `u16 nShards` + `u32` each, `u32 nKeys` + (`u64 key`, `u32 hash`) each |
-| 8 | Marker | `u16 kind` (0 note, 1 desync, 2 join, 3 leave, 4 test step, 5 save, 6 load, 7 rebase), `str16 text` |
+| 8 | Marker | `u16 kind` (0 note, 1 desync, 2 join, 3 leave, 4 test step, 5 save, 6 load, 7 rebase, 8 heal), `str16 text` |
 
 Marker kinds 1 and 4 are stable and are what other tools use (animcheck writes kind 4 summaries and kind 1 breaches).
+
+Marker kind 8 (heal, added for the area desync digests, additive): `heal <category> key=<id> cell=<id> <before> -> <after>` for one corrected key,
+`heals/min story=N actors=N containers=N objects=N total=N` when the heal total moved, and `BUG repeated <category> key=<id> xN authority{..} other{..}` for a
+key that came back after a heal. The Meta record then also carries `heals.<category>.total|perMin|mismatches` (categories story, actors, containers, objects)
+and the sums `heals.total` / `heals.perMin`; `tools/areadigest/dashboard.py nvfr <dump>` prints them as one line. Details: docs/tools/area-desync.md.
 
 ## 3. What the analyzer relies on
 

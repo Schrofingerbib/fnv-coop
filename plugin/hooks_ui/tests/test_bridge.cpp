@@ -1,5 +1,5 @@
 // Game-free tests for the production wiring: UiRouter + makeDialogueBridge + L8 DialogueNode over L4's InMemoryNetwork, and the ending
-// slideshow channel (SlideHost / SlideClient). Built once against the real code and once per mutant (NVUI_MUTANT=10..16, all must fail):
+// slideshow channel (SlideHost / SlideClient). Built once (FNVCOOP_RUNTIME_MUT); run once for real and once per twin (FNVCOOP_MUT=10..20, all must fail):
 //   10 client never unlocks at End   11 ending slide does not lock controls   12 slide swap not played   13 duplicate slides are replayed
 //   14 late joiner gets no replay    15 consent table ignored (plain box)     16 slide host not connected to the router
 //   17 narration stamp ignored       18 sequencer replays a released item      19 a lost predecessor blocks the show forever
@@ -475,6 +475,76 @@ TEST(stale_packets_of_an_old_show_are_ignored) {
     CHECK(!w.cr[1].sc->onPacket({0xD1, 1, 2}, w.now));  // a dialogue packet is not ours
 }
 
+// ---- one total order for slides and narration (showorder.h); twins 17..20 ------------------------------------------------------------
+// Twins 17..20 were declared in the sources but nothing ran them and no test could fail them. These do (FNVCOOP_MUT=17..20).
+TEST(show_sequencer_orders_drops_duplicates_and_skips_a_lost_item) {
+    ShowSequencer s;
+    std::vector<int> ran;
+    auto act = [&ran](int n) { return [&ran, n] { ran.push_back(n); }; };
+    CHECK(s.submit(ShowStamp{2, 1}, 0, act(2)));   // ord 2 arrives first and must wait for ord 1
+    CHECK(ran.empty() && s.pending() == 1);
+    CHECK(s.submit(ShowStamp{1, 0}, 5, act(1)));
+    CHECK((ran == std::vector<int>{1, 2}));
+    CHECK(!s.submit(ShowStamp{1, 0}, 10, act(11)));   // a retransmission of a released item is dropped (twin 18)
+    CHECK(!s.submit(ShowStamp{2, 1}, 10, act(12)));
+    CHECK((ran == std::vector<int>{1, 2}) && s.dups() == 2);
+    CHECK(s.submit(ShowStamp{4, 3}, 100, act(4)));    // ord 3 never arrives
+    s.tick(100 + 2999);
+    CHECK(ran.size() == 2 && s.pending() == 1);        // not yet: the gap timeout has not passed
+    s.tick(100 + 3000);                                // twin 19: a lost predecessor must not block the show forever
+    CHECK((ran == std::vector<int>{1, 2, 4}) && s.pending() == 0 && s.gapSkips() == 1);
+    CHECK(s.submit(ShowStamp(), 200, act(99)) && ran.back() == 99);   // an unstamped item plays at once
+}
+TEST(narration_gate_strips_the_stamp_and_follows_the_order) {
+    ShowSequencer seq;
+    std::vector<std::string> got;
+    NarrationGate::Sink sink;
+    sink.subtitle = [&got](const FormRef&, const std::string& t, float) { got.push_back("N:" + t); };
+    sink.voice = [&got](const FormRef&, const std::string& tok) { got.push_back("V:" + tok); };
+    NarrationGate g(seq, sink);
+    const FormRef npc = F(0x5000);
+    g.onSubtitle(npc, "two", 2.0f);
+    g.onVoice(npc, withOrder("b.ogg", ShowStamp{2, 1}), 0);   // the second line arrives first
+    CHECK(got.empty());                                         // twin 17 (stamp ignored) plays it at once, with the suffix still on the token
+    g.onSubtitle(npc, "one", 2.0f);
+    g.onVoice(npc, withOrder("a.ogg", ShowStamp{1, 0}), 1);
+    CHECK((got == std::vector<std::string>{"N:one", "V:a.ogg", "N:two", "V:b.ogg"}));
+    g.onSubtitle(npc, "plain", 2.0f);
+    g.onVoice(npc, "c.ogg", 2);                                 // no stamp: delivered at once, like before
+    CHECK(got.size() == 6 && got[4] == "N:plain" && got[5] == "V:c.ogg");
+}
+TEST(scene_narration_is_stamped_by_the_host_and_plays_in_order_with_the_slides) {
+    {   // the host stamps every scene line (twin 20: it does not)
+        World w;
+        w.narrate("The legion fell.", 0x6000);
+        w.step(100);
+        const Event* shown = nullptr;
+        for (auto& e : w.ev[1])
+            if (e.kind == Event::ForcedSayShow) shown = &e;
+        REQUIRE(shown != nullptr);
+        const auto& f = std::get<fnvcoop_dlg::ForcedLines>(shown->msg);
+        REQUIRE(f.lines.size() == 1);
+        std::string rest;
+        const ShowStamp st = parseOrder(f.lines[0].voice, rest);
+        CHECK(st.valid() && rest.empty());
+    }
+    // narration and slides interleaved on a link that duplicates and reorders: both players see exactly the host's order
+    for (uint64_t seed : {11u, 12u, 13u}) {
+        World w(10, 0.6, 120, seed);
+        std::vector<std::string> want;
+        for (int i = 1; i <= 6; ++i) {
+            w.narrate("line" + std::to_string(i), 0x6000 + 2u * uint32_t(i));
+            want.push_back("N:line" + std::to_string(i));
+            swapEnding(w, i);
+            char b[64];
+            want.push_back(std::string("S:") + kEnd(i, b));
+        }
+        w.slideHost->end();
+        w.step(2500);
+        for (PlayerId p = 1; p <= 2; ++p) CHECK(w.cr[p].shown == want);
+    }
+}
+
 // ---- voice token (what Line.voice carries) -----------------------------------------------------------------------------------------
 TEST(voice_token_roundtrip_and_garbage) {
     const std::string t = makeVoiceToken(FormRef("falloutnv.esm", 0x1234AB), FormRef("honesthearts.esm", 0x0F00), 3);
@@ -490,6 +560,9 @@ TEST(voice_token_roundtrip_and_garbage) {
 
 int main() {
     run("voice_token_roundtrip_and_garbage", voice_token_roundtrip_and_garbage);
+    run("show_sequencer_orders_drops_duplicates_and_skips_a_lost_item", show_sequencer_orders_drops_duplicates_and_skips_a_lost_item);
+    run("narration_gate_strips_the_stamp_and_follows_the_order", narration_gate_strips_the_stamp_and_follows_the_order);
+    run("scene_narration_is_stamped_by_the_host_and_plays_in_order_with_the_slides", scene_narration_is_stamped_by_the_host_and_plays_in_order_with_the_slides);
     run("consent_waits_for_the_party_then_resumes_with_confirm", consent_waits_for_the_party_then_resumes_with_confirm);
     run("consent_declined_gives_the_not_ready_button", consent_declined_gives_the_not_ready_button);
     run("plain_box_has_no_consent_round", plain_box_has_no_consent_round);

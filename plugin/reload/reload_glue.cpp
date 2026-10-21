@@ -1,3 +1,4 @@
+#include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
 #include "common/reload.h"
 
 #include <cstdio>
@@ -29,9 +30,7 @@ void guardEnd() { nvreload::unfreezeOthers(); }
 void ensureProbes() {
     if (g_probesAdded) return;
     g_probesAdded = true;
-#ifndef NVRELOAD_NO_WRITE_GUARD
-    nvhooks::setWriteGuard(&guardBegin, &guardEnd);
-#endif
+    if (!FNV_MUT(9)) nvhooks::setWriteGuard(&guardBegin, &guardEnd);   // twin 9: the write guard is not installed
     nvreload::global().addLeakProbe(nvreload::LeakProbe{"hooks", [] { return nvhooks::liveHookCount(); }, 0});
     nvreload::global().addLeakProbe(nvreload::LeakProbe{"hooks-chained-by-others", [] { return nvhooks::tamperedCount(); }, 0});
 }

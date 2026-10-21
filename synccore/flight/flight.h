@@ -28,7 +28,8 @@ enum DumpReason : uint8_t { kDumpManual = 0, kDumpDesync = 1, kDumpCrash = 2, kD
 enum Role : uint8_t { kRoleHost = 0, kRoleClient = 1, kRoleSim = 2 };
 enum OwnershipOp : uint8_t { kOwnGrant = 0, kOwnTransfer = 1, kOwnRelease = 2, kOwnRejectStale = 3, kOwnRejectEcho = 4, kOwnRejectNonOwner = 5 };
 enum DigestCategory : uint8_t { kCatStory = 0, kCatActors = 1, kCatContainers = 2, kCatObjects = 3, kCatOther = 4, kCatWorld = 4 };   // 4: the real engine world dumped at a desync (bucketed + per-key detail)
-enum MarkerKind : uint16_t { kMarkNote = 0, kMarkDesync = 1, kMarkJoin = 2, kMarkLeave = 3, kMarkTestStep = 4, kMarkSave = 5, kMarkLoad = 6, kMarkRebase = 7 };
+enum MarkerKind : uint16_t { kMarkNote = 0, kMarkDesync = 1, kMarkJoin = 2, kMarkLeave = 3, kMarkTestStep = 4, kMarkSave = 5, kMarkLoad = 6, kMarkRebase = 7,
+                             kMarkHeal = 8 /* area digest: one healed key, or a heals-per-minute summary (docs/tools/area-desync.md) */ };
 constexpr uint8_t kNoSlot = 0xFF;
 
 // TEST ONLY: each flag re-introduces one bug that the recorder's tests must catch (mutation twins).
@@ -42,6 +43,8 @@ struct FlightMutations {
     bool noDerivedDigest = false;  // SyncDigest messages do not yield a Digest record
     bool bucketsIgnoreValue = false;   // bucket hashes cover keys only: a changed value is invisible
     bool detailDropsKey = false;       // digestDetail loses the last entry
+    bool healNoMeta = false;           // healCounters() does not put the counters into the header Meta record
+    bool healedNoMarker = false;       // healed() records nothing
 };
 inline FlightMutations& flightMutations() { static FlightMutations m; return m; }
 
@@ -110,6 +113,14 @@ public:
     void digestDetail(uint8_t category, uint32_t epoch, uint64_t seq, const std::vector<std::pair<uint64_t, uint32_t>>& entries);
     void marker(uint16_t kind, const std::string& text);
 
+    // ---- area digest heals (synccore/areadigest; additive) ----
+    // One row per category (DigestCategory 0 story .. 3 objects). healCounters() puts "heals.<category>.total|perMin|mismatches" and the sums
+    // "heals.total" / "heals.perMin" into the header Meta record of the next dump (the desync dashboard and flight.py read them there) and, when
+    // the total moved since the last call, writes one kMarkHeal summary marker. healed() writes one kMarkHeal marker for one corrected key.
+    struct HealRow { uint8_t category = 0; uint64_t total = 0; uint32_t perMinute = 0; uint64_t mismatches = 0; };
+    void healCounters(const std::vector<HealRow>& rows);
+    void healed(uint8_t category, const std::string& text);
+
     // ---- dumping ----
     // Writes the ring to `path`. Returns false on I/O failure. Never throws.
     bool dump(const std::string& path, uint8_t reason = kDumpManual);
@@ -147,6 +158,7 @@ private:
     uint64_t lastAutoDumpMs_ = 0;
     uint32_t autoDumps_ = 0;
     std::atomic<uint32_t> fileSeq_{0};
+    uint64_t healTotalLast_ = 0;          // healCounters(): the total of the last call
 };
 
 // ---- observers: drop-in wrappers so synccore itself needs no changes ----

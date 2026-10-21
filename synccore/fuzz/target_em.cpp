@@ -20,6 +20,7 @@ struct FaultNames {
     const char* name;
     bool EngineFaults::*e;
     bool OwnershipFaults::*o;
+    bool hidden;   // accepted by --bug but not listed by --list-bugs: no oracle sees it alone (it only matters together with another fault); the unit tests twin it
 };
 const FaultNames kFaults[] = {
     {"no_dedupe", &EngineFaults::noDedupe, nullptr},
@@ -35,8 +36,17 @@ const FaultNames kFaults[] = {
     {"no_session_epoch", &EngineFaults::noSessionEpoch, nullptr},
     {"heal_disabled", &EngineFaults::healDisabled, nullptr},
     {"drop_no_idempotency", &EngineFaults::dropNoIdempotency, nullptr},
-    {"owner_keeps_publishing", &EngineFaults::ownerKeepsPublishing, nullptr},
+    {"owner_keeps_publishing", &EngineFaults::ownerKeepsPublishing, &OwnershipFaults::acceptStaleEpoch},   // the bug only bites when a receiver also applies old-epoch updates, as in the unit twin
     {"join_no_ownership", &EngineFaults::joinNoOwnership, nullptr},
+    {"death_not_idempotent", &EngineFaults::deathNotIdempotent, nullptr},
+    {"limb_not_synced", &EngineFaults::limbNotSynced, nullptr},
+    {"visual_shot_damages", &EngineFaults::visualShotDamages, nullptr},
+    {"blast_runs_everywhere", &EngineFaults::blastRunsEverywhere, nullptr},
+    {"new_owner_no_wait", &EngineFaults::newOwnerNoWait, nullptr, false},
+    {"digest_buckets_positions", &EngineFaults::digestBucketsPositions, nullptr, false},
+    {"digest_no_seq", &EngineFaults::digestNoSeq, nullptr, true},
+    {"created_key_is_player", &EngineFaults::createdKeyIsPlayer, nullptr, true},
+    {"join_no_tombstones", &EngineFaults::joinNoTombstones, nullptr, true},   // only a late copy of an old assignment (hell, a join near the end) shows it: unit twin only
     {"own_no_epoch", nullptr, &OwnershipFaults::noEpochBump},
     {"own_stale_epoch", nullptr, &OwnershipFaults::acceptStaleEpoch},
     {"own_adopt_echo", nullptr, &OwnershipFaults::adoptEcho},
@@ -89,6 +99,16 @@ public:
             s["link_retransmits"] += st.linkRetransmits; s["link_duplicates"] += st.linkDuplicates; s["double_applied"] += st.doubleApplied;
             s["repairs_sent"] += st.repairsSent;
         }
+        {   // coverage: how many actors ended the session dead on the machine that saw the most deaths (combat ops must really kill things)
+            uint64_t dead = 0;
+            for (int m = 0; m < n_; ++m) {
+                if (!connected(m)) continue;
+                uint64_t d = 0;
+                for (auto& kv : cl_->machine(static_cast<PlayerId>(m)).world().actors()) if (kv.second.dead) ++d;
+                dead = std::max(dead, d);
+            }
+            s["deaths"] = dead;
+        }
         const OwnershipService* svc = cl_->host().service();
         if (svc) { s["grants"] = svc->stats().grants; s["transfers"] = svc->stats().transfers; s["releases"] = svc->stats().releases; }
         return s;
@@ -108,7 +128,7 @@ public:
         while (cl_->now() < toMs) {
             cl_->step();
             if (frozen_) freezeAi();
-            trackBusy();
+            if (cl_->now() >= lastSampled_ + 50) { lastSampled_ = cl_->now(); trackBusy(); }   // hashing every digest of every machine is the slow part: sample at 20 Hz (by elapsed time, so any tick length samples)
             if (!frozen_) cl_->checkAlways();
         }
     }
@@ -117,10 +137,12 @@ public:
         std::vector<Violation> out;
         cl_->checkAlways();
         cl_->checkQuiescent();
+        if (frozen_) checkCompanions(out);
         for (auto& v : cl_->allViolations()) {
             const std::string& w = v.what;
-            const char* inv = "model_oracle";
-            if (w.find("stale update applied") != std::string::npos) inv = "stale_applied";
+            std::string inv = "model_oracle";
+            if (w.rfind("breach ", 0) == 0) inv = w.substr(7, w.find(':') - 7);   // a rule a test fault switched off took effect: "breach <name>: ..."
+            else if (w.find("stale update applied") != std::string::npos) inv = "stale_applied";
             else if (w.find("applied twice") != std::string::npos) inv = "double_apply";
             else if (w.find("two owners") != std::string::npos) inv = "multi_owner";
             else if (w.find("AI-driven") != std::string::npos) inv = "multi_owner";
@@ -149,7 +171,9 @@ public:
         for (auto& kv : w.actors()) {
             const ActorState& a = kv.second;
             Thing t; t.netId = a.id; t.type = 1; t.ident = (!a.dead && a.site) ? a.site : 0;
-            t.x = rnd(a.pos.x); t.y = rnd(a.pos.y); t.cell = static_cast<int>(a.cell); t.hp = a.health; t.dead = a.dead;
+            // A corpse's resting place is visual only (the model's own digest leaves it out, FULL-SYNC-PLAN 3.4 "ragdolls are visual only"): a story KillActor
+            // kills each machine's copy where that copy stands, which differs from the owner's by the interpolation error. Comparing it would flag every story kill.
+            t.x = a.dead ? 0 : rnd(a.pos.x); t.y = a.dead ? 0 : rnd(a.pos.y); t.cell = static_cast<int>(a.cell); t.hp = a.health; t.dead = a.dead;
             t.owner = a.dead ? -1 : static_cast<int>(mc.view().ownerOf(a.id));
             if (t.owner == static_cast<int>(kNoPlayer)) t.owner = -1;
             t.epoch = a.dead ? 0 : mc.view().epochOf(a.id);
@@ -174,8 +198,8 @@ public:
         ++counters_[std::string("op_") + opName(op.kind)];
         int m = ((op.m % n_) + n_) % n_;
         switch (op.kind) {
-            case OpKind::Join: if (m != 0 && !connected(m)) { cl_->join(static_cast<PlayerId>(m)); noteFresh(m); } return;
-            case OpKind::Leave: if (m != 0 && connected(m)) { cl_->checkConservation = false; cl_->leave(static_cast<PlayerId>(m)); }   // a leaver takes their items along
+            case OpKind::Join: if (m != 0 && !connected(m)) { cl_->join(static_cast<PlayerId>(m)); noteFresh(m); forgetRecruits(m); } return;
+            case OpKind::Leave: if (m != 0 && connected(m)) { cl_->checkConservation = false; cl_->leave(static_cast<PlayerId>(m)); forgetRecruits(m); }   // a leaver takes their items along
                 return;
             case OpKind::Save: lastSave_ = cl_->saveHost(); haveSave_ = true; return;
             case OpKind::Load:
@@ -184,6 +208,7 @@ public:
                     OwnEvent o; o.tMs = cl_->now(); o.ord = ++ord_; o.kind = OwnEvent::WorldEpoch; o.epoch = static_cast<uint32_t>(counters_["loads"]) + 1; own_.push_back(o);
                     cl_->checkConservation = false;   // only the host's save is the world: clients keep what they carry
                     cl_->loadHost(lastSave_);
+                    recruited_.clear();                // the saved world decides who is a companion
                 }
                 return;
             case OpKind::SetLink:
@@ -195,8 +220,9 @@ public:
                 int from = ((op.a % n_) + n_) % n_;
                 auto& ring = sent_[{from, m}];
                 if (from == m || ring.empty() || !connected(m) || !connected(from)) return;
-                const Bytes& env = ring[static_cast<size_t>(op.b) % ring.size()];
-                cl_->inject(static_cast<PlayerId>(m), static_cast<PlayerId>(from), env, op.c == 1 ? 1 : 0);
+                const Bytes* env = pickStale(ring, op.d, static_cast<size_t>(op.b));
+                if (!env) return;
+                cl_->inject(static_cast<PlayerId>(m), static_cast<PlayerId>(from), *env, op.c == 1 ? 1 : 0);
                 ++counters_["stale_injected"];
                 return;
             }
@@ -222,10 +248,47 @@ public:
             }
             case OpKind::Hit: {
                 std::vector<NetId> ids;
-                for (auto& kv : w.actors()) if (!kv.second.dead) ids.push_back(kv.first);
+                const bool strike = op.c == 1 || op.c == 2;   // c=1 a story NPC, c=2 any other actor: the attacker steps next to it first, so the hit is valid
+                for (auto& kv : w.actors()) if (!kv.second.dead && (!strike || kv.second.named == (op.c == 1))) ids.push_back(kv.first);
                 if (ids.empty()) return;
                 NetId v = ids[static_cast<size_t>(op.a) % ids.size()];
-                mc.attackActor(v, std::max(1, op.b), Limb::Torso, w.actors().at(v).pos, 1500);
+                const ActorState& target = w.actors().at(v);
+                if (strike) mc.move(target.cell, {target.pos.x + 90.0f, target.pos.y, target.pos.z});
+                if (op.b > 0) mc.attackActor(v, op.b, Limb::Torso, target.pos, 1500);
+                else if (!strike) mc.attackActor(v, 1, Limb::Torso, target.pos, 1500);
+                return;
+            }
+            case OpKind::Projectile: {
+                const NetId v = nearestActor(w, static_cast<PlayerId>(m));
+                if (!v) return;
+                mc.fireProjectile(v, std::max(1, op.b), static_cast<uint32_t>(std::max(300, op.d)), op.c == 1);
+                return;
+            }
+            case OpKind::Explosion: {
+                std::vector<NetId> ids;
+                for (auto& kv : w.actors()) if (!kv.second.dead) ids.push_back(kv.first);
+                if (ids.empty()) return;
+                const ActorState& t = w.actors().at(ids[static_cast<size_t>(op.a) % ids.size()]);
+                mc.detonate(t.pos, static_cast<float>(std::max(50, op.b)), std::max(1, op.c));
+                return;
+            }
+            case OpKind::LimbHit: {
+                const NetId v = nearestActor(w, static_cast<PlayerId>(m));
+                if (!v) return;
+                const int limb = 1 + ((op.c % 5) + 5) % 5;
+                mc.attackActor(v, std::max(1, op.b), static_cast<Limb>(limb), w.actors().at(v).pos, 1500);
+                return;
+            }
+            case OpKind::SimulKill: {
+                const NetId v = nearestActor(w, static_cast<PlayerId>(m));
+                if (!v) return;
+                mc.attackActor(v, 400, Limb::Torso, w.actors().at(v).pos, 1500);
+                const int second = ((op.b % n_) + n_) % n_;
+                if (second != m && connected(second)) {
+                    Machine& other = cl_->machine(static_cast<PlayerId>(second));
+                    if (other.world().findActor(v) && other.world().player(static_cast<PlayerId>(second)).cell == w.actors().at(v).cell) other.attackActor(v, 400, Limb::Torso, w.actors().at(v).pos, 1500);
+                }
+                if (op.c == 1 && connected(0)) cl_->machine(0).killByStory(v);
                 return;
             }
             case OpKind::Pickup: {
@@ -242,6 +305,30 @@ public:
                 std::advance(it, static_cast<size_t>(op.a) % ps.inventory.size());
                 FormRef base = it->first;
                 mc.drop(base);
+                return;
+            }
+            case OpKind::Corrupt: corrupt(m, op); return;
+            case OpKind::Recruit: {
+                if (m != 0) return;
+                std::vector<NetId> ids;
+                for (auto& kv : w.actors()) if (!kv.second.dead && kv.second.enabled) ids.push_back(kv.first);
+                const int who = ((op.b % n_) + n_) % n_;
+                if (ids.empty() || !connected(who)) return;
+                const NetId id = ids[static_cast<size_t>(op.a) % ids.size()];
+                if (mc.recruit(id, static_cast<PlayerId>(who))) recruited_[id] = static_cast<PlayerId>(who);
+                return;
+            }
+            case OpKind::Container: {
+                if (w.containers().empty()) return;
+                auto it = w.containers().begin();
+                std::advance(it, static_cast<size_t>(((op.a % 16) + 16) % 16) % w.containers().size());
+                const NetId id = it->first;
+                switch (((op.b % 4) + 4) % 4) {
+                    case 0: mc.openContainer(id); break;
+                    case 1: if (!it->second.items.empty()) mc.containerTake(id, it->second.items.begin()->first, 1); break;
+                    case 2: mc.containerPut(id, FormRef("falloutnv.esm", 0x200001u), 1); break;
+                    default: mc.closeContainer(id); break;
+                }
                 return;
             }
             case OpKind::Activate: {
@@ -277,6 +364,10 @@ public:
         if (r != ApplyResult::Applied) return;
         if (m.kind != OwnMsg::Grant && m.kind != OwnMsg::Commit && m.kind != OwnMsg::Release) return;
         if (self == 0) {
+            Envelope oe;   // remembered so a Stale op can replay an old assignment later
+            oe.sess = cl_->host().sess(); oe.src = 0; oe.dest = kNoPlayer; oe.body = MOwn{m};
+            ownRing_.push_back(encode(oe));
+            if (ownRing_.size() > 64) ownRing_.pop_front();
             OwnEvent o;
             o.tMs = t; o.ord = ++ord_; o.ref = static_cast<int>(m.netId); o.epoch = m.epoch; o.prevOwner = m.prevOwner == kNoPlayer ? -1 : static_cast<int>(m.prevOwner);
             o.owner = m.kind == OwnMsg::Release || m.owner == kNoPlayer ? -1 : static_cast<int>(m.owner);
@@ -319,6 +410,89 @@ public:
     }
 
 private:
+    // Which recorded message a Stale op replays: b picks among those of the wanted kind (d: 0 any, 1 requests that change state, 2 ownership, 3 the oldest).
+    const Bytes* pickStale(const std::deque<Bytes>& ring, int d, size_t b) const {
+        if (d == 0 || d == 3) return &ring[b % ring.size()];   // d=3: b counts from the oldest
+        if (d == 5) return ownRing_.empty() ? nullptr : &ownRing_[b % std::min<size_t>(ownRing_.size(), 8)];   // one of the oldest ownership broadcasts still remembered
+        std::vector<const Bytes*> match;
+        for (auto it = ring.rbegin(); it != ring.rend(); ++it) {
+            Envelope e;
+            if (!decode(*it, e)) continue;
+            const Body& body = e.body;
+            const bool request = std::holds_alternative<MDropReq>(body) || std::holds_alternative<MHit>(body) || std::holds_alternative<MPickup>(body) ||
+                                 std::holds_alternative<MContainerReq>(body) || std::holds_alternative<MActivate>(body) || std::holds_alternative<MSpawnRoll>(body);
+            const bool own = std::holds_alternative<MOwn>(body);
+            if ((d == 1 && request) || (d == 2 && own) || (d == 4 && std::holds_alternative<MDropReq>(body))) match.push_back(&*it);
+        }
+        return match.empty() ? nullptr : match[b % match.size()];
+    }
+    void forgetRecruits(int m) { for (auto it = recruited_.begin(); it != recruited_.end();) it = it->second == m ? recruited_.erase(it) : std::next(it); }
+    // A companion follows its recruiter wherever it goes (the follower exception). Checked once everything has settled; a recruiter that left or rejoined, or a
+    // host load, ends the promise (the service forgets recruiters when their player leaves).
+    void checkCompanions(std::vector<Violation>& out) {
+        for (auto& kv : recruited_) {
+            if (!connected(static_cast<int>(kv.second))) continue;
+            const ActorState* a = cl_->host().world().findActor(kv.first);
+            if (!a || a->dead || !a->enabled || a->recruiter != kv.second) continue;
+            const PlayerId owner = cl_->host().view().ownerOf(kv.first);
+            if (owner != kv.second)
+                out.push_back({"companion_not_with_recruiter", "companion " + std::to_string(kv.first) + " of p" + std::to_string(kv.second) + " is owned by " + (owner == kNoPlayer ? std::string("nobody") : "p" + std::to_string(owner)), cl_->now()});
+        }
+    }
+    // The living actor nearest to machine m's player, in the same cell (0 if none): a combat op aimed at it is in weapon range, so it is judged on its merits.
+    static NetId nearestActor(const World& w, PlayerId m) {
+        const PlayerState& p = w.player(m);
+        NetId best = 0;
+        float bestD = 1e30f;
+        for (auto& kv : w.actors()) {
+            const ActorState& a = kv.second;
+            if (a.dead || !a.enabled || a.cell != p.cell) continue;
+            const float d = distance(a.pos, p.pos);
+            if (d < bestD) { bestD = d; best = a.id; }
+        }
+        return best;
+    }
+    // Silent corruption of one guest's copy of something it does not own; only the digest repair can find it.
+    void corrupt(int m, const Op& op) {
+        if (m == 0 || !connected(m)) return;
+        Machine& mc = cl_->machine(static_cast<PlayerId>(m));
+        if (!mc.synced()) return;
+        World& w = mc.world();
+        const size_t pick = static_cast<size_t>(((op.a % 64) + 64) % 64);
+        switch (((op.c % 4) + 4) % 4) {
+            case 0: {
+                if (w.objects().empty()) return;
+                auto it = w.objects().begin();
+                std::advance(it, pick % w.objects().size());
+                it->second.open = !it->second.open;
+                return;
+            }
+            case 1: {
+                if (w.containers().empty()) return;
+                auto it = w.containers().begin();
+                std::advance(it, pick % w.containers().size());
+                if (it->second.inUseBy != kNoPlayer) return;   // a container in use is changing anyway
+                it->second.items[FormRef("falloutnv.esm", 0x200001u)] += 1;
+                return;
+            }
+            case 2: {
+                std::vector<NetId> ids;
+                for (auto& kv : w.actors()) if (!kv.second.dead && cl_->host().view().ownerOf(kv.first) != static_cast<PlayerId>(m)) ids.push_back(kv.first);
+                if (ids.empty()) return;
+                ActorState& a = w.actors().at(ids[pick % ids.size()]);
+                a.pos.x += 3.0f;                       // a few units and a few points of health: far below the old 256-unit / ten-point digest buckets
+                if (a.health > 3) a.health -= 3;
+                return;
+            }
+            default: {
+                if (w.items().empty()) return;
+                auto it = w.items().begin();
+                std::advance(it, pick % w.items().size());
+                it->second.taken = !it->second.taken;
+                return;
+            }
+        }
+    }
     void installShaper() {
         cl_->net().setShaper([this](PeerId from, PeerId to, uint64_t nowMs, Bytes& data) {
             auto key = std::make_pair(static_cast<int>(from), static_cast<int>(to));
@@ -372,6 +546,9 @@ private:
     std::unique_ptr<flight::EngineFlightObserver> fl_;
 #endif
     int n_ = 2;
+    uint64_t lastSampled_ = 0;              // last time trackBusy() ran
+    std::deque<Bytes> ownRing_;             // the host's last ownership broadcasts, oldest first
+    std::map<NetId, PlayerId> recruited_;   // companions made by Recruit ops (and still promised to their recruiter)
     bool frozen_ = false, keep_ = false, haveSave_ = false;
     size_t lastSave_ = 0;
     uint64_t ord_ = 0, lastBusy_ = 0, busyKey_ = 0;
@@ -391,7 +568,7 @@ std::unique_ptr<ITarget> makeEm(const Scenario& s, std::string* err) {
     for (auto& n : s.bugs) {
         bool found = false;
         for (auto& f : kFaults)
-            if (n == f.name) { if (f.e) ef.*f.e = true; else of.*f.o = true; found = true; }
+            if (n == f.name) { if (f.e) ef.*f.e = true; if (f.o) of.*f.o = true; found = true; }
         if (!found) { if (err) *err = "unknown fault for target em: " + n; return nullptr; }
     }
     auto t = std::make_unique<Em>(s, ef, of);
@@ -400,7 +577,7 @@ std::unique_ptr<ITarget> makeEm(const Scenario& s, std::string* err) {
 }
 std::vector<std::string> emBugs() {
     std::vector<std::string> v;
-    for (auto& f : kFaults) v.push_back(f.name);
+    for (auto& f : kFaults) if (!f.hidden) v.push_back(f.name);
     return v;
 }
 

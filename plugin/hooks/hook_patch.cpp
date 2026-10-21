@@ -12,12 +12,14 @@ constexpr bool kMutRefcountIgnored = true;    // first release restores even if 
 constexpr bool kMutNoLiveCount = true;        // live counter never decremented (leak accounting lies)
 constexpr bool kMutSuspendNoop = true;        // suspendAll claims success but leaves the patch in place
 constexpr bool kMutDtorKeepsHooks = true;     // destructor forgets the hooks instead of restoring them
+constexpr bool kMutTrampolineOfLive = true;    // trampolineOf answers the hooked entry itself (a caller would run our detour, not the original)
 #else
 constexpr bool kMutSkipPrologueCheck = false;
 constexpr bool kMutRefcountIgnored = false;
 constexpr bool kMutNoLiveCount = false;
 constexpr bool kMutSuspendNoop = false;
 constexpr bool kMutDtorKeepsHooks = false;
+constexpr bool kMutTrampolineOfLive = false;
 #endif
 
 namespace {
@@ -241,6 +243,19 @@ int HookRegistry::resumeAll() {
 
 void HookRegistry::collectTrampolines(std::vector<std::pair<Addr, size_t>>* out) const {
     for (const auto& [target, h] : hooks_) out->push_back({h.trampoline, h.trampSize});
+}
+
+Addr HookRegistry::trampolineOf(Addr target) const {
+    auto it = hooks_.find(target);
+    if (it == hooks_.end()) return 0;
+    return kMutTrampolineOfLive ? target : it->second.trampoline;
+}
+
+Addr trampolineOfAny(Addr target) {
+    std::lock_guard<std::mutex> g(g_regsMu);
+    for (auto* r : allRegs())
+        if (Addr t = r->trampolineOf(target)) return t;
+    return 0;
 }
 
 int suspendAllHooks() {

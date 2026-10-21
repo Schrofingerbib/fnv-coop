@@ -2,7 +2,11 @@
 
 #include <algorithm>
 
+#include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
+
 namespace nvui {
+
+bool mut(int n) { return FNV_MUT(n); }
 
 int32_t defaultChoiceFor(size_t n) { return n == 0 ? -1 : int32_t(n) - 1; }
 

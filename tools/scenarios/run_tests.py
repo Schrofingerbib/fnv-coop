@@ -777,7 +777,7 @@ class Cli(unittest.TestCase):
         self.assertIn("0 invalid", p.stdout)
         p = subprocess.run(py + ["list"], capture_output=True, text=True)
         self.assertEqual(p.returncode, 0)
-        self.assertEqual(len([l for l in p.stdout.splitlines() if l.strip()]), 14)
+        self.assertEqual(len([l for l in p.stdout.splitlines() if l.strip()]), 15)    # 14 + goodsprings_enemies (fight-test round, 2026-10-21)
         p = subprocess.run(py + ["plan", "vats_hit", "--prev", "goodsprings_fight"], capture_output=True, text=True)
         self.assertEqual(p.returncode, 0)
         self.assertIn('"reload": true', p.stdout)

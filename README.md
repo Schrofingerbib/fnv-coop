@@ -2,7 +2,7 @@
 
 [![Discord](https://img.shields.io/badge/Discord-chat%20and%20help-5865F2?logo=discord&logoColor=white)](https://discord.gg/EXGB49R82t)
 
-> **Status (October 2026): developer preview, about 40% of the way to full co-op. See the 10-step roadmap below.**
+> **Status (October 2026): developer preview, the code for full co-op is written; in-game testing is next. See the 10-step roadmap below.**
 >
 > | Area | Where it stands |
 > |---|---|
@@ -32,16 +32,16 @@ A step marked **Claimed** is being worked on right now. Want to take one? Open a
 
 | # | Step | What it means when you play | Status |
 |---|---|---|---|
-| 1 | Enemy and NPC sync | One PC runs each enemy's AI and everyone sees a smooth copy. Hits count once, deaths happen once, encounters spawn once, and enemy attacks, flinches and death poses look right on every screen. | **Claimed**: code written, finishing |
-| 2 | Enemy sync in the real game | The two-copy fight, ownership handoff, spawn and corpse-loot tests pass on a real PC, and the feature is switched on by default. | Next |
-| 3 | Player avatars | You see your friends as characters that walk, run, aim and animate, without needing NV:MP. | **Claimed**: finishing the code |
-| 4 | Full combat | Real-time VATS for every player, projectiles and explosions, companions in fights, crime and faction hostility. | **Claimed**: combat and real-time VATS being written |
-| 5 | Loot, items and containers | Shared containers and corpses, item drops and pickups, and no duplicated items. | **Claimed**: being written |
-| 6 | World, time and travel | Doors, terminals, switches and traps; time and weather; fast travel, waiting and sleeping by party vote; saving and rejoining. | **Claimed**: finishing the code |
-| 7 | Desync check and repair | Every area checks itself every few seconds and fixes any difference it finds. | **Claimed**: extending to enemies, loot and the world |
-| 8 | The whole main story in game | Every main questline swept stage by stage with two game copies, from Goodsprings to the endings. | **Claimed**: closing script gaps and writing sweeps for every questline (Goodsprings: 65 of 104 stages pass) |
-| 9 | Every side quest and DLC | All side quests, companions and the four DLCs, played through by two-copy test bots. | **Claimed**: sweeps and test bots being written |
-| 10 | Player release 1.0 | Installer, one-click host and join, split-screen on one PC, player guide. | **Claimed**: installer, launcher, split-screen and player guide being written |
+| 1 | Enemy and NPC sync | One PC runs each enemy's AI and everyone sees a smooth copy. Hits count once, deaths happen once, encounters spawn once, and enemy attacks, flinches and death poses look right on every screen. | Code written, in-game test next |
+| 2 | Enemy sync in the real game | The two-copy fight, ownership handoff, spawn and corpse-loot tests pass on a real PC, and the feature is switched on by default. | Next: the two-copy fight test in game |
+| 3 | Player avatars | You see your friends as characters that walk, run, aim and animate, without needing NV:MP. | Code written, in-game test next |
+| 4 | Full combat | Real-time VATS for every player, projectiles and explosions, companions in fights, crime and faction hostility. | Code written (combat, real-time VATS, companions, crime), in-game test next |
+| 5 | Loot, items and containers | Shared containers and corpses, item drops and pickups, and no duplicated items. | Code written, in-game test next |
+| 6 | World, time and travel | Doors, terminals, switches and traps; time and weather; fast travel, waiting and sleeping by party vote; saving and rejoining. | Code written, in-game test next |
+| 7 | Desync check and repair | Every area checks itself every few seconds and fixes any difference it finds. | Code written for enemies, loot and the world, in-game test next |
+| 8 | The whole main story in game | Every main questline swept stage by stage with two game copies, from Goodsprings to the endings. | Script calls synced: 99.98%. Playthrough bots for 17 questlines written. Goodsprings: 65 of 104 stages pass in game |
+| 9 | Every side quest and DLC | All side quests, companions and the four DLCs, played through by two-copy test bots. | Playthrough plans and test bots written, in-game runs next |
+| 10 | Player release 1.0 | Installer, one-click host and join, split-screen on one PC, player guide. | Installer, launcher, split-screen and player guide written, in-game test next |
 
 ## Play in three steps
 

@@ -1,0 +1,1164 @@
+{
+ "schema": 1,
+ "note": "Applied to docs/quest-policies/rules.json by tools/questsweep/rules_overlay.py; derived from rules.pending.json, plugin/hooks/data/guest_local_run.json and the lane review documents named in `source`.",
+ "ops": [
+  {
+   "quest": "AchievementQuest",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:07691E"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "AutoDocTimerQuest",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:179229"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "BH01",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:041E5C"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "CG00",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:0E58BF"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "FerociousLoyaltyQuest",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:16517D"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "FriendOfTheNightQuest",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:165119"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "Generic",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:032DF1"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "ImplantTimerQuest",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:176ACA"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "MeatOfChampions",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:164AF9"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "NVDLC02RadioMessage",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "HonestHearts.esm:010EF4"
+    ]
+   },
+   "why": "Happy Trails radio broadcast: playback state of the local radio (running flag), stub script, never gates story",
+   "source": "plugin/hooks/data/guest_local_run.json",
+   "entry": {
+    "tier": "T1",
+    "questline": "Systems: dlc_setup",
+    "curated": false
+   }
+  },
+  {
+   "quest": "NVDLC02RainQuest",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "HonestHearts.esm:00EDE5"
+    ]
+   },
+   "why": "Honest Hearts rain: pDepth tracks the local player height/camera every frame, presentation only",
+   "source": "plugin/hooks/data/guest_local_run.json",
+   "entry": {
+    "tier": "T1",
+    "questline": "Systems: dlc_setup",
+    "curated": false
+   }
+  },
+  {
+   "quest": "NVDLC05MQ00",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "GunRunnersArsenal.esm:00093B"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "RadioBlackMountain",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:0E60E8"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "RadioNewVegas",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:14E303"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "RadioVault101PA",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:07161B"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "TopsRadioQuest",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:16B672"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "VCG01Test",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:1055B5"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "VCG04",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:11649F"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "VCasinoCompsUltraLuxe",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:1614D4"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "VEndingBinks",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:15FF6F"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "VStreetLighting",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:127E9E"
+    ]
+   },
+   "why": "street lights follow each machine own game clock (LightsOn is a function of GameHour), a pure presentation toggle",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "vCasinoCompsAtomicWrangler",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:161510"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "vCasinoCompsGomorrah",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:1607FE"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "vCasinoCompsVikkiAndVance",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:161E90"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "vCountryRadioQuest",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:16B670"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "vDialogueCasinoCashier",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:17B77D"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "vGomorrahRadioQuest",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:16B671"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "vNCREmergencyRadio",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:14B3EC"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "vUltraLuxeRadioQuest",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:16B66F"
+    ]
+   },
+   "why": "per-machine quest script (plugin/hooks/data/guest_local_run.json): runs on every machine, nothing replicated",
+   "source": "plugin/hooks/data/guest_local_run.json"
+  },
+  {
+   "quest": "VDLCPackQuest",
+   "kind": "GuestLocalRun",
+   "mode": "merge",
+   "params": {
+    "scripts": [
+     "FalloutNV.esm:17912E",
+     "DeadMoney.esm:0062B1",
+     "FalloutNV.esm:070ECA",
+     "HonestHearts.esm:008A32",
+     "LonesomeRoad.esm:003604",
+     "OldWorldBlues.esm:002FD0"
+    ]
+   },
+   "why": "the DLC setup quests' stage results start the DLC story and must keep replicating, so only their object scripts are listed here: DeadMoney.esm:0062B1, FalloutNV.esm:070ECA, HonestHearts.esm:008A32, LonesomeRoad.esm:003604, OldWorldBlues.esm:002FD0",
+   "source": "plugin/hooks/data/guest_local_run.json (story-bearing quests: NVDLC01MQ00, NVDLC02MQ00, NVDLC03MQ00, NVDLC04MQ00)"
+  },
+  {
+   "quest": "AchievementQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "AudioHolotapes",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "AutoDocTimerQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "BH01",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "CG00",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "CG02",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "ControlRumble",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "Doctors",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "FFradioSignals02",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "FerociousLoyaltyQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "FriendOfTheNightQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "Generic",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "HD00JukeboxMusic",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "ImplantTimerQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "MeatOfChampions",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "NVDLC05MQ00",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "PerkWildWasteland",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "RadioBlackMountain",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "RadioNewVegas",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "RadioRepconQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "RadioTenpenny",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "RadioVault101PA",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "StripRadioQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "TopsRadioQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "VCG01Test",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "VCG04",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "VCasinoCompsUltraLuxe",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "VChipHistory",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "VDLCPackQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "VDoctors",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "VEndingBinks",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "vCampGuardianRadio",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "vCasinoCompsAtomicWrangler",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "vCasinoCompsGomorrah",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "vCasinoCompsVikkiAndVance",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "vCountryRadioQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "vDialogueCasinoCashier",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "vGSRadioQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "vGomorrahRadioQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "vNCREmergencyRadio",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "vUltraLuxeRadioQuest",
+   "kind": "PerPlayerScene",
+   "mode": "merge",
+   "params": {
+    "run": "every-machine",
+    "scope": "local-machine"
+   },
+   "why": "lane-decided per-machine scene: the engine drops its txns (runs on every machine)",
+   "source": "rules.pending.json PerPlayerScene.run/scope"
+  },
+  {
+   "quest": "NVDLC03MQ05",
+   "kind": "PerPlayerVars",
+   "mode": "merge",
+   "params": {
+    "vars": [
+     "bRestoreBodyParts",
+     "bImplants",
+     "nButton"
+    ]
+   },
+   "why": "per-player script variables (host-side copy per slot); wildcards and prose entries of the lane list are not variables and are left out: *SwapMsg, perks:Brainless/Spineless/Heartless <-> BigBrained/CardiacArrest/ReinforcedSpine, caps cost",
+   "source": "rules.pending.json PerPlayerScene.per_player"
+  },
+  {
+   "quest": "NVDLC03HQBuddy",
+   "kind": "PerPlayerVars",
+   "mode": "merge",
+   "params": {
+    "vars": [
+     "bAwaitingInput",
+     "nButton",
+     "perks"
+    ]
+   },
+   "why": "per-player script variables (host-side copy per slot); wildcards and prose entries of the lane list are not variables and are left out: caps cost",
+   "source": "rules.pending.json PerPlayerScene.per_player"
+  },
+  {
+   "quest": "NVDLC03X13Setup",
+   "kind": "PerPlayerVars",
+   "mode": "merge",
+   "params": {
+    "vars": [
+     "perks"
+    ]
+   },
+   "why": "per-player script variables (host-side copy per slot)",
+   "source": "rules.pending.json PerPlayerScene.per_player"
+  },
+  {
+   "quest": "NVDLC03X13Replay",
+   "kind": "PerPlayerVars",
+   "mode": "merge",
+   "params": {
+    "vars": [
+     "perks"
+    ]
+   },
+   "why": "per-player script variables (host-side copy per slot)",
+   "source": "rules.pending.json PerPlayerScene.per_player"
+  },
+  {
+   "quest": "NVDLC03GenericPerkQUEST",
+   "kind": "PerPlayerVars",
+   "mode": "merge",
+   "params": {
+    "vars": [
+     "perks",
+     "items"
+    ]
+   },
+   "why": "per-player script variables (host-side copy per slot)",
+   "source": "rules.pending.json PerPlayerScene.per_player"
+  },
+  {
+   "quest": "NVDLC03RadarFence",
+   "kind": "PerPlayerVars",
+   "mode": "merge",
+   "params": {
+    "vars": [
+     "iState",
+     "fTimer",
+     "bRadar"
+    ]
+   },
+   "why": "per-player script variables (host-side copy per slot)",
+   "source": "rules.pending.json PerPlayerScene.per_player"
+  },
+  {
+   "quest": "NVDLC03DialogueHQBuddies",
+   "kind": "PerPlayerVars",
+   "mode": "merge",
+   "params": {
+    "vars": [
+     "perks"
+    ]
+   },
+   "why": "per-player script variables (host-side copy per slot); wildcards and prose entries of the lane list are not variables and are left out: barter menu",
+   "source": "rules.pending.json PerPlayerScene.per_player"
+  },
+  {
+   "quest": "VNipton",
+   "kind": "ExclusiveStages",
+   "mode": "add",
+   "params": {
+    "stages": [
+     30,
+     35,
+     70
+    ],
+    "resolution": "first-wins"
+   },
+   "why": "alternative outcomes, not progress: the first committed one wins in host order",
+   "source": "questlines/prologue/policy_review.md P09: rescued vs captives killed vs failure race across initiators"
+  },
+  {
+   "quest": "nVPrimmDeputyConv",
+   "kind": "ExclusiveStages",
+   "mode": "add",
+   "params": {
+    "stages": [
+     110,
+     120,
+     130
+    ],
+    "resolution": "first-wins"
+   },
+   "why": "alternative outcomes, not progress: the first committed one wins in host order",
+   "source": "questlines/prologue/policy_review.md P05: the three sheriff endings are alternatives"
+  },
+  {
+   "quest": "VMQYesMan01a",
+   "kind": "ExclusiveStages",
+   "mode": "add",
+   "params": {
+    "stages": [
+     100,
+     110
+    ],
+    "resolution": "first-wins"
+   },
+   "why": "alternative outcomes, not progress: the first committed one wins in host order",
+   "source": "questlines/yesman/policy_review.md section 4: upgrade (100) or destroy (110) the Securitron army, mutually exclusive, both complete the quest"
+  },
+  {
+   "quest": "VDialogueMrHouse",
+   "kind": "ReadyCheck",
+   "mode": "add",
+   "params": {
+    "infos": [
+     "FalloutNV.esm:15EB69"
+    ],
+    "timeout_s": 120,
+    "on_timeout": "cancel",
+    "confirm": "all-players"
+   },
+   "why": "an irreversible INFO result: hold it until every joined player confirms; on timeout cancel so an AFK player cannot drag the party in",
+   "source": "questlines/house/policy_review.md F4: \"I'm ready. Let's finish this.\" is irreversible (controls off, save, warp)"
+  },
+  {
+   "quest": "VMQTops",
+   "kind": "ReadyCheck",
+   "mode": "add",
+   "params": {
+    "infos": [
+     "FalloutNV.esm:160723",
+     "FalloutNV.esm:160735"
+    ],
+    "timeout_s": 120,
+    "on_timeout": "cancel",
+    "confirm": "all-players"
+   },
+   "why": "an irreversible INFO result: hold it until every joined player confirms; on timeout cancel so an AFK player cannot drag the party in",
+   "source": "questlines/yesman/policy_review.md moment 5: Yes Man topics 067 / 073 begin SetStage VMQYesMan03 100, the point of no return"
+  },
+  {
+   "quest": "VMQ05",
+   "kind": "Barrier",
+   "mode": "merge",
+   "params": {
+    "stages": [
+     100
+    ]
+   },
+   "why": "without a stages list the engine holds every stage request of the quest",
+   "source": "rules.pending.json Barrier.stages (T6b pnr_vote plays VMQ05 100)"
+  },
+  {
+   "quest": "vHDBattleController",
+   "kind": "Barrier",
+   "mode": "merge",
+   "params": {
+    "stages": [
+     30
+    ]
+   },
+   "why": "without a stages list the engine holds every stage request of the quest",
+   "source": "rules.pending.json Barrier.stages"
+  },
+  {
+   "quest": "VMQ05",
+   "kind": "PartyTether",
+   "mode": "merge",
+   "params": {
+    "stages": [
+     60,
+     100
+    ]
+   },
+   "why": "without a stages list the engine holds every stage request of the quest",
+   "source": "rules.pending.json PartyTether.stages"
+  },
+  {
+   "quest": "vHDBattleController",
+   "kind": "PartyTether",
+   "mode": "merge",
+   "params": {
+    "stages": [
+     10
+    ]
+   },
+   "why": "without a stages list the engine holds every stage request of the quest",
+   "source": "rules.pending.json PartyTether.stages"
+  },
+  {
+   "quest": "VMQHouse1",
+   "kind": "PartyTether",
+   "mode": "merge",
+   "params": {
+    "stages": [
+     25
+    ]
+   },
+   "why": "without a stages list the engine holds every stage request of the quest",
+   "source": "rules.pending.json PartyTether.stages"
+  },
+  {
+   "quest": "FadeToCreditsTimer",
+   "kind": "Barrier",
+   "mode": "merge",
+   "params": {
+    "before": "slideshow"
+   },
+   "why": "controls of everyone stay locked from the barrier release until the committed SlideshowEnd",
+   "source": "rules.pending.json Barrier.before"
+  },
+  {
+   "quest": "SecuritronVaultExplodeQuest",
+   "kind": "Barrier",
+   "mode": "merge",
+   "params": {
+    "before": "slideshow"
+   },
+   "why": "controls of everyone stay locked from the barrier release until the committed SlideshowEnd",
+   "source": "rules.pending.json Barrier.before"
+  },
+  {
+   "quest": "VEnding",
+   "kind": "Barrier",
+   "mode": "merge",
+   "params": {
+    "before": "slideshow"
+   },
+   "why": "controls of everyone stay locked from the barrier release until the committed SlideshowEnd",
+   "source": "rules.pending.json Barrier.before"
+  },
+  {
+   "quest": "VHDKimballSpeech",
+   "kind": "Barrier",
+   "mode": "merge",
+   "params": {
+    "before": "slideshow"
+   },
+   "why": "controls of everyone stay locked from the barrier release until the committed SlideshowEnd",
+   "source": "rules.pending.json Barrier.before"
+  },
+  {
+   "quest": "VLegateShowdown",
+   "kind": "Barrier",
+   "mode": "merge",
+   "params": {
+    "before": "slideshow"
+   },
+   "why": "controls of everyone stay locked from the barrier release until the committed SlideshowEnd",
+   "source": "rules.pending.json Barrier.before"
+  },
+  {
+   "quest": "VMQEndStates",
+   "kind": "Barrier",
+   "mode": "merge",
+   "params": {
+    "before": "slideshow"
+   },
+   "why": "controls of everyone stay locked from the barrier release until the committed SlideshowEnd",
+   "source": "rules.pending.json Barrier.before"
+  },
+  {
+   "quest": "VMQEndStatesFreeside",
+   "kind": "Barrier",
+   "mode": "merge",
+   "params": {
+    "before": "slideshow"
+   },
+   "why": "controls of everyone stay locked from the barrier release until the committed SlideshowEnd",
+   "source": "rules.pending.json Barrier.before"
+  },
+  {
+   "quest": "VMQEndStatesTheStrip",
+   "kind": "Barrier",
+   "mode": "merge",
+   "params": {
+    "before": "slideshow"
+   },
+   "why": "controls of everyone stay locked from the barrier release until the committed SlideshowEnd",
+   "source": "rules.pending.json Barrier.before"
+  },
+  {
+   "quest": "VStoryStateQuest",
+   "kind": "Barrier",
+   "mode": "merge",
+   "params": {
+    "before": "slideshow"
+   },
+   "why": "controls of everyone stay locked from the barrier release until the committed SlideshowEnd",
+   "source": "rules.pending.json Barrier.before"
+  },
+  {
+   "quest": "NVDLC03MQ00",
+   "kind": "PartyTether",
+   "mode": "add",
+   "params": {
+    "anchor": "NVDLC03CrashedSatelliteREF",
+    "radius": 1500,
+    "gather": "auto-warp",
+    "stages": [
+     100
+    ]
+   },
+   "why": "the satellite button is one-way: refuse until every slot is inside the radius",
+   "source": "questlines/owb/policy_review.md: satellite activation is one-way; the MenuMode button sets stage 100"
+  }
+ ]
+}

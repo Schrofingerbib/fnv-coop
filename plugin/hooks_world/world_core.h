@@ -1,7 +1,7 @@
 // L12 world-state core (game-free, unit-tested). Everything here is plain C++ over synccore types; the engine glue lives
 // in world_hooks.cpp / world_apply.cpp and only feeds this code.
 //
-// NVWORLD_MUT=<n> compiles a deliberately broken variant (mutation twin n); the test binary must fail for every n.
+// Mutation twins: FNVCOOP_MUT=<n> at run time (test builds only, tools/mut/fnvcoop_mut.h) switches on a deliberately broken variant; the test binary must fail for every n.
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -15,9 +15,7 @@
 #include "fnvcoop/effect.h"
 #include "world_effects.h"
 
-#ifndef NVWORLD_MUT
-#define NVWORLD_MUT 0
-#endif
+#include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
 
 namespace nvworld {
 
@@ -126,9 +124,9 @@ public:
     // A new world was loaded (save load / new game / back to menu): created refs of the old world no longer exist.
     void clear() {
         map_.clear();
-#if NVWORLD_MUT != 27
-        pending_.clear();  // MUTANT 27: queued spawns of the old world survive a load
-#endif
+        if (!FNV_MUT(27)) {
+            pending_.clear();  // MUTANT 27: queued spawns of the old world survive a load
+        }
         deferred_.clear();
     }
     CreatedRefMap& map() { return map_; }
@@ -203,6 +201,10 @@ std::string setRelationLine(Relation kind, uint32_t factionA, uint32_t factionB)
 std::string scriptPackageLine(bool add, uint32_t packageID);         // on the actor
 std::string ignoreCrimeLine(bool on);                                // on the actor
 std::string setPCEnemyOfFactionLine(uint32_t factionID, bool on);
+std::string setOwnershipLine(uint32_t ownerID);                      // on the ref; 0 = no argument (the player owns it)
+std::string clearOwnershipLine();                                    // on the ref
+std::string setCellOwnershipLine(uint32_t cellID, uint32_t ownerID);
+std::string setCellPublicFlagLine(uint32_t cellID, bool on);
 std::string avLine(const SetActorValueRef& e);                       // on the actor; empty if the AV has no console name
 std::string placeAtMeLine(uint32_t baseID, int count);               // on a reference in the target cell
 std::string setPosLine(char axis, float v);

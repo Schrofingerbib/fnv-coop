@@ -4,7 +4,7 @@
    clear reason instead of 15 build scripts dying on "'cmake' is not recognized".
 2. Without the vcvars scripts that the build scripts call by full path, every suite that calls vcvars is FAIL, and the
    reason names the missing scripts and their folder.
-3. The tool list of each suite agrees with a scan of its runner script and the scripts that it calls (one level).
+3. The tool list of each suite agrees with a scan of its runner script and the scripts that it calls (two levels).
    A Python-only slow suite (T1b full) runs without CMake or MSVC. A cl-only suite (L6, L8) runs without CMake.
 4. Without out/questdata, or with only part of it, the suites that read it (T6b, T4b, L8) SKIP with the command that
    generates it and the names of the missing files.
@@ -40,7 +40,9 @@ CMAKE_CALL = re.compile(r"""(?im)^[ \t]*(?:call[ \t]+)?"?cmake(?:\.exe)?"?[ \t]+
 VCVARS_CALL = re.compile(r"(?i)\bvcvars(?:32|64|all)\.bat\b")
 SCRIPT_REF = re.compile(r"[\w%~.\\/-]+\.(?:cmd|bat|py)\b")
 VAR_PREFIX = re.compile(r"^(?:%~dp0|%\w+%[\\/]?)+")
-HARNESS = {HERE / "test_all.py", HERE / "test_all_selftest.py"}  # they name cmake and vcvars but build nothing
+BUILD_DRIVER = ROOT / "tools" / "build" / "build.py"  # MSVC env + cmake + build lock; every run_tests script goes through it
+HARNESS = {HERE / "test_all.py", HERE / "test_all_selftest.py", ROOT / "tools" / "lint" / "check_repo_hygiene.py"}
+# they name cmake, vcvars or build.py (in prose, or in the fixtures of their own tests) but build nothing
 
 
 def code_text(path: Path) -> str:
@@ -73,22 +75,33 @@ def runner_scripts(cmd) -> list:
 def called_scripts(path: Path) -> list:
     """The repo scripts that the code of `path` names (one level). %~dp0 and %VAR%\\ prefixes are removed."""
     out = []
-    for tok in SCRIPT_REF.findall(code_text(path)):
+    text = code_text(path)
+    for tok in SCRIPT_REF.findall(text):
         tok = VAR_PREFIX.sub("", tok)
         for base in (ROOT, path.parent):
             p = (base / tok).resolve()
             if p.is_file() and ROOT in p.parents:
                 out.append(p)
                 break
+    # ROOT / "tools" / "build" / "build.py" is a path built in pieces, which SCRIPT_REF cannot see: the shared build driver
+    if BUILD_DRIVER.is_file() and re.search(r"build\.py", text) and BUILD_DRIVER not in out:
+        out.append(BUILD_DRIVER)
     return out
 
 
 def scanned_tools(cmd) -> set:
-    """{'cmake', 'msvc'} subset that the runner scripts of `cmd` (and the scripts they call) call."""
+    """{'cmake', 'msvc'} subset that the runner scripts of `cmd` (and the scripts they call, two levels) call.
+    Two levels, because the build scripts now go through tools/build/build.py (MSVC env, build lock): the runner tests
+    name tools\\runner\\build_l1.cmd, which calls build.py, which calls vcvars and cmake."""
     first = runner_scripts(cmd)
     files = set(first)
-    for f in first:
-        files.update(called_scripts(f))
+    level = set(first)
+    for _ in range(2):
+        nxt = set()
+        for f in level - HARNESS:
+            nxt.update(called_scripts(f))
+        files.update(nxt)
+        level = nxt - HARNESS
     text = "\n".join(code_text(f) for f in sorted(files - HARNESS))
     return {t for t, rx in (("cmake", CMAKE_CALL), ("msvc", VCVARS_CALL)) if rx.search(text)}
 

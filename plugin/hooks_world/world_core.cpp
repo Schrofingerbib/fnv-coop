@@ -24,6 +24,9 @@ const char* worldEffectName(const WorldEffect& e) {
         case 4: return "SetScriptPackage";
         case 5: return "SetIgnoreCrime";
         case 6: return "SetFactionPlayerEnemy";
+        case 7: return "SetOwner";
+        case 8: return "SetCellOwner";
+        case 9: return "SetCellPublic";
     }
     return "?";
 }
@@ -32,9 +35,9 @@ const char* worldEffectName(const WorldEffect& e) {
 void CreatedRefMap::bind(const FormRef& host, uint32_t localRefID) {
     auto it = toLocal_.find(host);
     if (it != toLocal_.end()) {
-#if NVWORLD_MUT == 1
-        return;  // MUTANT: first binding wins
-#endif
+        if (FNV_MUT(1)) {
+            return;  // MUTANT: first binding wins
+        }
         toHost_.erase(it->second);
     }
     toLocal_[host] = localRefID;
@@ -56,9 +59,9 @@ bool CreatedRefMap::hostOf(uint32_t localRefID, FormRef* out) const {
 bool CreatedRefMap::forget(const FormRef& host) {
     auto it = toLocal_.find(host);
     if (it == toLocal_.end()) return false;
-#if NVWORLD_MUT != 2
-    toHost_.erase(it->second);
-#endif
+    if (!FNV_MUT(2)) {
+        toHost_.erase(it->second);
+    }
     toLocal_.erase(it);
     return true;
 }
@@ -75,9 +78,9 @@ bool WorldResolver::toRef(uint32_t refID, FormRef* out) {
         *out = FormRef(fnvcoop::createdRefPlugin(), refID);
         return true;
     }
-#if NVWORLD_MUT == 3
-    return false;  // MUTANT: client never translates its local created refs back to host refs
-#endif
+    if (FNV_MUT(3)) {
+        return false;  // MUTANT: client never translates its local created refs back to host refs
+    }
     return map_.hostOf(refID, out);
 }
 
@@ -119,6 +122,8 @@ bool createdTargetOf(const WorldEffect& e, FormRef* out) {
             if constexpr (std::is_same_v<T, SetActorValueRef> || std::is_same_v<T, SetEssential> || std::is_same_v<T, SetRestrained> ||
                           std::is_same_v<T, SetScriptPackage> || std::is_same_v<T, SetIgnoreCrime>)
                 r = &x.actor;
+            else if constexpr (std::is_same_v<T, SetOwner>)
+                r = &x.ref;
         },
         e);
     if (!r || r->plugin != fnvcoop::createdRefPlugin()) return false;
@@ -129,9 +134,9 @@ bool createdTargetOf(const WorldEffect& e, FormRef* out) {
 Route routeEffect(const fnvcoop::Effect& e, const CreatedRefMap& m, FormRef* waitOn) {
     FormRef t;
     if (!createdTargetOf(e, &t)) return Route::Apply;
-#if NVWORLD_MUT == 28
-    return Route::Apply;  // MUTANT: follow-ups on a not-yet-created ref are applied (and lost) instead of held
-#endif
+    if (FNV_MUT(28)) {
+        return Route::Apply;  // MUTANT: follow-ups on a not-yet-created ref are applied (and lost) instead of held
+    }
     if (m.local(t)) return Route::Apply;
     if (waitOn) *waitOn = t;
     return Route::HoldForCreated;
@@ -164,11 +169,8 @@ void DeferredQueue::hold(HeldEffect h) {
 std::vector<HeldEffect> DeferredQueue::takeBound(const CreatedRefMap& m) {
     std::vector<HeldEffect> out, keep;
     for (auto& h : q_) {
-#if NVWORLD_MUT == 29
-        bool ready = h.onCreated;  // MUTANT: released before the ref is bound
-#else
-        bool ready = h.onCreated && m.local(h.waitOn) != 0;
-#endif
+        // MUTANT 29: released before the ref is bound
+        bool ready = FNV_MUT(29) ? h.onCreated : (h.onCreated && m.local(h.waitOn) != 0);
         (ready ? out : keep).push_back(std::move(h));
     }
     q_ = std::move(keep);
@@ -180,9 +182,9 @@ std::vector<HeldEffect> DeferredQueue::takeRetries(int maxAttempts) {
     for (auto& h : q_) {
         ++h.attempts;
         int limit = h.onCreated ? maxAttempts * 4 : maxAttempts;
-#if NVWORLD_MUT == 30
-        limit = 1 << 30;  // MUTANT: nothing ever expires
-#endif
+        if (FNV_MUT(30)) {
+            limit = 1 << 30;  // MUTANT: nothing ever expires
+        }
         if (h.attempts > limit) {
             ++expired_;
             continue;
@@ -208,11 +210,11 @@ size_t DeferredQueue::dropFor(const FormRef& host) {
 
 // ------------------------------------------------------------------------------------------------ SpawnLedger
 SpawnAction SpawnLedger::onSpawn(const fnvcoop::SpawnRef& s, bool cellReady) {
-#if NVWORLD_MUT != 4
-    if (map_.local(s.ref())) return SpawnAction::Duplicate;
-    for (const auto& p : pending_)
-        if (p.id == s.id) return SpawnAction::Duplicate;
-#endif
+    if (!FNV_MUT(4)) {
+        if (map_.local(s.ref())) return SpawnAction::Duplicate;
+        for (const auto& p : pending_)
+            if (p.id == s.id) return SpawnAction::Duplicate;
+    }
     if (cellReady) return SpawnAction::Create;
     pending_.push_back(s);
     return SpawnAction::Queued;
@@ -220,18 +222,18 @@ SpawnAction SpawnLedger::onSpawn(const fnvcoop::SpawnRef& s, bool cellReady) {
 
 DespawnResult SpawnLedger::onDespawn(const fnvcoop::DespawnRef& d) {
     DespawnResult r;
-#if NVWORLD_MUT != 31
-    deferred_.dropFor(d.ref());  // MUTANT 31: held follow-ups of a despawned ref survive and hit a recycled id later
-#endif
-#if NVWORLD_MUT != 5
-    for (auto it = pending_.begin(); it != pending_.end(); ++it) {
-        if (it->id == d.id) {
-            pending_.erase(it);
-            r.action = DespawnAction::CancelledPending;
-            return r;
+    if (!FNV_MUT(31)) {
+        deferred_.dropFor(d.ref());  // MUTANT 31: held follow-ups of a despawned ref survive and hit a recycled id later
+    }
+    if (!FNV_MUT(5)) {
+        for (auto it = pending_.begin(); it != pending_.end(); ++it) {
+            if (it->id == d.id) {
+                pending_.erase(it);
+                r.action = DespawnAction::CancelledPending;
+                return r;
+            }
         }
     }
-#endif
     uint32_t id = map_.local(d.ref());
     if (!id) return r;  // Unknown: never created here (or already gone)
     map_.forget(d.ref());
@@ -245,14 +247,14 @@ std::vector<uint32_t> SpawnLedger::reconcile(const std::vector<fnvcoop::SpawnRef
     for (const auto& s : live) alive.insert(s.id);
     std::vector<uint32_t> stale;
     std::vector<FormRef> forget;
-#if NVWORLD_MUT != 32
-    for (const auto& kv : map_.all()) {  // MUTANT 32: a rejoining client keeps spawns the host already despawned
-        if (!alive.count(kv.first.localId)) {
-            stale.push_back(kv.second);
-            forget.push_back(kv.first);
+    if (!FNV_MUT(32)) {
+        for (const auto& kv : map_.all()) {  // MUTANT 32: a rejoining client keeps spawns the host already despawned
+            if (!alive.count(kv.first.localId)) {
+                stale.push_back(kv.second);
+                forget.push_back(kv.first);
+            }
         }
     }
-#endif
     for (const auto& f : forget) {
         map_.forget(f);
         deferred_.dropFor(f);
@@ -267,9 +269,9 @@ std::vector<uint32_t> SpawnLedger::reconcile(const std::vector<fnvcoop::SpawnRef
 std::vector<fnvcoop::SpawnRef> SpawnLedger::takeReady(const std::function<bool(const fnvcoop::SpawnRef&)>& ready) {
     std::vector<fnvcoop::SpawnRef> out, keep;
     for (auto& p : pending_) (ready(p) ? out : keep).push_back(p);
-#if NVWORLD_MUT == 6
-    return out;  // MUTANT: the queue is not drained, so the same spawn is created again on every flush
-#endif
+    if (FNV_MUT(6)) {
+        return out;  // MUTANT: the queue is not drained, so the same spawn is created again on every flush
+    }
     pending_ = std::move(keep);
     return out;
 }
@@ -282,29 +284,29 @@ bool RefVarTracker::observe(uint32_t refID, uint16_t index, double value) {
     auto it = last_.find(k);
     if (it == last_.end()) {
         last_[k] = value;
-#if NVWORLD_MUT == 7
-        return true;  // MUTANT: the baseline value is reported as a change
-#endif
+        if (FNV_MUT(7)) {
+            return true;  // MUTANT: the baseline value is reported as a change
+        }
         return false;
     }
-#if NVWORLD_MUT == 9
-    ++reported_;
-    it->second = value;
-    return true;  // MUTANT: unchanged values are reported too
-#endif
+    if (FNV_MUT(9)) {
+        ++reported_;
+        it->second = value;
+        return true;  // MUTANT: unchanged values are reported too
+    }
     if (it->second == value) return false;
-#if NVWORLD_MUT != 8
-    if (reported_ >= budget_) return false;  // deferred: the tracker keeps the old value, so a later poll reports it
-#endif
+    if (!FNV_MUT(8)) {
+        if (reported_ >= budget_) return false;  // deferred: the tracker keeps the old value, so a later poll reports it
+    }
     it->second = value;
     ++reported_;
     return true;
 }
 
 void RefVarTracker::forgetRef(uint32_t refID) {
-#if NVWORLD_MUT == 10
-    return;  // MUTANT: unloaded refs keep stale baselines
-#endif
+    if (FNV_MUT(10)) {
+        return;  // MUTANT: unloaded refs keep stale baselines
+    }
     for (auto it = last_.begin(); it != last_.end();) {
         if ((it->first >> 16) == refID) it = last_.erase(it);
         else ++it;
@@ -315,15 +317,15 @@ void RefVarTracker::forgetRef(uint32_t refID) {
 std::vector<fnvcoop::Effect> WeatherTimeSync::poll(const FormRef& weather, bool haveWeather, float timeScale) {
     std::vector<fnvcoop::Effect> out;
     if (haveWeather) {
-#if NVWORLD_MUT == 11
-        weather_ = weather;
-        out.push_back(fnvcoop::SetWeather{weather, false});  // MUTANT: every poll re-sends the weather
-#else
-        if (!weather_ || !(*weather_ == weather)) {
+        if (FNV_MUT(11)) {
             weather_ = weather;
-            out.push_back(fnvcoop::SetWeather{weather, false});
+            out.push_back(fnvcoop::SetWeather{weather, false});  // MUTANT: every poll re-sends the weather
+        } else {
+            if (!weather_ || !(*weather_ == weather)) {
+                weather_ = weather;
+                out.push_back(fnvcoop::SetWeather{weather, false});
+            }
         }
-#endif
     }
     if (timeScale > 0 && (!scale_ || *scale_ != timeScale)) {
         scale_ = timeScale;
@@ -333,17 +335,17 @@ std::vector<fnvcoop::Effect> WeatherTimeSync::poll(const FormRef& weather, bool 
 }
 
 void WeatherTimeSync::noteSent(const fnvcoop::Effect& e) {
-#if NVWORLD_MUT == 12
-    return;  // MUTANT: script-driven changes are sent a second time by the next poll
-#endif
+    if (FNV_MUT(12)) {
+        return;  // MUTANT: script-driven changes are sent a second time by the next poll
+    }
     if (auto* w = std::get_if<fnvcoop::SetWeather>(&e)) weather_ = w->weather;
     else if (auto* t = std::get_if<fnvcoop::SetTimeScale>(&e)) scale_ = t->scale;
 }
 
 bool WeatherTimeSync::blockLocal(bool guest, bool applying) {
-#if NVWORLD_MUT == 13
-    return false;  // MUTANT: guests keep their own weather
-#endif
+    if (FNV_MUT(13)) {
+        return false;  // MUTANT: guests keep their own weather
+    }
     return guest && !applying;
 }
 
@@ -352,9 +354,9 @@ std::optional<SetActorValueRef> makeAvEffect(const FormRef& actor, uint32_t av, 
     SetActorValueRef e;
     e.actor = actor;
     e.av = av;
-#if NVWORLD_MUT != 15
-    if (before == after) return std::nullopt;
-#endif
+    if (!FNV_MUT(15)) {
+        if (before == after) return std::nullopt;
+    }
     switch (kind) {
         case AvCmdKind::Set:
         case AvCmdKind::Force:
@@ -367,11 +369,11 @@ std::optional<SetActorValueRef> makeAvEffect(const FormRef& actor, uint32_t av, 
             break;
         case AvCmdKind::Damage:
             e.mode = AvMode::Damage;
-#if NVWORLD_MUT == 14
-            e.value = after - before;  // MUTANT: negative damage
-#else
-            e.value = before - after;
-#endif
+            if (FNV_MUT(14)) {
+                e.value = after - before;  // MUTANT: negative damage
+            } else {
+                e.value = before - after;
+            }
             break;
         case AvCmdKind::Restore:
             e.mode = AvMode::Restore;
@@ -415,11 +417,7 @@ static std::string num(float v) {
 std::string markForDeleteLine() { return "MarkForDelete"; }
 
 std::string setEssentialLine(const SetEssential& e, uint32_t id) {
-#if NVWORLD_MUT == 16
-    bool v = !e.essential;  // MUTANT
-#else
-    bool v = e.essential;
-#endif
+    const bool v = FNV_MUT(16) ? !e.essential : e.essential;  // MUTANT 16: inverted flag
     if (e.refOnly) return std::string("SetActorRefEssential ") + (v ? "1" : "0");
     return "SetEssential " + hex(id) + (v ? " 1" : " 0");
 }
@@ -427,9 +425,9 @@ std::string setEssentialLine(const SetEssential& e, uint32_t id) {
 std::string setRestrainedLine(bool on) { return on ? "SetRestrained 1" : "SetRestrained 0"; }
 
 std::string setRelationLine(Relation kind, uint32_t a, uint32_t b) {
-#if NVWORLD_MUT == 20
-    std::swap(a, b);  // MUTANT
-#endif
+    if (FNV_MUT(20)) {
+        std::swap(a, b);  // MUTANT
+    }
     const char* cmd = kind == Relation::Ally ? "SetAlly " : "SetEnemy ";
     // Neutral: SetEnemy with flags 0 (engine clears the relation); enemy/ally set both directions' default flags.
     return cmd + hex(a) + " " + hex(b) + (kind == Relation::Neutral ? " 0" : "");
@@ -440,29 +438,39 @@ std::string scriptPackageLine(bool add, uint32_t packageID) {
 }
 
 std::string ignoreCrimeLine(bool on) {
-#if NVWORLD_MUT == 38
-    on = !on;  // MUTANT
-#endif
+    if (FNV_MUT(38)) {
+        on = !on;  // MUTANT
+    }
     return on ? "IgnoreCrime 1" : "IgnoreCrime 0";
 }
 
 std::string setPCEnemyOfFactionLine(uint32_t factionID, bool on) {
-#if NVWORLD_MUT == 33
-    on = !on;  // MUTANT
-#endif
+    if (FNV_MUT(33)) {
+        on = !on;  // MUTANT
+    }
     return "SetPCEnemyOfFaction " + hex(factionID) + (on ? " 1" : " 0");
 }
+
+std::string setOwnershipLine(uint32_t ownerID) {
+    if (FNV_MUT(47)) ownerID = 0;   // MUTANT 47: the owner argument is dropped (the player ends up owning the thing)
+    return ownerID ? "SetOwnership " + hex(ownerID) : std::string("SetOwnership");
+}
+
+std::string clearOwnershipLine() { return "ClearOwnership"; }
+
+std::string setCellOwnershipLine(uint32_t cellID, uint32_t ownerID) {
+    if (FNV_MUT(48)) std::swap(cellID, ownerID);   // MUTANT 48: arguments swapped
+    return "SetCellOwnership " + hex(cellID) + " " + hex(ownerID);
+}
+
+std::string setCellPublicFlagLine(uint32_t cellID, bool on) { return "SetCellPublicFlag " + hex(cellID) + (on ? " 1" : " 0"); }
 
 std::string avLine(const SetActorValueRef& e) {
     const char* n = avName(e.av);
     if (!*n) return "";
     const char* cmd = nullptr;
     switch (e.mode) {
-#if NVWORLD_MUT == 17
-        case AvMode::Set: cmd = "ForceActorValue "; break;  // MUTANT: Set must change the base value, not the modified one
-#else
-        case AvMode::Set: cmd = "SetActorValue "; break;
-#endif
+        case AvMode::Set: cmd = FNV_MUT(17) ? "ForceActorValue " : "SetActorValue "; break;  // MUTANT 17: Set must change the base value, not the modified one
         case AvMode::Mod: cmd = "ModActorValue "; break;
         case AvMode::Damage: cmd = "DamageActorValue "; break;
         case AvMode::Restore: cmd = "RestoreActorValue "; break;
@@ -471,10 +479,10 @@ std::string avLine(const SetActorValueRef& e) {
 }
 
 std::string placeAtMeLine(uint32_t baseID, int count) {
-#if NVWORLD_MUT == 21
-    (void)count;
-    return "PlaceAtMe " + hex(baseID);  // MUTANT: count dropped
-#endif
+    if (FNV_MUT(21)) {
+        (void)count;
+        return "PlaceAtMe " + hex(baseID);  // MUTANT: count dropped
+    }
     return "PlaceAtMe " + hex(baseID) + " " + std::to_string(count);
 }
 
@@ -482,33 +490,39 @@ std::string setPosLine(char axis, float v) { return std::string("SetPos ") + axi
 
 // ------------------------------------------------------------------------------------------------ WorldLog
 void WorldLog::push(const WorldEffect& e) {
-#if NVWORLD_MUT != 18
-    for (auto& q : q_) {
-        if (q.index() != e.index()) continue;
-        bool same = false;
-        if (auto* a = std::get_if<SetActorValueRef>(&e)) {
-            auto& b = std::get<SetActorValueRef>(q);
-            same = a->mode == AvMode::Set && b.mode == AvMode::Set && a->actor == b.actor && a->av == b.av;
-        } else if (auto* c = std::get_if<SetEssential>(&e)) {
-            auto& d = std::get<SetEssential>(q);
-            same = c->actor == d.actor && c->refOnly == d.refOnly;
-        } else if (auto* f = std::get_if<SetRestrained>(&e)) {
-            same = f->actor == std::get<SetRestrained>(q).actor;
-        } else if (auto* g = std::get_if<SetIgnoreCrime>(&e)) {
-#if NVWORLD_MUT == 39
-            same = false;  // MUTANT: IgnoreCrime never coalesces
-#else
-            same = g->actor == std::get<SetIgnoreCrime>(q).actor;
-#endif
-        } else if (auto* h = std::get_if<SetFactionPlayerEnemy>(&e)) {
-            same = h->faction == std::get<SetFactionPlayerEnemy>(q).faction;
-        }
-        if (same) {
-            q = e;
-            return;
+    if (!FNV_MUT(18)) {
+        for (auto& q : q_) {
+            if (q.index() != e.index()) continue;
+            bool same = false;
+            if (auto* a = std::get_if<SetActorValueRef>(&e)) {
+                auto& b = std::get<SetActorValueRef>(q);
+                same = a->mode == AvMode::Set && b.mode == AvMode::Set && a->actor == b.actor && a->av == b.av;
+            } else if (auto* c = std::get_if<SetEssential>(&e)) {
+                auto& d = std::get<SetEssential>(q);
+                same = c->actor == d.actor && c->refOnly == d.refOnly;
+            } else if (auto* f = std::get_if<SetRestrained>(&e)) {
+                same = f->actor == std::get<SetRestrained>(q).actor;
+            } else if (auto* g = std::get_if<SetIgnoreCrime>(&e)) {
+            if (FNV_MUT(39)) {
+                    same = false;  // MUTANT: IgnoreCrime never coalesces
+            } else {
+                    same = g->actor == std::get<SetIgnoreCrime>(q).actor;
+            }
+            } else if (auto* h = std::get_if<SetFactionPlayerEnemy>(&e)) {
+                same = h->faction == std::get<SetFactionPlayerEnemy>(q).faction;
+            } else if (auto* o = std::get_if<SetOwner>(&e)) {
+                same = o->ref == std::get<SetOwner>(q).ref;
+            } else if (auto* co = std::get_if<SetCellOwner>(&e)) {
+                same = co->cell == std::get<SetCellOwner>(q).cell;
+            } else if (auto* cp = std::get_if<SetCellPublic>(&e)) {
+                same = cp->cell == std::get<SetCellPublic>(q).cell;
+            }
+            if (same) {
+                q = e;
+                return;
+            }
         }
     }
-#endif
     q_.push_back(e);
 }
 
@@ -542,9 +556,9 @@ void WorldBaseline::onEffect(const fnvcoop::Effect& e) {
                 spawns_.erase(it);
                 break;
             }
-#if NVWORLD_MUT != 34
-        purge(d->ref());  // MUTANT 34: state of a despawned ref stays in the baseline
-#endif
+        if (!FNV_MUT(34)) {
+            purge(d->ref());  // MUTANT 34: state of a despawned ref stays in the baseline
+        }
     } else if (auto* v = std::get_if<fnvcoop::RefScriptVar>(&e)) {
         vars_[{v->ref, v->index}] = v->value;
     }
@@ -559,11 +573,11 @@ void fold(std::vector<WorldEffect>& q, const WorldEffect& e) {
             return b && b->actor == a->actor && b->av == a->av;
         };
         if (a->mode == AvMode::Set) {
-#if NVWORLD_MUT != 35
-            for (auto it = q.begin(); it != q.end();)  // MUTANT 35: deltas from before the Set survive and are applied on top of it
-                if (sameKey(*it)) it = q.erase(it);
-                else ++it;
-#endif
+            if (!FNV_MUT(35)) {
+                for (auto it = q.begin(); it != q.end();)  // MUTANT 35: deltas from before the Set survive and are applied on top of it
+                    if (sameKey(*it)) it = q.erase(it);
+                    else ++it;
+            }
             q.push_back(e);
             return;
         }
@@ -571,11 +585,11 @@ void fold(std::vector<WorldEffect>& q, const WorldEffect& e) {
             if (!sameKey(q[i])) continue;
             auto& b = std::get<SetActorValueRef>(q[i]);
             if (b.mode == a->mode) {
-#if NVWORLD_MUT == 36
-                b.value = a->value;  // MUTANT: the latest delta replaces the sum
-#else
-                b.value += a->value;
-#endif
+                if (FNV_MUT(36)) {
+                    b.value = a->value;  // MUTANT: the latest delta replaces the sum
+                } else {
+                    b.value += a->value;
+                }
                 if (b.value == 0 && b.mode == AvMode::Mod) q.erase(q.begin() + i);
                 return;
             }
@@ -591,6 +605,9 @@ void fold(std::vector<WorldEffect>& q, const WorldEffect& e) {
         if (auto* x = std::get_if<SetRestrained>(&e)) return std::get<SetRestrained>(w).actor == x->actor;
         if (auto* x = std::get_if<SetIgnoreCrime>(&e)) return std::get<SetIgnoreCrime>(w).actor == x->actor;
         if (auto* x = std::get_if<SetFactionPlayerEnemy>(&e)) return std::get<SetFactionPlayerEnemy>(w).faction == x->faction;
+        if (auto* x = std::get_if<SetOwner>(&e)) return std::get<SetOwner>(w).ref == x->ref;
+        if (auto* x = std::get_if<SetCellOwner>(&e)) return std::get<SetCellOwner>(w).cell == x->cell;
+        if (auto* x = std::get_if<SetCellPublic>(&e)) return std::get<SetCellPublic>(w).cell == x->cell;
         if (auto* x = std::get_if<SetRelation>(&e)) return std::get<SetRelation>(w).a == x->a && std::get<SetRelation>(w).b == x->b;
         if (auto* x = std::get_if<SetScriptPackage>(&e))
             return std::get<SetScriptPackage>(w).actor == x->actor && std::get<SetScriptPackage>(w).package == x->package;
@@ -637,9 +654,9 @@ std::string worldEffectToJson(const WorldEffect& e) {
         o.set("actor", J(x->actor)).set("av", (int64_t)x->av).set("value", (double)x->value).set("mode", (int64_t)x->mode);
     } else if (auto* y = std::get_if<SetEssential>(&e)) {
         o.set("actor", J(y->actor)).set("essential", y->essential);
-#if NVWORLD_MUT != 19
-        o.set("refOnly", y->refOnly);
-#endif
+        if (!FNV_MUT(19)) {
+            o.set("refOnly", y->refOnly);
+        }
     } else if (auto* z = std::get_if<SetRestrained>(&e)) {
         o.set("actor", J(z->actor)).set("on", z->on);
     } else if (auto* r = std::get_if<SetRelation>(&e)) {
@@ -648,11 +665,18 @@ std::string worldEffectToJson(const WorldEffect& e) {
         o.set("actor", J(p->actor)).set("package", J(p->package)).set("add", p->add);
     } else if (auto* c = std::get_if<SetIgnoreCrime>(&e)) {
         o.set("actor", J(c->actor));
-#if NVWORLD_MUT != 40
-        o.set("on", c->on);  // MUTANT 40: the flag is not serialised
-#endif
+        if (!FNV_MUT(40)) {
+            o.set("on", c->on);  // MUTANT 40: the flag is not serialised
+        }
     } else if (auto* f = std::get_if<SetFactionPlayerEnemy>(&e)) {
         o.set("faction", J(f->faction)).set("on", f->on);
+    } else if (auto* ow = std::get_if<SetOwner>(&e)) {
+        o.set("ref", J(ow->ref)).set("clear", ow->clear);
+        if (!ow->owner.plugin.empty()) o.set("owner", J(ow->owner));
+    } else if (auto* co = std::get_if<SetCellOwner>(&e)) {
+        o.set("cell", J(co->cell)).set("owner", J(co->owner));
+    } else if (auto* cp = std::get_if<SetCellPublic>(&e)) {
+        o.set("cell", J(cp->cell)).set("on", cp->on);
     }
     return o.dump();
 }
@@ -702,6 +726,21 @@ bool worldEffectFromJson(const std::string& text, WorldEffect* out, std::string*
     } else if (t == "SetFactionPlayerEnemy") {
         SetFactionPlayerEnemy x;
         if (!ref("faction", &x.faction)) { if (err) *err = "bad faction"; return false; }
+        x.on = v.get("on").asBool();
+        *out = x;
+    } else if (t == "SetOwner") {
+        SetOwner x;
+        if (!ref("ref", &x.ref)) { if (err) *err = "bad ref"; return false; }
+        x.clear = v.get("clear").asBool();
+        if (!v.get("owner").asString("").empty() && !ref("owner", &x.owner)) { if (err) *err = "bad owner"; return false; }
+        *out = x;
+    } else if (t == "SetCellOwner") {
+        SetCellOwner x;
+        if (!ref("cell", &x.cell) || !ref("owner", &x.owner)) { if (err) *err = "bad cell or owner"; return false; }
+        *out = x;
+    } else if (t == "SetCellPublic") {
+        SetCellPublic x;
+        if (!ref("cell", &x.cell)) { if (err) *err = "bad cell"; return false; }
         x.on = v.get("on").asBool();
         *out = x;
     } else {

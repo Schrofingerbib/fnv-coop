@@ -1,4 +1,4 @@
-// L12 world-state unit tests. Built once against the real sources and once per NVWORLD_MUT=<n> (each mutant MUST fail).
+// L12 world-state unit tests. Built once (FNVCOOP_RUNTIME_MUT); run once for real and once per mutation twin with FNVCOOP_MUT=<n> (each twin MUST fail).
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -9,8 +9,12 @@
 #include "effect_json.h"
 #include "hook_patch.h"
 #include "world_addrs.h"
+#include "world_owner_addrs.h"
+#include "apply_lines.h"
 #include "world_core.h"
 #include "world_plan.h"
+#include "world_query.h"
+#include "engine_addrs.h"
 
 using namespace nvworld;
 using fnvcoop::FormRef;
@@ -435,6 +439,109 @@ TEST(plan_new_world_effects) {
     CHECK(p.status == PlanStatus::FormMissing);
     p = planWorldEffect(SetIgnoreCrime{FormRef("nosuchmod.esp", 1), true}, f.env);
     CHECK(p.status == PlanStatus::FormMissing);
+}
+
+// ---------------------------------------------------------------------------------------------- world-time lane: ownership, ObjectState, clock, saves
+TEST(ownership_lines_json_log) {
+    CHECK(setOwnershipLine(0x55) == "SetOwnership 00000055");
+    CHECK(setOwnershipLine(0) == "SetOwnership");   // no argument: the player owns it
+    CHECK(clearOwnershipLine() == "ClearOwnership");
+    CHECK(setCellOwnershipLine(0x10, 0x20) == "SetCellOwnership 00000010 00000020");
+    CHECK(setCellPublicFlagLine(0x10, true) == "SetCellPublicFlag 00000010 1");
+    CHECK(setCellPublicFlagLine(0x10, false) == "SetCellPublicFlag 00000010 0");
+    SetOwner withOwner{esm(0x700), esm(0x55), false};
+    SetOwner player{esm(0x700), FormRef(), false};
+    SetOwner cleared{esm(0x700), FormRef(), true};
+    for (WorldEffect e : {WorldEffect(withOwner), WorldEffect(player), WorldEffect(cleared), WorldEffect(SetCellOwner{esm(0x10), esm(0x20)}),
+                          WorldEffect(SetCellPublic{esm(0x10), true})}) {
+        WorldEffect back;
+        std::string err;
+        CHECK(worldEffectFromJson(worldEffectToJson(e), &back, &err));
+        CHECK(back == e);
+    }
+    CHECK(std::string(worldEffectName(SetOwner{})) == "SetOwner");
+    CHECK(std::string(worldEffectName(SetCellOwner{})) == "SetCellOwner");
+    CHECK(std::string(worldEffectName(SetCellPublic{})) == "SetCellPublic");
+    WorldLog l;
+    l.push(withOwner);
+    l.push(cleared);   // same ref: the later word replaces the earlier
+    l.push(SetOwner{esm(0x701), esm(0x55), false});
+    l.push(SetCellPublic{esm(0x10), true});
+    l.push(SetCellPublic{esm(0x10), false});
+    l.push(SetCellOwner{esm(0x10), esm(0x20)});
+    l.push(SetCellOwner{esm(0x10), esm(0x21)});
+    auto v = l.drain();
+    CHECK(v.size() == 4);
+    if (v.size() == 4) {
+        CHECK(std::get<SetOwner>(v[0]).clear);
+        CHECK(!std::get<SetCellPublic>(v[2]).on);
+        CHECK(std::get<SetCellOwner>(v[3]).owner == esm(0x21));
+    }
+    FormRef t;
+    CHECK(createdTargetOf(WorldEffect(SetOwner{created(4), esm(1), false}), &t) && t == created(4));
+    WorldBaseline b;
+    b.onWorld(withOwner);
+    b.onWorld(cleared);
+    b.onWorld(SetCellPublic{esm(0x10), true});
+    auto snap = b.snapshot();
+    CHECK(snap.world.size() == 2);
+}
+
+TEST(plan_ownership) {
+    PlanFx f;
+    auto p = planWorldEffect(SetOwner{esm(0x700), esm(0x55), false}, f.env);
+    CHECK(p.status == PlanStatus::Ok && p.steps.size() == 1 && p.steps[0].kind == StepKind::ConsoleOnRef && p.steps[0].refID == 0x700 &&
+          p.steps[0].line == "SetOwnership 00000055");
+    p = planWorldEffect(SetOwner{esm(0x700), FormRef(), false}, f.env);
+    CHECK(p.steps.size() == 1 && p.steps[0].line == "SetOwnership");
+    p = planWorldEffect(SetOwner{esm(0x700), FormRef(), true}, f.env);
+    CHECK(p.steps.size() == 1 && p.steps[0].line == "ClearOwnership" && p.steps[0].refID == 0x700);
+    p = planWorldEffect(SetOwner{esm(0x700), FormRef("nosuchmod.esp", 1), false}, f.env);
+    CHECK(p.status == PlanStatus::FormMissing);
+    p = planWorldEffect(SetCellOwner{esm(0x10), esm(0x20)}, f.env);
+    CHECK(p.steps.size() == 1 && p.steps[0].kind == StepKind::ConsoleGlobal && p.steps[0].line == "SetCellOwnership 00000010 00000020");
+    p = planWorldEffect(SetCellPublic{esm(0x10), true}, f.env);
+    CHECK(p.steps.size() == 1 && p.steps[0].kind == StepKind::ConsoleGlobal && p.steps[0].line == "SetCellPublicFlag 00000010 1");
+    p = planWorldEffect(SetCellPublic{FormRef("nosuchmod.esp", 1), true}, f.env);
+    CHECK(p.status == PlanStatus::FormMissing);
+}
+
+TEST(plan_object_state_clock_and_scripted_saves) {
+    PlanFx f;
+    CHECK(handlesEffect(fnvcoop::ObjectState{}) && handlesEffect(fnvcoop::AdvanceTime{}) && handlesEffect(fnvcoop::RequestSave{}));
+    fnvcoop::ObjectState os;
+    os.ref = esm(0x500);
+    os.mask = fnvcoop::kObjLock | fnvcoop::kObjOpen | fnvcoop::kObjDestroyed;
+    os.locked = true; os.level = 50; os.open = true; os.destroyed = true;
+    auto p = planEffect(os, f.env);
+    CHECK(p.status == PlanStatus::Ok);
+    CHECK(p.steps.size() == 3);
+    if (p.steps.size() == 3) {
+        for (auto& s : p.steps) CHECK(s.kind == StepKind::ConsoleOnRef && s.refID == 0x500);
+        CHECK(p.steps[0].line == nvhooks::lockCmd(50));   // the same console forms L5's RemoteApplier used
+        CHECK(p.steps[1].line == nvhooks::setOpenStateCmd(true));
+        CHECK(p.steps[2].line == nvhooks::setDestroyedCmd(true));
+    }
+    os.mask = fnvcoop::kObjLock;
+    os.locked = false;
+    p = planEffect(os, f.env);
+    CHECK(p.steps.size() == 1 && p.steps[0].line == nvhooks::unlockCmd());
+    os.mask = fnvcoop::kObjOpen;
+    os.open = false;
+    p = planEffect(os, f.env);
+    CHECK(p.steps.size() == 1 && p.steps[0].line == nvhooks::setOpenStateCmd(false));
+    os.mask = fnvcoop::kObjActivated;   // activate-once has no console form: nothing to run, still accepted
+    p = planEffect(os, f.env);
+    CHECK(p.status == PlanStatus::Ok && p.steps.empty());
+    os.mask = fnvcoop::kObjOpen;
+    os.ref = FormRef("nosuchmod.esp", 1);
+    CHECK(planEffect(os, f.env).status == PlanStatus::FormMissing);
+
+    p = planEffect(fnvcoop::AdvanceTime{90}, f.env);
+    CHECK(p.status == PlanStatus::Ok && p.steps.size() == 1 && p.steps[0].kind == StepKind::AdvanceClock && p.steps[0].minutes == 90);
+
+    p = planEffect(fnvcoop::RequestSave{0}, f.env);   // a client never saves because the host's script did
+    CHECK(p.status == PlanStatus::Ok && p.steps.empty());
 }
 
 // ---------------------------------------------------------------------------------------------- created-ref targets, routing, deferred queue
@@ -882,9 +989,9 @@ TEST(world_specs_match_dump) {
     };
     for (size_t i = 0; i < world_addrs::kCount; ++i) {
         nvhooks::HookSpec s = *world_addrs::kAll[i];
-#if NVWORLD_MUT == 26
-        s.expected[3] ^= 0x01;  // MUTANT: a spec that drifted from the evidence
-#endif
+        if (FNV_MUT(26)) {
+            s.expected[3] ^= 0x01;  // MUTANT: a spec that drifted from the evidence
+        }
         const DumpRow* r = find(s.name);
         CHECK(r != nullptr);
         if (!r) continue;
@@ -940,9 +1047,9 @@ TEST(world_cmdinfo_match) {
         CHECK(info.size() >= 0x24);
         if (info.size() < 0x24) continue;
         uint32_t params = c.numParams;
-#if NVWORLD_MUT == 41
-        params += 1;  // MUTANT: a spec table that disagrees with the engine's parameter count
-#endif
+        if (FNV_MUT(41)) {
+            params += 1;  // MUTANT: a spec table that disagrees with the engine's parameter count
+        }
         CHECK(le32(info, 8) == c.opcode);
         CHECK(le32(info, 0x18) == c.spec->target);
         CHECK(le16(info, 0x10) == c.needsParent);
@@ -952,8 +1059,173 @@ TEST(world_cmdinfo_match) {
     }
 }
 
+static std::vector<DumpRow> readDumpFile(const std::string& path) {
+    std::vector<DumpRow> rows;
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return rows;
+    char line[1024];
+    while (std::fgets(line, sizeof line, f)) {
+        char name[128], hex[64];
+        unsigned addr = 0;
+        int stolen = 0;
+        if (std::sscanf(line, "%127s 0x%x stolen=%d bytes16=%32s", name, &addr, &stolen, hex) != 4) continue;
+        DumpRow r;
+        r.name = name;
+        r.addr = addr;
+        r.stolen = stolen;
+        for (int i = 0; i < 16; ++i) {
+            unsigned b = 0;
+            std::sscanf(hex + 2 * i, "%2x", &b);
+            r.bytes.push_back((uint8_t)b);
+        }
+        rows.push_back(r);
+    }
+    std::fclose(f);
+    return rows;
+}
+
+TEST(owner_specs_match_the_static_dump) {
+    std::string dir = NVW_DUMP_PATH;
+    dir = dir.substr(0, dir.find_last_of("/\\") + 1);
+    auto rows = readDumpFile(dir + "owner_prologues.txt");
+    CHECK(rows.size() == 4);
+    CHECK(world_owner_addrs::kCount == 4);
+    for (size_t i = 0; i < world_owner_addrs::kCount; ++i) {
+        nvhooks::HookSpec s = *world_owner_addrs::kAll[i];
+        if (FNV_MUT(51)) s.expected[2] ^= 0x01;   // MUTANT 51: a spec that drifted from the evidence
+        const DumpRow* r = nullptr;
+        for (auto& x : rows) if (x.name == s.name) r = &x;
+        CHECK(r != nullptr);
+        if (!r) continue;
+        CHECK(r->addr == s.target);
+        CHECK(r->stolen == s.stolen);
+        CHECK(std::memcmp(r->bytes.data(), s.expected, 16) == 0);
+        CHECK(s.stolen >= 5 && s.expected[0] == 0x55 && s.expected[1] == 0x8b && s.expected[2] == 0xec);
+        CHECK(s.retBytes == 0);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------- world.query on detoured evaluators
+// Track A inbox 2026-10-21: our own capture detour on Cond_GetActorValue (and Cond_GetItemCount) changed the evaluator's first bytes to E9,
+// and the old "must start with 55 8B EC" check made world.query GetActorValue fail for every ref. Twins 43..46 live in world_query.cpp.
+static ReadMem memReader(FakeMem& m) { return [&m](uint32_t a, void* o, size_t n) { return m.read(a, o, n); }; }
+
+static void putEntry(FakeMem& mem, const nvhooks::HookSpec& s) {
+    mem.img[s.target] = std::vector<uint8_t>(s.expected, s.expected + s.expectedLen);
+    mem.img[s.target].resize(64, 0x90);
+}
+
+TEST(query_table) {
+    size_t n = 0;
+    const Evaluator* t = evaluators(&n);
+    CHECK(n >= 12);
+    for (size_t i = 0; i < n; ++i) {
+        CHECK(t[i].addr >= 0x590000 && t[i].addr < 0x5B0000);
+        const Evaluator* f = findEvaluator(t[i].name);
+        CHECK(f && f->addr == t[i].addr);
+    }
+    CHECK(findEvaluator("NoSuchFunction") == nullptr);
+    CHECK(findEvaluator("getactorvalue") == nullptr);  // exact names, like the console grammar the callers use
+    // the two evaluators our capture hooks patch must be in the table at the same addresses (that is the case the fix is for)
+    CHECK(findEvaluator("GetActorValue") && findEvaluator("GetActorValue")->addr == nvhooks::addr::Cond_GetActorValue.target);
+    CHECK(findEvaluator("GetItemCount") && findEvaluator("GetItemCount")->addr == nvhooks::addr::Cond_GetItemCount.target);
+    CHECK(findEvaluator("GetItemCount")->formParam && !findEvaluator("GetActorValue")->formParam);
+}
+
+TEST(query_clean_entry_is_called_live) {
+    FakeMem mem;
+    const Evaluator& q = *findEvaluator("GetRestrained");
+    mem.img[q.addr] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x90, 0x90};
+    EvalPlan p = resolveEvaluator(q, memReader(mem), [](uint32_t) { return 0u; });
+    CHECK(p.kind == EvalCall::Live && p.addr == q.addr);
+}
+
+TEST(query_our_detour_is_called_through_the_trampoline) {
+    for (const char* name : {"GetActorValue", "GetItemCount"}) {
+        const Evaluator& q = *findEvaluator(name);
+        const nvhooks::HookSpec& spec = std::string(name) == "GetActorValue" ? nvhooks::addr::Cond_GetActorValue : nvhooks::addr::Cond_GetItemCount;
+        FakeMem mem;
+        putEntry(mem, spec);
+        nvhooks::HookRegistry reg(mem);
+        nvhooks::Addr tramp = 0;
+        CHECK(reg.acquire(spec, 0x30000000, &tramp) == nvhooks::PatchStatus::Ok);
+        CHECK(mem.img[spec.target][0] == 0xE9);  // the live entry is now OUR jump: the old check refused exactly this
+        CHECK(reg.trampolineOf(spec.target) == tramp && tramp != 0);
+        CHECK(nvhooks::trampolineOfAny(spec.target) == tramp);
+        CHECK(nvhooks::trampolineOfAny(spec.target + 0x10) == 0);
+        EvalPlan p = resolveEvaluator(q, memReader(mem), [&](uint32_t t) { return static_cast<uint32_t>(nvhooks::trampolineOfAny(t)); });
+        CHECK(p.kind == EvalCall::Trampoline);
+        CHECK(p.addr == tramp);
+        CHECK(p.addr != q.addr);
+        // what is at the trampoline is the ORIGINAL function start (stolen bytes), followed by a jump back into the evaluator
+        uint8_t tb[16] = {};
+        CHECK(mem.read(tramp, tb, spec.stolen + 5));
+        CHECK(std::memcmp(tb, spec.expected, spec.stolen) == 0);
+        CHECK(tb[spec.stolen] == 0xE9);
+        // hook released: the entry is original again and is called live
+        CHECK(reg.release(spec) == nvhooks::PatchStatus::Restored);
+        CHECK(nvhooks::trampolineOfAny(spec.target) == 0);
+        p = resolveEvaluator(q, memReader(mem), [&](uint32_t t) { return static_cast<uint32_t>(nvhooks::trampolineOfAny(t)); });
+        CHECK(p.kind == EvalCall::Live && p.addr == q.addr);
+    }
+}
+
+TEST(query_suspended_hook_is_called_live) {
+    const Evaluator& q = *findEvaluator("GetActorValue");
+    const nvhooks::HookSpec& spec = nvhooks::addr::Cond_GetActorValue;
+    FakeMem mem;
+    putEntry(mem, spec);
+    nvhooks::HookRegistry reg(mem);
+    nvhooks::Addr tramp = 0;
+    CHECK(reg.acquire(spec, 0x30000000, &tramp) == nvhooks::PatchStatus::Ok);
+    CHECK(reg.suspendAll() == 0);  // reload drain: original bytes are back at the entry but the trampoline is still valid
+    EvalPlan p = resolveEvaluator(q, memReader(mem), [&](uint32_t t) { return static_cast<uint32_t>(reg.trampolineOf(t)); });
+    CHECK(p.kind == EvalCall::Live && p.addr == q.addr);
+    CHECK(reg.resumeAll() == 0);
+    p = resolveEvaluator(q, memReader(mem), [&](uint32_t t) { return static_cast<uint32_t>(reg.trampolineOf(t)); });
+    CHECK(p.kind == EvalCall::Trampoline && p.addr == tramp);
+}
+
+TEST(query_foreign_or_broken_entries_are_refused) {
+    const Evaluator& q = *findEvaluator("GetActorValue");
+    auto none = [](uint32_t) { return 0u; };
+    {   // somebody else's detour: E9 but not in our registry
+        FakeMem mem;
+        mem.img[q.addr] = {0xE9, 0x10, 0x20, 0x30, 0x00, 0x90, 0x90, 0x90};
+        EvalPlan p = resolveEvaluator(q, memReader(mem), none);
+        CHECK(p.kind == EvalCall::Refuse && p.addr == 0);
+    }
+    {   // the entry changed to something that is neither the prologue nor a jump (other exe build, other patcher)
+        FakeMem mem;
+        mem.img[q.addr] = {0xC3, 0x8B, 0xEC, 0x83, 0xEC, 0x0C, 0x90, 0x90};
+        CHECK(resolveEvaluator(q, memReader(mem), none).kind == EvalCall::Refuse);
+        mem.img[q.addr] = {0x55, 0x8B, 0xEB, 0x83, 0xEC, 0x0C, 0x90, 0x90};  // one byte off the prologue
+        CHECK(resolveEvaluator(q, memReader(mem), none).kind == EvalCall::Refuse);
+    }
+    {   // unreadable memory
+        FakeMem mem;
+        EvalPlan p = resolveEvaluator(q, memReader(mem), none);
+        CHECK(p.kind == EvalCall::Refuse && p.addr == 0);
+    }
+    {   // our registry names a trampoline, but its bytes are not the original prologue (corrupt / freed): never call it
+        FakeMem mem;
+        mem.img[q.addr] = {0xE9, 0x10, 0x20, 0x30, 0x00, 0x90, 0x90, 0x90};
+        mem.heap[0x21000000] = {0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
+        EvalPlan p = resolveEvaluator(q, memReader(mem), [](uint32_t) { return 0x21000000u; });
+        CHECK(p.kind == EvalCall::Refuse && p.addr == 0);
+        // and a trampoline that cannot be read at all
+        p = resolveEvaluator(q, memReader(mem), [](uint32_t) { return 0x22000000u; });
+        CHECK(p.kind == EvalCall::Refuse);
+    }
+}
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    run("query_table", query_table);
+    run("query_clean_entry_is_called_live", query_clean_entry_is_called_live);
+    run("query_our_detour_is_called_through_the_trampoline", query_our_detour_is_called_through_the_trampoline);
+    run("query_suspended_hook_is_called_live", query_suspended_hook_is_called_live);
+    run("query_foreign_or_broken_entries_are_refused", query_foreign_or_broken_entries_are_refused);
     run("created_ref_map", created_ref_map);
     run("world_resolver_host", world_resolver_host);
     run("world_resolver_client", world_resolver_client);
@@ -980,6 +1252,10 @@ int main() {
     run("world_cmdinfo_match", world_cmdinfo_match);
     run("new_world_effects_lines_json_log", new_world_effects_lines_json_log);
     run("plan_new_world_effects", plan_new_world_effects);
+    run("ownership_lines_json_log", ownership_lines_json_log);
+    run("plan_ownership", plan_ownership);
+    run("plan_object_state_clock_and_scripted_saves", plan_object_state_clock_and_scripted_saves);
+    run("owner_specs_match_the_static_dump", owner_specs_match_the_static_dump);
     run("created_targets", created_targets);
     run("route_and_retriable", route_and_retriable);
     run("deferred_queue_basic", deferred_queue_basic);

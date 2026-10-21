@@ -4,6 +4,8 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "combat/combat.h"
+#include "fnvcoop/engine/faults.h"
 #include "fnvcoop/types.h"
 
 namespace fnvcoop {
@@ -16,6 +18,14 @@ using NetId = uint32_t;     // one identity per thing; created refs use the 0xFF
 using CellId = uint32_t;
 constexpr uint32_t kCreatedIdBase = 0xFF000000u;
 inline bool isCreatedId(NetId id) { return (id >> 24) == 0xFF; }
+// Digest keys of the Actors category: an actor is keyed by its NetId, a player slot by kPlayerKeyBase | slot. The player range
+// is exactly kMaxSlots wide: created actors (0xFF......) sit above kPlayerKeyBase and must never be mistaken for a player slot
+// (a repair of a created actor used to overwrite the receiver's own player state with the host's stale copy).
+constexpr uint32_t kPlayerKeyBase = 0xF0000000u;
+constexpr uint32_t playerKey(uint32_t slot) { return kPlayerKeyBase | slot; }
+constexpr uint32_t playerSlotOfKey(uint32_t key) { return (key & 0xFFu) % kMaxSlots; }
+// (fault createdKeyIsPlayer = the old test, `key >= kPlayerKeyBase`, which also matched every created actor)
+inline bool isPlayerKey(uint32_t key) { return engineFaults().createdKeyIsPlayer ? key >= kPlayerKeyBase : (key >= kPlayerKeyBase && key < kPlayerKeyBase + kMaxSlots); }
 
 constexpr float kCellSize = 4096.0f;
 
@@ -26,7 +36,8 @@ struct Vec3 {
 float distance(const Vec3& a, const Vec3& b);
 float distance2d(const Vec3& a, const Vec3& b);
 
-enum class Limb : uint8_t { Torso = 0, Head, LeftArm, RightArm, LeftLeg, RightLeg, Count_ };
+// the body parts and the crippling rules are combat-core's (synccore/combat)
+using Limb = combat::Limb;
 
 enum class Category : uint8_t { Story = 0, Actors = 1, Containers = 2, Objects = 3, Count_ };
 const char* toString(Category c);
@@ -51,6 +62,7 @@ struct ActorState {
     PlayerId recruiter = kNoPlayer;
     NetId site = 0;             // spawn site that produced it (0 = placed)
     uint8_t limbMask = 0;       // crippled limbs
+    int32_t limbDmg[combat::kLimbCount] = {0, 0, 0, 0, 0, 0};   // accumulated damage per limb (the owner's bookkeeping, published with every hit event so a new owner continues it; not digested)
     uint32_t snapSeq = 0;       // owner's snapshot counter (newest wins)
     FormRef pick;               // leveled pick, made once by the host (equals base for non-leveled)
 };

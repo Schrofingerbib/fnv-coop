@@ -8,8 +8,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:07691E"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -56,7 +68,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -68,7 +83,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     },
     {
@@ -80,6 +98,15 @@
       "masks": []
      },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:179229"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -90,8 +117,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:041E5C"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -163,8 +202,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:0E58BF"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -175,7 +226,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -227,7 +281,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -344,7 +401,10 @@
     },
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -356,7 +416,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -383,7 +446,8 @@
     {
      "kind": "Barrier",
      "params": {
-      "step": "all-players-pass"
+      "step": "all-players-pass",
+      "before": "slideshow"
      },
      "origin": "curated"
     }
@@ -433,8 +497,20 @@
     },
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:16517D"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -633,8 +709,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:165119"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -645,8 +733,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:032DF1"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -657,7 +757,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -686,7 +789,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     },
     {
@@ -698,6 +804,15 @@
       "masks": []
      },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:176ACA"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -760,8 +875,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:164AF9"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -3896,6 +4023,15 @@
      "kind": "RewardAll",
      "params": {},
      "origin": "curated"
+    },
+    {
+     "kind": "PerPlayerVars",
+     "params": {
+      "vars": [
+       "perks"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -4069,6 +4205,16 @@
       }
      },
      "origin": "curated"
+    },
+    {
+     "kind": "PerPlayerVars",
+     "params": {
+      "vars": [
+       "perks",
+       "items"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -4135,6 +4281,17 @@
      "kind": "InitiatorDialogue",
      "params": {},
      "origin": "curated"
+    },
+    {
+     "kind": "PerPlayerVars",
+     "params": {
+      "vars": [
+       "bAwaitingInput",
+       "nButton",
+       "perks"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -4360,6 +4517,18 @@
      "kind": "InitiatorDialogue",
      "params": {},
      "origin": "curated"
+    },
+    {
+     "kind": "PartyTether",
+     "params": {
+      "anchor": "NVDLC03CrashedSatelliteREF",
+      "radius": 1500,
+      "gather": "auto-warp",
+      "stages": [
+       100
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -4624,6 +4793,17 @@
      "kind": "InitiatorDialogue",
      "params": {},
      "origin": "curated"
+    },
+    {
+     "kind": "PerPlayerVars",
+     "params": {
+      "vars": [
+       "bRestoreBodyParts",
+       "bImplants",
+       "nButton"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -4666,6 +4846,17 @@
      "kind": "PerPlayerScene",
      "params": {},
      "origin": "curated"
+    },
+    {
+     "kind": "PerPlayerVars",
+     "params": {
+      "vars": [
+       "iState",
+       "fTimer",
+       "bRadar"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -4924,6 +5115,15 @@
      "kind": "InitiatorDialogue",
      "params": {},
      "origin": "curated"
+    },
+    {
+     "kind": "PerPlayerVars",
+     "params": {
+      "vars": [
+       "perks"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -4975,6 +5175,15 @@
      "kind": "InitiatorDialogue",
      "params": {},
      "origin": "curated"
+    },
+    {
+     "kind": "PerPlayerVars",
+     "params": {
+      "vars": [
+       "perks"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -5853,8 +6062,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "GunRunnersArsenal.esm:00093B"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -5960,7 +6181,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -6039,8 +6263,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:0E60E8"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -6051,8 +6287,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:14E303"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -6063,7 +6311,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -6075,7 +6326,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -6087,8 +6341,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:07161B"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -6179,7 +6445,8 @@
     {
      "kind": "Barrier",
      "params": {
-      "step": "all-players-pass"
+      "step": "all-players-pass",
+      "before": "slideshow"
      },
      "origin": "curated"
     }
@@ -6192,7 +6459,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -6216,8 +6486,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:16B672"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -6306,8 +6588,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:1055B5"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -6330,7 +6624,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     },
     {
@@ -6342,6 +6639,15 @@
       "masks": []
      },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:11649F"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -6369,8 +6675,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:1614D4"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -6480,7 +6798,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -6492,8 +6813,25 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:17912E",
+       "DeadMoney.esm:0062B1",
+       "FalloutNV.esm:070ECA",
+       "HonestHearts.esm:008A32",
+       "LonesomeRoad.esm:003604",
+       "OldWorldBlues.esm:002FD0"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -7028,6 +7366,18 @@
       }
      },
      "origin": "curated"
+    },
+    {
+     "kind": "ReadyCheck",
+     "params": {
+      "infos": [
+       "FalloutNV.esm:15EB69"
+      ],
+      "timeout_s": 120,
+      "on_timeout": "cancel",
+      "confirm": "all-players"
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -7416,7 +7766,10 @@
     },
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -7832,7 +8185,8 @@
     {
      "kind": "Barrier",
      "params": {
-      "step": "all-players-pass"
+      "step": "all-players-pass",
+      "before": "slideshow"
      },
      "origin": "curated"
     }
@@ -7845,8 +8199,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:15FF6F"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -8935,7 +9301,8 @@
     {
      "kind": "Barrier",
      "params": {
-      "step": "all-players-pass"
+      "step": "all-players-pass",
+      "before": "slideshow"
      },
      "origin": "curated"
     }
@@ -9146,7 +9513,8 @@
     {
      "kind": "Barrier",
      "params": {
-      "step": "all-players-pass"
+      "step": "all-players-pass",
+      "before": "slideshow"
      },
      "origin": "curated"
     }
@@ -9675,7 +10043,10 @@
     {
      "kind": "Barrier",
      "params": {
-      "step": "all-players-pass"
+      "step": "all-players-pass",
+      "stages": [
+       100
+      ]
      },
      "origin": "curated"
     },
@@ -9714,7 +10085,11 @@
       "cells": [
        "HooverDam"
       ],
-      "gather": "auto-warp"
+      "gather": "auto-warp",
+      "stages": [
+       60,
+       100
+      ]
      },
      "origin": "curated"
     },
@@ -9861,7 +10236,8 @@
     {
      "kind": "Barrier",
      "params": {
-      "step": "all-players-pass"
+      "step": "all-players-pass",
+      "before": "slideshow"
      },
      "origin": "curated"
     }
@@ -9889,7 +10265,8 @@
     {
      "kind": "Barrier",
      "params": {
-      "step": "all-players-pass"
+      "step": "all-players-pass",
+      "before": "slideshow"
      },
      "origin": "curated"
     }
@@ -9917,7 +10294,8 @@
     {
      "kind": "Barrier",
      "params": {
-      "step": "all-players-pass"
+      "step": "all-players-pass",
+      "before": "slideshow"
      },
      "origin": "curated"
     }
@@ -9980,7 +10358,10 @@
       "cells": [
        "Lucky38BasementFloorB2"
       ],
-      "gather": "auto-warp"
+      "gather": "auto-warp",
+      "stages": [
+       25
+      ]
      },
      "origin": "curated"
     }
@@ -10326,6 +10707,19 @@
      "kind": "ShareKarmaRep",
      "params": {},
      "origin": "curated"
+    },
+    {
+     "kind": "ReadyCheck",
+     "params": {
+      "infos": [
+       "FalloutNV.esm:160723",
+       "FalloutNV.esm:160735"
+      ],
+      "timeout_s": 120,
+      "on_timeout": "cancel",
+      "confirm": "all-players"
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -10377,6 +10771,17 @@
       }
      },
      "origin": "curated"
+    },
+    {
+     "kind": "ExclusiveStages",
+     "params": {
+      "stages": [
+       100,
+       110
+      ],
+      "resolution": "first-wins"
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -12858,6 +13263,18 @@
       "owner": "recruiter"
      },
      "origin": "curated"
+    },
+    {
+     "kind": "ExclusiveStages",
+     "params": {
+      "stages": [
+       30,
+       35,
+       70
+      ],
+      "resolution": "first-wins"
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -12925,7 +13342,8 @@
     {
      "kind": "Barrier",
      "params": {
-      "step": "all-players-pass"
+      "step": "all-players-pass",
+      "before": "slideshow"
      },
      "origin": "curated"
     }
@@ -12961,6 +13379,15 @@
       }
      },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:127E9E"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -13264,6 +13691,18 @@
       "owner": "recruiter"
      },
      "origin": "curated"
+    },
+    {
+     "kind": "ExclusiveStages",
+     "params": {
+      "stages": [
+       110,
+       120,
+       130
+      ],
+      "resolution": "first-wins"
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -13513,7 +13952,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -13537,8 +13979,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:161510"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -13549,8 +14003,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:1607FE"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -13573,8 +14039,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:161E90"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -13585,8 +14063,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:16B670"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -13645,7 +14135,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     },
     {
@@ -13657,6 +14150,15 @@
      "kind": "InitiatorDialogue",
      "params": {},
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:17B77D"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -14404,7 +14906,10 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
     }
    ]
@@ -14433,8 +14938,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:16B671"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -14452,7 +14969,10 @@
        "HooverDamIntCheckpoint",
        "HooverDam"
       ],
-      "gather": "auto-warp"
+      "gather": "auto-warp",
+      "stages": [
+       10
+      ]
      },
      "origin": "curated"
     },
@@ -14528,7 +15048,10 @@
     {
      "kind": "Barrier",
      "params": {
-      "step": "all-players-pass"
+      "step": "all-players-pass",
+      "stages": [
+       30
+      ]
      },
      "origin": "curated"
     }
@@ -14594,8 +15117,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:14B3EC"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -14714,8 +15249,20 @@
    "rules": [
     {
      "kind": "PerPlayerScene",
-     "params": {},
+     "params": {
+      "run": "every-machine",
+      "scope": "local-machine"
+     },
      "origin": "curated"
+    },
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "FalloutNV.esm:16B66F"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   },
@@ -14752,6 +15299,38 @@
      "kind": "PerPlayerScene",
      "params": {},
      "origin": "curated"
+    }
+   ]
+  },
+  "NVDLC02RadioMessage": {
+   "tier": "T1",
+   "questline": "Systems: dlc_setup",
+   "curated": false,
+   "rules": [
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "HonestHearts.esm:010EF4"
+      ]
+     },
+     "origin": "questsweep"
+    }
+   ]
+  },
+  "NVDLC02RainQuest": {
+   "tier": "T1",
+   "questline": "Systems: dlc_setup",
+   "curated": false,
+   "rules": [
+    {
+     "kind": "GuestLocalRun",
+     "params": {
+      "scripts": [
+       "HonestHearts.esm:00EDE5"
+      ]
+     },
+     "origin": "questsweep"
     }
    ]
   }

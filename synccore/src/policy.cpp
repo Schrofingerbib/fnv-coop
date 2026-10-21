@@ -4,6 +4,7 @@
 #include <sstream>
 #include <vector>
 #include "fnvcoop/mutations.h"
+#include "fnvcoop/refop.h"
 #include "fnvcoop/wire.h"
 
 namespace fnvcoop {
@@ -190,6 +191,12 @@ size_t normalizeTxn(EffectTxn& txn, const SharePolicy& p) {
                     if (txn.cause.kind == CauseKind::DialogueResult && !mutations().paymentSharesAll) shared = false;
                 resolve(x.to, shared, txn.origin, p);
                 keep = x.to.mask != 0;
+            } else if constexpr (std::is_same_v<T, RefCommand>) {
+                // The capture addresses a non-player target (an actor, a container, a list, a quest) to All and the character-build calls to Origin; what
+                // it leaves at Default is a command on the PLAYER (a spell, a conditioned item ...), which is a reward like AddItem: shared only when the
+                // cause is a quest reward, otherwise the acting player's alone.
+                resolve(x.to, reward || mutations().refCmdPlayerShared, txn.origin, p);
+                keep = x.to.mask != 0 && refOpKnown(x.op);
             } else if constexpr (std::is_same_v<T, ModKarma>) {
                 resolve(x.to, p.karma, txn.origin, p);
                 keep = x.to.mask != 0;

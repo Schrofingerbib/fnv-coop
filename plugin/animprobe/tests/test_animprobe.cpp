@@ -1,4 +1,4 @@
-// Game-free tests of the animprobe core. Built once for real and once per ANIMPROBE_MUT=<n> (each mutant MUST fail).
+// Game-free tests of the animprobe core. Built once (FNVCOOP_RUNTIME_MUT); run once for real and once per FNVCOOP_MUT=<n> (each twin MUST fail).
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -83,8 +83,9 @@ static void testJson() {
     CHECK(back.get("anim").get("seqs").items().size() == 1);
     CHECK(back.get("anim").get("seqs").items()[0].get("group").asInt() == 12);
     CHECK(back.get("move_flags").asInt() == 0x100);
-    CHECK(back.get("bones").get("Bip01 Head").items().size() == 3);
-    CHECK(back.get("bones").get("Bip01 Head").items()[2].asNumber() == 3.0);
+    const auto& head = back.get("bones").get("Bip01 Head").items();
+    CHECK(head.size() == 3);
+    CHECK(head.size() == 3 && head[2].asNumber() == 3.0);   // (never index an empty list: a missing "bones" key must FAIL the test, not crash it)
     CHECK(HexId(0xABCDEF) == "0x00ABCDEF");
 
     ActorSample b;  // no bones, not the player: those keys must be absent

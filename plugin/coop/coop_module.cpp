@@ -39,6 +39,18 @@
 #ifdef NVCOOP_WITH_WORLD
 #include "world_hooks.h"
 #endif
+#ifdef NVCOOP_WITH_ACTORS
+#include "actors/actor_glue.h"
+#endif
+#ifdef NVCOOP_WITH_LIVE
+#include "live/live_glue.h"   // dll-wiring: [live] switches, the hub (session / load lifecycle, channels), the lanes' services
+#endif
+#ifdef NVCOOP_WITH_COMPANIONS
+#include "companions/companions_glue.h"   // companions, crime, kill XP ([companions] enabled, default off)
+#endif
+#ifdef NVCOOP_WITH_AREADIGEST
+#include "areadigest/area_glue.h"         // per-area desync digests and heal ([areadigest] enabled, default off)
+#endif
 
 namespace {
 using namespace nvcoop::coop;
@@ -66,6 +78,9 @@ std::string WorldEffectKey(const nvworld::WorldEffect& e) {
 class EngineWorld : public IWorldApplier {
 public:
     ApplyResult apply(const fnvcoop::Effect& e, const fnvcoop::IEffectSink::Context& ctx) override {
+#ifdef NVCOOP_WITH_LIVE
+        nvcoop::livewire::glueOnEffect(e);   // the ownership service must know a story KillActor / ResurrectActor / CompanionOwner before the engine acts on it
+#endif
 #ifdef NVCOOP_WITH_WORLD
         if (nvworld::handlesEffect(e)) {
             if (!g_worldApplier) return {false, "NoWorldApplier"};
@@ -184,6 +199,10 @@ std::unordered_map<std::string, std::string> LoadStringMap(const std::string& pa
 std::unordered_map<std::string, std::string> g_edids, g_infoQuest;
 // slot -> the guest's ghost refID on the host (L6 nvmp::GhostRefOfPlayer); 0 = unknown / NV:MP not present => stand-in player (ACTING-STANDIN)
 uint32_t GhostOf(fnvcoop::PlayerId slot) {
+#ifdef NVCOOP_WITH_LIVE
+    if (slot != fnvcoop::kHostPlayer)
+        if (uint32_t puppet = nvcoop::livewire::glueAvatarRef(static_cast<uint8_t>(slot))) return puppet;   // our own avatar layer first ([live] avatars=1)
+#endif
 #ifdef NVCOOP_WITH_NVMP
     return slot == fnvcoop::kHostPlayer ? 0u : nvmp::GhostRefOfPlayer(static_cast<uint8_t>(slot));
 #else
@@ -270,6 +289,12 @@ void TryStart() {
 #ifdef NVCOOP_WITH_WORLD
     g_worldApplier.reset(new nvworld::WorldApplier(*hub, nvhooks::resolver()));
     g_worldApplier->setExecLine([](const std::string& line, uint32_t refID) { return nvhooks::execConsoleLineOn(line, refID); });
+#ifdef NVCOOP_WITH_LIVE
+    // spawn arbitration makes this machine's own copy of a spawn it did not roll through the same applier as every other SpawnRef
+    nvcoop::livewire::glueSetSpawnApplier([](const fnvcoop::SpawnRef& s) {
+        return g_worldApplier && g_worldApplier->apply(fnvcoop::Effect(s)) == nvhooks::ApplyStatus::Ok;
+    });
+#endif
 #endif
     g_rt.reset(new Runtime(g_cfg, hub, &g_world, NowMs));
     g_rt->setDumper(&g_dumper);
@@ -327,6 +352,12 @@ void TryStart() {
             nvcoop::Log("coop: guest TriggerEnter on %s from slot %d: not drivable yet (needs the L5 event-dispatch hook)", nvhooks::refToStr(ref).c_str(), (int)slot);
             return;
         }
+#ifdef NVCOOP_WITH_COMPANIONS
+        if (kind == fnvcoop::IntentKind::ActivateRef && !nvcoop::social::glueAllowActivation(static_cast<uint8_t>(slot), ref)) {   // somebody else's companion
+            nvcoop::Log("coop: guest ActivateRef on %s from slot %d refused: another player's companion", nvhooks::refToStr(ref).c_str(), (int)slot);
+            return;
+        }
+#endif
         // v1 acting player = the host's own player (0x14) so `IsActionRef player` / `GetDistance player` pass; the guest's ghost ref
         // (L6) replaces it once available. Effects are attributed to the guest by origin (known limitation: the host's player
         // really receives the item too).
@@ -349,6 +380,9 @@ void TryStart() {
         bool ok = nvhooks::execConsoleLineOn(line, target);
         nvcoop::Log("coop: guest action %d on %s from slot %d -> '%s' as %08X: %s", (int)kind, nvhooks::refToStr(ref).c_str(), (int)slot, line, actor, ok ? "issued" : "FAILED");
         nvcoop::PushEvent("coop.guestAction", std::string("{\"slot\":") + std::to_string((int)slot) + ",\"ref\":\"" + nvhooks::refToStr(ref) + "\",\"issued\":" + (ok ? "true" : "false") + "}");
+#ifdef NVCOOP_WITH_COMPANIONS
+        if (ok) nvcoop::social::glueGuestInteraction(static_cast<uint8_t>(slot), kind == fnvcoop::IntentKind::PickUp, ref);   // theft / trespass / break-in by the guest
+#endif
     });
     if (g_cfg.role == Role::Client && g_cfg.forwardActivate) {
         nvhooks::setActivateObserver([](const fnvcoop::FormRef& target) {
@@ -559,11 +593,16 @@ bool MJoin(const std::string& params, std::string& out) {
     return true;
 }
 
-// coop.owner {ref}: the actor-ownership service is not in the plugin yet. T2a's engine layer owns the data (synccore/enginemodel); when it
-// is wired in, this reads (owner slot, epoch) from the service's owner table and answers {"owner": n, "epoch": n}.
-bool MOwner(const std::string&, std::string& out) {
-    out = "{\"unsupported\":true,\"reason\":\"actor-ownership service is not in the plugin yet\"}";
+// coop.owner {ref}: who owns that actor on THIS machine, from plugin/actors' ownership view: {"owner": n, "epoch": n, "known": b, ...}
+// (255 = nobody). Built without plugin/actors it answers unsupported.
+bool MOwner(const std::string& params, std::string& out) {
+#ifdef NVCOOP_WITH_ACTORS
+    return nvcoop::actors::glueOwnerRpc(params, out);
+#else
+    (void)params;
+    out = "{\"unsupported\":true,\"reason\":\"actor-ownership service is not in the plugin build\"}";
     return true;
+#endif
 }
 
 bool MInject(const std::string& params, std::string& out) {
@@ -576,6 +615,9 @@ bool MInject(const std::string& params, std::string& out) {
 
 void OnLoad(void*) {
     LoadConfig();
+#ifdef NVCOOP_WITH_LIVE
+    nvcoop::livewire::glueLoad();   // main.cpp already ran glueConfigure() (before any module loaded)
+#endif
     nvcoop::RegisterMethod("coop.status", MStatus, true);
     nvcoop::RegisterMethod("coop.log", MLog, true);
     nvcoop::RegisterMethod("coop.inject", MInject, true);
@@ -609,6 +651,9 @@ void OnFrame() {
         }
 #endif
         g_rt->frame();
+#if defined(NVCOOP_WITH_ACTORS) && !defined(NVCOOP_WITH_LIVE)
+        nvcoop::actors::glueFrame(g_rt.get());   // actor ownership: after the session ticked (it polls the mux; ours is a channel on it)
+#endif
         if (g_rt->replicator() && g_cfg.baseline) {   // polling needs a known host world (baseline) or the first poll would flood
             if (!g_polling) { nvhooks::enableStatePolling(true); g_polling = true; }
             nvhooks::pollHostState(g_pollSink);
@@ -645,6 +690,17 @@ void OnFrame() {
             nvcoop::Log("coop: gameplay controls %s (baseline sync)", lock ? "LOCKED" : "unlocked");
         }
     }
+#ifdef NVCOOP_WITH_LIVE
+    // The live layer (actors / avatars / combat / spawns, each behind its [live] switch): after the runtime ticked, because that is what
+    // polls the mux and delivers the datagrams its channels receive. Also runs with no session (post-load purges).
+    nvcoop::livewire::glueFrame(g_rt.get(), NowMs());
+#endif
+#ifdef NVCOOP_WITH_COMPANIONS
+    nvcoop::social::glueFrame(g_rt.get());       // after the live layer (needs actor ownership); null runtime = session gone
+#endif
+#ifdef NVCOOP_WITH_AREADIGEST
+    nvcoop::areadigest::glueFrame(g_rt.get());   // after the session polled the mux; no-op unless enabled
+#endif
 }
 
 bool WriteBytes(const std::string& path, const fnvcoop::Bytes& b) {
@@ -665,12 +721,21 @@ std::string ResolveSavePath(const std::string& p) {
 std::string g_loadPath;   // .fos path announced by PreLoadGame (PostLoadGame carries none)
 
 void OnMessage(uint32_t type, void* data, uint32_t len) {
+#ifdef NVCOOP_WITH_LIVE
+    nvcoop::livewire::glueMessage(type, data, len);   // PreLoad / PostLoad / NewGame purge stand-ins and puppets; Exit ends the session part
+#endif
     // Save/load: sidecar `<save>.fos.fnvcoop` next to the save (L4 round 6). Host sidecar = shared world + epoch + token map.
     if (type == NVSEMessagingInterface::kMessage_SaveGame && data && g_rt && g_cfg.baseline) {
         std::string path = ResolveSavePath(std::string(static_cast<const char*>(data), len ? strnlen(static_cast<const char*>(data), len) : strlen(static_cast<const char*>(data))));
         fnvcoop::Bytes b = g_rt->saveSidecar();
         if (!b.empty() && WriteBytes(path + ".fnvcoop", b)) nvcoop::Log("coop: wrote sidecar %s.fnvcoop (%u bytes)", path.c_str(), (unsigned)b.size());
         else nvcoop::Log("coop: no sidecar written for %s (empty or write failed)", path.c_str());
+#ifdef NVCOOP_WITH_LIVE
+        if (g_rt->host()) {   // the host's spawn-site table (which sites rolled what, who owns them) travels with its save
+            fnvcoop::Bytes sp = nvcoop::livewire::glueSpawnSidecar();
+            if (!sp.empty() && WriteBytes(path + ".fnvspawn", sp)) nvcoop::Log("coop: wrote spawn sidecar %s.fnvspawn (%u bytes)", path.c_str(), (unsigned)sp.size());
+        }
+#endif
     }
     if (type == NVSEMessagingInterface::kMessage_PreLoadGame && data)
         g_loadPath = ResolveSavePath(std::string(static_cast<const char*>(data), len ? strnlen(static_cast<const char*>(data), len) : strlen(static_cast<const char*>(data))));
@@ -681,6 +746,12 @@ void OnMessage(uint32_t type, void* data, uint32_t len) {
         bool ok = g_rt->onGameLoaded(&side, &what);
         nvcoop::Log("coop: game loaded (%s): %s -> %s", g_loadPath.c_str(), what.c_str(), ok ? "ok" : "not handled");
         nvcoop::PushEvent("coop.loaded", std::string("{\"ok\":") + (ok ? "true" : "false") + "}");
+#ifdef NVCOOP_WITH_LIVE
+        if (g_rt->host()) {   // (the live hub already purged the world-bound state of the old world in glueMessage above)
+            std::string sraw = ReadWholeFile(g_loadPath + ".fnvspawn");
+            if (!sraw.empty()) nvcoop::livewire::glueSpawnSidecarLoaded(fnvcoop::Bytes(sraw.begin(), sraw.end()));
+        }
+#endif
     }
     if (type == NVSEMessagingInterface::kMessage_PostLoadGame && data) g_gameLoaded = true;
     if (type == NVSEMessagingInterface::kMessage_ExitGame || type == NVSEMessagingInterface::kMessage_ExitGame_Console) {
@@ -697,6 +768,15 @@ NVCOOP_MODULE(l10_coop, "l10_coop", OnLoad, OnMessage, OnFrame);
 // socket), so peers see a short disconnect and rejoin. The client token is carried over so a client keeps its slot.
 namespace {
 void ReloadShutdown() {
+#ifdef NVCOOP_WITH_COMPANIONS
+    nvcoop::social::glueFrame(nullptr);         // session gone
+#endif
+#ifdef NVCOOP_WITH_AREADIGEST
+    nvcoop::areadigest::glueFrame(nullptr);
+#endif
+#ifdef NVCOOP_WITH_LIVE
+    nvcoop::livewire::glueShutdown();   // puppets down, ActorSync dropped, before the runtime (and its mux) goes away
+#endif
     if (g_rt) {
         nvhooks::SetPlayerControlsLocked(false);
         g_rt->stop();

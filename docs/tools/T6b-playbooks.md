@@ -55,6 +55,11 @@ Repairs are never ignored. Per step: digest mismatches/repairs may appear while 
 ## Tests and twins
 Clean runs (11 playbooks, 2/3/4 players, laggy link), 28 twins that must fail, plus chaos twins (a dropped reliable message never retransmitted fails under bad_wifi; a late repair in the quiet window; repairs over budget; unexplained loosening) (`registry.TWINS`), `counter_noise` fails every playbook, every fake bug has a twin (checked), failure files for T1b (failure.json, snapshots, events, `flight.dump` result or the error), bot crash becomes a failed step, empty playbook is not a pass, plan resolution plus three breakages, scenario refs checked against `forms.json.gz`, live snapdiff comparer on the golden snapshots, adapter over T6a's fake bridge, CLI exit codes.
 
+## Enemy / NPC sync playbooks and the playbook clock
+`enemy_fight`, `enemy_handoff`, `enemy_spawn`, `corpse_loot_race` (registry `ENEMY_TESTS`, runner `tools/bots/run_fight.py`, status doc
+docs/tools/enemy-tests.md). Waits in fake runs are measured in the fake world's virtual time since 2026-10-21 (`clocks.py`): the `*_s` options
+of a fast run are virtual seconds with a 5 s floor, so the numbers above (0.2 to 0.3) no longer depend on CPU load.
+
 ## Limits
 - The fake proves the playbook logic and its checks, not the real console grammar or timing; those are UNVERIFIED until the first in-game run.
 - Snapdiff in the real game runs on `shared` only, so per-player state (inventories, positions) is checked by playbook queries, not snapdiff.

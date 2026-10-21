@@ -33,12 +33,18 @@ void io(Archive& a, MActorEvent& m) {
     a.varu32(m.id); a.varu32(m.epoch); a.varu(m.eventId); a.u8(k); m.kind = static_cast<ActorEventKind>(k & 1);
     a.vari32(m.health); a.u8(m.limbMask); a.boolean(m.dead); ioLoot(a, m.loot);
     a.varu32(m.seq); a.varu32(m.cell); io(a, m.pos); a.f32(m.yaw);
+    for (auto& d : m.limbDmg) a.vari32(d);
+    a.u8(m.killerKind); a.varu32(m.killerId);
+    if (a.reading() && m.killerKind > 2) a.fail();
 }
 void io(Archive& a, MHit& m) {
     uint8_t l = static_cast<uint8_t>(m.limb);
     a.varu(m.hitId); a.boolean(m.attackerIsPlayer); a.varu32(m.attacker); a.boolean(m.victimIsPlayer); a.varu32(m.victim);
     a.vari32(m.damage); a.u8(l); m.limb = static_cast<Limb>(l % static_cast<uint8_t>(Limb::Count_)); io(a, m.impact); a.f32(m.weaponRange); a.u8(m.hops);
+    a.u32(m.firedAt); a.varu32(m.attackerEpoch); a.u64(m.projectile); a.u64(m.explosionId);
 }
+void io(Archive& a, MProjectile& m) { combat::io(a, m.p); a.varu32(m.aim); a.vari32(m.damage); a.varu32(m.flightMs); }
+void io(Archive& a, MExplosion& m) { combat::io(a, m.e); }
 void io(Archive& a, MOwn& m) { io(a, m.m); }
 void io(Archive& a, MEffects& m) {
     a.varu(m.seq);
@@ -65,7 +71,7 @@ void io(Archive& a, MSpawnActor& m) { a.varu32(m.id); a.varu32(m.site); io(a, m.
 void io(Archive& a, MSiteState& m) { a.varu32(m.site); a.varu32(m.spawned); a.boolean(m.cleared); a.varu(m.clearedAtMs); a.varu32(m.spawnCount); }
 void io(Archive& a, MActivate& m) { a.varu32(m.obj); }
 void io(Archive& a, MDigest& m) {
-    a.u8(m.cat); a.u64(m.total);
+    a.u8(m.cat); a.varu32(m.seq); a.u64(m.total);
     size_t n = m.keys.size();
     if (!a.count(n, 1u << 20)) return;
     if (a.reading()) m.keys.assign(n, {});
@@ -98,14 +104,14 @@ void io(Archive& a, Action& v) {
 const char* toString(ActionKind k) {
     static const char* names[] = {"Move", "Attack", "Pickup", "Drop", "ContainerOpen", "ContainerClose", "ContainerTake",
                                   "ContainerPut", "Activate", "UseDoor", "Recruit", "Dismiss", "HostSetStage", "HostSetLock",
-                                  "HostKill", "Revive"};
+                                  "HostKill", "Revive", "Projectile", "Explode"};
     return static_cast<size_t>(k) < sizeof names / sizeof *names ? names[static_cast<size_t>(k)] : "?";
 }
 
 const char* bodyName(const Body& b) {
     static const char* names[] = {"FullState", "Pose", "Vitals", "ActorSnap", "ActorEvent", "Hit", "Own", "Effects", "DropReq",
                                   "ItemCreated", "Pickup", "ItemTaken", "ContainerReq", "ContainerRes", "ContainerSync",
-                                  "SpawnRoll", "SpawnActor", "SiteState", "Activate", "Digest", "Repair"};
+                                  "SpawnRoll", "SpawnActor", "SiteState", "Activate", "Digest", "Repair", "Projectile", "Explosion"};
     return names[b.index()];
 }
 

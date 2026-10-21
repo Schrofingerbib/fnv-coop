@@ -3,6 +3,7 @@
 //   anim.stats                                                              -> probe cost (microseconds)
 //   anim.bones                                                              -> default bone name list
 // Everything here is READ ONLY, runs on the main thread, and every raw memory access is SEH-guarded so a wrong offset
+// yields a missing field, never a crash. Offsets and vtable slots were checked statically against the reference
 // FalloutNV.exe 1.4.0.525 (tools/animcheck/verify_engine.py re-runs those checks); where the xNVSE header was wrong
 // (NiAVObject world transform) we use raw offsets instead of the header struct.
 #include <Windows.h>

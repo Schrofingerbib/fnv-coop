@@ -2,6 +2,7 @@
 // One script run = one EffectTxn. Clients apply effects directly; they never re-run scripts.
 #pragma once
 #include <cstdint>
+#include <string>
 #include <variant>
 #include <vector>
 #include "fnvcoop/types.h"
@@ -351,6 +352,23 @@ struct RefAngle {
     }
 };
 
+// RefCommand (story-capture): one script command that acts on a reference, or on nothing, and has no Effect type of its own. `op` is a RefOp
+// (refop.h) and decides what the slots mean (plugin/hooks/ref_ops.h has the per-op layout). `ref` is the calling reference (empty plugin =
+// none), `a` / `b` are form arguments, i / j / k / l integer arguments, f a float. Events are applied once by every machine that should see them
+// (`to` narrows player-targeted ones; actor AI orders are applied only by the machine that owns the actor). State ops keep the last command per
+// key in the ShadowState and reach late joiners with the baseline. Unknown ops are rejected by the decoder.
+struct RefCommand {
+    uint16_t op = 0;
+    FormRef ref, a, b;
+    int32_t i = 0, j = 0, k = 0, l = 0;
+    float f = 0;
+    std::string s;   // a text argument (PlayIdle's idle name): at most 255 characters on the wire
+    Recipient to;
+    bool operator==(const RefCommand& o) const {
+        return op == o.op && ref == o.ref && a == o.a && b == o.b && i == o.i && j == o.j && k == o.k && l == o.l && f == o.f && s == o.s && to == o.to;
+    }
+};
+
 // Convenience: the actor-value id the hooks use for experience (RewardXP folds into ModActorValue).
 constexpr uint32_t kAvExperience = 0x10000;
 
@@ -360,7 +378,7 @@ using Effect = std::variant<SetStage, SetObjective, SetGlobal, EnableRef, Disabl
                             CompanionOwner, ForcedDialogue, BarrierArrive, BarrierRelease, SayOnceFlag, CompleteQuest,
                             CompleteAllObjectives, SetLock, SetFactionRank, SetPerk, SwapTexture, SetFastTravelLock, FailQuest, SpawnRef, DespawnRef, ObjectState, RefScriptVar, RefAddItem,
                             RefRemoveItem, RemoveAllItems, AddTopic, AddNote, RemoveNote, SetMapMarker, ForceActiveQuest, RequestSave,
-                            SetWeather, SetTimeScale, AdvanceTime, RefAngle>;
+                            SetWeather, SetTimeScale, AdvanceTime, RefAngle, RefCommand>;
 
 const char* effectName(const Effect& e);
 

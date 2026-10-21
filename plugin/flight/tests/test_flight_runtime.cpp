@@ -1,5 +1,5 @@
 // T1a plugin-side tests: the Service (ini, dump, crash path) and the recorder wired into real host + client Runtimes over loopback
-// ENet. Build with -DFLIGHT_MUT=n for the mutation twins (each wiring bug must make this program FAIL):
+// ENet. Run with FNVCOOP_MUT=n (runtime twins, tools/mut/fnvcoop_mut.h) for the mutation twins (each wiring bug must make this program FAIL):
 //   1 host recorder not attached   2 client recorder not attached   3 recorder attached after start()
 #include <chrono>
 #include <cstdio>
@@ -17,9 +17,8 @@ using namespace nvcoop::coop::test;
 namespace fl = fnvcoop::flight;
 namespace fs = std::filesystem;
 
-#ifndef FLIGHT_MUT
-#define FLIGHT_MUT 0
-#endif
+#include "fnvcoop_mut.h"
+#define FLIGHT_MUT (fnvcoop_mut::current())   // runtime twin number (env FNVCOOP_MUT=n); this test is always built with FNVCOOP_RUNTIME_MUT
 
 static int g_checks = 0, g_failed = 0;
 #define CHECK(c)                                                                                     \

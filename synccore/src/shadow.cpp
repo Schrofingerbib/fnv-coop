@@ -25,8 +25,10 @@ void ShadowState::applyTxn(const EffectTxn& txn, PlayerId me, std::vector<Effect
 namespace {
 // Bucket-digest segments an effect can change (bit per BucketCache segment, see baseline.cpp walkSegment). Unknown kinds dirty everything.
 constexpr uint64_t S(unsigned i) { return 1ull << i; }
+// Namespace scope (not local to segmentsOf): the lambdas below use them, and the legacy MSVC lambda processor (cl without
+// /permissive-, as the L7 snapshot suite builds it) rejects a local constexpr used in a non-capturing lambda (C3493).
+constexpr uint64_t none = 0, all = ~0ull;
 uint64_t segmentsOf(const Effect& eff) {
-    constexpr uint64_t none = 0, all = ~0ull;
     return std::visit(Overloaded{
         [](const SetStage&) { return S(3); },
         [](const SetObjective&) { return S(4); },
@@ -60,6 +62,7 @@ uint64_t segmentsOf(const Effect& eff) {
         [](const SetWeather&) { return S(19); },
         [](const SetTimeScale&) { return S(20); },
         [](const RefAngle&) { return S(21); },
+        [](const RefCommand& c) { return refOpIsState(c.op) ? S(12) : none; },   // state ops share the texture segment (baseline.cpp case 12)
         // ledger, event and spawn/inventory effects are not baseline entries
         [](const AddItem&) { return none; }, [](const RemoveItem&) { return none; }, [](const ModActorValue&) { return none; },
         [](const ModReputation&) { return none; }, [](const ModKarma&) { return none; }, [](const SetPlayerControls&) { return none; },
@@ -347,6 +350,15 @@ void ShadowState::applyEffect(const Effect& eff, PlayerId origin, PlayerId me, s
             if (mut.angleKeepsFirst && angles.count({e.ref, e.axis})) return;
             if (foldAngle(angles, angleOrig, e)) emit(e);
         },
+        [&](const RefCommand& e) {
+            if (!refOpKnown(e.op)) return;
+            if (!refOpIsState(e.op) && !mut.refCmdAllState) { if (toMe(e.to)) emit(e); return; }   // event: no state, only its recipients perform it
+            const RefOpKey key = refOpKeyOf(e);
+            auto it = refOps.find(key);
+            if (it != refOps.end() && (mut.refCmdKeepsFirst || it->second == e)) return;   // same command again (or, under the twin, a later one is ignored)
+            refOps[key] = e;
+            if (toMe(e.to)) emit(e);
+        },
         [&](const SwapTexture& e) {
             auto key = std::make_pair(e.ref, e.slot);
             auto it = textures.find(key);
@@ -414,7 +426,7 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
     }
     for (auto& [n, o] : from.companionOwner) if (!to.companionOwner.count(n)) out.push_back(CompanionOwner{n, o, false, 0});
     // round 3
-    if (!mutations().originsIgnored) {   // spawned / despawned in `from` but not in `to`: take the spawn back, drop the tombstone (before any respawn below)
+    if (!preimageIgnored(kPiSpawn)) {   // spawned / despawned in `from` but not in `to`: take the spawn back, drop the tombstone (before any respawn below)
         for (auto& [r, info] : from.spawned) if (!to.spawned.count(r) && !to.despawned.count(r)) { DespawnRef f{r.localId}; f.forget = true; out.push_back(f); }
         for (auto& r : from.despawned) if (!to.despawned.count(r)) { DespawnRef f{r.localId}; f.forget = true; out.push_back(f); }
     }
@@ -432,7 +444,7 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
             if (auto it = from.objects.find(r); it != from.objects.end()) a = it->second;
             if (auto it = to.objects.find(r); it != to.objects.end()) b = it->second;
             ObjectState e; e.ref = r;
-            if (a.open != b.open) { e.mask |= kObjOpen; e.open = b.open; }
+            if (a.open != b.open && !(a.open && !b.open && preimageIgnored(kPiObjectState))) { e.mask |= kObjOpen; e.open = b.open; }   // a.open && !b.open is the revert
             if (b.destroyed && !a.destroyed) { e.mask |= kObjDestroyed; e.destroyed = true; }
             if (b.activated && !a.activated) { e.mask |= kObjActivated; e.activatedOnce = true; }
             if (e.mask) out.push_back(e);
@@ -446,7 +458,7 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
             out.push_back(x);
         }
     }
-    if (!mutations().originsIgnored)
+    if (!preimageIgnored(kPiRefVar))
         for (auto& [k, v] : from.refVars)
             if (!to.refVars.count(k))
                 if (const Origin* o = orgOf(from, kOrgRefVar, k.first, k.second)) out.push_back(RefScriptVar{k.first, k.second, o->d, true, o->d});
@@ -458,8 +470,13 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
             RefInv a, b;
             if (auto it = from.refInv.find(r); it != from.refInv.end()) a = it->second;
             if (auto it = to.refInv.find(r); it != to.refInv.end()) b = it->second;
-            if (b.cleared && !a.cleared) { out.push_back(RemoveAllItems{r}); a.delta.clear(); }
-            else if (a.cleared && !b.cleared && a.hasPre && !mutations().originsIgnored) {   // cleared in `from`, not in `to`: put the contents back
+            if (b.cleared && !a.cleared) {
+                RemoveAllItems c{r};
+                if (b.hasPre && !preimageIgnored(kPiClearPre)) { c.hasBefore = true; for (auto& [f, n] : b.pre) c.items.emplace_back(f, static_cast<int32_t>(n)); }   // carry the pre-image so the receiver can undo the clear after a host load
+                out.push_back(c);
+                a.delta.clear();
+            }
+            else if (a.cleared && !b.cleared && a.hasPre && !preimageIgnored(kPiRefInv)) {   // cleared in `from`, not in `to`: put the contents back
                 RemoveAllItems u; u.ref = r; u.undo = true;
                 for (auto& [f, c] : a.pre) u.items.emplace_back(f, static_cast<int32_t>(c));
                 out.push_back(u);
@@ -471,6 +488,7 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
             for (auto& i : items) {
                 int64_t x = a.delta.count(i) ? a.delta.at(i) : 0, y = b.delta.count(i) ? b.delta.at(i) : 0;
                 int64_t d = y - x;
+                if (y == 0 && preimageIgnored(kPiRefInv)) continue;   // twin: a delta only `from` holds is not taken back
                 while (d != 0) {
                     int32_t c = static_cast<int32_t>(std::clamp<int64_t>(d, INT32_MIN + 1, INT32_MAX));
                     if (c > 0) out.push_back(RefAddItem{r, i, c}); else out.push_back(RefRemoveItem{r, i, -c});
@@ -490,7 +508,7 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
             out.push_back(x);
         }
     }
-    if (!mutations().originsIgnored)
+    if (!preimageIgnored(kPiMarker))
         for (auto& [m, f] : from.mapMarkers)
             if (!to.mapMarkers.count(m))
                 if (const Origin* o = orgOf(from, kOrgMarker, m, 0)) out.push_back(SetMapMarker{m, static_cast<uint8_t>(o->n), true, static_cast<uint8_t>(o->n)});
@@ -498,14 +516,14 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
         SetWeather x{to.weather, to.weatherForced};
         if (const Origin* o = orgOf(to, kOrgWeather, FormRef(), 0)) { x.hasBefore = true; x.before = o->f; x.beforeForce = o->b; }
         out.push_back(x);
-    } else if (!to.weatherSet && from.weatherSet && !mutations().originsIgnored) {
+    } else if (!to.weatherSet && from.weatherSet && !preimageIgnored(kPiWeather)) {
         if (const Origin* o = orgOf(from, kOrgWeather, FormRef(), 0)) out.push_back(SetWeather{o->f, o->b, true, o->f, o->b});
     }
     if (to.timeScale != 0 && to.timeScale != from.timeScale) {
         SetTimeScale x{to.timeScale};
         if (const Origin* o = orgOf(to, kOrgTimeScale, FormRef(), 0)) { x.hasBefore = true; x.before = static_cast<float>(o->d); }
         out.push_back(x);
-    } else if (to.timeScale == 0 && from.timeScale != 0 && !mutations().originsIgnored) {
+    } else if (to.timeScale == 0 && from.timeScale != 0 && !preimageIgnored(kPiTimeScale)) {
         if (const Origin* o = orgOf(from, kOrgTimeScale, FormRef(), 0)) out.push_back(SetTimeScale{static_cast<float>(o->d), true, static_cast<float>(o->d)});
     }
     for (auto& [k, deg] : to.angles) {
@@ -536,7 +554,7 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
             out.push_back(l);
         }
     }
-    if (!mutations().originsIgnored)
+    if (!preimageIgnored(kPiLock))
         for (auto& [r, v] : from.locks)   // locked / unlocked in `from` but never touched in `to`: restore the original
             if (!to.locks.count(r))
                 if (const Origin* o = orgOf(from, kOrgLock, r, 0)) out.push_back(SetLock{r, o->b, o->n, true, o->b, o->n});
@@ -547,6 +565,10 @@ void ShadowState::diffEffects(const ShadowState& from, const ShadowState& to, Pl
     for (auto& [k, t] : to.textures) {
         auto it = from.textures.find(k);
         if (it == from.textures.end() || !(it->second == t)) out.push_back(SwapTexture{k.first, t, k.second});
+    }
+    for (auto& [k, c] : to.refOps) {   // state commands the target has and `from` lacks or holds a different last value of (nothing takes one back: no pre-image)
+        auto it = from.refOps.find(k);
+        if ((it == from.refOps.end() || !(it->second == c)) && (me == kNoPlayer || c.to.mode != Recipient::Mask || c.to.includes(me))) out.push_back(c);
     }
     for (auto& [k, on] : to.fastTravelLock) {
         auto it = from.fastTravelLock.find(k);
@@ -630,7 +652,7 @@ bool ShadowState::operator==(const ShadowState& o) const {
            spawned == o.spawned && despawned == o.despawned && createdCounter == o.createdCounter && objects == o.objects &&
            refVars == o.refVars && refInv == o.refInv && topics == o.topics && notes == o.notes && mapMarkers == o.mapMarkers &&
            companionKind == o.companionKind && weatherSet == o.weatherSet && (!weatherSet || (weather == o.weather && weatherForced == o.weatherForced)) &&
-           timeScale == o.timeScale && angles == o.angles && angleOrig == o.angleOrig;
+           timeScale == o.timeScale && angles == o.angles && angleOrig == o.angleOrig && refOps == o.refOps;
 }
 
 std::string ShadowState::describeDifference(const ShadowState& o) const {
@@ -653,6 +675,7 @@ std::string ShadowState::describeDifference(const ShadowState& o) const {
     if (topics != o.topics || notes != o.notes || mapMarkers != o.mapMarkers) return "journal";
     if (weatherSet != o.weatherSet || timeScale != o.timeScale) return "weather/time";
     if (angles != o.angles || angleOrig != o.angleOrig) return "angles";
+    if (refOps != o.refOps) return "refOps";
     return "round2-state";
 }
 
@@ -796,6 +819,23 @@ void ioRound2(Archive& a, ShadowState& s) {
              if (a.reading()) { if (kind < kOrgWeather || kind > kOrgLock || idx > 0xFFFF) a.fail(); std::get<0>(k) = kind; std::get<2>(k) = static_cast<uint16_t>(idx); }
          },
          [&](Origin& o) { io(a, o.f); a.f64(o.d); a.vari32(o.n); a.boolean(o.b); });
+    {   // RefCommand state ops. The key is derived from the command, so only the commands travel.
+        size_t n = s.refOps.size();
+        if (a.count(n, kMaxEntries)) {
+            if (a.reading()) {
+                s.refOps.clear();
+                for (size_t i = 0; i < n && a.ok(); ++i) {
+                    Effect e;
+                    io(a, e);
+                    auto* c = a.ok() ? std::get_if<RefCommand>(&e) : nullptr;
+                    if (!c || !refOpIsState(c->op)) { a.fail(); break; }
+                    s.refOps[refOpKeyOf(*c)] = *c;
+                }
+            } else {
+                for (auto& [k, c] : s.refOps) { Effect e = c; io(a, e); }
+            }
+        }
+    }
 }
 }  // namespace
 

@@ -61,7 +61,7 @@ struct IBotEngine {
     virtual int alwaysRun() { return -1; }
 };
 
-// Mutants for this file, every one must make tests/test_bots.cpp fail:
+// Runtime twins (FNVCOOP_MUT=<n>) for this file, every one must make tests/test_bots.cpp fail:
 //  native message box press (33, 36, 40; the others of 33..41 are in bot_engine.h):
 //  33 native path never used    36 native path tried before the UI layer    40 native reply says path "ui"
 //  always-run (42, 43, 46; 44 and 45 are in bot_engine.h):
@@ -70,16 +70,13 @@ struct IBotEngine {
 
 // The Run control (9) to hold so that the player moves at the wanted speed. alwaysRun: 1 on, 0 off, -1 unknown.
 inline bool runControlFor(bool wantRun, int alwaysRun) {
-#if NVBOTS_MUTANT == 42
-    (void)alwaysRun;
-    return wantRun;
-#elif NVBOTS_MUTANT == 46
-    if (alwaysRun < 0) return !wantRun;
-    return wantRun != (alwaysRun == 1);
-#else
+    if (FNV_MUT(42)) return wantRun;
+    if (FNV_MUT(46)) {
+        if (alwaysRun < 0) return !wantRun;
+        return wantRun != (alwaysRun == 1);
+    }
     if (alwaysRun < 0) return wantRun;   // unknown: the key meaning, and the replies say alwaysRun:null
     return wantRun != (alwaysRun == 1);
-#endif
 }
 inline Value alwaysRunValue(int alwaysRun) { return alwaysRun < 0 ? Value() : Value(alwaysRun == 1); }
 
@@ -95,11 +92,11 @@ inline void headingDeg(const double a[3], const double b[3], double* yaw, double
     double y = std::atan2(dx, dy) * rad;
     if (y < 0) y += 360.0;
     *yaw = y;
-#if NVBOTS_MUTANT == 9
-    *pitch = std::atan2(dz, std::sqrt(dx * dx + dy * dy)) * rad;
-#else
-    *pitch = -std::atan2(dz, std::sqrt(dx * dx + dy * dy)) * rad;
-#endif
+    if (FNV_MUT(9)) {
+        *pitch = std::atan2(dz, std::sqrt(dx * dx + dy * dy)) * rad;
+    } else {
+        *pitch = -std::atan2(dz, std::sqrt(dx * dx + dy * dy)) * rad;
+    }
 }
 
 class BotRpc {
@@ -111,12 +108,12 @@ public:
         const uint64_t now = e_.nowMs();
         in_.advanceFrame();
         if (IEngine* g = e_.engine()) vats_.tick(*g, now, [this](int c) { in_.tap(c, 3); });
-#if NVBOTS_MUTANT != 12
-        if (moveUntil_ && now >= moveUntil_) { in_.stopMove(); moveUntil_ = 0; moving_ = false; }
-#endif
-#if NVBOTS_MUTANT != 43
-        if (moving_) followRun();
-#endif
+        if (!FNV_MUT(12)) {
+            if (moveUntil_ && now >= moveUntil_) { in_.stopMove(); moveUntil_ = 0; moving_ = false; }
+        }
+        if (!FNV_MUT(43)) {
+            if (moving_) followRun();
+        }
         if (shotsLeft_ > 0 && now >= nextShotAt_) {
             in_.tap(kAttack, holdFrames_);
             --shotsLeft_;
@@ -145,9 +142,7 @@ public:
             // `run` omitted: hold no Run key, so the game's own always-run toggle picks the speed (what bot.move did before
             // run meant the speed). Only an explicit run:true/false asks for a speed.
             speedGiven_ = !p.get("run").isNull();
-#if NVBOTS_MUTANT == 47
-            speedGiven_ = true;   // twin: an omitted run counts as run:false and walks under always-run
-#endif
+            if (FNV_MUT(47)) speedGiven_ = true;   // twin 47: an omitted run counts as run:false and walks under always-run
             wantRun_ = p.get("run").asBool(false);
             const int alwaysRun = e_.alwaysRun();
             const bool runControl = speedGiven_ ? runControlFor(wantRun_, alwaysRun) : false;
@@ -156,11 +151,11 @@ public:
             moveUntil_ = ms > 0 ? e_.nowMs() + (uint64_t)ms : 0;
             o.set("held", heldList()).set("run", wantRun_).set("runControl", runControl).set("alwaysRun", alwaysRunValue(alwaysRun));
         } else if (method == "bot.stop") {
-#if NVBOTS_MUTANT == 10
-            in_.stopMove();
-#else
-            in_.releaseAll();
-#endif
+            if (FNV_MUT(10)) {
+                in_.stopMove();
+            } else {
+                in_.releaseAll();
+            }
             shotsLeft_ = 0;
             moveUntil_ = 0;
             moving_ = false;
@@ -185,9 +180,9 @@ public:
         } else if (method == "bot.fire") {
             int shots = (int)p.get("shots").asInt(1);
             if (shots < 1 || shots > 200) { out = "shots out of range"; return false; }
-#if NVBOTS_MUTANT == 11
-            ++shots;
-#endif
+            if (FNV_MUT(11)) {
+                ++shots;
+            }
             gapMs_ = (uint64_t)p.get("gapMs").asInt(180);
             holdFrames_ = 3;
             shotsLeft_ = shots;
@@ -214,11 +209,11 @@ public:
             int button = (int)p.get("button").asInt(-1);
             if (method == "bot.consent") {
                 const std::string a = p.get("answer").asString("");
-#if NVBOTS_MUTANT == 21
-                button = a == "ready" ? 1 : a == "notyet" ? 0 : -1;
-#else
-                button = a == "ready" ? 0 : a == "notyet" ? 1 : -1;
-#endif
+                if (FNV_MUT(21)) {
+                    button = a == "ready" ? 1 : a == "notyet" ? 0 : -1;
+                } else {
+                    button = a == "ready" ? 0 : a == "notyet" ? 1 : -1;
+                }
             }
             if (button < 0 || button > 9) { out = "bad button/answer"; return false; }
             if (method == "bot.consent") {   // the party-consent prompt is always the UI layer's own box
@@ -262,13 +257,13 @@ public:
             if (!g) { out = "unsupported: engine glue not wired"; return false; }
             const std::string tref = p.get("ref").asString("");
             ok = terminalPick(*g, tref, (int)p.get("entry").asInt(-1), &o, &out);
-#if NVBOTS_MUTANT != 25
-            if (ok) {
-                Value rec = Value::object();
-                rec.set("index", o.get("index")).set("text", o.get("used"));
-                termUsed_[tref].push_back(rec);
+            if (!FNV_MUT(25)) {
+                if (ok) {
+                    Value rec = Value::object();
+                    rec.set("index", o.get("index")).set("text", o.get("used"));
+                    termUsed_[tref].push_back(rec);
+                }
             }
-#endif
         } else if (method == "dev.terminalState") {
             Value arr = Value::array();
             for (const Value& v : termUsed_[p.get("ref").asString("")]) arr.push(v);
@@ -313,25 +308,21 @@ private:
         IEngine* g = e_.engine();
         bool applies = false;
         std::string uiErr, nativeErr;
-#if NVBOTS_MUTANT == 36
-        if (g && pressNativeMessageButton(*g, button, o, &nativeErr, &applies)) { o->set("path", "native"); return true; }
-#endif
+        if (FNV_MUT(36)) {
+            if (g && pressNativeMessageButton(*g, button, o, &nativeErr, &applies)) { o->set("path", "native"); return true; }
+        }
         uint32_t menu = 0;
         if (e_.pressBox(button, &menu, &uiErr)) {
             o->set("menu", (int64_t)menu).set("button", (int64_t)button).set("path", "ui");
             return true;
         }
-#if NVBOTS_MUTANT != 33
-        if (g && pressNativeMessageButton(*g, button, o, &nativeErr, &applies)) {
-#if NVBOTS_MUTANT == 40
-            o->set("path", "ui");
-#else
-            o->set("path", "native");
-#endif
-            return true;
+        if (!FNV_MUT(33)) {
+            if (g && pressNativeMessageButton(*g, button, o, &nativeErr, &applies)) {
+                o->set("path", FNV_MUT(40) ? "ui" : "native");
+                return true;
+            }
+            if (applies) { *out = "native message box: " + nativeErr + " (ui layer: " + uiErr + ")"; return false; }
         }
-        if (applies) { *out = "native message box: " + nativeErr + " (ui layer: " + uiErr + ")"; return false; }
-#endif
         *out = uiErr;
         return false;
     }

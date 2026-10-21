@@ -77,7 +77,7 @@ def serializers(text):
 def fields_of(body):
     alias = {m.group(1): m.group(2) for m in re.finditer(r"uint32_t (\w+) = e\.(\w+);", body)}
     found = []
-    for m in re.finditer(r"io\(a, e\.(\w+)\)|a\.(u8|u16|u32|u64|varu32|varu|vari32|vari|f32|f64|boolean)\((?:e\.)?(\w+)\)", body):
+    for m in re.finditer(r"io\(a, e\.(\w+)\)|a\.(u8|u16|u32|u64|varu32|varu|vari32|vari|f32|f64|boolean|str)\((?:e\.)?(\w+)\)", body):
         if m.group(1):
             name = m.group(1)
             found.append(("to" if name == "to" else name, m.start()))

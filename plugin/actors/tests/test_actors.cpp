@@ -1,0 +1,988 @@
+// plugin/actors tests (game-free). Every scenario is a function returning "" on success or a description of the first violation; the real
+// tests CHECK it is empty, the `twin` tests switch a run-time fault in the OwnershipService / live layer on and CHECK it is NOT empty
+// (the oracle sees the damage). The compile-time mutants (NVA_MUT=n) run this whole file against a deliberately broken ActorSync.
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <sstream>
+#include "minitest.h"
+#include "rig.h"
+#include "actors/owner_rpc.h"
+#include "common/minijson.h"
+#include "fnvcoop/wire.h"
+
+using namespace nva_test;
+
+namespace {
+
+std::string fail(const std::string& what, const Rig& r) { return what + " (t=" + std::to_string(r.now) + ")"; }
+
+bool closeTo(float a, float b, float eps) { return std::fabs(a - b) <= eps; }
+float dist2d(const live::Vec3& a, const live::Vec3& b) { return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y)); }
+
+Bytes craftBatch(PlayerId peer, const live::ActorSnapshot& s) {
+    live::SnapshotSender snd;
+    snd.queue(peer, s, 1000);
+    std::vector<Bytes> v = snd.flush(peer, 1000);
+    return v.empty() ? Bytes() : wrapLive(SubBatch, v[0]);
+}
+
+live::ActorSnapshot craftSnap(NetId id, OwnerEpoch epoch, uint32_t seq, CellId cell, live::Vec3 pos) {
+    live::ActorSnapshot s;
+    s.netId = id; s.ownerEpoch = epoch; s.seq = seq; s.tick = 5000; s.cell = cell; s.pos = pos;
+    return s;
+}
+
+void inject(Rig& r, int to, int from, const Bytes& data) { r.at(to).sync->receive(static_cast<PlayerId>(from), data.data(), data.size()); }
+
+Bytes envelopeBytes(PlayerId src, PlayerId dest, Body b) {
+    Envelope e;
+    e.src = src; e.dest = dest; e.body = std::move(b);
+    return encodeEnvelope(e);
+}
+
+// ---- scenario: one actor, two machines; ownership follows the players, the owner publishes, the others are driven ----------------
+std::string scnOwnerNonOwner() {
+    Rig r(2);
+    r.addActor(100, 3, V(1000), false, ~0u, 40, 0);
+    r.setPose(0, 3, V(0)); r.setPose(1, 3, V(3000));
+    r.run(1500);
+    OwnerInfo h = r.host().sync->ownerOf(100), c = r.at(1).sync->ownerOf(100);
+    if (h.owner != 0 || c.owner != 0) return fail("host should own an actor both players are near", r);
+    if (h.epoch == 0 || h.epoch != c.epoch) return fail("epoch not shared", r);
+    if (!r.host().eng.a[100].ai) return fail("owner AI is off", r);
+    if (r.at(1).eng.a[100].ai) return fail("non-owner AI is on", r);
+    if (r.at(1).sync->stats().published != 0) return fail("non-owner published", r);
+    if (r.host().sync->stats().published == 0) return fail("owner never published", r);
+    const float ox = r.host().eng.a[100].pos.x, cx = r.at(1).eng.a[100].pos.x;
+    if (ox < 1030) return fail("actor never moved", r);
+    if (std::fabs(ox - cx) > 40) return fail("non-owner copy lags more than 40 units: " + std::to_string(ox - cx), r);
+    if (r.at(1).eng.a[100].drives == 0) return fail("non-owner is not driven from snapshots", r);
+    if (!r.errors.empty()) return r.errors[0];
+    return "";
+}
+
+std::string scnClientOwns() {
+    Rig r(2);
+    r.addActor(101, 3, V(1000), false, 0b11, 30, 0);
+    r.setPose(0, 8, V(0)); r.setPose(1, 3, V(1200));   // the host player is far away
+    r.run(1500);
+    const OwnerInfo h = r.host().sync->ownerOf(101), c = r.at(1).sync->ownerOf(101);
+    if (h.owner != 1 || c.owner != 1) return fail("the client should own an actor only it is near", r);
+    if (!r.at(1).eng.a[101].ai) return fail("client AI off for its own actor", r);
+    if (r.host().eng.a[101].ai) return fail("host AI on for a client-owned actor", r);
+    if (r.host().sync->stats().published != 0) return fail("host published an actor it does not own", r);
+    if (dist2d(r.host().eng.a[101].pos, r.at(1).eng.a[101].pos) > 40) return fail("host copy does not follow the client-owned actor", r);
+    if (!r.errors.empty()) return r.errors[0];
+    return "";
+}
+
+// ---- scenario: the host walks away, ownership moves to the client with no respawn and no lost state ------------------------------
+std::string scnHandoff(Rig& r) {
+    r.addActor(100, 3, V(1000), false, ~0u, 40, 0);
+    r.setPose(0, 3, V(0)); r.setPose(1, 3, V(3000));
+    r.run(1500);
+    const OwnerInfo before = r.host().sync->ownerOf(100);
+    if (before.owner != 0) return fail("setup: host should own", r);
+    const std::vector<std::string> hostOps0 = r.host().eng.opsFor(100);
+    r.setPose(0, 9, V(0));   // host leaves: its cell is no longer next to the actor
+    uint64_t pendingSince = 0;
+    bool aiSwitched = false;
+    live::Vec3 hostPosAtSwitch, clientPosAtSwitch;
+    for (int i = 0; i < 300 && !aiSwitched; ++i) {
+        r.step(10);
+        if (!pendingSince && r.host().sync->service()->handoffPending(100)) pendingSince = r.now;
+        if (r.at(1).eng.a[100].ai) {
+            aiSwitched = true;
+            hostPosAtSwitch = r.host().eng.a[100].pos; clientPosAtSwitch = r.at(1).eng.a[100].pos;
+        }
+    }
+    if (!aiSwitched) return fail("the client never took over", r);
+    if (pendingSince == 0) return fail("no handoff was ever pending", r);
+    if (r.now - pendingSince > 500) return fail("handoff needed " + std::to_string(r.now - pendingSince) + " ms (a forced commit?)", r);
+    if (r.host().eng.a[100].ai) return fail("old owner still runs AI", r);
+    if (!closeTo(hostPosAtSwitch.x, clientPosAtSwitch.x, 0.45f))   /* the new owner has already walked one 10 ms step (0.4 units) when we look */ return fail("new owner did not continue from the old owner's final state: " + std::to_string(hostPosAtSwitch.x) + " vs " + std::to_string(clientPosAtSwitch.x), r);
+    r.run(600);
+    const float x1 = r.at(1).eng.a[100].pos.x;
+    if (x1 < clientPosAtSwitch.x + 10) return fail("the new owner's AI does not keep walking", r);
+    const OwnerInfo h = r.host().sync->ownerOf(100), c = r.at(1).sync->ownerOf(100);
+    if (h.owner != 1 || c.owner != 1) return fail("owner after handoff is not the client", r);
+    if (h.epoch != before.epoch + 1 || c.epoch != h.epoch) return fail("epoch did not rise by exactly one", r);
+    // order of engine calls on the new owner: place, then AI (never the other way round)
+    {
+        const std::vector<std::string> ops = r.at(1).eng.opsFor(100);
+        auto place = std::find(ops.begin(), ops.end(), "place:100"), ai1 = std::find(ops.begin(), ops.end(), "ai1:100");
+        if (place == ops.end() || ai1 == ops.end() || place > ai1) return fail("new owner must place the authoritative state BEFORE restoring AI", r);
+        if (r.at(1).eng.count("place", 100) != 1 || r.at(1).eng.count("ai1", 100) != 1) return fail("engine calls on the new owner are not exactly one place + one AI-on", r);
+    }
+    for (auto& mc : r.m) {
+        if (mc->eng.count("spawn", 100) || mc->eng.count("remove", 100)) return fail("actor was recreated during the handoff (Respawn/Reset3D class)", r);
+        if (mc->eng.a[100].standInSpawns) return fail("clone made for an actor that exists", r);
+    }
+    if (r.host().eng.opsFor(100).size() < hostOps0.size() + 1 || r.host().eng.count("ai0", 100) < 2) return fail("old owner never turned AI off", r);
+    if (r.aiCount(100) != 1) return fail("AI count is not exactly one", r);
+    if (!r.errors.empty()) return r.errors[0];
+    return "";
+}
+
+std::string scnTransferContinuity() { Rig r(2); return scnHandoff(r); }
+
+// ---- scenario: replayed ownership traffic and final states change nothing (idempotent handoff) ----------------------------------
+std::string scnIdempotent() {
+    Rig r(3);
+    std::string e = scnHandoff(r);
+    if (!e.empty()) return "setup: " + e;
+    r.setPose(2, 9, V(0));
+    r.run(300);
+    std::vector<std::vector<std::string>> opsBefore;
+    std::vector<uint64_t> takeBefore;
+    std::vector<OwnerInfo> infoBefore;
+    for (auto& mc : r.m) { opsBefore.push_back(mc->eng.ops); takeBefore.push_back(mc->sync->stats().takeovers); infoBefore.push_back(mc->sync->ownerOf(100)); }
+    const std::vector<NetMsg> all = r.net.captured;
+    for (int pass = 0; pass < 3; ++pass)
+        for (size_t i = 0; i < all.size(); ++i) {
+            const NetMsg& m = all[pass % 2 ? all.size() - 1 - i : i];   // forward, backward, forward
+            r.net.q.push_back(m);
+            r.net.q.back().at = r.now; r.net.q.back().order = r.net.order++;
+        }
+    r.run(200);
+    for (int i = 0; i < r.n(); ++i) {
+        Machine& mc = r.at(i);
+        if (mc.eng.ops.size() != opsBefore[static_cast<size_t>(i)].size()) return fail("machine " + std::to_string(i) + ": a replayed message caused engine calls: " + mc.eng.ops.back(), r);
+        if (mc.sync->stats().takeovers != takeBefore[static_cast<size_t>(i)]) return fail("machine " + std::to_string(i) + ": a replay caused a second takeover", r);
+        const OwnerInfo o = mc.sync->ownerOf(100);
+        if (o.owner != infoBefore[static_cast<size_t>(i)].owner || o.epoch != infoBefore[static_cast<size_t>(i)].epoch) return fail("machine " + std::to_string(i) + ": a replay changed ownership", r);
+    }
+    if (r.at(1).eng.count("ai1", 100) != 1) return fail("AI restored more than once", r);
+    if (r.at(1).eng.a[100].placeCalls != 1) return fail("final state placed more than once", r);
+    if (r.aiCount(100) != 1) return fail("AI count after replay is not one", r);
+    if (!r.errors.empty()) return r.errors[0];
+    return "";
+}
+
+// ---- scenario: STR #906. A past owner (or an impostor) talking after a handoff must not move the actor or the ownership ----------
+std::string scnStaleEcho() {
+    Rig r(3);
+    r.addActor(100, 3, V(1000), false, ~0u, 40, 0);
+    r.setPose(0, 3, V(0)); r.setPose(1, 3, V(2500)); r.setPose(2, 9, V(0));
+    r.run(1500);
+    const OwnerEpoch e0 = r.host().sync->ownerOf(100).epoch;
+    if (r.host().sync->ownerOf(100).owner != 0) return fail("setup: host should own", r);
+    r.setPose(0, 9, V(0));
+    if (!r.runUntil([&] { return r.at(1).eng.a[100].ai; }, 2000)) return fail("setup: handoff did not happen", r);
+    r.run(400);
+    const OwnerInfo now1 = r.at(2).sync->ownerOf(100);
+    if (now1.owner != 1 || now1.epoch != e0 + 1) return fail("setup: bad owner after handoff", r);
+    live::ActorSnapshot cur;
+    // (a) the old owner's last words arrive late as a reliable full state, epoch e0
+    {
+        live::ActorSnapshot stale = craftSnap(100, e0, 900000, 3, V(9999, 9999));
+        MSnapFull m; m.s = stale; m.final = true;
+        inject(r, 2, 0, envelopeBytes(0, kNoPlayer, m));
+        if (!r.at(2).sync->latestState(100, cur) || closeTo(cur.pos.x, 9999, 1)) return fail("stale final state (old epoch) was applied on a bystander", r);
+        inject(r, 1, 0, envelopeBytes(0, kNoPlayer, m));
+        if (!r.at(1).sync->latestState(100, cur) || closeTo(cur.pos.x, 9999, 1)) return fail("stale final state (old epoch) was applied on the new owner", r);
+        r.step(10);
+        if (closeTo(r.at(2).eng.a[100].pos.x, 9999, 100)) return fail("the bystander's actor was thrown across the map by a stale echo", r);
+    }
+    // (b) an old Grant replayed at everybody
+    {
+        fnvcoop::OwnMsg g; g.kind = fnvcoop::OwnMsg::Grant; g.netId = 100; g.epoch = e0; g.owner = 0; g.prevOwner = kNoPlayer;
+        inject(r, 2, 0, envelopeBytes(0, kNoPlayer, MOwn{g}));
+        inject(r, 1, 0, envelopeBytes(0, kNoPlayer, MOwn{g}));
+        if (r.at(2).sync->ownerOf(100).owner != 1 || r.at(2).sync->ownerOf(100).epoch != e0 + 1) return fail("a replayed old Grant rewound ownership on a bystander", r);
+        if (r.at(1).sync->ownerOf(100).owner != 1) return fail("a replayed old Grant took ownership from the new owner", r);
+        if (!r.at(1).eng.a[100].ai) return fail("a replayed old Grant turned the new owner's AI off", r);
+    }
+    // (c) a client that is not the owner publishes at the right epoch: the host refuses
+    {
+        live::ActorSnapshot imp = craftSnap(100, e0 + 1, 800000, 3, V(7777, 7777));
+        inject(r, 0, 2, craftBatch(2, imp));
+        if (!r.host().sync->latestState(100, cur) || closeTo(cur.pos.x, 7777, 1)) return fail("the host accepted a snapshot from a player who does not own the actor", r);
+        MSnapFull m; m.s = imp; m.s.seq = 800001;
+        inject(r, 0, 2, envelopeBytes(2, kNoPlayer, m));
+        if (!r.host().sync->latestState(100, cur) || closeTo(cur.pos.x, 7777, 1)) return fail("the host accepted a full state from a non-owner", r);
+    }
+    // (d) an old-epoch snapshot as a datagram batch, from the old owner, at the new owner and a bystander
+    {
+        live::ActorSnapshot stale = craftSnap(100, e0, 700000, 3, V(6666, 6666));
+        inject(r, 2, 0, craftBatch(0, stale));
+        inject(r, 1, 0, craftBatch(0, stale));
+        if (!r.at(2).sync->latestState(100, cur) || closeTo(cur.pos.x, 6666, 1)) return fail("a stale batch moved the bystander's copy", r);
+        if (!r.at(1).sync->latestState(100, cur) || closeTo(cur.pos.x, 6666, 1)) return fail("a stale batch moved the new owner's state", r);
+    }
+    r.run(300);
+    if (r.at(2).sync->stats().staleEpochDropped == 0) return fail("no stale-epoch drop was counted", r);
+    if (r.host().sync->stats().notOwnerDropped == 0) return fail("no non-owner drop was counted at the host", r);
+    if (r.aiCount(100) != 1 || !r.at(1).eng.a[100].ai) return fail("AI is not exactly on the owner after the echoes", r);
+    if (!r.errors.empty()) return r.errors[0];
+    return "";
+}
+
+// ---- scenario: follower exception ----------------------------------------------------------------------------------------------
+std::string scnFollower() {
+    Rig r(2);
+    r.addActor(300, 3, V(1000), false, ~0u, 20, 0);
+    r.setPose(0, 3, V(0)); r.setPose(1, 6, V(0));   // the client player is far from the actor
+    r.run(1200);
+    if (r.host().sync->ownerOf(300).owner != 0) return fail("setup: host should own", r);
+    fnvcoop::CompanionOwner co;
+    co.npc = refOf(300); co.owner = 1; co.active = true;
+    r.host().sync->onEffect(fnvcoop::Effect(co));
+    r.at(1).sync->onEffect(fnvcoop::Effect(co));
+    if (!r.runUntil([&] { return r.at(1).eng.a[300].ai; }, 2000)) return fail("a recruited companion did not move to its recruiter's machine", r);
+    if (r.host().eng.a[300].ai) return fail("old owner still runs the companion", r);
+    const OwnerEpoch e1 = r.host().sync->ownerOf(300).epoch;
+    // the recruiter wanders on; the host player stays right next to the companion: ownership must not come back
+    r.setPose(1, 7, V(0));
+    r.run(4000);
+    if (r.host().sync->ownerOf(300).owner != 1 || r.host().sync->ownerOf(300).epoch != e1) return fail("the companion left its recruiter while the recruiter walked on", r);
+    // dismissed: the normal rule returns it to the host (nearest eligible player, host preferred)
+    co.active = false;
+    r.host().sync->onEffect(fnvcoop::Effect(co));
+    if (!r.runUntil([&] { return r.host().sync->ownerOf(300).owner == 0 && r.host().eng.a[300].ai; }, 3000)) return fail("a dismissed companion did not return to the nearest player", r);
+    if (r.aiCount(300) != 1) return fail("AI count is not one after dismissal", r);
+    if (!r.errors.empty()) return r.errors[0];
+    return "";
+}
+
+// ---- scenario: no flapping at a border -----------------------------------------------------------------------------------------
+std::string scnNoFlap() {
+    Rig r(3);
+    r.addActor(150, 3, V(0));
+    r.setPose(0, 9, V(0));   // host out of range
+    r.setPose(1, 3, V(1000)); r.setPose(2, 3, V(1100));
+    r.run(1200);
+    int changes = 0;
+    OwnerEpoch last = r.host().sync->ownerOf(150).epoch;
+    for (int i = 0; i < 40; ++i) {   // the two clients take turns being a little closer
+        r.setPose(1, 3, V(i % 2 ? 1100.0f : 1000.0f)); r.setPose(2, 3, V(i % 2 ? 1000.0f : 1100.0f));
+        r.run(300);
+        const OwnerEpoch e = r.host().sync->ownerOf(150).epoch;
+        if (e != last) { ++changes; last = e; }
+    }
+    if (changes > 1) return fail("ownership flapped " + std::to_string(changes) + " times between two equally near players", r);
+    return "";
+}
+
+// ---- scenario: named NPCs die only through the host's KillActor ------------------------------------------------------------------
+std::string scnNamed() {
+    Rig r(3);
+    r.addActor(200, 3, V(500), true, ~0u);      // named story NPC
+    r.addActor(201, 3, V(600), false, ~0u);     // ordinary NPC
+    r.setPose(0, 3, V(0)); r.setPose(1, 3, V(2000)); r.setPose(2, 3, V(2500));
+    r.run(1500);
+    for (auto& mc : r.m) if (!mc->eng.a[200].prot) return fail("a named NPC is not protected on machine " + std::to_string(mc->slot), r);
+    if (r.host().eng.a[201].prot) return fail("an ordinary NPC was protected", r);
+    // the engine on every machine reports a lethal hit: the answer is no (owner: named; others: not the owner)
+    for (auto& mc : r.m)
+        if (mc->sync->onLocalDeath(200)) return fail("machine " + std::to_string(mc->slot) + " let a named NPC die by damage", r);
+    if (r.host().sync->stats().namedDeathsBlocked == 0) return fail("blocked named death not counted", r);
+    // forged death declarations: from the owner (named) and from a non-owner
+    {
+        MDeath d; d.id = 200; d.epoch = r.host().sync->ownerOf(200).epoch; d.eventId = 77; d.cell = 3;
+        inject(r, 1, 0, envelopeBytes(0, kNoPlayer, d));
+        inject(r, 0, 1, envelopeBytes(1, kNoPlayer, d));
+        inject(r, 2, 0, envelopeBytes(0, kNoPlayer, d));
+        r.run(200);
+        for (auto& mc : r.m) if (mc->sync->isDead(200) || mc->eng.a[200].dead) return fail("a forged death declaration killed the named NPC on machine " + std::to_string(mc->slot), r);
+    }
+    // the story authority kills it: everybody, exactly once, protection dropped first, ownership released
+    {
+        fnvcoop::KillActor ka; ka.actor = refOf(200);
+        for (auto& mc : r.m) mc->sync->onEffect(fnvcoop::Effect(ka));
+        for (auto& mc : r.m) mc->sync->onEffect(fnvcoop::Effect(ka));   // delivered twice: still once
+        r.run(400);
+        for (auto& mc : r.m) {
+            if (!mc->sync->isDead(200)) return fail("KillActor did not kill the named NPC on machine " + std::to_string(mc->slot), r);
+            if (mc->eng.a[200].kills != 1) return fail("kill applied " + std::to_string(mc->eng.a[200].kills) + " times on machine " + std::to_string(mc->slot) + " (must be once)", r);
+            if (mc->eng.a[200].prot) return fail("protection still on after the authorised kill", r);
+            if (mc->eng.a[200].ai) return fail("a dead named NPC still runs AI on machine " + std::to_string(mc->slot), r);
+        }
+    }
+    // an ordinary NPC: the owner's death declaration reaches everybody once
+    {
+        if (!r.host().sync->onLocalDeath(201)) return fail("the owner may not let an ordinary NPC die", r);
+        if (r.at(1).sync->onLocalDeath(201)) return fail("a non-owner declared a death", r);
+        r.run(400);
+        for (auto& mc : r.m) {
+            if (!mc->sync->isDead(201)) return fail("ordinary NPC death did not reach machine " + std::to_string(mc->slot), r);
+            if (mc->slot != 0 && mc->eng.a[201].kills != 1) return fail("ordinary NPC death applied " + std::to_string(mc->eng.a[201].kills) + " times on machine " + std::to_string(mc->slot), r);
+        }
+        // a delayed duplicate of the declaration changes nothing
+        NetMsg dm;
+        bool haveDm = false;
+        for (auto& c : r.net.captured) { Envelope e; if (c.data.size() > 2 && c.data[1] == SubEnvelope && decodeEnvelope(c.data.data() + 2, c.data.size() - 2, e) && std::holds_alternative<MDeath>(e.body)) { dm = c; haveDm = true; break; } }
+        if (!haveDm) return fail("no death message was sent", r);
+        const int kills = r.at(1).eng.a[201].kills;
+        inject(r, 1, dm.from, dm.data);
+        if (r.at(1).eng.a[201].kills != kills) return fail("a duplicated death message killed twice", r);
+    }
+    if (!r.errors.empty()) return r.errors[0];
+    return "";
+}
+
+// ---- scenario: leveled pick is shared ------------------------------------------------------------------------------------------------
+std::string scnPick() {
+    const FormRef A("falloutnv.esm", 0x601), B("falloutnv.esm", 0x602), C("falloutnv.esm", 0x603);
+    Rig r(3);
+    r.addActor(400, 3, V(500), false, 0b011, 0, 0, A);   // machines 0 and 1 have it; machine 2 gets it later
+    r.at(1).eng.a[400].base = B; r.at(1).sync->onNativeBase(400, B);   // the client's own leveled roll differs
+    r.setPose(0, 3, V(0)); r.setPose(1, 3, V(2000)); r.setPose(2, 3, V(2500));
+    r.run(1500);
+    if (r.host().sync->ownerOf(400).owner != 0) return fail("setup: host should own", r);
+    for (int i = 0; i < 2; ++i) {
+        if (r.at(i).sync->pickOf(400) != A) return fail("machine " + std::to_string(i) + " has no pick A", r);
+        if (r.at(i).eng.a[400].base != A) return fail("machine " + std::to_string(i) + " engine base is not the owner's pick", r);
+    }
+    if (r.at(1).eng.a[400].baseSets != 1) return fail("client swapped its base " + std::to_string(r.at(1).eng.a[400].baseSets) + " times", r);
+    // a non-owner cannot override the pick
+    {
+        MPickReport rep; rep.id = 400; rep.base = B;
+        inject(r, 0, 1, envelopeBytes(1, kHostPlayer, rep));
+        r.run(100);
+        if (r.host().sync->pickOf(400) != A || r.at(1).sync->pickOf(400) != A) return fail("a non-owner's report changed the pick", r);
+    }
+    // ownership moves; the new owner's native roll does not replace the pick
+    r.setPose(0, 9, V(0));
+    if (!r.runUntil([&] { return r.at(1).eng.a[400].ai; }, 2500)) return fail("setup: handoff did not happen", r);
+    r.run(300);
+    if (r.host().sync->pickOf(400) != A || r.at(1).eng.a[400].base != A || r.host().eng.a[400].base != A) return fail("the pick changed with the owner", r);
+    r.at(1).eng.a[400].base = B; r.at(1).sync->onNativeBase(400, B);   // the engine rolls again (e.g. after a reload)
+    if (r.at(1).eng.a[400].base != A) return fail("a re-roll was not swapped back to the shared pick", r);
+    // late load: the actor appears on machine 2 with yet another roll
+    r.at(2).eng.addReal(400, 3, V(500), C);
+    ActorMeta meta; meta.netId = 400; meta.ref = refOf(400); meta.base = C; meta.cell = 3; meta.pos = V(500);
+    r.at(2).sync->track(meta);
+    r.run(200);
+    if (r.at(2).eng.a[400].base != A) return fail("a late-loaded actor kept its own roll", r);
+    return r.errors.empty() ? "" : r.errors[0];
+}
+
+// ---- scenario: stand-in clones ----------------------------------------------------------------------------------------------------
+std::string scnStandIn() {
+    Rig r(2);
+    r.addActor(500, 3, V(800), false, 0b01, 40, 0);   // only the host has it loaded
+    r.at(1).eng.cellsLoaded.insert(3);                // the client has the cell, but no ref of the actor
+    r.setPose(0, 3, V(0)); r.setPose(1, 3, V(400));
+    r.run(1500);
+    Machine& c = r.at(1);
+    if (!c.sync->isStandIn(500) || c.eng.count("spawn", 500) != 1) return fail("no stand-in was made for an actor the client does not have", r);
+    if (!c.eng.a[500].standIn || c.eng.a[500].real) return fail("stand-in state wrong", r);
+    if (c.eng.a[500].ai) return fail("a stand-in runs AI", r);
+    if (c.sync->stats().published != 0) return fail("a stand-in published", r);
+    if (std::fabs(c.eng.a[500].pos.x - r.host().eng.a[500].pos.x) > 40) return fail("stand-in does not follow the owner", r);
+    if (r.host().sync->isStandIn(500)) return fail("the owner made a clone of its own actor", r);
+    // the real actor loads: the clone goes away, exactly once
+    c.eng.addReal(500, 3, V(900), FormRef("falloutnv.esm", 0x500));
+    c.sync->onActorLoaded(500);
+    r.run(300);
+    if (c.sync->isStandIn(500) || c.eng.count("remove", 500) != 1) return fail("the stand-in was not removed when the real actor loaded", r);
+    if (c.eng.a[500].ai) return fail("the real actor runs AI on a non-owner after the stand-in was replaced", r);
+    // a second one, then purge on load
+    r.addActor(501, 3, V(900), false, 0b01);
+    r.run(600);
+    if (!c.sync->isStandIn(501)) return fail("second stand-in missing", r);
+    c.sync->purgeStandIns();
+    if (!c.sync->standIns().empty() || c.eng.a[501].standIn) return fail("stand-ins survived a purge (they must never be saved)", r);
+    // an unloaded cell makes it go away too
+    if (!r.runUntil([&] { return c.sync->isStandIn(501); }, 600)) return fail("the purged stand-in never came back while the actor is still around", r);
+    c.eng.cellsLoaded.clear();
+    r.run(200);
+    if (c.sync->isStandIn(501)) return fail("a stand-in outlived its cell", r);
+    return r.errors.empty() ? "" : r.errors[0];
+}
+
+// ---- scenario: the host loses the final state: the forced commit still hands over ------------------------------------------------
+std::string scnLostFinal() {
+    Rig r(2);
+    r.net.dropIf = [](const NetMsg& m) {
+        Envelope e;
+        return m.data.size() > 2 && m.data[1] == SubEnvelope && decodeEnvelope(m.data.data() + 2, m.data.size() - 2, e) && std::holds_alternative<MSnapFull>(e.body) && std::get<MSnapFull>(e.body).final;
+    };
+    r.addActor(100, 3, V(1000), false, ~0u, 40, 0);
+    r.setPose(0, 3, V(0)); r.setPose(1, 3, V(3000));
+    r.run(1500);
+    r.setPose(0, 9, V(0));
+    if (!r.runUntil([&] { return r.at(1).eng.a[100].ai; }, 3000)) return fail("a lost final state must not block the handoff forever", r);
+    if (r.host().sync->service()->stats().forcedCommits == 0) return fail("the commit was not forced", r);
+    if (std::fabs(r.at(1).eng.a[100].pos.x - r.host().eng.a[100].pos.x) > 60) return fail("takeover without the final state used a stale position", r);
+    {   // no final state arrived: the best-known state is placed at the takeover, still before the AI comes back
+        const std::vector<std::string> ops = r.at(1).eng.opsFor(100);
+        auto place = std::find(ops.begin(), ops.end(), "place:100"), ai1 = std::find(ops.begin(), ops.end(), "ai1:100");
+        if (place == ops.end() || ai1 == ops.end() || place > ai1) return fail("a takeover without a final state must place the best-known state before restoring AI", r);
+        if (r.at(1).eng.a[100].placeCalls != 1) return fail("expected exactly one place on the new owner", r);
+    }
+    return r.errors.empty() ? "" : r.errors[0];
+}
+
+// ---- scenario: a client owner leaves ----------------------------------------------------------------------------------------------
+std::string scnOwnerLeaves() {
+    Rig r(2);
+    r.addActor(101, 3, V(1000), false, ~0u, 30, 0);
+    r.setPose(0, 5, V(0)); r.setPose(1, 3, V(1000));
+    r.run(1500);
+    if (r.host().sync->ownerOf(101).owner != 1) return fail("setup: client should own", r);
+    r.net.down.insert(1);
+    r.host().sync->playerLeft(1);
+    r.setPose(1, 0, V(0), false);
+    r.setPose(0, 3, V(0));
+    r.run(1500);
+    if (r.host().sync->ownerOf(101).owner != 0 || !r.host().eng.a[101].ai) return fail("the host did not take over an actor whose owner left", r);
+    if (r.host().eng.count("spawn", 101) || r.host().eng.count("remove", 101)) return fail("recreated on owner loss", r);
+    return r.errors.empty() ? "" : r.errors[0];
+}
+
+// ---- scenario: a client-owned NPC dies; a scripted resurrect continues the same ownership history ----------------------------------
+std::string scnClientOwnerDeath() {
+    Rig r(3);
+    r.addActor(101, 3, V(1000), false, ~0u, 30, 0);
+    r.setPose(0, 8, V(0)); r.setPose(1, 3, V(1200)); r.setPose(2, 3, V(2500));
+    r.run(1500);
+    if (r.host().sync->ownerOf(101).owner != 1) return fail("setup: client 1 should own", r);
+    if (r.host().sync->onLocalDeath(101)) return fail("the host (not the owner) declared a death", r);
+    if (!r.at(1).sync->onLocalDeath(101)) return fail("the owner may not let an ordinary NPC die", r);
+    r.run(500);
+    for (auto& mc : r.m) {
+        if (!mc->sync->isDead(101)) return fail("death of a client-owned NPC did not reach machine " + std::to_string(mc->slot), r);
+        if (mc->eng.a[101].ai) return fail("a dead NPC still runs AI on machine " + std::to_string(mc->slot), r);
+        if (mc->slot != 1 && mc->eng.a[101].kills != 1) return fail("death applied " + std::to_string(mc->eng.a[101].kills) + " times on machine " + std::to_string(mc->slot), r);
+        if (mc->slot == 1 && mc->eng.a[101].kills != 0) return fail("the owner's own engine was told to kill again", r);
+    }
+    return r.errors.empty() ? "" : r.errors[0];
+}
+
+std::string scnResurrect() {
+    Rig r(2);
+    r.addActor(210, 3, V(500), true, ~0u, 20, 0);
+    r.setPose(0, 3, V(0)); r.setPose(1, 3, V(2000));
+    r.run(1500);
+    const OwnerInfo before = r.host().sync->ownerOf(210);
+    if (before.owner != 0) return fail("setup: host should own", r);
+    fnvcoop::KillActor ka; ka.actor = refOf(210);
+    for (auto& mc : r.m) mc->sync->onEffect(fnvcoop::Effect(ka));
+    r.run(600);
+    for (auto& mc : r.m) if (!mc->sync->isDead(210) || mc->eng.a[210].ai) return fail("setup: kill did not take on machine " + std::to_string(mc->slot), r);
+    const float xDead = r.host().eng.a[210].pos.x;
+    fnvcoop::ResurrectActor rz; rz.actor = refOf(210);
+    for (auto& mc : r.m) mc->sync->onEffect(fnvcoop::Effect(rz));
+    r.run(1500);
+    for (auto& mc : r.m) {
+        if (mc->sync->isDead(210) || mc->eng.a[210].dead) return fail("resurrect did not revive on machine " + std::to_string(mc->slot), r);
+        if (mc->eng.a[210].revives != 1) return fail("revive applied " + std::to_string(mc->eng.a[210].revives) + " times on machine " + std::to_string(mc->slot), r);
+        if (!mc->eng.a[210].prot) return fail("a resurrected named NPC is not protected again on machine " + std::to_string(mc->slot), r);
+    }
+    const OwnerInfo after = r.host().sync->ownerOf(210), c = r.at(1).sync->ownerOf(210);
+    if (after.owner != 0 || c.owner != 0) return fail("ownership after a resurrect is not the host's", r);
+    if (after.epoch != before.epoch || c.epoch != before.epoch) return fail("the resurrect restarted the epoch history: " + std::to_string(before.epoch) + " -> " + std::to_string(after.epoch) + "/" + std::to_string(c.epoch), r);
+    if (!r.host().eng.a[210].ai || r.at(1).eng.a[210].ai) return fail("AI is not on the owner only after the resurrect", r);
+    if (r.host().eng.a[210].pos.x <= xDead + 5) return fail("the resurrected NPC does not move", r);
+    if (std::fabs(r.at(1).eng.a[210].pos.x - r.host().eng.a[210].pos.x) > 40) return fail("the other copy does not follow the resurrected NPC", r);
+    return r.errors.empty() ? "" : r.errors[0];
+}
+
+// ---- scenario: the host restarts from a save (a new session: ownership epochs start again) while a client keeps running ---------------
+// The client had seen epoch 2 for the actor. A new host numbers its epochs from 1 again; a client that kept its old epoch / seq floors would
+// drop every snapshot of the new session as "stale" and show a frozen actor forever.
+std::string scnHostRestart() {
+    Rig r(2);
+    std::string e = scnHandoff(r);   // the client now owns actor 100 at epoch 2 and has published at it
+    if (!e.empty()) return "setup: " + e;
+    Machine& h = r.host();
+    SyncConfig c;
+    c.self = 0; c.isHost = true;
+    c.adjacent = [](CellId a, CellId b) { return a == b || a + 1 == b || b + 1 == a; };
+    h.sync = std::make_unique<ActorSync>(c, h.eng, *h.ep);   // the host process was restarted: no ownership history
+    h.sync->playerJoined(1);
+    ActorMeta meta;
+    meta.netId = 100; meta.ref = refOf(100); meta.base = FormRef("falloutnv.esm", 0x500); meta.cell = 3; meta.pos = V(1000);
+    h.sync->track(meta);
+    r.at(1).sync->hostLost();
+    r.at(1).sync->hostConnected();
+    r.setPose(0, 3, V(0)); r.setPose(1, 3, V(3000));   // the host is next to the actor again (the client is in the cell too, but farther)
+    const int drivesBefore = r.at(1).eng.a[100].drives;
+    r.run(3000);
+    const OwnerInfo hi = r.host().sync->ownerOf(100), ci = r.at(1).sync->ownerOf(100);
+    if (hi.owner != 0 || ci.owner != 0) return fail("the new session did not give the actor to the host (host sees " + std::to_string(hi.owner) + ", client sees " + std::to_string(ci.owner) + ")", r);
+    if (ci.epoch != hi.epoch) return fail("client and host disagree on the epoch after the restart", r);
+    if (r.at(1).eng.a[100].drives < drivesBefore + 20) { const Stats& st = r.at(1).sync->stats(); const Stats& hs = r.host().sync->stats(); return fail("the client stopped following the actor after the host restarted (its old epoch floor rejects the new session) drives=" + std::to_string(r.at(1).eng.a[100].drives) + " before=" + std::to_string(drivesBefore) + " applied=" + std::to_string(st.snapshotsApplied) + " staleEp=" + std::to_string(st.staleEpochDropped) + " staleSeq=" + std::to_string(st.staleSeqDropped) + " notOwner=" + std::to_string(st.notOwnerDropped) + " future=" + std::to_string(st.futureEpoch) + " unknown=" + std::to_string(st.unknownActor) + " hostPub=" + std::to_string(hs.published) + " hostEpoch=" + std::to_string(hi.epoch), r); }
+    if (std::fabs(r.at(1).eng.a[100].pos.x - r.host().eng.a[100].pos.x) > 60) return fail("the client's copy is frozen far from the host's actor after the host restarted", r);
+    return "";
+}
+
+// ---- scenario: a client whose actor module comes up after the host's join burst ----------------------------------------------------
+// ActorRuntime registers its mux channel only once the client has joined, and the host sends its records / picks / ownership table in the
+// frame it sees the join: those datagrams can reach the client's mux before any handler exists and are dropped there. The same happens to a
+// client that goes through a baseline (hostLost / hostConnected) while the host never saw it leave. The client has to ask for the table.
+std::string scnJoinBurstLost() {
+    Rig r(2);
+    r.net.dropIf = [](const NetMsg& m) { return m.from == 0 && m.to == 1; };   // nothing the host sends reaches the client's module yet
+    r.addActor(100, 3, V(1000), false, 0b01, 40, 0);                            // only the host has it loaded
+    r.setPose(0, 3, V(0)); r.setPose(1, 3, V(3000));
+    r.run(1200);
+    if (r.at(1).sync->ownerOf(100).known) return fail("setup: the client learned of the actor although the host's datagrams were dropped", r);
+    r.net.dropIf = nullptr;
+    r.at(1).sync->hostConnected();   // the runtime has just come up
+    r.run(1500);
+    if (!r.at(1).sync->ownerOf(100).known) return fail("a client that missed the host's join burst never learned the actor", r);
+    std::string ag = r.agreement(100);
+    if (!ag.empty()) return fail("after the late start: " + ag, r);
+    if (r.at(1).sync->ownerOf(100).owner != 0) return fail("the client does not know the host owns the actor", r);
+    // a baseline: the client's view is wiped, the host does not notice anything
+    r.at(1).sync->hostLost();
+    if (r.at(1).sync->ownerOf(100).owner != kNoPlayer) return fail("setup: hostLost kept the ownership view", r);
+    r.at(1).sync->hostConnected();
+    r.run(1500);
+    ag = r.agreement(100);
+    if (!ag.empty()) return fail("after a baseline: " + ag, r);
+    if (r.at(1).sync->ownerOf(100).owner != 0) return fail("the client's ownership view stayed empty after a baseline", r);
+    return r.errors.empty() ? "" : r.errors[0];
+}
+
+// ---- scenario: a forced commit while the old owner has not heard of the Transfer ---------------------------------------------------
+// The host's messages to guest 1 (the owner) take 2.6 s, longer than the handoff timeout (1 s): the host commits without guest 1's final state,
+// while guest 1 keeps simulating until the Transfer reaches it. The new owner must not start its AI before guest 1's final state (or its
+// departure, or the safety timeout) shows that guest 1 stopped: at no step may two machines run the AI of one actor.
+std::string scnSlowOldOwner(bool newOwnerIsHost) {
+    Rig r(newOwnerIsHost ? 2 : 3);
+    r.addActor(100, 3, V(1000), false, ~0u, 40, 0);
+    r.setPose(0, 9, V(0)); r.setPose(1, 3, V(3000));
+    if (!newOwnerIsHost) r.setPose(2, 3, V(6000));
+    r.run(1800);
+    if (r.host().sync->ownerOf(100).owner != 1) return fail("setup: guest 1 should own the actor", r);
+    r.net.extraDelay = [](const NetMsg& m) { return (m.from == 0 && m.to == 1) ? 2600u : 0u; };
+    const int next = newOwnerIsHost ? 0 : 2;
+    if (newOwnerIsHost) r.setPose(0, 3, V(1000)); else r.setPose(2, 3, V(1100));
+    const uint64_t t0 = r.now;
+    if (!r.runUntil([&] { return r.host().sync->ownerOf(100).owner == next; }, 4000)) return fail("setup: the actor never moved to machine " + std::to_string(next), r);
+    if (r.host().sync->service()->stats().forcedCommits == 0) return fail("setup: the commit was not forced", r);
+    r.run(1000);   // the old owner still has not heard (2.6 s)
+    if (r.at(next).eng.a[100].ai) return fail("the new owner drives the actor while the old owner has not heard of the handoff", r);
+    if (r.at(1).eng.a[100].ai == false && r.now < t0 + 2400) return fail("setup: guest 1 stopped before it could have heard", r);
+    // a final state of a much older handoff says nothing about this one
+    if (!newOwnerIsHost) {
+        MSnapFull old; old.s = craftSnap(100, 0, 99, 3, V(1000)); old.final = true;
+        inject(r, 2, 0, envelopeBytes(1, kNoPlayer, old));
+        r.run(10);
+        if (r.at(2).eng.a[100].ai) return fail("an old-epoch final state released the hold", r);
+    }
+    if (!r.runUntil([&] { return r.at(next).eng.a[100].ai; }, 4000 - 1000)) return fail("the new owner never started after the old owner stopped", r);
+    if (r.now - t0 > 3600) return fail("the new owner waited for the safety timeout instead of the old owner's final state (" + std::to_string(r.now - t0) + " ms)", r);
+    r.run(600);
+    if (r.aiCount(100) != 1) return fail("AI count is not exactly one", r);
+    if (!newOwnerIsHost && r.host().sync->stats().staleFinalsForwarded == 0) return fail("the host never passed the old owner's final state on", r);
+    r.net.extraDelay = nullptr;
+    r.run(1500);
+    const std::string ag = r.agreement(100);
+    if (!ag.empty()) return fail(ag, r);
+    return r.errors.empty() ? "" : r.errors[0];
+}
+
+void checkEmpty(const std::string& e) { CHECK_MSG(e.empty(), e); }
+
+}  // namespace
+
+TEST(own, owner_and_non_owner) { checkEmpty(scnOwnerNonOwner()); }
+TEST(own, client_owns_what_only_it_is_near) { checkEmpty(scnClientOwns()); }
+TEST(own, transfer_continues_from_final_state) { checkEmpty(scnTransferContinuity()); }
+TEST(own, transfer_is_idempotent) { checkEmpty(scnIdempotent()); }
+TEST(own, stale_echo_str906) { checkEmpty(scnStaleEcho()); }
+TEST(own, named_npc_protection) { checkEmpty(scnNamed()); }
+TEST(own, follower_exception) { checkEmpty(scnFollower()); }
+TEST(own, no_flapping_at_a_border) { checkEmpty(scnNoFlap()); }
+TEST(own, leveled_pick_shared) { checkEmpty(scnPick()); }
+TEST(own, stand_in_clones) { checkEmpty(scnStandIn()); }
+TEST(own, lost_final_state_forced_commit) { checkEmpty(scnLostFinal()); }
+TEST(own, host_restart_resets_epoch_floors) { checkEmpty(scnHostRestart()); }
+TEST(own, join_burst_lost_is_requested_again) { checkEmpty(scnJoinBurstLost()); }
+TEST(own, forced_commit_host_new_owner_waits_for_old_owner) { checkEmpty(scnSlowOldOwner(true)); }
+TEST(own, forced_commit_guest_new_owner_waits_for_old_owner) { checkEmpty(scnSlowOldOwner(false)); }
+TEST(own, owner_leaves) { checkEmpty(scnOwnerLeaves()); }
+TEST(own, client_owner_death) { checkEmpty(scnClientOwnerDeath()); }
+TEST(own, resurrect_continues_epoch_history) { checkEmpty(scnResurrect()); }
+
+TEST(own, handoff_with_loss_and_jitter) {
+    NetOpts o;
+    o.lossUnreliable = 0.2; o.dupUnreliable = 0.1; o.jitterMs = 40;
+    Rig r(2, 5, o);
+    checkEmpty(scnHandoff(r));
+}
+
+// ---- run-time fault twins: the oracle must notice the damage -------------------------------------------------------------------------
+TEST(twin, accept_stale_epoch) {
+    fnvcoop::OwnershipFaults f; f.acceptStaleEpoch = true;
+    fnvcoop::OwnershipFaultScope s(f);
+    CHECK(!scnStaleEcho().empty());
+}
+TEST(twin, adopt_echo) {
+    fnvcoop::OwnershipFaults f; f.adoptEcho = true;
+    fnvcoop::OwnershipFaultScope s(f);
+    CHECK(!scnStaleEcho().empty());
+}
+TEST(twin, accept_non_owner) {
+    fnvcoop::OwnershipFaults f; f.acceptNonOwner = true;
+    fnvcoop::OwnershipFaultScope s(f);
+    CHECK(!scnStaleEcho().empty());
+}
+TEST(twin, follower_ignored) {
+    fnvcoop::OwnershipFaults f; f.followerIgnored = true;
+    fnvcoop::OwnershipFaultScope s(f);
+    CHECK(!scnFollower().empty());
+}
+TEST(twin, transfer_no_ack) {
+    fnvcoop::OwnershipFaults f; f.transferNoAck = true;
+    fnvcoop::OwnershipFaultScope s(f);
+    CHECK(!scnTransferContinuity().empty());
+}
+TEST(twin, no_hysteresis) {
+    fnvcoop::OwnershipFaults f; f.noHysteresis = true;
+    fnvcoop::OwnershipFaultScope s(f);
+    CHECK(!scnNoFlap().empty());
+}
+TEST(twin, no_epoch_bump) {
+    fnvcoop::OwnershipFaults f; f.noEpochBump = true;
+    fnvcoop::OwnershipFaultScope s(f);
+    CHECK(!scnTransferContinuity().empty());
+}
+
+// ---- coop.owner ------------------------------------------------------------------------------------------------------------------------
+TEST(rpc, coop_owner) {
+    Rig r(3);
+    r.addActor(100, 3, V(1000), false, ~0u, 20, 0);
+    r.setPose(0, 3, V(0)); r.setPose(1, 3, V(2000)); r.setPose(2, 3, V(2500));
+    r.run(1500);
+    const OwnerInfo truth = r.host().sync->ownerOf(100);
+    CHECK(truth.known && truth.owner == 0 && truth.epoch >= 1);
+    CHECK(r.host().sync->service()->ownerOf(100) == truth.owner && r.host().sync->service()->epochOf(100) == truth.epoch);   // the service itself agrees
+    for (int i = 0; i < 3; ++i) {
+        std::string out;
+        CHECK(nvcoop::actors::ownerRpc(r.at(i).sync.get(), "{\"ref\":\"FalloutNV.esm:000064\"}", out));
+        nvcoop::json::Value v; std::string err;
+        REQUIRE(nvcoop::json::parse(out, v, err));
+        CHECK(v.get("known").asBool());
+        CHECK_MSG(v.get("owner").asInt(-1) == truth.owner, out);
+        CHECK_MSG(v.get("epoch").asInt(-1) == static_cast<int64_t>(truth.epoch), out);
+        CHECK(v.get("self").asInt(-1) == i);
+        CHECK(v.get("mine").asBool() == (i == 0));
+        CHECK(v.get("ai").asBool() == (i == 0));
+        CHECK(!v.find("unsupported"));
+    }
+    // after a handoff every machine reports the new pair
+    r.setPose(0, 9, V(0));
+    CHECK(r.runUntil([&] { return r.at(1).eng.a[100].ai || r.at(2).eng.a[100].ai; }, 3000));
+    r.run(400);
+    const OwnerInfo t2 = r.host().sync->ownerOf(100);
+    CHECK(t2.owner != 0 && t2.epoch == truth.epoch + 1);
+    for (int i = 0; i < 3; ++i) {
+        std::string out;
+        CHECK(nvcoop::actors::ownerRpc(r.at(i).sync.get(), "{\"ref\":\"falloutnv.esm:64\"}", out));
+        nvcoop::json::Value v; std::string err;
+        REQUIRE(nvcoop::json::parse(out, v, err));
+        CHECK_MSG(v.get("owner").asInt(-1) == t2.owner && v.get("epoch").asInt(-1) == static_cast<int64_t>(t2.epoch), out);
+    }
+    std::string out;
+    CHECK(nvcoop::actors::ownerRpc(r.host().sync.get(), "{\"ref\":\"falloutnv.esm:00FFFF\"}", out));
+    CHECK(out.find("\"known\":false") != std::string::npos && out.find("\"owner\":255") != std::string::npos);
+    CHECK(nvcoop::actors::ownerRpc(nullptr, "{}", out) && out.find("unsupported") != std::string::npos);
+    CHECK(!nvcoop::actors::ownerRpc(r.host().sync.get(), "{\"ref\":\"nonsense\"}", out));
+    CHECK(!nvcoop::actors::ownerRpc(r.host().sync.get(), "{}", out));
+    CHECK(!nvcoop::actors::ownerRpc(r.host().sync.get(), "{not json", out));
+    FormRef fr;
+    CHECK(nvcoop::actors::parseRef("FalloutNV.esm:00ABCD", fr) && fr.plugin == "falloutnv.esm" && fr.localId == 0xABCD);
+    CHECK(!nvcoop::actors::parseRef(":12", fr) && !nvcoop::actors::parseRef("a.esm:", fr) && !nvcoop::actors::parseRef("a.esm:zz", fr));
+}
+
+// ---- wire ----------------------------------------------------------------------------------------------------------------------------
+namespace {
+std::vector<Body> sampleBodies() {
+    std::vector<Body> v;
+    fnvcoop::OwnMsg g; g.kind = fnvcoop::OwnMsg::Transfer; g.netId = 5; g.epoch = 9; g.owner = 2; g.prevOwner = 1;
+    v.push_back(MOwn{g});
+    ActorMeta meta; meta.netId = 7; meta.ref = refOf(7); meta.base = refOf(8); meta.named = true; meta.created = true; meta.cell = 4; meta.pos = V(1, 2, 3);
+    v.push_back(MTrack{meta});
+    MSnapFull sf; sf.s = craftSnap(7, 3, 4, 5, V(1.5f, -2.5f, 3)); sf.s.rot = V(0.1f, 0.2f, 0.3f); sf.s.vel = V(4, 5, 6);
+    sf.s.anim.locomotion = 3; sf.s.anim.sneak = true; sf.s.anim.aim = true; sf.s.ai.combatTarget = 11; sf.s.ai.package = 12; sf.s.ai.alert = 2;
+    live::AvValue av; av.av = 1; av.value = -40; sf.s.avDeltas.push_back(av);
+    sf.final = true;
+    v.push_back(sf);
+    MDeath d; d.id = 7; d.epoch = 3; d.eventId = 0x0100000000000009ull; d.cell = 4; d.pos = V(9, 8, 7);
+    v.push_back(d);
+    v.push_back(MPick{7, refOf(99)});
+    v.push_back(MPickReport{7, refOf(98)});
+    v.push_back(MResync{7});
+    // enemy-anim: the schema v2 animation extension inside the full state, and the opaque owner event
+    MSnapFull sf2; sf2.s = craftSnap(8, 3, 6, 5, V(1, 2, 3));
+    sf2.s.anim.locomotion = 5; sf2.s.anim.weaponDrawn = true; sf2.s.anim.action = 223; sf2.s.anim.actionSeq = 200; sf2.s.anim.knocked = true; sf2.s.anim.ragdoll = true;
+    v.push_back(sf2);
+    MAnimEvent ae; ae.id = 7; ae.epoch = 3; ae.eventId = 0x0100000000000011ull; ae.payload = Bytes{1, 2, 3, 4, 5};
+    v.push_back(ae);
+    return v;
+}
+
+// ---- enemy-anim: MAnimEvent (reliable owner event with an opaque payload) ----------------------------------------------------------------
+std::string scnAnimEvents() {
+    Rig r(3);
+    r.addActor(101, 3, V(1000), false, ~0u, 30, 0);
+    r.setPose(0, 8, V(0)); r.setPose(1, 3, V(1200)); r.setPose(2, 3, V(2500));
+    r.run(1500);
+    if (r.host().sync->ownerOf(101).owner != 1) return fail("setup: client 1 should own", r);
+    std::vector<std::vector<ActorSync::AnimEventIn>> got(3);
+    for (int i = 0; i < 3; ++i) r.at(i).sync->setAnimEventHandler([&got, i](const ActorSync::AnimEventIn& e) { got[static_cast<size_t>(i)].push_back(e); });
+    const Bytes payload{9, 8, 7};
+    if (r.host().sync->sendAnimEvent(101, payload)) return fail("the host (not the owner) sent an animation event", r);
+    if (r.at(2).sync->sendAnimEvent(101, payload)) return fail("a bystander sent an animation event", r);
+    if (!r.at(1).sync->sendAnimEvent(101, payload)) return fail("the owner could not send an animation event", r);
+    r.run(300);
+    if (got[1].size() != 0) return fail("the sender got its own event back", r);
+    for (int i : {0, 2}) {
+        if (got[static_cast<size_t>(i)].size() != 1) return fail("machine " + std::to_string(i) + " got " + std::to_string(got[static_cast<size_t>(i)].size()) + " copies of the event", r);
+        const auto& e = got[static_cast<size_t>(i)][0];
+        if (e.id != 101 || e.payload != payload || e.from != 1) return fail("event content wrong on machine " + std::to_string(i), r);
+    }
+    // a duplicate delivery of the same datagram is applied once
+    const size_t before = r.net.captured.size();
+    for (size_t k = 0; k < before; ++k) {
+        const NetMsg& m = r.net.captured[k];
+        Envelope env;
+        if (m.to == 2 && m.data.size() > 2 && m.data[1] == SubEnvelope && decodeEnvelope(m.data.data() + 2, m.data.size() - 2, env) && std::holds_alternative<MAnimEvent>(env.body))
+            r.at(2).sync->receive(static_cast<PlayerId>(m.from), m.data.data(), m.data.size());
+    }
+    r.run(100);
+    if (got[2].size() != 1) return fail("a replayed event was applied again (" + std::to_string(got[2].size()) + ")", r);
+    // a forged event from a bystander (src 2, owner is 1) is judged and dropped by the host: nobody else sees it
+    MAnimEvent forged; forged.id = 101; forged.epoch = r.host().sync->ownerOf(101).epoch; forged.eventId = (2ull << 48) | 77; forged.payload = Bytes{6};
+    Envelope fe; fe.src = 2; fe.dest = kNoPlayer; fe.body = forged;
+    r.net.send(2, 0, true, encodeEnvelope(fe));
+    r.run(300);
+    if (got[0].size() != 1 || got[1].size() != 0) return fail("a forged event from a non-owner was delivered", r);
+    if (r.host().sync->stats().animEventsRejected == 0) return fail("the forged event was not counted as rejected", r);
+    // an old epoch from the real owner is dropped too (stale)
+    MAnimEvent stale; stale.id = 101; stale.epoch = 0; stale.eventId = (1ull << 48) | 999; stale.payload = Bytes{5};
+    Envelope se; se.src = 1; se.dest = kNoPlayer; se.body = stale;
+    r.net.send(1, 0, true, encodeEnvelope(se));
+    r.run(300);
+    if (got[0].size() != 1 || got[2].size() != 1) return fail("an event of an old epoch was delivered", r);
+    return r.errors.empty() ? "" : r.errors[0];
+}
+}  // namespace
+
+TEST(anim, owner_events_reach_everyone_once_and_forgeries_do_not) { checkEmpty(scnAnimEvents()); }
+
+TEST(wire, roundtrip_every_message) {
+    for (const Body& b : sampleBodies()) {
+        Envelope e; e.src = 2; e.dest = kNoPlayer; e.body = b;
+        const Bytes a = encodeEnvelope(e);
+        REQUIRE(a.size() > 2 && a[0] == kChannelActors && a[1] == SubEnvelope);
+        Envelope back;
+        CHECK_MSG(decodeEnvelope(a.data() + 2, a.size() - 2, back), bodyName(b));
+        CHECK(back.src == 2 && back.dest == kNoPlayer && back.body.index() == b.index());
+        CHECK_MSG(encodeEnvelope(back) == a, bodyName(b));   // decode(encode(x)) re-encodes to the same bytes
+    }
+}
+
+TEST(wire, malformed_input_never_crashes) {
+    fnvcoop::Rng rng(11);
+    std::vector<Bytes> seeds;
+    for (const Body& b : sampleBodies()) { Envelope e; e.src = 1; e.body = b; seeds.push_back(encodeEnvelope(e)); }
+    live::ActorSnapshot s = craftSnap(7, 3, 4, 5, V(1, 2, 3));
+    seeds.push_back(craftBatch(1, s));
+    Rig r(2);
+    r.checkInvariants = false;   // forged host messages may legitimately confuse a client: only "no crash" is asserted here
+    r.addActor(7, 3, V(0));
+    int accepted = 0;
+    for (int i = 0; i < 4000; ++i) {
+        Bytes d = seeds[rng.range(0, static_cast<uint32_t>(seeds.size() - 1))];
+        const int muts = static_cast<int>(rng.range(0, 4));
+        for (int k = 0; k < muts && !d.empty(); ++k) d[rng.range(0, static_cast<uint32_t>(d.size() - 1))] ^= static_cast<uint8_t>(1u << rng.range(0, 7));
+        if (rng.chance(0.3) && !d.empty()) d.resize(rng.range(0, static_cast<uint32_t>(d.size())));
+        if (rng.chance(0.05)) { d.assign(rng.range(0, 40), 0); for (auto& b : d) b = static_cast<uint8_t>(rng.u32()); }
+        Envelope e;
+        if (d.size() > 2 && decodeEnvelope(d.data() + 2, d.size() - 2, e)) ++accepted;
+        r.host().sync->receive(1, d.data(), d.size());
+        r.at(1).sync->receive(0, d.data(), d.size());
+        if (i % 50 == 0) r.step(10);
+    }
+    CHECK(accepted > 0);
+    CHECK(r.host().sync->stats().undecodable > 0);
+    r.run(1000);   // still alive
+}
+
+TEST(wire, spoofed_sources_are_ignored) {
+    Rig r(3);
+    r.addActor(100, 3, V(0));
+    r.setPose(0, 3, V(0)); r.setPose(1, 3, V(100)); r.setPose(2, 3, V(200));
+    r.run(1000);
+    const OwnerInfo before = r.host().sync->ownerOf(100);
+    fnvcoop::OwnMsg g; g.kind = fnvcoop::OwnMsg::Grant; g.netId = 100; g.epoch = before.epoch + 5; g.owner = 2;
+    inject(r, 0, 1, envelopeBytes(1, kHostPlayer, MOwn{g}));            // a client may only Ack
+    inject(r, 0, 1, envelopeBytes(2, kHostPlayer, MResync{100}));       // claims to be client 2
+    inject(r, 1, 2, envelopeBytes(0, kNoPlayer, MOwn{g}));              // a client posing as the host
+    CHECK(r.host().sync->ownerOf(100).owner == before.owner && r.host().sync->ownerOf(100).epoch == before.epoch);
+    CHECK(r.at(1).sync->ownerOf(100).owner == before.owner);
+    CHECK(r.host().sync->stats().spoofed >= 2 && r.at(1).sync->stats().spoofed >= 1);
+}
+
+TEST(wire, net_ids) {
+    const NetId a = deriveNetId(FormRef("FalloutNV.esm", 0x104C1C)), b = deriveNetId(FormRef("falloutnv.esm", 0x104C1C));
+    CHECK(a == b && a != 0);
+    CHECK(deriveNetId(FormRef("falloutnv.esm", 1)) != deriveNetId(FormRef("deadmoney.esm", 1)));
+    int bad = 0;
+    for (uint32_t i = 1; i < 200000; ++i) { const NetId n = deriveNetId(FormRef("falloutnv.esm", i)); if (n == 0 || (n >> 24) == 0xFF) ++bad; }
+    CHECK(bad == 0);
+}
+
+// ---- churn: many seeds, lossy net, players roaming; invariants every step, agreement at the end -----------------------------------
+namespace {
+std::string churn(uint64_t seed, int machines, int actors, uint32_t runMs, bool leaves = false) {
+    NetOpts o;
+    o.latencyMs = 15; o.jitterMs = 40; o.lossUnreliable = 0.10; o.dupUnreliable = 0.05;
+    Rig r(machines, seed, o);
+    fnvcoop::Rng rng(seed * 31 + 7);
+    for (int i = 0; i < actors; ++i)
+        r.addActor(1000 + i, static_cast<CellId>(2 + i % 6), V(500.0f + 300.0f * i), false, ~0u, rng.chance(0.5) ? 25.0f : -25.0f, 0);
+    for (int p = 0; p < machines; ++p) r.setPose(p, static_cast<CellId>(2 + rng.range(0, 6)), V(100.0f * p));
+    r.run(1200);
+    uint64_t nextMove[8] = {}, nextToggle[8] = {};
+    bool gone[8] = {};
+    auto disconnect = [&](int p) {
+        r.net.down.insert(p);
+        r.host().sync->playerLeft(static_cast<PlayerId>(p));
+        r.at(p).sync->hostLost();
+        gone[p] = true;
+    };
+    auto reconnect = [&](int p) {
+        r.net.down.erase(p);
+        r.host().sync->playerJoined(static_cast<PlayerId>(p));
+        r.at(p).sync->hostConnected();
+        gone[p] = false;
+    };
+    for (uint32_t t = 0; t < runMs; t += 10) {
+        if (leaves)
+            for (int p = 1; p < machines; ++p)
+                if (r.now >= nextToggle[p]) {
+                    nextToggle[p] = r.now + 1500 + rng.range(0, 3500);
+                    if (gone[p]) reconnect(p); else disconnect(p);
+                }
+        for (int p = 0; p < machines; ++p)
+            if (r.now >= nextMove[p] && !gone[p]) {
+                nextMove[p] = r.now + 400 + rng.range(0, 1800);
+                r.setPose(p, static_cast<CellId>(2 + rng.range(0, 6)), V(static_cast<float>(rng.range(0, 3000))));
+            }
+        r.step(10);
+        if (!r.errors.empty()) return "seed " + std::to_string(seed) + ": " + r.errors[0];
+    }
+    // quiet: everybody is back, no more movement, clean net
+    for (int p = 1; p < machines; ++p) if (gone[p]) reconnect(p);
+    r.net.o.lossUnreliable = 0; r.net.o.dupUnreliable = 0; r.net.o.jitterMs = 0;
+    for (auto& mc : r.m) for (auto& kv : mc->eng.a) kv.second.vx = kv.second.vy = 0;
+    r.run(4000);
+    if (!r.errors.empty()) return "seed " + std::to_string(seed) + ": " + r.errors[0];
+    for (int i = 0; i < actors; ++i) {
+        const NetId id = 1000 + i;
+        const std::string ag = r.agreement(id);
+        if (!ag.empty()) return "seed " + std::to_string(seed) + ": actor " + std::to_string(id) + ": " + ag;
+        const OwnerInfo h = r.host().sync->ownerOf(id);
+        if (h.owner == kNoPlayer) { if (r.aiCount(id) != 0) return "seed " + std::to_string(seed) + ": unowned actor has AI running"; continue; }
+        if (r.aiMachine(id) != h.owner || r.aiCount(id) != 1) return "seed " + std::to_string(seed) + ": actor " + std::to_string(id) + " AI is not exactly on owner " + std::to_string(h.owner) + " (on " + std::to_string(r.aiMachine(id)) + ", count " + std::to_string(r.aiCount(id)) + ")";
+        const live::Vec3 truth = r.at(h.owner).eng.a[id].pos;
+        for (int j = 0; j < machines; ++j) {
+            if (dist2d(r.at(j).eng.a[id].pos, truth) > 60) return "seed " + std::to_string(seed) + ": actor " + std::to_string(id) + " on machine " + std::to_string(j) + " is " + std::to_string(dist2d(r.at(j).eng.a[id].pos, truth)) + " units from the owner";
+            if (r.at(j).eng.a[id].standIn) return "seed " + std::to_string(seed) + ": unexpected stand-in";
+        }
+    }
+    uint64_t dg = r.host().sync->ownershipDigest();
+    for (int j = 1; j < machines; ++j) if (r.at(j).sync->ownershipDigest() != dg) return "seed " + std::to_string(seed) + ": ownership digests differ";
+    return "";
+}
+}  // namespace
+
+TEST(churn, players_leave_and_rejoin) {
+    for (uint64_t seed = 101; seed <= 108; ++seed) {
+        const std::string e = churn(seed, 3 + static_cast<int>(seed % 2), 4, 25000, true);
+        CHECK_MSG(e.empty(), e);
+    }
+}
+
+TEST(churn, roaming_players_lossy_net) {
+    for (uint64_t seed = 1; seed <= 12; ++seed) {
+        const std::string e = churn(seed, 2 + static_cast<int>(seed % 3), 5, 20000);
+        CHECK_MSG(e.empty(), e);
+    }
+}
+
+// ---- ActorRuntime over the real MuxTransport ------------------------------------------------------------------------------------------
+TEST(runtime, mux_session_roundtrip) {
+    fnvcoop::InMemoryNetwork net(3);
+    FakeEngine hostEng, cliEng;
+    fnvcoop::ITransport* hostEnd = net.endpoint(0);
+    fnvcoop::ITransport* cliEnd = net.endpoint(1);
+    fnvcoop::MuxTransport hostMux(*hostEnd), cliMux(*cliEnd);
+    ActorRuntime hostRt(hostEng), cliRt(cliEng);
+    hostRt.config().adjacent = cliRt.config().adjacent = [](CellId a, CellId b) { return a == b; };
+    uint64_t now = 1000;
+    bool joined = true;
+    auto frame = [&](uint64_t dt) {
+        now += dt;
+        net.advance(now);
+        hostEng.simulate(static_cast<uint32_t>(dt)); cliEng.simulate(static_cast<uint32_t>(dt));
+        fnvcoop::PeerId from; Bytes d;
+        while (hostMux.poll(from, d)) {}
+        while (cliMux.poll(from, d)) {}
+        FrameInfo hf;
+        hf.active = true; hf.isHost = true; hf.self = 0; hf.mux = &hostMux; hf.nowMs = now;
+        if (joined) { ClientLink l; l.slot = 1; l.peer = 1; l.joined = true; hf.clients.push_back(l); }
+        hostRt.frame(hf);
+        FrameInfo cf;
+        cf.active = true; cf.isHost = false; cf.self = 1; cf.hostLinkUp = joined; cf.mux = &cliMux; cf.nowMs = now;
+        cliRt.frame(cf);
+    };
+    frame(10);
+    REQUIRE(hostRt.sync() && cliRt.sync());
+    ActorSync* hs = hostRt.sync();
+    ActorSync* cs = cliRt.sync();
+    hostEng.addReal(100, 3, V(1000), refOf(0x500), 30, 0);
+    cliEng.addReal(100, 3, V(1000), refOf(0x500), 30, 0);
+    ActorMeta meta; meta.netId = 100; meta.ref = refOf(100); meta.base = refOf(0x500); meta.cell = 3; meta.pos = V(1000);
+    hs->track(meta); cs->track(meta);
+    PlayerPose p0, p1;
+    p0.present = p1.present = true; p0.cell = p1.cell = 3; p0.pos = V(0); p1.pos = V(2000);
+    for (int i = 0; i < 150; ++i) {
+        for (ActorSync* s : {hs, cs}) { s->setPlayerPose(0, p0); s->setPlayerPose(1, p1); }
+        frame(10);
+    }
+    CHECK(hs->ownerOf(100).owner == 0 && cs->ownerOf(100).owner == 0);
+    CHECK(hs->ownerOf(100).epoch == cs->ownerOf(100).epoch && hs->ownerOf(100).epoch >= 1);
+    CHECK(hostEng.a[100].ai && !cliEng.a[100].ai);
+    CHECK_MSG(std::fabs(hostEng.a[100].pos.x - cliEng.a[100].pos.x) < 40 && hostEng.a[100].pos.x > 1010, "host x=" + std::to_string(hostEng.a[100].pos.x) + " client x=" + std::to_string(cliEng.a[100].pos.x) + " hostAi=" + std::to_string(hostEng.a[100].ai) + " owner=" + std::to_string((int)hs->ownerOf(100).owner));
+    CHECK(cs->stats().published == 0 && hs->stats().published > 0);
+    // a datagram from a peer that is not a joined client is dropped
+    {
+        fnvcoop::ITransport* stranger = net.endpoint(9);
+        stranger->send(0, Bytes{kChannelActors, SubEnvelope, 1, 2, 3});
+        frame(30);
+        CHECK(hostRt.droppedUnknownPeer() >= 1);
+    }
+    // handoff over the real mux
+    p0.cell = 9;
+    for (int i = 0; i < 250; ++i) {
+        for (ActorSync* s : {hs, cs}) { s->setPlayerPose(0, p0); s->setPlayerPose(1, p1); }
+        frame(10);
+    }
+    CHECK(hs->ownerOf(100).owner == 1 && cs->ownerOf(100).owner == 1);
+    CHECK(cliEng.a[100].ai && !hostEng.a[100].ai);
+    CHECK(cliEng.count("place", 100) == 1 && cliEng.count("spawn", 100) == 0);
+    // the link drops: the client forgets ownership; the host re-decides
+    joined = false;
+    for (int i = 0; i < 100; ++i) {
+        hs->setPlayerPose(0, p0);
+        frame(10);
+    }
+    CHECK(cliRt.sync() == nullptr || cliRt.sync()->ownerOf(100).owner == kNoPlayer);
+    CHECK(hs->ownerOf(100).owner != 1);
+    // the session ends
+    {
+        FrameInfo off;
+        hostRt.frame(off);
+        CHECK(hostRt.sync() == nullptr);
+    }
+}

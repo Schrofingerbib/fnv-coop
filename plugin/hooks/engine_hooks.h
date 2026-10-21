@@ -223,6 +223,13 @@ void setNonPlayerAvObserver(NonPlayerAvObserver obs);
 using ScriptPackageObserver = std::function<void(const fnvcoop::FormRef& actor, const fnvcoop::FormRef& package, bool add)>;
 void setScriptPackageObserver(ScriptPackageObserver obs);
 
+// Story-capture (docs/tools/story-capture.md): hooks ~75 more script commands (AI orders, spells, ownership, chargen ...) and records them as
+// RefCommand effects (plugin/hooks/ref_ops.h). OFF by default; call BEFORE Init(). nvcoop.ini [hooks] story_capture=1 turns it on (hooks_module.cpp).
+void setStoryCapture(bool on);
+bool storyCaptureEnabled();
+// The console executor injected with setConsoleExec (empty when none): RemoteApplier falls back to it when it has no executor of its own.
+std::function<bool(const std::string&, uint32_t)> consoleExec();
+
 // Counters for effects the engine produced that have no Effect type yet (e.g. CompleteQuest, container AddItem on a
 // non-player). Exposed so tests/telemetry can show gaps instead of silently dropping them.
 struct Unmapped {
@@ -230,6 +237,7 @@ struct Unmapped {
     uint64_t itemOnNonPlayer = 0;
     uint64_t avOnNonPlayer = 0;
     uint64_t questFailed = 0;
+    uint64_t storyDropped = 0;   // story-capture: a command ran but could not be recorded (calling reference or form without a stable name)
 };
 const Unmapped& unmapped();
 

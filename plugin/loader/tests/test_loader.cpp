@@ -1,6 +1,6 @@
 // Game-free tests for the hot-reload loader (CoreHost) using stub core DLLs. No NVSE, no game.
 // Usage: nvloader_test <dir with nvstub_*.dll>   (a scratch dir "run" is created inside it)
-// Exit 0 = every check passed. The same file is built against mutant loaders, which must make it fail.
+// Exit 0 = every check passed. Run with FNVCOOP_MUT=21..32 (runtime twins of loader_host.cpp) it must fail.
 #include <atomic>
 #include <chrono>
 #include <cstdio>

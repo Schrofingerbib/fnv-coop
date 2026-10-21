@@ -1,5 +1,5 @@
 // Game-free tests for the reload state registry. Exit code != 0 on any failure.
-// Built once against the real sources and once per NVRELOAD_MUTANT=1..7; every mutant MUST fail.
+// Built once (FNVCOOP_RUNTIME_MUT); run once for real and once per FNVCOOP_MUT=1..8; every twin MUST fail.
 #include <atomic>
 #include <chrono>
 #include <cstdio>

@@ -7,8 +7,8 @@
 //   refusal   a hook chained over by "another mod" vetoes the reload and the old core keeps running
 //   config    nvcoop.ini beside the core file is rewritten before every reload; each new core reads the new value beside
 //             its own module (the loader's cache copy), as the real modules do
-// Usage: test_reload_host <core dll> <work dir>.   Exit 0 = every check passed. Built against mutant cores, which must fail,
-// and as nvreload_host_test_<twin> against a mutant loader (NVLOADER_MUTANT_NOCONFIG / CONFIGONCE), which must fail too.
+// Usage: test_reload_host <core dll> <work dir>.   Exit 0 = every check passed. Run with FNVCOOP_MUT=1..9 (runtime twins of the test core) it must fail,
+// and with FNVCOOP_MUT=25 / 26 (runtime twins of the loader: noconfig / configonce, loader_host.cpp) it must fail too.
 #include <winsock2.h>
 #include <windows.h>
 #include <psapi.h>
@@ -314,6 +314,14 @@ int main(int argc, char** argv) {
             Sleep(20);  // a worker is now blocked in the detour (its instruction pointer is in the kernel)
             ReloadResult r = host.Reload("held");
             CHECK(!r.ok, "reload refused while a thread is inside a detour");
+            {
+                // The failure must be explained in the log: what timed out, how long, which thread, and what it was inside.
+                std::string lg = Slurp(g_run + "reload_host.log");
+                CHECK(lg.find("REFUSED by the drain") != std::string::npos, "the log says the drain refused the reload");
+                CHECK(lg.find("drain timed out after") != std::string::npos && lg.find("limit 400 ms") != std::string::npos, "the log names the drain timeout and its limit");
+                CHECK(lg.find("is still inside the code that would be unloaded") != std::string::npos, "the log says a thread is still inside");
+                CHECK(lg.find("return address 0x") != std::string::npos || lg.find("instruction pointer 0x") != std::string::npos, "the log says where the thread was found");
+            }
             CHECK(host.generation() == static_cast<uint32_t>(kCycles + 1), "same generation keeps running after the drain refusal");
             if (hold) hold(0);
             Sleep(20);

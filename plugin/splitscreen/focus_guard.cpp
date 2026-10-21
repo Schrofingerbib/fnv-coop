@@ -3,7 +3,9 @@
 #include <atomic>
 #include <mutex>
 
-// Mutation twins for plugin\splitscreen\run_tests.cmd (each must make the tests fail):
+#include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
+
+// Runtime mutation twins (FNVCOOP_MUT=<n>, tools/mut/fnvcoop_mut.h) for plugin\splitscreen\run_tests.cmd (each must make the tests fail):
 //   1 = pass everything (the engine behaviour this guard exists to prevent)
 //   2 = also swallow activation (the engine would never learn it is active again)
 //   3 = swallow, but do not forward the other messages to the original procedure
@@ -11,10 +13,6 @@
 //   5 = no reset on WM_NCDESTROY (the guard keeps the destroyed window and rejects the new one)
 //   6 = no mutex in Install and Uninstall (two Install calls on one window make the guard chain to itself)
 //   7 = WM_NCDESTROY cleanup without the mutex (an Uninstall + Install on another thread during it loses the new window)
-#ifndef FOCUS_GUARD_MUTANT
-#define FOCUS_GUARD_MUTANT 0
-#endif
-
 namespace nvsplit {
 namespace {
 std::atomic<HWND> g_hwnd{nullptr};
@@ -32,19 +30,15 @@ LRESULT CALLBACK GuardProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     WNDPROC orig = g_orig.load();
-#if FOCUS_GUARD_MUTANT == 3
-    return DefWindowProcA(h, msg, wp, lp);
-#endif
+    if (FNV_MUT(3)) return DefWindowProcA(h, msg, wp, lp);
     const LRESULT r = orig ? CallWindowProcA(orig, h, msg, wp, lp) : DefWindowProcA(h, msg, wp, lp);
-#if FOCUS_GUARD_MUTANT != 5
-    if (msg == WM_NCDESTROY) {
+    if (!FNV_MUT(5) && msg == WM_NCDESTROY) {
         // The last message this window gets. The engine has seen it (above). Forget the window, so that Install accepts the
         // window the game makes next. Hold the mutex: otherwise an Uninstall + Install of another window on another thread
         // could run between the check and the stores, and this cleanup would then erase the new window's state. No deadlock:
         // Install and Uninstall send no messages to the window while they hold it (SetWindowLongPtr of GWLP_WNDPROC does not).
-#if FOCUS_GUARD_MUTANT != 7
-        std::lock_guard<std::mutex> lock(g_lock);
-#endif
+        std::unique_lock<std::mutex> lock(g_lock, std::defer_lock);
+        if (!FNV_MUT(7)) lock.lock();
         if (g_hwnd.load() == h) {
 #ifdef FOCUS_GUARD_TESTING
             if (auto hook = g_destroyHook.load()) hook(h);  // the race test runs Uninstall + Install on another thread here
@@ -53,29 +47,20 @@ LRESULT CALLBACK GuardProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             g_hwnd.store(nullptr);
         }
     }
-#endif
     return r;
 }
 }  // namespace
 
 Action Decide(UINT msg, WPARAM wParam) {
-#if FOCUS_GUARD_MUTANT == 1
-    (void)msg; (void)wParam;
-    return Action::Pass;
-#else
+    if (FNV_MUT(1)) return Action::Pass;
     if (msg != WM_ACTIVATE) return Action::Pass;
-#if FOCUS_GUARD_MUTANT == 2
-    return Action::Swallow;
-#else
+    if (FNV_MUT(2)) return Action::Swallow;
     return LOWORD(wParam) == WA_INACTIVE ? Action::Swallow : Action::Pass;
-#endif
-#endif
 }
 
 bool Install(HWND h) {
-#if FOCUS_GUARD_MUTANT != 6
-    std::lock_guard<std::mutex> lock(g_lock);
-#endif
+    std::unique_lock<std::mutex> lock(g_lock, std::defer_lock);
+    if (!FNV_MUT(6)) lock.lock();
     if (!h || !IsWindow(h)) return false;
     HWND cur = g_hwnd.load();
     if (cur == h) return true;
@@ -100,9 +85,8 @@ bool Install(HWND h) {
 }
 
 bool Uninstall() {
-#if FOCUS_GUARD_MUTANT != 6
-    std::lock_guard<std::mutex> lock(g_lock);
-#endif
+    std::unique_lock<std::mutex> lock(g_lock, std::defer_lock);
+    if (!FNV_MUT(6)) lock.lock();
     HWND h = g_hwnd.load();
     if (!h) return false;
     if (!IsWindow(h)) {
@@ -110,9 +94,7 @@ bool Uninstall() {
         return false;
     }
     if (reinterpret_cast<WNDPROC>(GetWindowLongPtrA(h, GWLP_WNDPROC)) != &GuardProc) return false;  // another subclass on top
-#if FOCUS_GUARD_MUTANT != 4
-    SetWindowLongPtrA(h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_orig.load()));
-#endif
+    if (!FNV_MUT(4)) SetWindowLongPtrA(h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_orig.load()));
     g_hwnd.store(nullptr);
     return true;
 }

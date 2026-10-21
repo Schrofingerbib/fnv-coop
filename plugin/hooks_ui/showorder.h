@@ -20,9 +20,8 @@
 
 #include "fnvcoop/types.h"
 
-#ifndef NVUI_MUTANT
-#define NVUI_MUTANT 0
-#endif
+// One out-of-line definition (ui_core.cpp) so header-only code and every TU agree: the twins are only live in the *_rt test libs.
+namespace nvui { bool mut(int n); }
 
 namespace nvui {
 
@@ -93,7 +92,7 @@ public:
             if (a) a();
             return true;
         }
-        if (s.ord <= released_ && NVUI_MUTANT != 18) {
+        if (s.ord <= released_ && !mut(18)) {
             ++dups_;
             return false;
         }
@@ -107,7 +106,7 @@ public:
     }
 
     void tick(uint64_t nowMs) {
-        if (NVUI_MUTANT != 19 && !pending_.empty() && !draining_) {  // MUTANT 19: a missing predecessor blocks the show forever
+        if (!mut(19) && !pending_.empty() && !draining_) {  // MUTANT 19: a missing predecessor blocks the show forever
             auto it = pending_.begin();
             if (nowMs - it->second.at >= cfg_.gapMs) {
                 ++gapSkips_;
@@ -185,8 +184,8 @@ public:
 
     void onVoice(const fnvcoop::FormRef& npc, const std::string& voice, uint64_t nowMs) {
         std::string rest;
-        const ShowStamp st = NVUI_MUTANT == 17 ? ShowStamp() : parseOrder(voice, rest);  // MUTANT 17: the stamp is ignored (no ordering)
-        if (NVUI_MUTANT == 17) rest = voice;
+        const ShowStamp st = mut(17) ? ShowStamp() : parseOrder(voice, rest);  // MUTANT 17: the stamp is ignored (no ordering)
+        if (mut(17)) rest = voice;
         Stash s = stash_;
         stash_.has = false;
         if (!st.valid()) {

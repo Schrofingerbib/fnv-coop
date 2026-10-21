@@ -20,9 +20,8 @@
 #include "fnvcoop_dlg/messages.h"
 #include "showorder.h"
 
-#ifndef NVUI_MUTANT
-#define NVUI_MUTANT 0
-#endif
+// One out-of-line definition (ui_core.cpp) so header-only code and every TU agree: the twins are only live in the *_rt test libs.
+namespace nvui { bool mut(int n); }
 
 namespace nvui {
 
@@ -142,7 +141,7 @@ public:
         (void)nowMs;
         if (p == fnvcoop::kHostPlayer || p >= 8) return;
         connected_ |= uint8_t(1u << p);
-        if (!active_ || NVUI_MUTANT == 14) return;
+        if (!active_ || mut(14)) return;
         for (SlideItem it : items_) {  // late joiner: the whole show so far, in order. Narration is not replayed, so the replay is unstamped.
             it.after = 0;
             emit(p, SlideMsg::Slide, it);
@@ -271,7 +270,7 @@ public:
             maybeFinish();
             return true;
         }
-        if (m.item.seq < next_ && NVUI_MUTANT != 13) {
+        if (m.item.seq < next_ && !mut(13)) {
             ++dups_;
             return true;
         }
@@ -352,8 +351,8 @@ private:
         if (!seq_->submit(st, nowMs_, [this, s]() { execute(s); })) --inflight_;  // a stale/duplicate stamp: this slide was already shown
     }
     void execute(const SlideItem& s) {
-        if (s.kind == SlideKind::Ending && !locked_ && NVUI_MUTANT != 11) setLock(true);
-        if (cb_.swap && NVUI_MUTANT != 12) cb_.swap(s.ref, s.oldTex, s.newTex);
+        if (s.kind == SlideKind::Ending && !locked_ && !mut(11)) setLock(true);
+        if (cb_.swap && !mut(12)) cb_.swap(s.ref, s.oldTex, s.newTex);
         ++played_;
         if (inflight_ > 0) --inflight_;
         maybeFinish();
@@ -361,7 +360,7 @@ private:
     void finish() {
         done_ = true;
         pending_.clear();
-        if (locked_ && NVUI_MUTANT != 10) setLock(false);
+        if (locked_ && !mut(10)) setLock(false);
     }
     void setLock(bool l) {
         locked_ = l;

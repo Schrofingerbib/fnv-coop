@@ -32,6 +32,9 @@
 #ifdef NVCOOP_WITH_SNAPSHOT
 #include "fnvcoop_snapshot/snapshot.h"
 #endif
+#ifdef NVCOOP_WITH_LIVE
+#include "coop/live/live_glue.h"   // dll-wiring: nvcoop.ini [live] switches for the enemy / NPC / avatar sync (all OFF by default)
+#endif
 
 namespace {
 
@@ -461,7 +464,13 @@ public:
     }
 
     bool SaveGame(const std::string& name, std::string& err) override {
+#ifdef NVCOOP_WITH_LIVE
+        nvcoop::livewire::glueBeforeSave();   // clones made by the actor port must not be written into the save
+#endif
         SaveAttempt a = DirectSaveSEH(name.c_str());
+#ifdef NVCOOP_WITH_LIVE
+        nvcoop::livewire::glueAfterSave();
+#endif
         Log("saveGame(%s): ret=%d canSave(menus)=%d canSave(ignoreMenus)=%d playerFlags798=%08X dead108=%u busy=%u exc=%d",
             name.c_str(), a.ret, a.canSave0, a.canSave1, a.playerFlags, a.dead, a.busy, a.exception);
         if (a.ret == 1) return true;  // NVSE's SaveGame message completes the bridge job
@@ -478,7 +487,7 @@ public:
             return false;
         }
         static int n = 0;
-        if (path.empty()) path = g_gameDir + "Data\NVSE\Plugins\nvcoop_shot_" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(++n) + ".png";
+        if (path.empty()) path = g_gameDir + "Data\\NVSE\\Plugins\\nvcoop_shot_" + std::to_string(GetCurrentProcessId()) + "_" + std::to_string(++n) + ".png";
         nvcoop::ShotInfo info;
         if (!nvcoop::CaptureBackbufferPng(path, info, err)) return false;
         return true;
@@ -647,6 +656,11 @@ __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse) {
         Log("window thread started (minimize=%d focusGuard=%d)", g_minimize.load() ? 1 : 0, g_focusGuard.load() ? 1 : 0);
     }
 
+#ifdef NVCOOP_WITH_LIVE
+    // [live] switches and the [actors] tuning are read BEFORE any module loads, so a lane that installs something at load time already knows
+    // whether it is switched on, whatever the module order is.
+    nvcoop::livewire::glueConfigure(IniPath());
+#endif
     for (auto& m : nvcoop::registry::Modules()) {
         Log("module %s", m.name ? m.name : "?");
         if (m.onLoad) m.onLoad(nvse);

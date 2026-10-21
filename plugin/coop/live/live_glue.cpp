@@ -1,0 +1,670 @@
+// The live layer inside nvcoop.dll (dll-wiring). See live_glue.h. Game-facing part: reads the ini, turns the coop Runtime into a SessionView,
+// forwards NVSE messages, and wraps each lane that exists in this build as a live-hub service. Everything is OFF unless nvcoop.ini [live]
+// switches it on (or the environment: NVCOOP_LIVE_ACTORS / _AVATARS / _COMBAT / _SPAWNS / _SOCIAL = 1).
+#include "live_glue.h"
+
+#include <Windows.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "PluginAPI.h"
+#include "common/minijson.h"
+#include "common/nvcoop_api.h"
+#include "coop_runtime.h"
+#include "live_hub.h"
+
+#ifdef NVCOOP_WITH_ACTORS
+#include "actors/actor_glue.h"
+#endif
+#ifdef NVCOOP_WITH_NVMP
+#include "nvmp/ghost_ref.h"
+#endif
+#ifdef NVLIVE_ACTOR_ENGINE
+#include "actors/engine/actor_engine_api.h"
+#include "live_actors_cfg.h"
+#endif
+#ifdef NVCOOP_WITH_AVATAR_ENGINE
+#include "avatar_glue.h"   // plugin/avatar/engine: the module owns the AvatarRuntime; we put it on the network (avatar_net.h)
+#include "avatar_net.h"
+#endif
+#ifdef NVCOOP_WITH_COMBAT
+#include "combat/combat_glue.h"
+#endif
+#ifdef NVCOOP_WITH_COMPANIONS
+#include "companions/companions_glue.h"
+#endif
+#ifdef NVCOOP_WITH_SPAWN
+#include "GameData.h"
+#include "GameForms.h"
+#include "spawn/engine_adapter.h"
+#include "spawn/spawn_glue.h"
+#ifdef NVCOOP_WITH_WORLD
+#include "world_hooks.h"
+#endif
+#endif
+
+namespace nvcoop::livewire {
+
+namespace {
+
+// ---- ini + environment ------------------------------------------------------------------------------------------------------------------
+std::string g_iniPath;
+
+std::string upper(std::string s) {
+    for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::string iniOrEnv(const char* section, const char* key, const char* def) {
+    char name[160];
+    std::snprintf(name, sizeof name, "NVCOOP_%s_%s", upper(section).c_str(), upper(key).c_str());
+    char buf[512];
+    DWORD n = GetEnvironmentVariableA(name, buf, sizeof buf);
+    if (n > 0 && n < sizeof buf) return buf;
+    if (g_iniPath.empty()) return def;
+    GetPrivateProfileStringA(section, key, def, buf, sizeof buf, g_iniPath.c_str());
+    return buf;
+}
+
+// ---- services ---------------------------------------------------------------------------------------------------------------------------
+// A switched-off or not-built lane still appears in the status, so "why does nothing happen" has an answer.
+class PlaceholderService : public ILiveService {
+public:
+    explicit PlaceholderService(const char* n) : name_(n) {}
+    const char* name() const override { return name_; }
+private:
+    const char* name_;
+};
+
+nvcoop::coop::Runtime* g_rt = nullptr;
+bool glueAvatarIsPuppet(uint32_t ref);   // defined below (avatars service)
+
+#ifdef NVCOOP_WITH_ACTORS
+// plugin/actors: the ownership service builds its own ActorSync from the Runtime (and registers its own mux channel), so this service has no
+// channels; the hub gives it the session lifecycle. The real engine port is installed by the actor-port module when [actors] allows it.
+class ActorsService : public ILiveService {
+public:
+    ActorsService() {
+#ifdef NVLIVE_ACTOR_ENGINE
+        // Refs another layer drives are never NPCs: our player puppets, and the NV:MP ghosts while that mod is around. A tracked actor that
+        // becomes excluded is dropped by the port at its next scan.
+        nvcoop::actors::engine::setRefExclusion([](nvcoop::actors::engine::RefId ref) {
+            if (glueAvatarIsPuppet(ref)) return true;
+#ifdef NVCOOP_WITH_NVMP
+            for (uint8_t slot = 1; slot < fnvcoop::kMaxSlots; ++slot)
+                if (nvmp::GhostRefOfPlayer(slot) == ref) return true;
+#endif
+            return false;
+        });
+#endif
+    }
+    ~ActorsService() override {
+#ifdef NVLIVE_ACTOR_ENGINE
+        nvcoop::actors::engine::setRefExclusion(nullptr);
+#endif
+    }
+    const char* name() const override { return "actors"; }
+    void tick(uint64_t) override { nvcoop::actors::glueFrame(g_rt); }
+    void sessionEnd() override { nvcoop::actors::glueFrame(nullptr); }   // tears the ActorSync down
+    void loadEnd() override { purge(); }
+    void gameExit() override { purge(); }
+private:
+    static void purge() {
+        if (auto* s = nvcoop::actors::glueSync()) s->purgeStandIns();   // stand-ins are never saved and never survive a load
+    }
+};
+#endif
+
+#ifdef NVCOOP_WITH_AVATAR_ENGINE
+// IAvatarSide over the avatar module's glue (avatar_glue.h). That module ticks the runtime and handles the NVSE load events itself, so the
+// side has nothing to do for tick / events; only the clock matters: the module's interpolation buffers run on its QueryPerformanceCounter ms.
+uint32_t QpcMs() {
+    static LARGE_INTEGER f = [] {
+        LARGE_INTEGER x;
+        QueryPerformanceFrequency(&x);
+        return x;
+    }();
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return static_cast<uint32_t>(static_cast<uint64_t>(t.QuadPart) * 1000ull / static_cast<uint64_t>(f.QuadPart));
+}
+
+class GlueSide : public IAvatarSide {
+public:
+    void setSnapshotSink(SnapshotSink s) override { nvcoop::avatar::glue::SetSnapshotSink(std::move(s)); }
+    void setEquipSink(EquipSink s) override { nvcoop::avatar::glue::SetEquipSink(std::move(s)); }
+    void setLocalIdentity(fnvcoop::live::NetId n, fnvcoop::live::OwnerEpoch e) override { nvcoop::avatar::glue::SetLocalIdentity(n, e); }
+    bool addRemote(nvcoop::avatar::Slot s, const nvcoop::avatar::Appearance& a) override { return nvcoop::avatar::glue::AddRemote(s, a); }
+    void removeRemote(nvcoop::avatar::Slot s) override { nvcoop::avatar::glue::RemoveRemote(s); }
+    bool setRemoteAppearance(nvcoop::avatar::Slot s, const nvcoop::avatar::Appearance& a) override { return nvcoop::avatar::glue::SetRemoteAppearance(s, a); }
+    bool readLocalAppearance(nvcoop::avatar::Appearance& out) override { return nvcoop::avatar::glue::ReadLocalAppearance(out); }
+    void onRemoteSnapshot(nvcoop::avatar::Slot s, const fnvcoop::live::ActorSnapshot& snap, uint32_t) override {
+        nvcoop::avatar::glue::OnRemoteSnapshot(s, snap, QpcMs());   // arrival on the module's own clock
+    }
+    void onRemoteEquipment(nvcoop::avatar::Slot s, const std::vector<nvcoop::avatar::EquipEntry>& w) override {
+        nvcoop::avatar::glue::OnRemoteEquipment(s, w);
+    }
+    void tick(uint32_t) override {}
+    void onEvent(Event) override {}
+    bool purgePending() const override { return false; }
+    nvcoop::avatar::RefId refOf(nvcoop::avatar::Slot s) const override { return nvcoop::avatar::glue::PuppetRef(s); }
+    bool slotOf(nvcoop::avatar::RefId ref, nvcoop::avatar::Slot& slot) const override {
+        auto s = nvcoop::avatar::glue::PuppetSlot(ref);
+        if (!s) return false;
+        slot = *s;
+        return true;
+    }
+    std::string statusJson() override { return "{}"; }
+};
+
+struct GlueSideHolder { GlueSide side; };
+
+AvatarNetOptions avatarOptions() {
+    AvatarNetOptions o;
+    o.tickSide = false;   // the avatar module ticks its runtime itself
+    return o;
+}
+
+class AvatarsService : private GlueSideHolder, public AvatarNet {
+public:
+    AvatarsService() : GlueSideHolder(), AvatarNet(side, avatarOptions()) {
+        setPoseSink([this](PlayerId slot, bool present, fnvcoop::live::CellId cell, const fnvcoop::live::Vec3& pos) {
+#ifdef NVLIVE_ACTOR_ENGINE
+            if (slot != self()) {   // the local player is read by the port itself (it also knows the adjacent cells)
+                nvcoop::actors::PlayerPose p;   // the ownership service wants every remote player's place
+                p.present = present;
+                p.cell = cell;
+                p.pos = pos;
+                nvcoop::actors::engine::setPlayerPose(slot, p);
+            }
+#endif
+#ifdef NVCOOP_WITH_SPAWN
+            nvcoop::spawn::setPlayerPose(slot, present, cell, nvcoop::spawn::sp::Vec3{pos.x, pos.y, pos.z});   // every slot, the local one too
+#endif
+            (void)slot; (void)present; (void)cell; (void)pos;
+        });
+    }
+    void sessionBegin(const SessionInfo& info, ILiveLink& link) override {
+        AvatarNet::sessionBegin(info, link);
+#ifdef NVLIVE_ACTOR_ENGINE
+        // combat targets between actors and players survive the wire: the port asks which net id stands for a player ref
+        nvcoop::actors::engine::setPlayerNetIdResolver(
+            [this](nvcoop::actors::engine::RefId ref) -> nvcoop::actors::NetId {
+                if (ref == nvcoop::actors::engine::kLocalPlayerRef) return self() == kNoPlayer ? 0 : playerNetId(self());
+                PlayerId s = kNoPlayer;
+                return slotOfPuppetRef(ref, s) ? playerNetId(s) : 0;
+            },
+            [this](nvcoop::actors::NetId id) -> nvcoop::actors::engine::RefId {
+                if (!isPlayerNetId(id)) return 0;
+                const PlayerId s = slotOfPlayerNetId(id);
+                if (s == self()) return nvcoop::actors::engine::kLocalPlayerRef;
+                return puppetRef(s);
+            });
+#endif
+    }
+    void sessionEnd() override {
+#ifdef NVLIVE_ACTOR_ENGINE
+        nvcoop::actors::engine::setPlayerNetIdResolver(nullptr, nullptr);
+#endif
+        AvatarNet::sessionEnd();
+    }
+};
+AvatarNet* g_avatarNet = nullptr;
+#endif
+
+#ifdef NVCOOP_WITH_SPAWN
+std::function<bool(const fnvcoop::SpawnRef&)> g_spawnApplier;   // coop_module's WorldApplier: makes this machine's own copy of a spawn it did not roll
+
+// Host respawn timers run on GAME time (Wait / Sleep must count): GameDaysPassed * 24 h. SEH-guarded, no C++ objects in the frame.
+bool GameDaysSEH(float* out) {
+    static TESGlobal* cached = nullptr;
+    __try {
+        if (cached && cached->name.m_data && _stricmp(cached->name.m_data, "GameDaysPassed") == 0) {
+            *out = cached->data;
+            return true;
+        }
+        DataHandler* dh = DataHandler::Get();
+        if (!dh) return false;
+        for (auto it = dh->globalList.Begin(); !it.End(); ++it) {
+            TESGlobal* g = it.Get();
+            if (g && g->name.m_data && _stricmp(g->name.m_data, "GameDaysPassed") == 0) {
+                cached = g;
+                *out = g->data;
+                return true;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        cached = nullptr;
+    }
+    return false;
+}
+uint64_t GameMsNow() {
+    float days = 0;
+    if (GameDaysSEH(&days) && days >= 0) return static_cast<uint64_t>(static_cast<double>(days) * 24.0 * 3600.0 * 1000.0);
+    return GetTickCount64();   // not readable (yet): the wall clock never stalls a respawn
+}
+
+// plugin/spawn: same shape as the actors glue (own runtime and mux channel). The engine events the lane documents in spawn_glue.h come from
+// the actor port's listeners; the engine adapter is built over the port's engine as soon as it exists.
+class SpawnService : public ILiveService {
+public:
+    SpawnService() {
+#ifdef NVLIVE_ACTOR_ENGINE
+        using namespace nvcoop::actors::engine;
+        tracked_ = addActorTrackedListener([](const TrackedEvent& e) { if (!e.standIn) nvcoop::spawn::onPlacedLoaded(e.ref); });
+        died_ = addActorDiedListener([](const DiedEvent& e) { nvcoop::spawn::onActorDied(e.netId); });
+        setCreatedIdResolver(nvcoop::spawn::createdIdResolver);   // the actor feed asks the spawn lane who a created actor is
+#endif
+        nvcoop::spawn::setIgnore([](nvcoop::spawn::RefId r) {   // puppets and the port's stand-ins are never rolls
+#ifdef NVLIVE_ACTOR_ENGINE
+            if (nvcoop::actors::engine::isStandIn(r)) return true;
+#endif
+            return glueAvatarIsPuppet(r);
+        });
+        nvcoop::spawn::setGameClock(GameMsNow);
+#ifdef NVCOOP_WITH_WORLD
+        // the host's script PlaceAtMe (a SpawnRef with the script as its cause), seen before the coop runtime takes the txn
+        nvworld::setTxnObserver([this](const fnvcoop::EffectTxn& t) {
+            for (const fnvcoop::Effect& e : t.effects)
+                if (const auto* sr = std::get_if<fnvcoop::SpawnRef>(&e)) onHostSpawn(t.cause, *sr);
+        });
+#endif
+    }
+    ~SpawnService() override {
+#ifdef NVCOOP_WITH_WORLD
+        nvworld::setTxnObserver(nullptr);
+#endif
+        nvcoop::spawn::setEngine(nullptr);
+        nvcoop::spawn::setGameClock(nullptr);
+#ifdef NVLIVE_ACTOR_ENGINE
+        nvcoop::actors::engine::removeListener(tracked_);
+        nvcoop::actors::engine::removeListener(died_);
+        nvcoop::actors::engine::setCreatedIdResolver(nullptr);
+#endif
+        nvcoop::spawn::setIgnore(nullptr);
+    }
+    const char* name() const override { return "spawns"; }
+    void sessionBegin(const SessionInfo&, ILiveLink&) override { ensureEngine(); }
+    void tick(uint64_t) override {
+        nvcoop::spawn::glueFrame(g_rt);
+        drainHostSpawns();   // after the lane ticked: its SpawnSync exists (the first frame of a session builds it)
+    }
+    void sessionEnd() override {
+        pendingSpawns_.clear();
+        nvcoop::spawn::glueFrame(nullptr);
+    }
+    void loadEnd() override { pendingSpawns_.clear(); nvcoop::spawn::onWorldLoaded(); }
+    void gameExit() override { nvcoop::spawn::onWorldLoaded(); }
+    bool engineWired() const { return adapter_ != nullptr; }
+
+private:
+    // Called from inside the capture hub's sink, i.e. while a script runs: only note it here; the lane (which may send, hide or show things)
+    // gets it at this frame's tick, outside the script.
+    void onHostSpawn(const fnvcoop::Cause& cause, const fnvcoop::SpawnRef& s) {
+        if (cause.source.plugin.empty()) return;   // no script form to name the site after
+        if (pendingSpawns_.size() < 256) pendingSpawns_.emplace_back(cause.source, s);
+    }
+    void drainHostSpawns() {
+        std::vector<std::pair<fnvcoop::FormRef, fnvcoop::SpawnRef>> now;
+        now.swap(pendingSpawns_);
+        for (const auto& p : now) {
+            const fnvcoop::SpawnRef& s = p.second;
+            nvcoop::spawn::sp::SiteDef def;
+            def.kind = nvcoop::spawn::sp::SiteKind::Script;
+            def.anchor = p.first;
+            def.id = nvcoop::spawn::sp::siteIdOf(def.kind, def.anchor);
+            def.cellForm = s.cell;
+            def.cell = nvhooks::resolver().fromRef(s.cell);
+            def.pos = nvcoop::spawn::sp::Vec3{s.x, s.y, s.z};
+            nvcoop::spawn::RefInfo info;
+            if (adapter_ && adapter_->describe(s.id, info)) def.interior = info.interior;
+            nvcoop::spawn::onHostSpawnEffect(def, s);
+        }
+    }
+    std::vector<std::pair<fnvcoop::FormRef, fnvcoop::SpawnRef>> pendingSpawns_;
+    // Built once the actor port's engine exists (its module may load after ours). Until then the lane runs with its no-op engine: the site table
+    // is mirrored, nothing is ever rolled, held or deleted.
+    void ensureEngine() {
+        if (adapter_) return;
+#ifdef NVLIVE_ACTOR_ENGINE
+        nvcoop::actors::engine::IActorEngine* eng = nvcoop::actors::engine::actorEngine();
+        if (!eng) {
+            if (!warned_) nvcoop::Log("live: spawns=1 but the actor port's engine is not installed ([actors] engine=1 is needed): spawn arbitration stays passive");
+            warned_ = true;
+            return;
+        }
+        nvcoop::spawn::AdapterHooks h;
+        h.placedNetId = [](nvcoop::spawn::RefId, const fnvcoop::FormRef& wire) { return nvcoop::actors::deriveNetId(wire); };
+        h.refOfNet = [](nvcoop::spawn::NetId id) { return nvcoop::actors::engine::refOf(id); };
+#ifdef NVCOOP_WITH_WORLD
+        h.bindCreated = [](nvcoop::spawn::RefId ref, nvcoop::spawn::NetId id) { nvworld::ledger().onCreated(fnvcoop::createdRef(id), ref); };
+        h.isCreatedBound = [](nvcoop::spawn::NetId id) { return nvworld::ledger().map().local(fnvcoop::createdRef(id)) != 0; };
+        h.netOfCreated = [](nvcoop::spawn::RefId ref, nvcoop::spawn::NetId& id) {
+            fnvcoop::FormRef host;
+            if (!nvworld::ledger().map().hostOf(ref, &host)) return false;
+            id = host.localId;
+            return true;
+        };
+#endif
+        h.createFromSpawnRef = [](const fnvcoop::SpawnRef& s) { return g_spawnApplier && g_spawnApplier(s); };
+        // rebase (a leveled pick swap) and extras (ExtraLeveledCreature / ExtraEncounterZone reads) have no verified engine path yet: TODO-RE in
+        // plugin/spawn/engine_adapter.h. Absent hooks are counted by the lane (Stats::rebaseFailed), never faked.
+        adapter_.reset(new nvcoop::spawn::EngineAdapter(*eng, std::move(h)));
+        nvcoop::spawn::setEngine(adapter_.get());
+        nvcoop::Log("live: spawn arbitration wired to the actor port's engine");
+#endif
+    }
+    std::unique_ptr<nvcoop::spawn::EngineAdapter> adapter_;
+    bool warned_ = false;
+#ifdef NVLIVE_ACTOR_ENGINE
+    nvcoop::actors::engine::ListenerId tracked_ = 0, died_ = 0;
+#endif
+};
+#endif
+
+#ifdef NVCOOP_WITH_COMBAT
+// plugin/combat: the hit gate and the engine effects live in its own module; this service gives it the session lifecycle.
+class CombatService : public ILiveService {
+public:
+    const char* name() const override { return "combat"; }
+    void tick(uint64_t) override { nvcoop::combat::glueFrame(g_rt); }
+    void sessionEnd() override { nvcoop::combat::glueFrame(nullptr); }
+};
+#endif
+
+#ifdef NVCOOP_WITH_COMPANIONS
+// plugin/companions: companions, crime, shared kill rewards. Its frame is NOT driven from here: coop_module.cpp calls nvcoop::social::glueFrame() once per
+// frame, right after livewire::glueFrame() (so after the actor layer ran), and that stays the ONE call site; a second call from this tick would run the
+// social session twice per frame. What the live layer adds is the service entry (coop.live status shows "social"), the [live] social=1 dependency on
+// actors=1 and, with avatars=1, the avatar layer's puppet map (a remote player's puppet is a "player" to the party rules, like combat's).
+class SocialService : public ILiveService {
+public:
+    const char* name() const override { return "social"; }
+};
+#endif
+
+struct Glue {
+    LiveSwitches sw;
+    bool configured = false, loaded = false;
+    std::string actorsNotes;
+    std::vector<std::unique_ptr<ILiveService>> owned;   // declared BEFORE the hub: members die in reverse order, and ~LiveHub ends the session
+    LiveHub hub;                                        // part of every service, so the services must still exist then
+    uint64_t lastNow = 0;
+};
+Glue& G() {
+    static Glue g;
+    return g;
+}
+
+SessionView makeView(nvcoop::coop::Runtime* rt, uint64_t nowMs) {
+    SessionView v;
+    v.nowMs = nowMs;
+    if (!rt || !rt->running()) return v;
+    v.active = true;
+    v.mux = rt->mux();
+    if (auto* host = rt->host()) {
+        v.isHost = true;
+        v.self = fnvcoop::kHostPlayer;
+        for (const auto& cv : host->clients()) {
+            ClientLink l;
+            l.slot = cv.slot;
+            l.peer = cv.peer;
+            l.joined = cv.joined;
+            v.clients.push_back(l);
+        }
+    } else if (auto* cl = rt->client()) {
+        v.isHost = false;
+        v.self = cl->joined() ? cl->slot() : fnvcoop::kNoPlayer;
+        v.hostLinkUp = cl->joined() && !cl->baselineActive();
+    } else {
+        v.active = false;
+    }
+    return v;
+}
+
+// coop.live {}: what the live layer is doing on this machine.
+bool MLive(const std::string&, std::string& out) {
+    Glue& g = G();
+    nvcoop::json::Value o = nvcoop::json::Value::object();
+    o.set("switches", describeSwitches(g.sw)).set("warnings", g.sw.warnings).set("configured", g.configured).set("loaded", g.loaded);
+    o.set("actorsConfigNotes", g.actorsNotes);
+    out = o.dump();
+    // splice the hub (and avatar) status in as raw JSON (already JSON text)
+    if (!out.empty() && out.back() == '}') {
+        out.pop_back();
+        out += ",\"hub\":" + g.hub.statusJson();
+#ifdef NVCOOP_WITH_AVATAR_ENGINE
+        out += std::string(",\"avatarModule\":{\"enabled\":") + (nvcoop::avatar::glue::Enabled() ? "true" : "false") + ",\"running\":" +
+               (nvcoop::avatar::glue::Running() ? "true" : "false") + "}";
+        if (g_avatarNet) out += ",\"avatars\":" + g_avatarNet->statusJson();
+#endif
+        out += "}";
+    }
+    return true;
+}
+
+}  // namespace
+
+IniGetter glueIni() { return [](const char* s, const char* k, const char* d) { return iniOrEnv(s, k, d); }; }
+
+namespace {
+// Where nvcoop.ini is when nobody told us (split-loader builds have no main.cpp): next to this DLL, like every module reads it.
+std::string DefaultIniPath() {
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&DefaultIniPath), &self);
+    char buf[MAX_PATH] = {};
+    GetModuleFileNameA(self, buf, MAX_PATH);
+    std::string p = buf;
+    size_t s = p.find_last_of("\\/");
+    return (s == std::string::npos ? std::string() : p.substr(0, s + 1)) + "nvcoop.ini";
+}
+void ensureConfigured() {
+    if (!G().configured) glueConfigure(g_iniPath.empty() ? DefaultIniPath() : g_iniPath);
+}
+}  // namespace
+
+// Lazy: a module's onLoad may ask before anybody called glueConfigure (the order of modules is not defined).
+const LiveSwitches& glueSwitches() {
+    ensureConfigured();
+    return G().sw;
+}
+
+void glueSetSpawnApplier(std::function<bool(const fnvcoop::SpawnRef&)> f) {
+#ifdef NVCOOP_WITH_SPAWN
+    g_spawnApplier = std::move(f);
+#else
+    (void)f;
+#endif
+}
+
+void glueOnEffect(const fnvcoop::Effect& e) {
+#ifdef NVLIVE_ACTOR_ENGINE
+    if (G().sw.actors) nvcoop::actors::engine::onEffect(e);
+#else
+    (void)e;
+#endif
+}
+
+void glueBeforeSave() {
+#ifdef NVLIVE_ACTOR_ENGINE
+    if (G().sw.actors) nvcoop::actors::engine::beforeSave();
+#endif
+#ifdef NVCOOP_WITH_AVATAR_ENGINE
+    if (nvcoop::avatar::glue::Enabled()) nvcoop::avatar::glue::PreSave();   // also for the dev loopback ([avatar] enabled=1 alone)
+#endif
+}
+
+void glueAfterSave() {
+#ifdef NVCOOP_WITH_AVATAR_ENGINE
+    if (nvcoop::avatar::glue::Enabled()) nvcoop::avatar::glue::PostSave();
+#endif
+}
+
+// The host's site table travels with its save as <save>.fnvspawn (next to the coop sidecar <save>.fnvcoop); a client has none.
+fnvcoop::Bytes glueSpawnSidecar() {
+#ifdef NVCOOP_WITH_SPAWN
+    if (G().sw.spawns) return nvcoop::spawn::saveState();
+#endif
+    return {};
+}
+void glueSpawnSidecarLoaded(const fnvcoop::Bytes& b) {
+#ifdef NVCOOP_WITH_SPAWN
+    if (G().sw.spawns && !b.empty() && !nvcoop::spawn::loadState(b)) nvcoop::Log("live: spawn sidecar could not be read");
+#else
+    (void)b;
+#endif
+}
+
+void glueConfigure(const std::string& iniPath) {
+    Glue& g = G();
+    g_iniPath = iniPath;
+    g.sw = readLiveSwitches(glueIni());
+    g.configured = true;
+    nvcoop::Log("live: switches %s", describeSwitches(g.sw).c_str());
+    if (!g.sw.warnings.empty()) nvcoop::Log("live: %s", g.sw.warnings.c_str());
+#ifdef NVLIVE_ACTOR_ENGINE
+    {   // the real actor port is tuned from [actors] (its module reads the same values through readActorsConfig). [live] actors=0 keeps the port
+        // installed but unfed: it only undoes the restraints a crashed run left in its ledger, and never tracks an actor without a session.
+        nvcoop::actors::engine::Config c = readActorsConfig(glueIni(), nvcoop::actors::engine::Config(), &g.actorsNotes);
+        nvcoop::actors::engine::configure(c);
+        if (!g.actorsNotes.empty()) nvcoop::Log("live: %s", g.actorsNotes.c_str());
+    }
+#endif
+}
+
+void glueLoad() {
+    Glue& g = G();
+    if (g.loaded) return;
+    ensureConfigured();
+    g.loaded = true;
+    auto add = [&](std::unique_ptr<ILiveService> svc, bool enabled) {
+        if (!g.hub.add(svc.get(), enabled)) nvcoop::Log("live: service %s refused by the hub (channel clash)", svc->name());
+        g.owned.push_back(std::move(svc));
+    };
+#ifdef NVCOOP_WITH_ACTORS
+    if (g.sw.actors) add(std::unique_ptr<ILiveService>(new ActorsService()), true);
+    else add(std::unique_ptr<ILiveService>(new PlaceholderService("actors")), false);
+#else
+    add(std::unique_ptr<ILiveService>(new PlaceholderService("actors")), false);
+#endif
+#ifdef NVCOOP_WITH_AVATAR_ENGINE
+    if (g.sw.avatars) {
+        if (!nvcoop::avatar::glue::Enabled())
+            nvcoop::Log("live: avatars=1 but the avatar module is off ([avatar] enabled=1 is needed): puppets cannot appear");
+        std::unique_ptr<AvatarsService> a(new AvatarsService());
+        g_avatarNet = a.get();
+        add(std::move(a), true);
+    } else {
+        add(std::unique_ptr<ILiveService>(new PlaceholderService("avatars")), false);
+    }
+#else
+    add(std::unique_ptr<ILiveService>(new PlaceholderService("avatars")), false);   // not in this build
+#endif
+#ifdef NVCOOP_WITH_COMBAT
+    if (g.sw.combat) add(std::unique_ptr<ILiveService>(new CombatService()), true);
+    else add(std::unique_ptr<ILiveService>(new PlaceholderService("combat")), false);
+#else
+    add(std::unique_ptr<ILiveService>(new PlaceholderService("combat")), false);   // not in this build
+#endif
+#ifdef NVCOOP_WITH_SPAWN
+    if (g.sw.spawns) add(std::unique_ptr<ILiveService>(new SpawnService()), true);
+    else add(std::unique_ptr<ILiveService>(new PlaceholderService("spawns")), false);
+#else
+    add(std::unique_ptr<ILiveService>(new PlaceholderService("spawns")), false);   // not in this build
+#endif
+#ifdef NVCOOP_WITH_COMPANIONS
+    if (g.sw.social) add(std::unique_ptr<ILiveService>(new SocialService()), true);
+    else add(std::unique_ptr<ILiveService>(new PlaceholderService("social")), false);
+#else
+    add(std::unique_ptr<ILiveService>(new PlaceholderService("social")), false);   // not in this build
+#endif
+#if defined(NVCOOP_WITH_COMPANIONS) && defined(NVCOOP_WITH_AVATAR_ENGINE)
+    if (g.sw.social && g.sw.avatars)   // a puppet is a "player" to the party rules: a hit on it is a hit on its real player
+        nvcoop::social::setPlayerRefMap(
+            [](uint32_t ref, uint8_t& slot) {
+                PlayerId s = kNoPlayer;
+                if (!g_avatarNet || !g_avatarNet->slotOfPuppetRef(ref, s)) return false;
+                slot = s;
+                return true;
+            },
+            [](uint8_t slot) { return glueAvatarRef(slot); });
+#endif
+#if defined(NVCOOP_WITH_COMBAT) && defined(NVCOOP_WITH_AVATAR_ENGINE)
+    if (g.sw.combat && g.sw.avatars)   // a puppet is a "player" to combat: hits on it go to its real player
+        nvcoop::combat::setPlayerRefMap(
+            [](uint32_t ref, uint8_t& slot) {
+                PlayerId s = kNoPlayer;
+                if (!g_avatarNet || !g_avatarNet->slotOfPuppetRef(ref, s)) return false;
+                slot = s;
+                return true;
+            },
+            [](uint8_t slot) { return glueAvatarRef(slot); });
+#endif
+    nvcoop::RegisterMethod("coop.live", MLive, true);
+#ifdef NVCOOP_WITH_SPAWN
+    nvcoop::RegisterMethod("coop.spawn", [](const std::string& params, std::string& out) { return nvcoop::spawn::glueRpc(params, out); }, true);
+#endif
+    nvcoop::Log("live: hub ready, %u of %u services enabled", (unsigned)g.hub.enabledCount(), (unsigned)g.hub.serviceCount());
+}
+
+void glueFrame(nvcoop::coop::Runtime* rt, uint64_t nowMs) {
+    Glue& g = G();
+    if (!g.loaded) return;
+    g_rt = rt;
+    g.lastNow = nowMs;
+    g.hub.frame(makeView(rt, nowMs));
+}
+
+void glueMessage(uint32_t type, void* data, uint32_t) {
+    Glue& g = G();
+    if (!g.loaded) return;
+    switch (type) {
+        case NVSEMessagingInterface::kMessage_PreLoadGame: g.hub.onLoadBegin(); break;
+        case NVSEMessagingInterface::kMessage_PostLoadGame:
+            if (data) g.hub.onLoadEnd();   // data = success
+            break;
+        case NVSEMessagingInterface::kMessage_NewGame:
+            g.hub.onLoadBegin();   // the world is replaced without a Pre / PostLoad pair
+            g.hub.onLoadEnd();
+            break;
+        case NVSEMessagingInterface::kMessage_SaveGame: g.hub.onSaved(); break;
+        case NVSEMessagingInterface::kMessage_ExitToMainMenu:
+        case NVSEMessagingInterface::kMessage_ExitGame:
+        case NVSEMessagingInterface::kMessage_ExitGame_Console: g.hub.onGameExit(); break;
+        default: break;
+    }
+}
+
+void glueShutdown() {
+    Glue& g = G();
+    if (!g.loaded) return;
+    g_rt = nullptr;
+    g.hub.frame(SessionView());   // ends the session part of every service (puppets down, ActorSync dropped)
+}
+
+uint32_t glueAvatarRef(uint8_t slot) {
+#ifdef NVCOOP_WITH_AVATAR_ENGINE
+    return g_avatarNet ? g_avatarNet->puppetRef(slot) : 0;
+#else
+    (void)slot;
+    return 0;
+#endif
+}
+
+namespace {
+bool glueAvatarIsPuppet(uint32_t ref) {
+#ifdef NVCOOP_WITH_AVATAR_ENGINE
+    PlayerId s = kNoPlayer;
+    return g_avatarNet && g_avatarNet->slotOfPuppetRef(ref, s);
+#else
+    (void)ref;
+    return false;
+#endif
+}
+}  // namespace
+
+}  // namespace nvcoop::livewire

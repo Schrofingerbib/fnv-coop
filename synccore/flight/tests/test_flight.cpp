@@ -7,6 +7,11 @@
 #include <map>
 #include <memory>
 #include <thread>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include "flight/flight.h"
 #include "fnvcoop/session.h"
 #include "fnvcoop/protocol.h"
@@ -33,8 +38,19 @@ Config cfgFor(uint8_t slot, uint8_t role, size_t ring = 1u << 20, const char* la
     Config c; c.slot = slot; c.role = role; c.ringBytes = ring; c.label = label; return c;
 }
 
+// ctest runs the flight tests in parallel in one working directory: scratch files carry the process id, or two tests
+// would dump over each other ("out_flight_tmp.nvfr") and one of them reads the other one's trace.
+std::string scratch(const char* stem, const char* ext = ".nvfr") {
+#ifdef _WIN32
+    int pid = _getpid();
+#else
+    int pid = static_cast<int>(getpid());
+#endif
+    return std::string(stem) + "_" + std::to_string(pid) + ext;
+}
+
 Trace dumpAndParse(FlightRecorder& r, uint8_t reason = kDumpTest) {
-    std::string path = "out_flight_tmp.nvfr";
+    std::string path = scratch("out_flight_tmp");
     Trace t;
     bool ok = r.dump(path, reason);
     REQUIRE(ok);
@@ -239,11 +255,12 @@ TEST(flight, disabled_recorder_records_nothing) {
 TEST(flight, cut_short_file_parses_up_to_the_last_full_record) {
     FlightRecorder r(cfgFor(0, kRoleSim));
     for (int i = 0; i < 10; ++i) r.marker(kMarkNote, "abc");
-    r.dump("out_flight_cut.nvfr");
-    Trace full; REQUIRE(readTrace("out_flight_cut.nvfr", full));
-    FILE* f = std::fopen("out_flight_cut.nvfr", "rb");
+    const std::string cutPath = scratch("out_flight_cut");
+    r.dump(cutPath);
+    Trace full; REQUIRE(readTrace(cutPath, full));
+    FILE* f = std::fopen(cutPath.c_str(), "rb");
     std::vector<uint8_t> b(100000); size_t n = std::fread(b.data(), 1, b.size(), f); std::fclose(f); b.resize(n);
-    std::remove("out_flight_cut.nvfr");
+    std::remove(cutPath.c_str());
     b.resize(b.size() - 3);
     Trace cut; REQUIRE(parseTrace(b, cut));
     CHECK(cut.records.size() + 1 == full.records.size());
@@ -444,7 +461,7 @@ static std::vector<uint8_t> goldenBytes(bool host) {
     DigestEvent d; d.category = kCatActors; d.epoch = 1; d.seq = 5; d.hash = 0xFEEDFACEull; d.itemCount = 2; d.keys = {{0x1001, 11}, {0x1002, 12}};
     r.digest(d);
     r.marker(kMarkTestStep, "golden");
-    std::string p = "out_flight_golden.nvfr";
+    std::string p = scratch("out_flight_golden");
     REQUIRE(r.dump(p, kDumpTest));
     FILE* f = std::fopen(p.c_str(), "rb");
     std::vector<uint8_t> b(1u << 22); size_t n = std::fread(b.data(), 1, b.size(), f); std::fclose(f); b.resize(n);

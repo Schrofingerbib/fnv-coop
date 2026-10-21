@@ -128,8 +128,10 @@ TEST(world, envelope_codec_roundtrips_every_message_type) {
     MPose po; po.slot = 2; po.cell = 4; po.pos = {1, 2, 3}; po.seq = 8; bodies.push_back(po);
     MVitals vi; vi.slot = 1; vi.health = 50; vi.seq = 2; bodies.push_back(vi);
     MActorSnap sn; sn.id = 9; sn.epoch = 2; sn.seq = 5; sn.pos = {4, 5, 6}; sn.settle = true; bodies.push_back(sn);
-    MActorEvent ev; ev.id = 9; ev.eventId = 123456789012ull; ev.kind = ActorEventKind::Death; ev.dead = true; ev.loot = {{Q(1), 2}}; bodies.push_back(ev);
-    MHit hi; hi.hitId = 77; hi.victim = 3; hi.damage = 25; hi.limb = Limb::Head; bodies.push_back(hi);
+    MActorEvent ev; ev.id = 9; ev.eventId = 123456789012ull; ev.kind = ActorEventKind::Death; ev.dead = true; ev.loot = {{Q(1), 2}};
+    ev.limbDmg[2] = 31; ev.killerKind = 1; ev.killerId = 2; bodies.push_back(ev);
+    MHit hi; hi.hitId = 77; hi.victim = 3; hi.damage = 25; hi.limb = Limb::Head;
+    hi.firedAt = 123456; hi.attackerEpoch = 4; hi.projectile = 0x1000000000005ull; hi.explosionId = (1ull << 55) | 9; bodies.push_back(hi);
     bodies.push_back(MOwn{om});
     MEffects ef; ef.seq = 3; ef.fx = {Effect{SetStage{Q(1), 4}}, Effect{KillActor{Q(2)}}}; bodies.push_back(ef);
     MDropReq dr; dr.reqId = 1; dr.base = Q(3); bodies.push_back(dr);
@@ -145,6 +147,9 @@ TEST(world, envelope_codec_roundtrips_every_message_type) {
     bodies.push_back(MActivate{0x4000});
     MDigest dg; dg.cat = 1; dg.total = 5; dg.keys = {{1, 2}, {3, 4}}; bodies.push_back(dg);
     MRepair rp; rp.cat = 2; rp.states = {{7, {1, 2, 3}}}; rp.removes = {9}; bodies.push_back(rp);
+    MProjectile pj; pj.p.id = (1ull << 48) | 5; pj.p.shooter = combat::Entity::player(1); pj.p.weapon = Q(4); pj.p.origin = {1, 2, 3}; pj.p.velocity = {10, 0, 0};
+    pj.p.firedAtTick = 500; pj.p.explosive = true; pj.aim = 9; pj.damage = 40; pj.flightMs = 700; bodies.push_back(pj);
+    MExplosion ex; ex.e.id = (1ull << 48) | 6; ex.e.source = combat::Entity::actor(9); ex.e.sourceEpoch = 3; ex.e.pos = {5, 6, 7}; ex.e.radius = 300; ex.e.damage = 60; ex.e.tick = 900; bodies.push_back(ex);
     CHECK(bodies.size() == std::variant_size_v<Body>);
     for (auto& b : bodies) {
         Envelope e; e.sess = 4; e.src = 2; e.dest = kNoPlayer; e.body = b;

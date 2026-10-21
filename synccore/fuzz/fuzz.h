@@ -14,7 +14,7 @@
 namespace fnvcoop::fuzz {
 
 // ------------------------------------------------------------------ scenario
-enum class OpKind : uint8_t { Move, Hit, Pickup, Drop, Spawn, Activate, Join, Leave, Save, Load, SetLink, Stale, Count };
+enum class OpKind : uint8_t { Move, Hit, Pickup, Drop, Spawn, Activate, Join, Leave, Save, Load, SetLink, Stale, Corrupt, Recruit, Container, Projectile, Explosion, LimbHit, SimulKill, Count };
 const char* opName(OpKind k);
 bool opFromName(const std::string& s, OpKind& out);
 
@@ -29,7 +29,20 @@ bool opFromName(const std::string& s, OpKind& out);
 //   Join/Leave m (machine 0, the host, never leaves)
 //   Save/Load  host save point / load the latest save
 //   SetLink a=minLatencyMs b=maxLatencyMs c=loss permille d=duplicate permille
-//   Stale   m=receiver, a=sender, b=which recorded message, c=0 old-content replay (fresh packet) / 1 raw duplicate
+//   Stale   m=receiver, a=sender, b=which recorded message, c=0 old-content replay (fresh packet) / 1 raw duplicate,
+//           d=which kind of message b chooses among: 0 any, 1 state-changing requests (drop, hit, pickup, container, activate, spawn roll),
+//           2 ownership messages, 3 the oldest ones first (messages from before a host load), 4 the newest drop request, 5 an old ownership assignment
+//           (the oldest of the host's last 64 broadcasts, em only)
+// The ops below exist only for the em target (generate(..., "em")); mini ignores them:
+//   Corrupt   m=guest, c=what (0 object flag, 1 container count, 2 actor drifts a few units, 3 ground item flag), a=which: a silent change of the guest's copy only,
+//             which the digest repair has to find
+//   Recruit   m=host, a=actor slot, b=player: the actor becomes that player's companion
+//   Container m, a=container slot, b=0 open 1 take 2 put 3 close, c=count
+//   Projectile m=shooter, a=victim slot, b=damage, c=1 explosive, d=flight ms: the shooter's owner runs the real one, every other machine a visual copy
+//   Explosion  m=thrower, a=victim slot (the blast is centred on that actor), b=radius, c=damage: damage reaches each victim through its own owner
+//   LimbHit    m, a=victim slot (0 = the nearest actor to m), b=damage, c=limb (1..5): limbs cripple by accumulated damage
+//   SimulKill  m=first attacker, b=second attacker machine, c=1: both fire a lethal hit at the nearest actor in the same instant, and the host also story-kills it
+//   Hit with c=1 / c=2: a strike on a story NPC / any actor: the attacker first steps next to the victim (so the hit is valid) and the hit is stamped valid
 struct Op {
     uint32_t t = 0;
     OpKind kind = OpKind::Move;
@@ -48,7 +61,8 @@ struct Scenario {
     std::vector<Op> ops;              // sorted by t
 };
 
-Scenario generate(uint64_t seed, int machines, uint32_t durationMs);
+// `target` only decides which extra ops are added (see above); "mini" generates the same scenarios as before.
+Scenario generate(uint64_t seed, int machines, uint32_t durationMs, const std::string& target = "mini");
 std::string toJson(const Scenario& s);
 bool fromJson(const std::string& text, Scenario& out, std::string* err = nullptr);
 
@@ -163,7 +177,9 @@ struct RunOptions {
 };
 RunResult run(const Scenario& s, const RunOptions& opt);
 // Delta-debug the ops (then link, machines) down to a smaller scenario that still violates `invariant`.
-Scenario shrink(const Scenario& s, const RunOptions& opt, const std::string& invariant, int* runs = nullptr);
+// onlyWithBugs: a candidate counts as "still failing" only while the injected bugs are what breaks it, i.e. the same scenario with the bugs removed passes. Without it a session that
+// also fails on the real code (its own bug, nothing to do with the injected fault) shrinks into a "repro" of the fault that does not reproduce it.
+Scenario shrink(const Scenario& s, const RunOptions& opt, const std::string& invariant, int* runs = nullptr, bool onlyWithBugs = false);
 bool writeTraces(const ITarget& t, const Scenario& s, const RunResult& r, const std::string& dir, const std::string& name);
 
 std::string fnvHex(const std::string& s);

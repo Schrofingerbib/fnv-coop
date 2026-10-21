@@ -1,5 +1,5 @@
 // Game-free tests for the focus guard, on a real hidden Win32 window whose procedure stands in for the engine's.
-// Prints "focus guard: N checks, M failed". plugin\splitscreen\run_tests.cmd builds it once per FOCUS_GUARD_MUTANT.
+// Prints "focus guard: N checks, M failed". plugin\splitscreen\run_tests.cmd builds it once and runs it once per runtime twin (FNVCOOP_MUT=1..7).
 // The test build defines FOCUS_GUARD_TESTING (CMakeLists.txt), which gives the test-only hooks in focus_guard.h.
 #include "../focus_guard.h"
 

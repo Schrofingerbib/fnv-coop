@@ -13,10 +13,8 @@
 #include "bots_addrs.h"
 #include "common/minijson.h"
 
-#ifndef NVBOTS_MUTANT
-#define NVBOTS_MUTANT 0
-#endif
-// Extra mutants for this file (13..22), every one must make tests/test_bots.cpp fail:
+#include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
+// Runtime twins for this file (13..45), every one must make tests/test_bots.cpp fail:
 //  13 dialogue pick ignores the ready state    14 pick matches the wrong list index        15 pick skips the special-topic refusal
 //  16 menu id map has 0x3F1/0x3F0 swapped      17 VATS wins nothing over the menu id       18 inventory counts deltas, not totals
 //  19 vats job never gives up on a bad target  20 pick leaves the click gate untouched     21 consent buttons swapped
@@ -108,13 +106,8 @@ inline const char* menuKindOf(uint32_t id) {
         case 0x3EA: case 0x3EB: case 0x3FF: case 0x40B: case 0x425: return "pipboy";
         case 0x3EC: return "hud";
         case 0x3EF: return "loading";
-#if NVBOTS_MUTANT == 16
-        case 0x3F0: return "dialogue";
-        case 0x3F1: return "container";
-#else
-        case 0x3F0: return "container";
-        case 0x3F1: return "dialogue";
-#endif
+        case 0x3F0: return FNV_MUT(16) ? "dialogue" : "container";   // twin 16: 0x3F0/0x3F1 swapped
+        case 0x3F1: return FNV_MUT(16) ? "container" : "dialogue";
         case 0x3F5: return "pause";
         case 0x3F6: return "lockpick";
         case 0x41D: return "barter";
@@ -132,11 +125,11 @@ inline bool menuInfo(IEngine& e, Value* out, std::string* err) {
     e.rd32(eng::kVatsCamera + eng::kVatsMode, &mode);
     const uint32_t id = e.topMenuId(mgr);
     const char* kind = menuKindOf(id);
-#if NVBOTS_MUTANT == 17
-    (void)mode;
-#else
-    if (mode != 0) kind = "vats";
-#endif
+    if (FNV_MUT(17)) {
+        (void)mode;
+    } else {
+        if (mode != 0) kind = "vats";
+    }
     *out = Value::object();
     out->set("kind", kind).set("id", (int64_t)id).set("vatsMode", (int64_t)mode);
     uint32_t dlg = 0;
@@ -158,15 +151,11 @@ inline int alwaysRunState(IEngine& e) {
     Addr32 player = 0;
     uint8_t on = 0, pad = 0, padOff = 0;
     if (!e.resolveRef("", &player) || !player) return -1;
-#if NVBOTS_MUTANT == 45
-    if (!e.rd8(player + eng::kPlayerAlwaysRun + 1, &on)) return -1;
-#else
-    if (!e.rd8(player + eng::kPlayerAlwaysRun, &on)) return -1;
-#endif
+    if (!e.rd8(player + eng::kPlayerAlwaysRun + (FNV_MUT(45) ? 1 : 0), &on)) return -1;   // twin 45: reads the byte after the flag
     if (!e.rd8(eng::kPadConnected, &pad) || !e.rd8(eng::kDisable360Value, &padOff)) return -1;
-#if NVBOTS_MUTANT != 44
-    if (pad && !padOff) return 0;
-#endif
+    if (!FNV_MUT(44)) {
+        if (pad && !padOff) return 0;
+    }
     return on ? 1 : 0;
 }
 
@@ -179,15 +168,15 @@ inline int alwaysRunState(IEngine& e) {
 // On success `out` gets {menu, button, value, buttons}: value is what the engine records (GetButtonPressed), buttons is how many the box has.
 inline bool pressNativeMessageButton(IEngine& e, int button, Value* out, std::string* err, bool* applies) {
     *applies = false;
-#if NVBOTS_MUTANT != 41
-    if (!e.onMainThread()) { *applies = true; *err = "the native message press must run on the game main thread"; return false; }
-#endif
+    if (!FNV_MUT(41)) {
+        if (!e.onMainThread()) { *applies = true; *err = "the native message press must run on the game main thread"; return false; }
+    }
     uint32_t mgr = 0;
     if (!e.rd32(eng::kInterfaceMgrPtr, &mgr) || !mgr) { *err = "interface manager not ready"; return false; }
     const uint32_t top = e.topMenuId(mgr);
-#if NVBOTS_MUTANT != 38
-    if (top != eng::kMenuIdMessage) { *err = "the top menu is not the native message box (top menu id " + std::to_string(top) + ")"; return false; }
-#endif
+    if (!FNV_MUT(38)) {
+        if (top != eng::kMenuIdMessage) { *err = "the top menu is not the native message box (top menu id " + std::to_string(top) + ")"; return false; }
+    }
     *applies = true;
     uint32_t arr = 0, tileMenu = 0, menu = 0, vt = 0;
     if (!e.rd32(eng::kTileMenuArrayData, &arr) || !arr || !e.rd32(arr + 4 * (eng::kMenuIdMessage - eng::kMenuIdMin), &tileMenu) || !tileMenu ||
@@ -196,21 +185,19 @@ inline bool pressNativeMessageButton(IEngine& e, int button, Value* out, std::st
         return false;
     }
     e.rd32(menu, &vt);
-#if NVBOTS_MUTANT != 34
-    if (vt != addr::MessageMenuVtbl) {
-        char b[96];
-        std::snprintf(b, sizeof b, "menu 1001 is not a MessageMenu (vtable %08X, want %08X): refused", vt, addr::MessageMenuVtbl);
-        *err = b;
-        return false;
+    if (!FNV_MUT(34)) {
+        if (vt != addr::MessageMenuVtbl) {
+            char b[96];
+            std::snprintf(b, sizeof b, "menu 1001 is not a MessageMenu (vtable %08X, want %08X): refused", vt, addr::MessageMenuVtbl);
+            *err = b;
+            return false;
+        }
     }
-#endif
     uint32_t idx = 0, count = 0;
     const bool current = e.rd32(eng::kMsgQueueIdx, &idx) && e.rd32(eng::kMsgQueue + 8, &count) && idx < count;
-#if NVBOTS_MUTANT != 39
-    if (!current) { *err = "the message box has no current message (it is closing)"; return false; }
-#else
-    (void)current;
-#endif
+    if (!FNV_MUT(39)) {
+        if (!current) { *err = "the message box has no current message (it is closing)"; return false; }
+    }
     struct Btn { Addr32 tile; int32_t value; };
     std::vector<Btn> bs;
     uint32_t node = menu + eng::kMsgButtonHead;
@@ -229,14 +216,10 @@ inline bool pressNativeMessageButton(IEngine& e, int button, Value* out, std::st
         *err = "button " + std::to_string(button) + " is not shown (the box has " + std::to_string(bs.size()) + " buttons)";
         return false;
     }
-#if NVBOTS_MUTANT == 35
-    const Btn& pick = bs[(size_t)(button + 1 < (int)bs.size() ? button + 1 : button)];
-#else
-    const Btn& pick = bs[(size_t)button];
-#endif
-#if NVBOTS_MUTANT != 37
-    if (!pick.tile) { *err = "button " + std::to_string(button) + " has no tile"; return false; }
-#endif
+    const Btn& pick = FNV_MUT(35) ? bs[(size_t)(button + 1 < (int)bs.size() ? button + 1 : button)] : bs[(size_t)button];
+    if (!FNV_MUT(37)) {
+        if (!pick.tile) { *err = "button " + std::to_string(button) + " has no tile"; return false; }
+    }
     if (!e.msgMenuHandleClick(menu, eng::kMsgClickId, pick.tile)) { *err = "the live glue refused the HandleClick call (pins or vtable did not match)"; return false; }
     out->set("menu", (int64_t)eng::kMenuIdMessage).set("button", (int64_t)button).set("value", (int64_t)pick.value).set("buttons", (int64_t)bs.size());
     return true;
@@ -265,17 +248,17 @@ inline bool dialogPick(IEngine& e, uint32_t wantFormId, Value* out, std::string*
     uint32_t dlg = 0, lb = 0, state = 0;
     if (!e.rd32(eng::kDialogMenuPtr, &dlg) || !dlg) { *err = "no dialogue open"; return false; }
     e.rd32(dlg + eng::kDlgState, &state);
-#if NVBOTS_MUTANT != 13
-    if (state != (uint32_t)eng::kDlgReady) { *err = "dialogue not ready (state " + std::to_string(state) + ", need 2)"; return false; }
-#endif
+    if (!FNV_MUT(13)) {
+        if (state != (uint32_t)eng::kDlgReady) { *err = "dialogue not ready (state " + std::to_string(state) + ", need 2)"; return false; }
+    }
     uint32_t gate = 0;
     e.rd32(dlg + eng::kDlgClickGate, &gate);
-#if NVBOTS_MUTANT != 20
-    if (gate) {
-        if (e.nowTick() - gate < 500) { *err = "click gate closed (a click happened < 500 ms ago)"; return false; }
-        e.wr32(dlg + eng::kDlgClickGate, 0);
+    if (!FNV_MUT(20)) {
+        if (gate) {
+            if (e.nowTick() - gate < 500) { *err = "click gate closed (a click happened < 500 ms ago)"; return false; }
+            e.wr32(dlg + eng::kDlgClickGate, 0);
+        }
     }
-#endif
     std::vector<Choice> cs;
     if (!dialogChoices(e, &cs, err)) return false;
     const Choice* hit = nullptr;
@@ -288,20 +271,20 @@ inline bool dialogPick(IEngine& e, uint32_t wantFormId, Value* out, std::string*
         out->set("offered", ids);
         return false;
     }
-#if NVBOTS_MUTANT == 15
-#else
-    if (e.infoSpecial(hit->info)) { *err = "special INFO (flag 0x80): the replicated click path does not cover it"; return false; }
-#endif
-#if NVBOTS_MUTANT == 26
-    if (e.infoSpeechCheck(hit->info)) { *err = "special INFO (speech check): refused"; return false; }
-#endif
+    if (FNV_MUT(15)) {
+    } else {
+        if (e.infoSpecial(hit->info)) { *err = "special INFO (flag 0x80): the replicated click path does not cover it"; return false; }
+    }
+    if (FNV_MUT(26)) {
+        if (e.infoSpeechCheck(hit->info)) { *err = "special INFO (speech check): refused"; return false; }
+    }
     const bool speechCheck = e.infoSpeechCheck(hit->info);
     e.rd32(dlg + eng::kDlgListBox, &lb);
-#if NVBOTS_MUTANT == 14
-    e.lbSelect(lb, hit->idx + 1);
-#else
-    e.lbSelect(lb, hit->idx);
-#endif
+    if (FNV_MUT(14)) {
+        e.lbSelect(lb, hit->idx + 1);
+    } else {
+        e.lbSelect(lb, hit->idx);
+    }
     const Addr32 item = e.lbSelected(lb);
     if (item != hit->item) { *err = "selection did not land on the requested choice"; return false; }
     e.wr8(item + eng::kItemFlag, 0);
@@ -347,12 +330,12 @@ inline bool inventoryInfo(IEngine& e, const std::string& ref, const std::vector<
                 uint32_t d = 0;
                 e.rd32(entry + 4, &d);
                 delta = (int32_t)d;
-#if NVBOTS_MUTANT == 18
-                if (delta) add(type, delta);
-#else
-                const int total = e.itemTotal(data, type);
-                if (total) add(type, total);
-#endif
+                if (FNV_MUT(18)) {
+                    if (delta) add(type, delta);
+                } else {
+                    const int total = e.itemTotal(data, type);
+                    if (total) add(type, total);
+                }
             }
             node = next;
         }
@@ -371,9 +354,9 @@ inline bool terminalEntries(IEngine& e, const std::string& ref, std::vector<Term
     uint32_t mgr = 0, menu = 0, top = 0;
     if (!e.rd32(eng::kInterfaceMgrPtr, &mgr) || !mgr) { *err = "interface manager not ready"; return false; }
     top = e.topMenuId(mgr);
-#if NVBOTS_MUTANT != 24
-    if (top != 0x421) { *err = "terminal menu is not open (top menu id " + std::to_string(top) + "); activate the terminal first"; return false; }
-#endif
+    if (!FNV_MUT(24)) {
+        if (top != 0x421) { *err = "terminal menu is not open (top menu id " + std::to_string(top) + "); activate the terminal first"; return false; }
+    }
     if (!e.rd32(eng::kTerminalMenuPtr, &menu) || !menu) { *err = "terminal menu object missing"; return false; }
     Addr32 want = 0, shown = 0;
     if (!e.resolveRef(ref, &want) || !want) { *err = "terminal reference not loaded"; return false; }
@@ -410,11 +393,8 @@ inline bool terminalPick(IEngine& e, const std::string& ref, int entry, Value* o
     for (const TermEntry& t : es) names.push(t.text);
     out->set("entries", names);
     if (entry < 0 || entry >= (int)es.size()) { *err = "entry index out of range (" + std::to_string(es.size()) + " entries shown)"; return false; }
-#if NVBOTS_MUTANT == 23
-    const TermEntry& pick = es[(size_t)(entry + 1 < (int)es.size() ? entry + 1 : entry)];
-#else
-    const TermEntry& pick = es[(size_t)entry];
-#endif
+    // twin 23: terminal entry index off by one
+    const TermEntry& pick = FNV_MUT(23) ? es[(size_t)(entry + 1 < (int)es.size() ? entry + 1 : entry)] : es[(size_t)entry];
     if (!pick.tile) { *err = "entry has no tile"; return false; }
     e.termClick(menu, pick.tile);
     out->set("used", pick.text).set("index", (int64_t)pick.idx);
@@ -441,11 +421,7 @@ inline bool walkRefs(IEngine& e, const std::string& base, const std::string& cel
         if (!e.rd32(node, &ref) || !e.rd32(node + 4, &next)) break;
         if (ref) {
             uint32_t bf = 0, id = 0, flags = 0;
-#if NVBOTS_MUTANT == 32
-            const uint32_t skip = 0x20;
-#else
-            const uint32_t skip = 0x820;
-#endif
+            const uint32_t skip = FNV_MUT(32) ? 0x20 : 0x820;   // twin 32: the disabled flag is not skipped
             if (e.rd32(ref + 0x20, &bf) && bf && e.rd32(bf + eng::kFormId, &id) && id == baseId && e.rd32(ref + 0x08, &flags) && !(flags & skip))
                 refs->push_back(ref);
         }
@@ -485,24 +461,24 @@ inline bool fastTravel(IEngine& e, const std::string& marker, Value* out, std::s
     uint32_t mgr = 0, menuKindId = 0, vatsMode = 0;
     if (e.rd32(eng::kInterfaceMgrPtr, &mgr) && mgr) menuKindId = e.topMenuId(mgr);
     e.rd32(eng::kVatsCamera + eng::kVatsMode, &vatsMode);
-#if NVBOTS_MUTANT != 30
-    if (vatsMode != 0 || menuKindId == 0x3EF || menuKindId == 0x3F1 || menuKindId == 0x420 || menuKindId == 0x3F0 || menuKindId == 0x421 || menuKindId == 0x41D) {
-        *err = "busy: a loading, dialogue, VATS, container, terminal or barter menu is open";
-        return false;
+    if (!FNV_MUT(30)) {
+        if (vatsMode != 0 || menuKindId == 0x3EF || menuKindId == 0x3F1 || menuKindId == 0x420 || menuKindId == 0x3F0 || menuKindId == 0x421 || menuKindId == 0x41D) {
+            *err = "busy: a loading, dialogue, VATS, container, terminal or barter menu is open";
+            return false;
+        }
     }
-#endif
     uint32_t pending = 0;
     if (e.rd32(player + addr::kPlayerPending, &pending) && pending) { *err = "busy: a travel or teleport is already pending"; return false; }
-#if NVBOTS_MUTANT != 29
-    if (!e.canFastTravel(player)) { *err = "the engine refuses fast travel right now (combat, enemies near, overencumbered, in air or blocked here)"; return false; }
-#endif
+    if (!FNV_MUT(29)) {
+        if (!e.canFastTravel(player)) { *err = "the engine refuses fast travel right now (combat, enemies near, overencumbered, in air or blocked here)"; return false; }
+    }
     const Addr32 obj = e.newTravelObj();
     if (!obj) { *err = "could not allocate the travel object"; return false; }
-#if NVBOTS_MUTANT == 31
-    e.wr32(obj + 0x2C, mk);
-#else
-    e.wr32(obj + addr::kTravelObjMarker, mk);
-#endif
+    if (FNV_MUT(31)) {
+        e.wr32(obj + 0x2C, mk);
+    } else {
+        e.wr32(obj + addr::kTravelObjMarker, mk);
+    }
     e.setPendingTravel(player, obj);
     out->set("genuine", true).set("queued", true);
     return true;
@@ -511,9 +487,7 @@ inline bool fastTravel(IEngine& e, const std::string& marker, Value* out, std::s
 // True when two form names ("Plugin.esm:HEX", or a bare HEX) name the same form. The plugin part compares without case and the
 // hex part compares as a number. The engine names forms "falloutnv.esm:015169" and callers send "FalloutNV.esm:15169" (in game, 2026-10-21).
 inline bool sameFormName(const std::string& a, const std::string& b) {
-#if NVBOTS_MUTANT == 48
-    return a == b;
-#else
+    if (FNV_MUT(48)) return a == b;   // twin 48: names compared as plain text
     const size_t ca = a.rfind(':'), cb = b.rfind(':');
     const std::string pa = ca == std::string::npos ? "" : a.substr(0, ca), pb = cb == std::string::npos ? "" : b.substr(0, cb);
     if (pa.size() != pb.size()) return false;
@@ -535,7 +509,6 @@ inline bool sameFormName(const std::string& a, const std::string& b) {
     };
     uint32_t va = 0, vb = 0;
     return hex(ca == std::string::npos ? a : a.substr(ca + 1), &va) && hex(cb == std::string::npos ? b : b.substr(cb + 1), &vb) && va == vb;
-#endif
 }
 
 // ---- bot.drops: what the engine's OnDrop event reported ----
@@ -560,12 +533,12 @@ public:
         Value arr = Value::array();
         for (const DropRec& r : recs_) {
             if (r.seq <= since) continue;
-#if NVBOTS_MUTANT != 27
-            if (!base.empty() && !sameFormName(r.base, base)) continue;
-#endif
-#if NVBOTS_MUTANT != 28
-            if (nowMs > r.atMs && nowMs - r.atMs > windowMs) continue;
-#endif
+            if (!FNV_MUT(27)) {
+                if (!base.empty() && !sameFormName(r.base, base)) continue;
+            }
+            if (!FNV_MUT(28)) {
+                if (nowMs > r.atMs && nowMs - r.atMs > windowMs) continue;
+            }
             Value v = Value::object();
             v.set("seq", r.seq).set("ref", r.ref).set("base", r.base).set("dropper", r.dropper);
             arr.push(v);
@@ -586,11 +559,11 @@ class VatsJob {
 public:
     enum Phase { kIdle, kEnter, kTarget, kAccept, kPlayback, kDone, kFailed };
     bool start(IEngine& e, const std::string& ref, const std::string& limb, uint64_t now, std::string* err) {
-#if NVBOTS_MUTANT != 22
-        if (!limb.empty()) { *err = "unsupported: limb selection in VATS is not implemented"; return false; }
-#else
-        (void)limb;
-#endif
+        if (!FNV_MUT(22)) {
+            if (!limb.empty()) { *err = "unsupported: limb selection in VATS is not implemented"; return false; }
+        } else {
+            (void)limb;
+        }
         if (phase_ == kEnter || phase_ == kTarget || phase_ == kAccept || phase_ == kPlayback) { *err = "a VATS job is already running"; return false; }
         if (!e.resolveRef(ref, &want_) || !want_) { *err = "target not loaded"; return false; }
         uint32_t mode = 0;
@@ -617,10 +590,7 @@ public:
                 if (mode == 4) { phase_ = kPlayback; break; }
                 if (now - tPhase_ < 500) break;
                 if (selected(e) == want_) { tap(5); phase_ = kAccept; tPhase_ = now; break; }
-                if (cycles_ >= 12
-#if NVBOTS_MUTANT == 19
-                    && false
-#endif
+                if (cycles_ >= 12 && !FNV_MUT(19)   // twin 19: the job never gives up on a bad target
                     ) return fail("target_not_selectable (cycled all targets)");
                 tap(3); ++cycles_; tPhase_ = now;
                 break;

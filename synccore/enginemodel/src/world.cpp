@@ -1,6 +1,7 @@
 #include "fnvcoop/engine/world.h"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include "fnvcoop/wire.h"
 
 namespace fnvcoop::engine {
@@ -50,6 +51,7 @@ void io(Archive& a, ActorState& v) {
     a.vari32(v.health); a.vari32(v.maxHealth);
     a.boolean(v.dead); a.boolean(v.enabled); a.boolean(v.aiOn); a.boolean(v.hostile); a.boolean(v.named);
     a.u8(v.recruiter); a.varu32(v.site); a.u8(v.limbMask); a.varu32(v.snapSeq); io(a, v.pick);
+    for (auto& d : v.limbDmg) a.vari32(d);
 }
 void io(Archive& a, ContainerState& v) {
     a.varu32(v.id); a.varu32(v.cell); io(a, v.pos); a.boolean(v.corpse); ioItems(a, v.items); a.u8(v.inUseBy);
@@ -302,22 +304,32 @@ bool World::applyEffect(const Effect& e) {
 
 namespace {
 int32_t bucket(float v) { return static_cast<int32_t>(std::floor(v / 256.0f)); }
+// A position is compared exactly. A coarse bucket used to hide small differences, and a difference below the bucket size never healed: an owner
+// that left (or lost its link) while its actor was still walking left the host and a guest holding different last positions, forever.
+// An actor that is still moving changes the digest on every report, so it never looks "stable" and is not repaired mid-walk.
+int32_t coord(float v) {
+    if (engineFaults().digestBucketsPositions) return bucket(v);
+    int32_t bits;
+    std::memcpy(&bits, &v, sizeof bits);
+    return bits;
+}
+int32_t healthKey(int32_t hp) { return engineFaults().digestBucketsPositions ? (hp <= 0 ? 0 : (hp + 9) / 10) : hp; }
 
 void canonActor(Archive& a, const ActorState& s) {
     // a corpse stops where it fell and ragdolls are visual only: the final resting position is not part of the digest
-    int32_t b[3] = {s.dead ? 0 : bucket(s.pos.x), s.dead ? 0 : bucket(s.pos.y), s.dead ? 0 : bucket(s.pos.z)};
+    int32_t b[3] = {s.dead ? 0 : coord(s.pos.x), s.dead ? 0 : coord(s.pos.y), s.dead ? 0 : coord(s.pos.z)};
     a.varu32(const_cast<uint32_t&>(s.id)); a.boolean(const_cast<bool&>(s.dead)); a.boolean(const_cast<bool&>(s.enabled));
     uint32_t cell = s.cell; a.varu32(cell);
-    int32_t hb = s.health <= 0 ? 0 : (s.health + 9) / 10; a.vari32(hb);
+    int32_t hb = healthKey(s.health); a.vari32(hb);
     for (int i = 0; i < 3; ++i) a.vari32(b[i]);
     uint8_t rec = s.recruiter, limbs = s.limbMask; a.u8(rec); a.u8(limbs);
     FormRef pick = s.pick; io(a, pick);
 }
 void canonPlayer(Archive& a, const PlayerState& s) {
-    int32_t b[3] = {bucket(s.pos.x), bucket(s.pos.y), bucket(s.pos.z)};
+    int32_t b[3] = {coord(s.pos.x), coord(s.pos.y), coord(s.pos.z)};
     uint8_t slot = s.slot; a.u8(slot);
     uint32_t cell = s.cell; a.varu32(cell);
-    int32_t hb = s.health <= 0 ? 0 : (s.health + 9) / 10; a.vari32(hb);
+    int32_t hb = healthKey(s.health); a.vari32(hb);
     bool dead = s.dead; a.boolean(dead);
     for (int i = 0; i < 3; ++i) a.vari32(b[i]);
 }
@@ -341,7 +353,6 @@ void canonSite(Archive& a, const SpawnSiteState& s) {
     uint32_t id = s.id, sp = s.spawned, cnt = s.spawnCount; a.varu32(id); a.varu32(sp); a.varu32(cnt);
     bool cl = s.cleared; a.boolean(cl);
 }
-constexpr uint32_t kPlayerKeyBase = 0xF0000000u;
 uint64_t hashOf(Archive& a) { auto b = a.finish(); return hash64(b.data(), b.size()); }
 }  // namespace
 
@@ -355,7 +366,7 @@ std::map<uint32_t, uint64_t> World::keyHashes(Category c) const {
         case Category::Actors:
             for (auto& kv : actors_) { Archive a = Archive::writer(); canonActor(a, kv.second); put(kv.first, a); }
             for (uint8_t p = 0; p < kMaxSlots; ++p)
-                if (players_[p].present) { Archive a = Archive::writer(); canonPlayer(a, players_[p]); put(kPlayerKeyBase | p, a); }
+                if (players_[p].present) { Archive a = Archive::writer(); canonPlayer(a, players_[p]); put(playerKey(p), a); }
             break;
         case Category::Containers:
             for (auto& kv : containers_) { Archive a = Archive::writer(); canonContainer(a, kv.second); put(kv.first, a); }
@@ -392,8 +403,8 @@ bool World::exportKey(Category c, uint32_t key, Archive& a) const {
                 if (keyOfQuest(kv.first) == key) { FormRef f = kv.first; uint32_t s = kv.second; io(a, f); a.varu32(s); return true; }
             return false;
         case Category::Actors: {
-            if (key >= kPlayerKeyBase) {
-                const PlayerState& p = players_[(key & 0xFF) % kMaxSlots];
+            if (isPlayerKey(key)) {
+                const PlayerState& p = players_[playerSlotOfKey(key)];
                 if (!p.present) return false;
                 PlayerState copy = p; copy.inventory.clear();   // inventories never travel
                 io(a, copy); return true;
@@ -428,9 +439,9 @@ bool World::importKey(Category c, uint32_t key, Archive& a) {
             quests_[f] = s; return true;
         }
         case Category::Actors: {
-            if (key >= kPlayerKeyBase) {
+            if (isPlayerKey(key)) {
                 PlayerState p; io(a, p);
-                if (!a.ok() || p.slot >= kMaxSlots) return false;
+                if (!a.ok() || p.slot != playerSlotOfKey(key)) return false;
                 p.inventory = players_[p.slot].inventory;   // never overwritten by a repair
                 players_[p.slot] = p; return true;
             }
@@ -474,7 +485,7 @@ void World::removeKey(Category c, uint32_t key) {
             for (auto it = quests_.begin(); it != quests_.end(); ++it) if (keyOfQuest(it->first) == key) { quests_.erase(it); return; }
             return;
         case Category::Actors:
-            if (key >= kPlayerKeyBase) { players_[(key & 0xFF) % kMaxSlots].present = false; return; }
+            if (isPlayerKey(key)) { players_[playerSlotOfKey(key)].present = false; return; }
             eraseActor(key); return;
         case Category::Containers: containers_.erase(key); items_.erase(key); return;
         case Category::Objects: objects_.erase(key); sites_.erase(key); return;

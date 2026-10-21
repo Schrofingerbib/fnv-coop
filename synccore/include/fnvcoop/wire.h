@@ -17,11 +17,11 @@
 
 namespace fnvcoop {
 
-constexpr uint8_t kWireVersion = 5;
+constexpr uint8_t kWireVersion = 6;
 // Hello / Reject use a version-independent envelope byte so that two incompatible builds can still tell each other WHY
 // they cannot play together instead of silently dropping each other's datagrams.
 constexpr uint8_t kHandshakeEnvelope = 0xA1;
-constexpr uint16_t kProtocolVersion = 5;
+constexpr uint16_t kProtocolVersion = 6;
 uint64_t hash64(const void* data, size_t size, uint64_t seed = 1469598103934665603ull);   // FNV-1a
 constexpr size_t kMaxEffectsPerTxn = 1024;
 constexpr size_t kMaxTxnsPerBatch = 256;

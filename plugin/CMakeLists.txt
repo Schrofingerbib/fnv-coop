@@ -81,7 +81,7 @@ endif()
 # NOTE: xNVSE headers use max()/min(): do NOT define NOMINMAX for targets that include them.
 option(NVCOOP_LINK_SNAPSHOT "Link L7 fnvcoop_snapshot into nvcoop.dll (needs the xNVSE game-API sources; links in L7 snapshot)" ON)
 set(NVCOOP_SKIP_SUBDIRS "" CACHE STRING "semicolon list of plugin/<dir> to leave out (e.g. a lane whose code does not build yet)")
-foreach(sub hooks hooks_ui hooks_world snapshot nvmp coop flight animprobe reload bots splitscreen)
+foreach(sub hooks hooks_ui hooks_world snapshot nvmp coop flight animprobe reload bots actors avatar combat spawn splitscreen intents world_time vats companions areadigest loot)
   if(sub IN_LIST NVCOOP_SKIP_SUBDIRS)
     continue()
   endif()
@@ -93,6 +93,11 @@ foreach(sub hooks hooks_ui hooks_world snapshot nvmp coop flight animprobe reloa
     endif()
   endif()
 endforeach()
+# dll-wiring: the live layer's glue (plugin/coop/live) comes AFTER every lane above, so it links whichever of actors / avatar / combat / spawn exist.
+# Everything it adds to nvcoop.dll stays inert until nvcoop.ini [live] switches it on (all OFF by default).
+if(NOT "coop/live" IN_LIST NVCOOP_SKIP_SUBDIRS AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/coop/live/CMakeLists.txt")
+  add_subdirectory(coop/live)
+endif()
 # Track B focus guard: it subclasses the game window, so it goes only into the DLL that is never unloaded
 # (this monolithic nvcoop.dll, or the split-mode loader in plugin/loader/CMakeLists.txt).
 if(TARGET nvsplit_focus AND NOT NVCOOP_SPLIT_LOADER)
@@ -101,6 +106,10 @@ if(TARGET nvsplit_focus AND NOT NVCOOP_SPLIT_LOADER)
 endif()
 if(NVCOOP_LINK_SNAPSHOT AND TARGET fnvcoop_snapshot)
   target_compile_definitions(nvcoop PRIVATE NVCOOP_WITH_SNAPSHOT=1)
+endif()
+# story-capture: RefCommand AI orders are performed only by the machine that owns the actor; needs the actors engine API (plugin/hooks/story_owner_gate.cpp)
+if(TARGET nvcoop AND TARGET nvcoop_actor_engine_core AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/hooks/story_owner_gate.cpp")
+  target_sources(nvcoop PRIVATE ${CMAKE_CURRENT_LIST_DIR}/hooks/story_owner_gate.cpp)
 endif()
 
 if(NVCOOP_SPLIT_LOADER)

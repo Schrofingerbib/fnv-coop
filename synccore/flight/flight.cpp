@@ -263,6 +263,44 @@ void FlightRecorder::marker(uint16_t kind, const std::string& text) {
     push(kMarker, 0, v.data(), v.size());
 }
 
+static const char* healCategoryName(uint8_t c) {
+    static const char* names[] = {"story", "actors", "containers", "objects"};
+    return c < 4 ? names[c] : "other";
+}
+
+void FlightRecorder::healCounters(const std::vector<HealRow>& rows) {
+    if (!enabled()) return;
+    uint64_t total = 0, perMin = 0;
+    std::string line = "heals/min";
+    for (const HealRow& r : rows) {
+        const std::string base = std::string("heals.") + healCategoryName(r.category);
+        if (!flightMutations().healNoMeta) {
+            meta(base + ".total", std::to_string(r.total));
+            meta(base + ".perMin", std::to_string(r.perMinute));
+            meta(base + ".mismatches", std::to_string(r.mismatches));
+        }
+        total += r.total;
+        perMin += r.perMinute;
+        line += std::string(" ") + healCategoryName(r.category) + "=" + std::to_string(r.perMinute);
+    }
+    if (!flightMutations().healNoMeta) {
+        meta("heals.total", std::to_string(total));
+        meta("heals.perMin", std::to_string(perMin));
+    }
+    bool moved = false;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        moved = total != healTotalLast_;
+        healTotalLast_ = total;
+    }
+    if (moved) marker(kMarkHeal, line + " total=" + std::to_string(total));
+}
+
+void FlightRecorder::healed(uint8_t category, const std::string& text) {
+    if (flightMutations().healedNoMarker) return;
+    marker(kMarkHeal, std::string("heal ") + healCategoryName(category) + " " + text);
+}
+
 FlightRecorder::Stats FlightRecorder::stats() const {
     std::lock_guard<std::mutex> g(mu_);
     Stats s;

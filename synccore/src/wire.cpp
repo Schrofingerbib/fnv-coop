@@ -1,4 +1,5 @@
 #include "fnvcoop/wire.h"
+#include "fnvcoop/refop.h"
 #include <cmath>
 #include <cstring>
 #include <type_traits>
@@ -368,6 +369,16 @@ void ioE(Archive& a, RefAngle& e) {
     a.boolean(e.hasBefore);
     if (e.hasBefore) a.f32(e.before); else if (a.reading()) e.before = 0;
 }
+void ioE(Archive& a, RefCommand& e) {
+    uint32_t op = e.op;
+    a.varu32(op);
+    if (a.reading()) { if (op > 0xFFFF || !refOpKnown(static_cast<uint16_t>(op))) { a.fail(); return; } e.op = static_cast<uint16_t>(op); }
+    io(a, e.ref); io(a, e.a); io(a, e.b);
+    a.vari32(e.i); a.vari32(e.j); a.vari32(e.k); a.vari32(e.l);
+    a.f32(e.f);
+    a.str(e.s);
+    io(a, e.to);
+}
 void ioE(Archive& a, AdvanceTime& e) { a.varu32(e.minutes); }
 void ioE(Archive& a, CompleteAllObjectives& e) { io(a, e.quest); }
 void ioE(Archive& a, SetLock& e) {
@@ -410,7 +421,7 @@ const char* effectName(const Effect& e) {
                                   "StopQuest", "MoveRef", "KillActor", "ResurrectActor", "SetScriptVar",
                                   "SetPlayerControls", "PartyTether", "SlideshowEnd", "SaveSuppress", "CompanionOwner",
                                   "ForcedDialogue", "BarrierArrive", "BarrierRelease", "SayOnceFlag", "CompleteQuest",
-                                  "CompleteAllObjectives", "SetLock", "SetFactionRank", "SetPerk", "SwapTexture", "SetFastTravelLock", "FailQuest", "SpawnRef", "DespawnRef", "ObjectState", "RefScriptVar", "RefAddItem", "RefRemoveItem", "RemoveAllItems", "AddTopic", "AddNote", "RemoveNote", "SetMapMarker", "ForceActiveQuest", "RequestSave", "SetWeather", "SetTimeScale", "AdvanceTime", "RefAngle"};
+                                  "CompleteAllObjectives", "SetLock", "SetFactionRank", "SetPerk", "SwapTexture", "SetFastTravelLock", "FailQuest", "SpawnRef", "DespawnRef", "ObjectState", "RefScriptVar", "RefAddItem", "RefRemoveItem", "RemoveAllItems", "AddTopic", "AddNote", "RemoveNote", "SetMapMarker", "ForceActiveQuest", "RequestSave", "SetWeather", "SetTimeScale", "AdvanceTime", "RefAngle", "RefCommand"};
     return names[e.index()];
 }
 

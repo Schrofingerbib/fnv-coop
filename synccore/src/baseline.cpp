@@ -80,6 +80,13 @@ KV kvSpawn(const FormRef& r, const SpawnInfo& i) {
 KV kvTombstone(const FormRef& r) { Fnv k; k.b(32); k.form(r); return kv(k, k); }
 KV kvRefClear(const FormRef& r) { Fnv k; k.b(30); k.form(r); return kv(k, k); }
 KV kvAngle(const FormRef& r, uint8_t axis, float deg) { Fnv k; k.b(28); k.form(r); k.b(axis); Fnv v = k; v.u32(fbits(deg)); return kv(k, v); }
+KV kvRefOp(const RefCommand& c) {
+    const RefOpKey key = refOpKeyOf(c);
+    Fnv k; k.b(33); k.u32(std::get<0>(key)); k.form(std::get<1>(key)); k.form(std::get<2>(key)); k.form(std::get<3>(key));
+    Fnv v = k; v.u32(c.op); v.form(c.ref); v.form(c.a); v.form(c.b); v.u32(static_cast<uint32_t>(c.i)); v.u32(static_cast<uint32_t>(c.j));
+    v.u32(static_cast<uint32_t>(c.k)); v.u32(static_cast<uint32_t>(c.l)); v.u32(fbits(c.f)); v.str(c.s); v.b(static_cast<uint8_t>(c.to.mode)); v.b(c.to.mask);
+    return kv(k, v);
+}
 KV kvTravel(const FormRef& s) { Fnv k; k.b(19); k.form(s); Fnv v = k; v.b(1); return kv(k, v); }
 
 // Key/value hashes of an effect that is a baseline-style state entry.
@@ -122,6 +129,7 @@ bool kvOf(const Effect& e, KV& out) {
         else if constexpr (std::is_same_v<E, SlideshowEnd>) out = kvSlideshow();
         else if constexpr (std::is_same_v<E, SaveSuppress>) out = kvSave(x.on);
         else if constexpr (std::is_same_v<E, SetFastTravelLock>) out = kvTravel(x.scope);
+        else if constexpr (std::is_same_v<E, RefCommand>) { if (refOpIsState(x.op)) out = kvRefOp(x); else ok = false; }
         else ok = false;
     }, e);
     return ok;
@@ -153,7 +161,8 @@ bool isBaselineCovered(const Effect& e) {
            std::holds_alternative<AddNote>(e) || std::holds_alternative<SetMapMarker>(e) || std::holds_alternative<SetWeather>(e) ||
            std::holds_alternative<SetTimeScale>(e) || std::holds_alternative<RefAngle>(e) ||
            std::holds_alternative<RefAddItem>(e) || std::holds_alternative<RefRemoveItem>(e) || std::holds_alternative<RemoveAllItems>(e) ||
-           std::holds_alternative<SpawnRef>(e) || std::holds_alternative<DespawnRef>(e);
+           std::holds_alternative<SpawnRef>(e) || std::holds_alternative<DespawnRef>(e) ||
+           (std::holds_alternative<RefCommand>(e) && refOpIsState(std::get<RefCommand>(e).op));
 }
 
 namespace {
@@ -214,7 +223,10 @@ void walkSegment(const ShadowState& w, unsigned seg, F&& put) {
     case 9: for (auto& a : w.kills) put(5, kvKill(a)); break;
     case 10: for (auto& [r, p] : w.placed) put(5, kvPlaced(r, p.cell, p.x, p.y, p.z)); break;
     case 11: for (auto& [r, l] : w.locks) put(5, kvLock(r, l.first, l.second)); break;
-    case 12: for (auto& [k, t] : w.textures) put(5, kvTexture(k.first, k.second, t)); break;
+    case 12:
+        for (auto& [k, t] : w.textures) put(5, kvTexture(k.first, k.second, t));
+        for (auto& [k, c] : w.refOps) put(5, kvRefOp(c));   // RefCommand state ops share this segment
+        break;
     case 13: for (auto& [n, o] : w.companionOwner) put(5, kvCompanion(n, o, w.companionKind.count(n) ? w.companionKind.at(n) : uint8_t(0))); break;
     case 14: for (auto& [r, o] : w.objects) put(5, kvObj(r, o.open, o.destroyed, o.activated)); break;
     case 15: for (auto& [k, val] : w.refVars) put(3, kvRefVar(k.first, k.second, val)); break;
@@ -415,6 +427,7 @@ std::vector<BaselineEntry> baselineEntries(const ShadowState& w) {
         add(v, 5, e);
     }
     for (auto& [k, t] : w.textures) add(v, 5, SwapTexture{k.first, t, k.second});
+    for (auto& [k, c] : w.refOps) add(v, 5, c);
     for (auto& [n, o] : w.companionOwner) add(v, 5, CompanionOwner{n, o, true, w.companionKind.count(n) ? w.companionKind.at(n) : uint8_t(0)});
     for (auto& [r, o] : w.objects) {
         ObjectState e; e.ref = r; e.mask = kObjOpen | kObjDestroyed | kObjActivated; e.open = o.open; e.destroyed = o.destroyed; e.activatedOnce = o.activated;
@@ -447,7 +460,11 @@ std::vector<BaselineEntry> baselineEntries(const ShadowState& w) {
         add(v, 5, RefAngle{k.first, k.second, deg, o != w.angleOrig.end(), o != w.angleOrig.end() ? o->second : 0.f});
     }
     for (auto& [r, inv] : w.refInv) {
-        if (inv.cleared) add(v, 5, RemoveAllItems{r});
+        if (inv.cleared) {
+            RemoveAllItems c{r};
+            if (inv.hasPre && !preimageIgnored(kPiClearPre)) { c.hasBefore = true; for (auto& [f, n] : inv.pre) c.items.emplace_back(f, static_cast<int32_t>(n)); }   // the pre-image travels with the clear (not part of the entry's key or value)
+            add(v, 5, c);
+        }
         for (auto& [i, d] : inv.delta) {
             const int32_t c = static_cast<int32_t>(std::clamp<int64_t>(d < 0 ? -d : d, 0, INT32_MAX));
             if (d > 0) add(v, 5, RefAddItem{r, i, c}); else if (d < 0) add(v, 5, RefRemoveItem{r, i, c});
@@ -539,13 +556,13 @@ bool revertEffectFor(const ShadowState& clientWorld, uint64_t key, Effect& out) 
             out = RefAngle{g->ref, g->axis, o->second, true, o->second};
             return true;
         }
-        if (!mutations().originsIgnored) {   // restore the value the client's world had before it first changed (pre-images kept in its shadow)
+        {   // restore the value the client's world had before it first changed (pre-images kept in its shadow)
             auto org = [&](uint8_t kind, const FormRef& r, uint16_t idx) -> const Origin* { return orgIn(clientWorld, kind, r, idx); };
-            if (auto* x = std::get_if<SpawnRef>(&e.effect)) { DespawnRef f{x->id}; f.forget = true; out = f; return true; }   // the host's timeline never had it
-            if (auto* x = std::get_if<DespawnRef>(&e.effect)) { DespawnRef f{x->id}; f.forget = true; out = f; return true; }  // drop the client-only tombstone
-            if (auto* x = std::get_if<RefAddItem>(&e.effect)) { out = RefRemoveItem{x->ref, x->item, x->count}; return true; }     // take back what the client added
-            if (auto* x = std::get_if<RefRemoveItem>(&e.effect)) { out = RefAddItem{x->ref, x->item, x->count}; return true; }
-            if (auto* x = std::get_if<RemoveAllItems>(&e.effect)) {
+            if (auto* x = std::get_if<SpawnRef>(&e.effect); x && !preimageIgnored(kPiSpawn)) { DespawnRef f{x->id}; f.forget = true; out = f; return true; }   // the host's timeline never had it
+            if (auto* x = std::get_if<DespawnRef>(&e.effect); x && !preimageIgnored(kPiSpawn)) { DespawnRef f{x->id}; f.forget = true; out = f; return true; }  // drop the client-only tombstone
+            if (auto* x = std::get_if<RefAddItem>(&e.effect); x && !preimageIgnored(kPiRefInv)) { out = RefRemoveItem{x->ref, x->item, x->count}; return true; }     // take back what the client added
+            if (auto* x = std::get_if<RefRemoveItem>(&e.effect); x && !preimageIgnored(kPiRefInv)) { out = RefAddItem{x->ref, x->item, x->count}; return true; }
+            if (auto* x = std::get_if<RemoveAllItems>(&e.effect); x && !preimageIgnored(kPiRefInv)) {
                 auto it = clientWorld.refInv.find(x->ref);
                 if (it == clientWorld.refInv.end() || !it->second.hasPre) return false;
                 RemoveAllItems u; u.ref = x->ref; u.undo = true;
@@ -553,27 +570,26 @@ bool revertEffectFor(const ShadowState& clientWorld, uint64_t key, Effect& out) 
                 out = u;
                 return true;
             }
-            if (auto* x = std::get_if<SetLock>(&e.effect)) {
+            if (auto* x = std::get_if<SetLock>(&e.effect); x && !preimageIgnored(kPiLock)) {
                 if (const Origin* o = org(kOrgLock, x->ref, 0)) { out = SetLock{x->ref, o->b, o->n, true, o->b, o->n}; return true; }
                 return false;
             }
-            if (auto* x = std::get_if<RefScriptVar>(&e.effect)) {
+            if (auto* x = std::get_if<RefScriptVar>(&e.effect); x && !preimageIgnored(kPiRefVar)) {
                 if (const Origin* o = org(kOrgRefVar, x->ref, x->index)) { out = RefScriptVar{x->ref, x->index, o->d, true, o->d}; return true; }
                 return false;
             }
-            if (auto* x = std::get_if<SetMapMarker>(&e.effect)) {
+            if (auto* x = std::get_if<SetMapMarker>(&e.effect); x && !preimageIgnored(kPiMarker)) {
                 if (const Origin* o = org(kOrgMarker, x->marker, 0)) { out = SetMapMarker{x->marker, static_cast<uint8_t>(o->n), true, static_cast<uint8_t>(o->n)}; return true; }
                 return false;
             }
-            if (std::holds_alternative<SetWeather>(e.effect)) {
+            if (std::holds_alternative<SetWeather>(e.effect) && !preimageIgnored(kPiWeather)) {
                 if (const Origin* o = org(kOrgWeather, FormRef(), 0)) {
-                    const auto& x = std::get<SetWeather>(e.effect);
                     out = SetWeather{o->f, o->b, true, o->f, o->b};
                     return true;
                 }
                 return false;
             }
-            if (std::holds_alternative<SetTimeScale>(e.effect)) {
+            if (std::holds_alternative<SetTimeScale>(e.effect) && !preimageIgnored(kPiTimeScale)) {
                 if (const Origin* o = org(kOrgTimeScale, FormRef(), 0)) {
                     out = SetTimeScale{static_cast<float>(o->d), true, static_cast<float>(o->d)};
                     return true;
@@ -581,8 +597,10 @@ bool revertEffectFor(const ShadowState& clientWorld, uint64_t key, Effect& out) 
                 return false;
             }
         }
-        if (auto* o = std::get_if<ObjectState>(&e.effect)) {   // sticky bits (destroyed / activated once) cannot be undone
-            if (o->destroyed || o->activatedOnce) return false;
+        if (auto* o = std::get_if<ObjectState>(&e.effect); o && !preimageIgnored(kPiObjectState)) {   // sticky bits (destroyed / activated once) cannot be undone
+            // The sticky bits stay (the engine has no command to clear them), but the open bit of the same object can still be put back:
+            // the shadow diff does it, so the baseline path must agree.
+            if ((o->destroyed || o->activatedOnce) && (!o->open || preimageIgnored(kPiStickyOpen))) return false;
             ObjectState r; r.ref = o->ref; r.mask = kObjOpen; r.open = false; out = r; return true;
         }
         return false;

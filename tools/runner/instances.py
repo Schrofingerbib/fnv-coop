@@ -366,6 +366,14 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
         if not same_file(p, plugins / p.name):  # a source that is already the installed file must not be deleted
             _replace(p, plugins / p.name)
         installed.append("Data/NVSE/Plugins/" + p.name)
+    # The volatile-keys list goes next to nvcoop.dll (the plugin looks there first). The dll no longer bakes in the
+    # source-tree path by default, because that path would carry the builder's user name into every built dll.
+    vk = Path(__file__).resolve().parents[2] / "plugin" / "snapshot" / "data" / "volatile_keys.txt"
+    vk_dst = plugins / "nvcoop_volatile_keys.txt"
+    plugin_installed = any(p.suffix.lower() == ".dll" and p.name.lower().startswith("nvcoop") for p in sources)
+    if plugin_installed and vk.is_file() and not same_file(vk, vk_dst):
+        _replace(vk, vk_dst)
+        installed.append("Data/NVSE/Plugins/" + vk_dst.name)
     cfg = write_plugin_ini(d, i, role, autoload, autoload_delay_frames, ini_extra)
     meta = {
         "instance": i, "role": role, "dir": str(d), "pipe": rf"\\.\pipe\nvcoop-{i}",

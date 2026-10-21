@@ -23,6 +23,7 @@ bool Machine::doAction(const Action& i) {
             MHit h;
             h.hitId = nextId(); h.attackerIsPlayer = true; h.attacker = cfg_.self; h.victimIsPlayer = false; h.victim = v->id;
             h.damage = i.n; h.limb = i.limb; h.impact = i.pos; h.weaponRange = i.f;
+            h.firedAt = static_cast<uint32_t>(now_);
             PlayerId owner = view_.ownerOf(v->id);
             if (owner == kNoPlayer) owner = kHostPlayer;
             sendHit(h, owner);
@@ -151,6 +152,8 @@ bool Machine::doAction(const Action& i) {
             sendBody(v, kNoPlayer);
             return true;
         }
+        case ActionKind::Projectile: return doProjectile(i);
+        case ActionKind::Explode: return doExplode(i);
         default: return false;
     }
 }

@@ -1,6 +1,6 @@
-# fnv-coop wire protocol v5
+# fnv-coop wire protocol v6
 
-Status: matches `synccore/` (kWireVersion = 5, kProtocolVersion = 5, host sidecar version 3, client sidecar version 2; v5 added `Welcome.rewards` (reward ids), IntentKind 6/7 (ReportNear / ReportFar) and the exact-state host objective merge; v3 added FailQuest (tag 32); v4 added effect tags 33-48 (census round 3), the CompanionOwner `active`/`kind` fields and the round-3 sections at the end of the ShadowState encoding). Source of truth is the code:
+Status: matches `synccore/` (kWireVersion = 6, kProtocolVersion = 6, host sidecar version 4, client sidecar version 3; v6 added the RefCommand effect (tag 49, section 21) and its section at the end of the ShadowState encoding; v5 added `Welcome.rewards` (reward ids), IntentKind 6/7 (ReportNear / ReportFar) and the exact-state host objective merge; v3 added FailQuest (tag 32); v4 added effect tags 33-48 (census round 3), the CompanionOwner `active`/`kind` fields and the round-3 sections at the end of the ShadowState encoding). Source of truth is the code:
 `synccore/include/fnvcoop/{wire.h,protocol.h,effect.h,transport_util.h}`, `synccore/src/{wire.cpp,protocol.cpp,shadow.cpp}`.
 Round-trip, fuzz and golden tests live in `synccore/tests/` (run `synccore\run_tests.bat`).
 
@@ -29,6 +29,15 @@ game hooks (L5)  ->  effects  ->  HostSession / ClientSession (synccore)  ->  IT
 | `0xFC` | story / session envelope (everything in this document) | L4 synccore |
 | `0xD1` | dialogue adapter | L8 `plugin/dialogue` |
 | `0xE5` | ending slideshow (SwapTexture slides host -> guests, End carries the slide total) | L11 `plugin/hooks_ui/slideshow.h` |
+| `0xAD` | player avatars: live snapshots (kind 1/2), Roster 0x40, Look 0x41 (v1, still decoded), Resync 0x42, **Look v2 0x43** (`plugin/coop/live/avatar_wire.h`, "Avatar channel 0xAD" below) | avatars `plugin/coop/live/avatar_*`, dll-wiring `live_*` |
+| `0xA5` | spawn-site arbitration: client rolls (MRoll), verdicts, site records, site ownership, table digest / resync; always reliable (`synccore/spawn/spawn_wire.h`, docs/tools/spawn-arb.md) | spawn-arb `synccore/spawn` + `plugin/spawn` |
+| `0xCB` | combat: hits, hit NACKs, vitals, death declarations, projectile / explosion declarations, crime reports, hostility effects (section 14) | combat-hooks `plugin/combat/combat_wire.h` |
+| `0x7E` | world time: clock beacons, wait / sleep / fast-travel requests and verdicts, combat status (section 15) | world-time `plugin/world_time/wt_wire.h` |
+| `0xDA` | area desync digests: per-area digests, targeted item diff, authoritative heal pushes (section 17) | area-desync `synccore/areadigest/ad_wire.h` |
+| `0x5C` | social: companion roster / commands / state / inventory, crime reports, detections, wanted table, alarms, hostility, kill reports, social settings, digests (section 18) | companions-crime `synccore/social/wire.h`, `plugin/companions` |
+| `0x8D` | guest intents: Intent (guest -> host) and Verdict (host -> guest) for activations, pickups, triggers, container locks, terminal entries (section 19) | guest-intents `plugin/intents/intent_wire.h` |
+| `0xB7` | real-time VATS: host settings, a player's VATS mode, queued VATS actions, the party slow-mo grant (section 20) | vats `plugin/vats/vats_wire.h` |
+| `0xB1` | loot: container / corpse open, take, put, close, register; dropped items, pickup claims, physics clutter (section 22) | loot `synccore/loot/loot_wire.h`, `plugin/loot` |
 
 New channels must pick an unused first byte that is not 0xFC and is not 0xA1 (see 3.2), and be registered here and in
 `transport_util.h`. Datagrams with an unknown first byte are dropped by the mux. `AppData` (type 8) is an alternative for small
@@ -198,6 +207,7 @@ Tag = variant index. Field list after the tag (types per 3.3, FormRef per sectio
 | 47 | SetTimeScale | f32 scale, boolean hasBefore, f32 before (SetGlobalTimeMultiplier, 0 = never set) |
 | 48 | AdvanceTime | varu32 minutes (sleep / wait; EVENT) |
 | 49 | RefAngle | ref, u8 axis, f32 degrees, boolean hasBefore, f32 before |
+| 50 | RefCommand | varu32 op, ref, a, b, vari32 i, vari32 j, vari32 k, vari32 l, f32 f, str s, to |
 <!-- END EFFECT TABLE -->
 
 Integer deltas on purpose (XP, caps, karma, rep): replicas stay bit-identical. Floats appear only for globals, positions and
@@ -409,7 +419,9 @@ exactly-once per submission, not per target - the script decides whether it is r
 player is warped; shared player storage containers (`NVCCPlayerStorageREF`, companion containers) become per-player (host keeps one container
 per slot, intent target resolved by slot).
 
-**Open items.** L5: acting-player resolution at the script engine choke point + the guest dispatch hook for `TriggerEnter`; L6: ghost refID per
+**Status 2026-10-21:** the host side (puppet as acting player, stand-in policy, TriggerEnter through `MarkBaseExtraListScriptEvent`, per-slot container redirection) and the guest side
+(all seven kinds) are implemented in `plugin/intents` on its own channel, section 19; the stand-in described under 4 is now limited to targets that open no menu.
+**Open items (older text).** L5: acting-player resolution at the script engine choke point + the guest dispatch hook for `TriggerEnter`; L6: ghost refID per
 slot (`Runtime::setGhostResolver`); L4: rules for per-player containers; L10: per-slot container redirection in the executor.
 
 ## 12. Census round 3 semantics (wire v4)
@@ -466,3 +478,355 @@ barrier release until the committed `SlideshowEnd`, with a failsafe), `PerPlayer
 explicit sharing rule of the quest applies; `run = every-machine` + `scope = local-machine` makes the quest guest-local), `PerPlayerVars` (host side
 per-slot copies, `RulesEngine::saveState`), the `max-over-party` / `sum-over-party` reductions, and payment: a `RemoveItem` in a topic result
 (`CauseKind::DialogueResult`) with a Default recipient is charged to the initiator while rewards in the same result still go to the party.
+
+## 14. Combat channel (first byte 0xCB)
+
+Code: `plugin/combat/combat_wire.{h,cpp}` (messages), `plugin/combat/combat_sync.cpp` (rules of use), `synccore/combat/combat.h` (the payload structs and
+their `io()`). Rides the coop `MuxTransport` next to the story channel; everything is reliable-ordered (ENet channel 0). Status: unit-tested game-free
+(`plugin\combat\run_tests.cmd`); never run in a game.
+
+```
+byte 0   0xCB                kChannelCombat
+byte 1   0x01                kCombatModuleWire (bumped on any incompatible change here; synccore/combat bumps kCombatWireVersion for its structs)
+byte 2.. Archive (string table + body):  u8 src, u8 dest, u8 hops, u8 kind-1, body
+```
+
+| kind (index+1) | message | direction | body |
+|---|---|---|---|
+| 1 | `MHit` | attacker's machine -> victim's owner (via the host) | `HitEvent` |
+| 2 | `MHitNack` | victim's owner -> attacker | `hitId`, `HitReason`, `resync` |
+| 3 | `MVitals` | victim's owner -> everyone | `who`, `epoch`, `seq`, `health`, `maxHealth`, `limbMask`, `dead`, `cause` (hit id) |
+| 4 | `MDeath` | the declarer -> everyone | `DeathDecl` |
+| 5 | `MProjectile` | shooter's owner -> everyone | `ProjectileSpawn` |
+| 6 | `MExplosion` | source's owner -> everyone | `ExplosionEvent` |
+| 7 | `MCrime` | anybody -> host | `CrimeReport` |
+| 8 | `MHostility` | host -> everyone | `HostilityEffect` |
+
+Rules (each has a mutation twin in `plugin/combat/tests`):
+- `src` is the author. The host overwrites it with the transport peer of a client's datagram (`Stats::spoofed`), so a client speaks only for itself. A client
+  accepts datagrams from the host only.
+- **A hit is resolved once, by the owner of its victim.** The attacker's machine fills a `HitEvent` (damage as ITS engine computed it, limb, impact point,
+  weapon, ammo, projectile / explosion id, `attackerEpoch` for an NPC attacker, `vats` flag) and sends it with `dest` = the owner it believes in. The host
+  re-routes by its own table (`hops` counts relays, limit 3), never trusting `dest`. The receiver runs `HitValidator::judge` (owner? new id? alive? attacker is
+  the sender / the NPC's owner at the current epoch? range? rate?). Accepted: `applyHit` (health, limb crippling, named / essential floor at 1), the engine takes
+  the health off, `MVitals` goes to everyone. A client never forwards a hit it does not own the victim of: it NACKs.
+- **NACK and re-send.** `HandoffInProgress`, `UnknownVictim`, `NotVictimOwner` (the id was not consumed) are re-sent with the SAME id; `FutureAttackerEpoch`,
+  `AttackerUnknown` (consumed) with a FRESH id. At most 3 re-sends, 150 ms apart, forgotten after 4 s.
+- **Vitals** carry `(epoch, seq)` per victim; a receiver ignores an older pair, accepts only the owner's (or, for a player, that player's) message, mirrors health
+  to its copy (never below 1 while alive: a death arrives as `MDeath`) and takes the UNION of crippled limbs (nothing un-cripples a limb).
+- **Death.** ActorSync / the actor port decides THAT an actor dies (owner; for a named NPC only the host's KillActor). `MDeath` adds the credit: killer, weapon,
+  crippled limbs, once per actor (`DeathLedger`: idempotent by actor id and by declaration id). A named NPC is declared by the host (`DeathSource::StoryHost`)
+  only; an owner's declaration for a named NPC is refused. Kill XP is paid once per death (`XpLedger`), to the killing blow or split (`xpmode`).
+- **Projectiles / explosions** are declared by the shooter's / source's owner and are VISUAL ONLY on every other machine: the engine hit gate neutralises any hit
+  made by a copy, a visual explosion (matched by position and base form for 2 s) or a sourceless projectile while a visual one flies. Explosion damage goes out as
+  one `MHit` per victim to that victim's owner with `hitId = explosionHitId(explosion, victim)`, so a second planning pass cannot double it.
+- **Crime / hostility** (off unless `[combat] crime=1`): `MCrime` -> host `HostilityBook` -> `MHostility` to everyone; a client's `MHostility` is ignored.
+
+VATS: real-time VATS shots resolve through the same `MHit` (the `vats` flag is informational). Track B owns the VATS UI; see docs/tools/combat-hooks.md "VATS interface".
+
+## 15. World-time channel (first byte 0x7E)
+
+Own channel with its own version byte (`kWireVersion` in `plugin/world_time/wt_types.h`, currently 1): the story wire version and `kProtocolVersion` are
+NOT touched, because nothing in the story envelope or in the effect table changed. Source of truth: `plugin/world_time/wt_wire.{h,cpp}` (round trip, every
+single-bit flip, every truncation and the range checks have tests and twins), behaviour in `wt_session.cpp`, `wt_clock.cpp`, `wt_broker.cpp`. Off unless
+`nvcoop.ini [worldtime] enabled=1` on every machine.
+
+```
+byte 0  0x7E            kChannelWorldTime
+byte 1  kWireVersion
+byte 2  MsgType
+...     payload, little endian; strings are u8 length + bytes (at most 96); FormRef = string plugin + u32 id
+last 4  crc32 (IEEE) of every byte before it
+```
+
+| Type | Message | Direction | Payload |
+|---|---|---|---|
+| 1 | `Beacon` | host -> clients | `u32 seq`, time (`i32 year`, `u8 month`, `u8 day`, `f64 hour`, `f64 daysPassed`), `f32 rate` (game minutes per real second, measured; 0 while the host clock was paused), `f32 timeScale`, `u32 skipEpoch`, `u8 flags` (bit0 jump, bit1 partyTravel) |
+| 2 | `SkipRequest` | client -> host | `u32 reqId`, `u8 kind` (0 wait, 1 sleep), `u32 minutes` (1..100000) |
+| 3 | `TravelRequest` | client -> host | `u32 reqId`, `FormRef marker` |
+| 4 | `Verdict` | host -> the asker | `u32 reqId`, `u8 kind`, `u8 granted`, `u8 reason`, `u32 minutes`, `u8 party` |
+| 5 | `TravelGo` | host -> clients | `u32 reqId`, `FormRef marker`, `u8 mover`, `u8 party` |
+| 6 | `Hello` | client -> host | `u8 wireVersion`: "send me a beacon now" (repeated every 3 s until one arrived) |
+| 7 | `Status` | client -> host | `u8 inCombat`, about once a second; the host ignores a report older than 5 s |
+
+Rules:
+- **The host's clock is the only clock.** A `Beacon` goes out every 5 s and at once after a jump (script `set GameHour`, a host load, a granted skip; the first
+  beacon of a host process is a jump). A client extrapolates it (`rate`), and snaps to the extrapolated host time when its own clock is more than 2.5 game
+  minutes away (soft, at most once a second) or when the beacon says `jump` (hard, at once). Reordered old beacons are ignored (a host restart is recognised by
+  `jump` with a lower `seq`). Drift is "hour-of-day difference plus a whole number of days", so it does not depend on whether `GameDaysPassed` is continuous.
+- **Wait / sleep** needs every joined player: the host asks through L8's `raiseModal` (asker confirms, everybody else answers Ready / Not yet, any no or a
+  timeout declines), refuses while anybody is fighting, allows one question at a time, starts an 8 s cooldown after a no, caps a skip at 12 h and re-checks the
+  party (a player who joined, a fight that started) when the consent arrives. A grant sets the host clock, records the story effect `AdvanceTime` (tag 48) and
+  sends a jump beacon with `skipEpoch + 1`; a client applies the skip once whichever of effect and beacon arrives first.
+- **Fast travel** is free by default (the engine's own may-travel check refuses combat). With `[worldtime] travel=party`, or while a `PartyTether` holds the
+  party, a client asks first; after consent the host sends `TravelGo(party=1)` and EVERYBODY travels to the marker. The mode rides in every beacon.
+- Requests from a slot that is not a joined client, beacons from a client, and duplicate request ids are ignored. A client drops a request that got no
+  verdict after 60 s.
+- Not on this channel: `RequestSave` (tag 45) is acknowledged and ignored by clients (only the host's save is the world); `ObjectState` (tag 35) is also
+  produced by a poll of native door / lock / destroyed changes (`wt_objects.cpp`), so the story log, the baseline and rejoin carry them like script changes.
+
+## 16. Avatar channel (first byte 0xAD)
+
+Owner: avatars (`plugin/coop/live/avatar_wire.*`, `avatar_net.*`, `plugin/avatar/stream_rate.h`). Star topology: a client talks to the host only, the host
+relays. Game-free codec, unit tested (`plugin\avatar\full\run_tests.cmd`). Nothing here has run in a game.
+
+| Kind byte | Message | Direction | Delivery | Payload |
+|---|---|---|---|---|
+| 1 / 2 | SnapshotBatch / SnapshotAck | both | unreliable sequenced | the `synccore/live` datagram (CRC protected), netId `0xFE0000<slot>` |
+| 0x40 | Roster | host -> clients | reliable | `u8 n`, `n` slots (every slot that has a player, the host included) |
+| 0x41 | Look v1 | owner -> host -> others | reliable | still decoded: slot, race, sex, hair, eyes, faceHash, name, equipment (form + weapon flag) |
+| 0x42 | Resync | client -> host | reliable | empty: "my link came back, send the roster and every look again" |
+| **0x43** | **Look v2** | owner -> host -> others | reliable | `u8 version (2)`, `u8 slot`, `u8 flags`, `u32 race`, `u32 hair`, `u32 eyes`, `u32 faceHash`, [`u32 hairColor`], [`u16 height`, `u16 weight`], [`u8 n`, `n` face coefficients], `u8 nameLen`, name, `u8 n`, `n` x (`u32 form`, `u8 flags`, [`u8 mods`]) |
+
+Look v2 flags: bit 0 female, bit 1 hair colour follows, bit 2 height and weight follow (thousandths, 0 = unknown), bit 3 face block follows (1..160 signed bytes,
+the FaceGen coefficients in 1/16), bits 4 to 7 reserved (a decoder rejects them). Equipment flags: bit 0 weapon (the HELD weapon), bit 1 a modification byte follows
+(1..7, bit n = mod n+1; only on a weapon), the other bits reserved. A decoder rejects a truncated message, trailing bytes, a slot of 8 or more, more than 64 items,
+more than 48 name bytes. `encodeLook` always writes v2; the count of equipment entries is the last byte of a look without equipment.
+
+Rules:
+- **Rates** (FULL-SYNC-PLAN section 2): the stream of player S reaches observer O at 20 Hz when O is in the same cell within 2800 units (1.25x hysteresis), at 5 Hz in
+  the same cell beyond that or in an adjacent cell, at 1 Hz anywhere else (the ownership and spawn services still want every place). A snapshot that arrives before its
+  turn is kept (latest wins) and released when the turn comes, so the final position of a player who stopped is never lost. A client decides what the host gets of it
+  (the uplink) by the HIGHEST tier any other player has for it, because the host relays that stream onward.
+- **No forged avatars**: the host accepts a snapshot or a look from a client only for that client's own slot; a roster only from the host.
+- A look is sent when it changes (checked twice a second; the game is asked for the local appearance every 2 s) and once to every newcomer. A client applies a look to a
+  puppet whose template (race, sex) is unchanged IN PLACE (hair, height, equipment, weapon mods); another race or sex needs another template NPC, which is a new puppet that
+  keeps the equipment.
+- Versioning: the avatar messages carry their own version (`kAvatarWireVersion = 2`, inside Look v2); an older build ignores kind 0x43 (it counts it as a bad datagram)
+  and shows its puppets with the template look. `kProtocolVersion` is NOT bumped for this channel: it is not part of the Hello handshake, and the live layer's
+  own version gate (`kLiveSchemaVersion`, `kActorWireVersion`) already refuses mixed builds of the snapshot schema.
+
+## 17. Area digest channel (first byte 0xDA)
+
+Code: `synccore/areadigest/ad_wire.{h,cpp}` (messages), `synccore/areadigest/areadigest.cpp` (rules of use). Rides the coop `MuxTransport` next to the other
+channels; everything is reliable-ordered (ENet channel 0). Status: unit-tested game-free (`plugin/areadigest/run_tests.cmd`); never run in a game.
+Design and counters: `docs/tools/area-desync.md`.
+
+```
+byte 0   0xDA                kChannelAreaDigest
+byte 1.. Archive (string table + body):  u8 version (kAreaDigestWireVersion = 1), u8 src slot, u8 body index, body
+```
+
+| index | message | direction | body |
+|---|---|---|---|
+| 0 | `MDigest` | client -> host, every `intervalMs` (2 s) | `round`, loaded `cells`, per (cell, category) `{cell, cat, hash, count}`, optional story digest `{hash, count, seq, epoch}` |
+| 1 | `MItemsReq` | host -> client (or host -> an actor's owner) | `caseId`, groups `{cell, cat}` and/or keys `{cat, key}` whose full items are wanted |
+| 2 | `MItems` | client -> host | `caseId`, `truncated`, items `{key, cat, cell, alive, hp, pos, state, settledMs, version}` |
+| 3 | `MHeal` | host -> the machine that is wrong | `caseId`, items `{authoritative item, forVersion, epoch}` |
+
+Categories: 1 actors, 2 containers, 3 objects (0 = story is only the optional digest part of `MDigest`, never an item).
+
+Rules (each has a mutation twin in `synccore/areadigest/tests`):
+- `src` is the author claim; the receiver trusts the transport peer (`Counters::spoofed` counts a mismatch). A client accepts `MItemsReq` and `MHeal` from the host
+  only, the host accepts `MDigest` and `MItems` from joined clients only (`wrongDirection`, `unknownPeer`).
+- A digest is rate limited per client (`intervalMs / 2`). An item that changed less than `settleMs` ago hashes only its identity (cell, alive): a value still
+  travelling never makes two digests differ. A group whose diff showed nothing to heal is not diffed again while both hashes stay the same (backoff 10 s, doubling, 40 s cap).
+- The authority of an item is the owner of the actor (fetched from the owner with an `MItemsReq` by key when it is a third machine) and the host for everything
+  else. An actor with no known owner, or with a handoff in flight, is never healed. Nothing is healed unless both sides were quiet for `settleMs`.
+- `MHeal` carries the target's own item `version` and the owner `epoch`: the target drops the heal when the item changed since it reported it, when it knows a newer
+  owner epoch, when it owns the actor itself, or when nothing differs any more. A duplicated `MHeal` therefore changes nothing the second time.
+- Position: an actor more than 2 m off is moved smoothly, more than 10 m off or in another cell it is snapped. Health differences up to `hpTolerance` (5) and
+  corpse positions are ignored. Death is never applied by a heal (it is handed to the actor module); a resurrect is refused.
+- Containers and objects are `delegated` in the plugin: a mismatch asks the story layer's repair (`HostSession::requestDigest`) instead of pushing values.
+- Versioning: the module carries its own version byte; `kProtocolVersion` / `kWireVersion` are NOT bumped for this channel (it is not part of the Hello
+  handshake, like 0xAC, 0xCB, 0xA5, 0xAD). A build without the module drops the datagrams as unroutable; the host's exchange with such a client times out
+  (`casesTimedOut`) and backs off.
+
+## 18. Social channel (first byte 0x5C)
+
+Code: `synccore/social/wire.{h,cpp}` (messages and their payload structs), `plugin/companions/social_sync.cpp` (rules of use). Rides the coop `MuxTransport` next to the other
+channels; everything is reliable-ordered. Status: unit-tested game-free (`plugin\companions
+un_tests.cmd`, `synccore\social
+un_tests.cmd`); never run in a game.
+
+```
+byte 0   0x5C                kChannelSocial
+byte 1   0x01                kSocialWireVersion
+byte 2.. Archive (string table + body):  u8 src, u8 dest, u8 kind index, body
+```
+
+`src` is the author claim; the host replaces it with the transport peer's slot on a client's datagram (`Stats::spoofed` counts a mismatch) and a client accepts the host only.
+`dest` = 255 means everyone except `src`. A client sends to the host only.
+
+| kind (index+1) | message | direction | body |
+|---|---|---|---|
+| 1 | `MCrime` | anybody -> host | `CrimeEvent` (kind, criminal, victim, crime faction, cell, where, dead / hostile flags, `nativeMask`) |
+| 2 | `MDetect` | an NPC's owner -> host | `Detection` (observer NPC net id, its crime faction, the player it sees, cell, seen / lost) |
+| 3 | `MBounty` | host -> everyone | the wanted table or its changes: per faction `{bounty, attack, murder, enemy, rev}`; `full` replaces the table |
+| 4 | `MAlarm` | host -> everyone | `AlarmOrder` (id, faction, cell, where, criminal, until) |
+| 5 | `MHostility` | host -> everyone | combat's `HostilityEffect` (SetEnemy / SetAlly / StopCombat), same idempotency ids as section 14 |
+| 6 | `MKill` | anybody -> host | `KillReport` (death id, victim facts, killer, recruiter, contributors, `nativeMask`, cell, where) |
+| 7 | `MRoster` | host -> everyone | the companion table: `{npc, owner, kind, state{mode, stance, range, rev}}` |
+| 8 | `MCmd` | the owner -> host | `CompanionCmd` (id, from, npc, kind, arg) |
+| 9 | `MCmdNack` | host -> the issuer | command id and the refusal reason |
+| 10 | `MState` | host -> everyone | one companion's `{mode, stance, range, rev}` |
+| 11 | `MInv` | the owner -> host, host -> everyone else | one signed inventory delta `{txn, npc, item, delta}` |
+| 12 | `MInvFull` | the owner -> host -> everyone, or host -> a joiner | a companion's whole table of changes |
+| 13 | `MInvAsk` | anybody -> host | "send me this companion's table" |
+| 14 | `MSettings` | host -> everyone | the host's settings: kill XP mode and scope, karma sharing, friendly fire, foreign-companion policy, follower caps, karma table, `rev` |
+| 15 | `MDigest` | host -> everyone, every 5 s | companion-table digest, wanted-table digest, settings `rev` |
+| 16 | `MResync` | client -> host | "send me everything" (join, a digest mismatch, a refused command) |
+
+Rules (each has a mutation twin: `synccore/social/tests` 801..883, `plugin/companions/tests` 901..931):
+- **Companions** belong to their recruiter. The host learns recruits and dismisses from the story effects (`CompanionOwner`), drops a recruit beyond the follower caps, and tells
+  everyone (`MRoster`). Every machine keeps only ITS player's companions flagged as teammates in its engine (a flag for anybody else's, or for an NPC the roster does not
+  know, is taken off after a cooldown; nothing is touched before the host's picture has arrived). The roster is also fed to plugin/actors (`engine::onEffect`), so the actor
+  layer's follower exception makes the recruiter's machine the NPC's owner.
+- **Commands** (wait, follow, stance, range, wheel, trade, equip, heal, talk, summon, dismiss) are owner-only: the owner's machine refuses a stranger's at once, the host
+  refuses a forged one with `MCmdNack`, once per id, rate limited. State carries a revision; an older one never overwrites a newer one.
+- **Inventory**: only the owner's machine reports its companion's inventory changes (a poll of the engine's changes against the base container, so UI moves, scripts and
+  the NPC's own pickups all count). The host accepts a delta from the owner only, once per txn id, within range; every other machine applies it to its copy once; the owner
+  ignores the echo. A joiner gets the host's table and derives what to change.
+- **Crime**: a witnessed crime becomes one decision on the host (`CrimeJudge`): a wanted score per faction, the engine's faction flags (SetPCFactionAttack / SetPCFactionMurder /
+  SetPCEnemyOfFaction), SetEnemy / SetAlly through `MHostility`, one alarm per faction and cell, infamy as a committed `ModReputation`. A witness is an NPC of the faction that
+  cares, in the cell, seen within the window by ANY player: each NPC's owner reports its own NPCs' sightings (`MDetect`; a report about an NPC the sender does not own is
+  rejected). A guest's theft / break-in / trespass is judged on the host from the guest's intent. A burst is one crime.
+- **Kill rewards**: a kill is settled once on the host (by death id) by the host's setting (killing blow or party share, scope: everybody / same cell / near). XP, karma and
+  reputation reach the other players as committed effects with explicit recipient masks (`ModActorValue` experience, `ModKarma`, `ModReputation`); the host's own part is applied
+  directly. A slot whose own engine already paid natively (`nativeMask`, claimable for the sender's own slot only) is not paid again.
+- Versioning: the module carries its own version byte; `kProtocolVersion` / `kWireVersion` are NOT bumped for this channel (it is not part of the Hello handshake, like 0xAC,
+  0xCB, 0xA5, 0xAD, 0x7E, 0xDA). A build without the module drops the datagrams as unroutable.
+
+## 19. Guest-intents channel (first byte 0x8D)
+
+Code: `plugin/intents/intent_wire.{h,cpp}` (codec), `intent_host.cpp` (rules of use), `intent_client.cpp`, docs/tools/guest-intents.md. Rides the coop `MuxTransport` next to the
+story channel; always reliable-ordered. Status: unit-tested game-free (`plugin\intents\run_tests.cmd`, including a real Runtime with a host and two guests over ENet loopback);
+never run in a game. This is the full implementation of the design in section 12 (the older story-channel intents `ActivateRef` / `TriggerEnter` / `PickUp` still work and are
+served by the same host pipeline).
+
+```
+byte 0   0x8D   kChannelIntents
+byte 1   0x01   kIntentsWire (bumped on any incompatible change here)
+byte 2   type   1 Intent, 2 Verdict
+byte 3.. Archive (string table + body)
+```
+
+| type | message | direction | body |
+|---|---|---|---|
+| 1 | `Intent` | guest -> host | `varu32 session`, `varu32 id`, `u8 kind` (1..9), FormRef `target`, `boolean hasAux` [FormRef `aux`], `vari32 value`, `bytes path` (<= 8) |
+| 2 | `Verdict` | host -> guest | `varu32 session`, `varu32 id`, `u8 result` (0..14), `u8 holder` (slot, 0xFF none), `boolean hasRedirect` [FormRef `redirect`] |
+
+Kinds: 1 Activate, 2 TriggerEnter, 3 PickUp, 4 Hit, 5 DialogueStart, 6 TerminalUse (`path` = entry indices from the top menu down), 7 ContainerOpen, 8 ContainerClose, 9 TriggerLeave.
+Results: 0 Executed, 1 Duplicate, 2 Disabled, 3 NotJoined, 4 RateLimited, 5 BadTarget, 6 NotLoaded, 7 OutOfRange, 8 Busy (`holder`), 9 Taken, 10 Denied, 11 NoPuppet, 12 Unsupported, 13 Failed, 14 Stale.
+
+Rules (each has a mutation twin in `plugin/intents/tests`, numbers 301..326):
+- `session` is the guest's story session id; ids start at 1 in every session and only grow. The host runs each (slot, session, id) once; a repeat gets the SAME verdict again, an older id
+  is `Duplicate`, id 0 is `Stale`. The slot is the transport peer's, never a field of the message. A datagram from a peer that is not a joined player is dropped.
+- A guest never applies anything from an intent. The host runs the interaction under `Runtime::runAsGuest(slot)` with the guest's puppet as the acting player; every effect
+  comes back as an ordinary txn with `origin = slot`. A pickup is a CLAIM: the first wins (`Taken` for the rest), the item ref is disabled and an `AddItem{base, count, Recipient::origin()}`
+  is committed, so the item reaches the claimer only. A container has one user at a time (`Busy` + `holder`), leased (`lock_lease_ms`), released by ContainerClose, by the holder
+  leaving, or by the lease. A shared storage container in `nvcoop_intents.json` is answered with `redirect` = the container of that player.
+- Guards (host): rate limit per player (token bucket), reach from the puppet to the target, `Hit` refused on actors (the combat channel raises OnHit for them), a per-player trigger
+  cooldown, a bounded claim table. Everything is switchable per kind in `nvcoop.ini [intents]`.
+- Versioning: the module has its own version byte; `kProtocolVersion` / `kWireVersion` are NOT bumped (the channel is not part of the Hello handshake, like 0xAC, 0xCB, 0xA5, 0xAD,
+  0x7E, 0xDA). A build without the module drops the datagrams as unroutable and the guest's intents time out (`pending_timeout_ms`), after which the local call has already gone on for
+  everything except pickups and trigger events.
+
+## 20. VATS channel (first byte 0xB7)
+
+Code: `plugin/vats/vats_wire.{h,cpp}` (messages), `plugin/vats/vats_sync.cpp` (rules of use), docs/tools/vats.md. Rides the coop `MuxTransport`; everything is
+reliable-ordered (ENet channel 0). Star topology: a client talks to the host only, the host relays. Status: unit-tested game-free (`plugin\vats\run_tests.cmd`);
+never run in a game. This channel is self-versioned (byte 1) and does NOT change the story envelope, so `kProtocolVersion` is not bumped (the combat, avatar and
+world-time channels did the same): a build without this module drops the unknown first byte at the mux.
+
+```
+byte 0   0xB7                kChannelVats
+byte 1   0x01                kVatsModuleWire (bumped on any incompatible change here)
+byte 2.. Archive (string table + body):  u8 src, u8 dest, u8 hops, u8 kind-1, body
+```
+
+| kind (index+1) | message | direction | body |
+|---|---|---|---|
+| 1 | `MConfig` | host -> everyone | `varu32 epoch`, `u8 flags` (1 realtime, 2 partySlowMo, 4 autoFire, 8 killCam, 16 guardFriendly, 32 perks), `f32 slowScale`, `varu32 slowMaxMs`, `varu32 slowCooldownMs`, `varu32 autoFireDelayMs` |
+| 2 | `MPhase` | anyone -> everyone | `u8 player`, `u8 mode` (0 none, 1 target select, 2 limb select, 3 unknown, 4 playback), `u8 limb` (25..31 or 255), `u8 queued`, `varu32 target` (actor net id, 0 = none), `varu32 seq` |
+| 3 | `MAction` | anyone -> everyone | `u8 shooter`, `varu32 victim` (net id), `u8 limb`, `u8 queued`, `varu32 seq` |
+| 4 | `MSlowMo` | host -> everyone | `varu32 epoch`, `varu32 seq`, `bool active`, `f32 scale`, `varu32 remainingMs`, `u8 cause` |
+
+Rules (each has a mutation twin in `plugin/vats/tests`):
+- **The host's settings win.** A client adopts every `MConfig` it receives and falls back to its own nvcoop.ini only when the host link drops. The host rejects an
+  `MConfig` from a client. Numbers are clamped on decode (`slowScale` 0.10 to 0.90, `slowMaxMs` 500 to 10000, `slowCooldownMs` 0 to 120000, `autoFireDelayMs` 0 to 3000).
+- `src` is the author. The host overwrites it with the transport peer's slot (`Stats::spoofed`), and a client may only announce its own `MPhase` / `MAction`.
+  A client accepts datagrams from the host only. Relays stop at `hops` = 3.
+- **Party slow-mo is host-authoritative.** Only an ENTRY into VATS (mode 0 to non-zero) of any player can start a window, one window at a time, never longer than
+  `slowMaxMs` (a second entrant does not extend it), ending early when the last VATS user leaves or disconnects, followed by a cooldown. The host repeats the
+  current grant every second while it runs. A client expires a window by itself `remainingMs` + 750 ms after the last grant it heard (a lost host cannot leave the
+  party slowed), ignores an older `(epoch, seq)` and clamps `scale` and `remainingMs`.
+- The damage of a VATS shot is NOT on this channel: it is an ordinary `MHit` of the combat channel (section 14), resolved once by the victim's owner.
+
+## 21. RefCommand: script commands on a reference (wire v6, story-capture)
+
+Code: `synccore/include/fnvcoop/refop.h` (op ids and merge rules), `effect.h` (the struct), `wire.cpp` (`ioE`), `shadow.cpp` / `baseline.cpp` (state),
+`plugin/hooks/ref_ops.{h,cpp}` (engine side). Docs: docs/tools/story-capture.md. Status: unit-tested game-free (`synccore` group `refcmd`, `plugin\hooks\run_story_tests.cmd`);
+never run in a game. The hooks that produce it are OFF unless `nvcoop.ini [hooks] story_capture=1`.
+
+One new effect, tag 49 (the table in section 6 is generated): `varu32 op, ref, a, b, vari32 i, j, k, l, f32 f, str s (at most 255 bytes), recipient`.
+`ref` is the calling reference (empty plugin = none), `a` / `b` are form arguments, `s` is a text argument. What the slots mean is per op (`kStorySpecs`).
+
+- **Op ids are append-only** and part of the format. A decoder rejects op 0 and every id it does not know (`Malformed`); a txn that carries one is dropped whole.
+- **Event or state.** `refop.h` marks every op. An EVENT (StartCombat, EvaluatePackage, Dispel, the chargen calls ...) is delivered once to its
+  recipients and remembered nowhere. A STATE op (SetGhost, SetScale, AddSpell / RemoveSpell, AddFormToFormList ...) replaces the previous command with the same key
+  `(group, ref, a, b)` (the slots the op keys on; AddSpell and RemoveSpell share a group, so the later of the two per spell wins). State commands are part of the
+  ShadowState (sidecar), of the baseline (class 5, key hash segment 12 next to textures) and of the diff a late joiner gets. They carry no pre-image: a host load
+  cannot take one back from a client (the same limit as the one-way quest effects).
+- **Recipients.** The capture sets `to`: Origin for the character-build calls (SetLevel, SetSPECIALPoints ...), All for achievements and challenges and for every command on
+  something other than the player (actor, container, list, quest), Default for a command on the player. `normalizeTxn` resolves Default like the reward of AddItem (everyone
+  for a quest or dialogue result, the acting player otherwise), so a client performs a command only if its slot is in `to`.
+- **Who performs it.** Every machine that is a recipient receives an event; actor AI orders (EvaluatePackage, StartCombat, StopCombat, ResetAI, Look, SetAlert, PlayGroup ...)
+  are performed only by the machine that runs the actor's AI (`RemoteApplier::setDefaultRemoteDrivenQuery`, wired to the actor ownership layer); the others answer NotForMe and
+  see the result through the actor snapshots. Activate is performed only on activators and doors.
+- **Version.** `kWireVersion` and `kProtocolVersion` are 6, the host sidecar is version 4 and the client sidecar version 3. An older build is turned away at the handshake
+  and an older sidecar is not resumed (the world is rebuilt from the host's baseline).
+
+
+## 22. Loot channel (first byte 0xB1)
+
+Code: `synccore/loot/loot.{h,cpp}` (rules), `synccore/loot/loot_wire.{h,cpp}` (messages), `plugin/loot/loot_sync.{h,cpp}` (the live-hub service), docs/tools/loot.md. Rides the coop
+`MuxTransport` through the live hub (`livewire::ILiveService`); everything is reliable-ordered except `MClutter` (unreliable sequenced). Status: unit-tested game-free
+(`plugin\lootun_tests.cmd`); never run in a game. The channel is self-versioned and does NOT change the story envelope, so `kProtocolVersion` / `kWireVersion` are not bumped
+(like 0xAC, 0xCB, 0xA5, 0xAD, 0x7E, 0xDA, 0xB7): a build without the module drops the datagrams as unroutable and a guest's requests time out and roll back.
+
+```
+byte 0   0xB1                kChannelLoot
+byte 1.. Archive (string table + body):  u8 version (=1), u8 src, u8 body index, body
+```
+
+`src` is informational: the host uses the transport peer's slot and counts a mismatch (`Stats::spoofed`); a guest accepts datagrams from the host only.
+
+| index | message | direction | body |
+|---|---|---|---|
+| 0 | `ReqRegister` | guest -> host | `varu32 txn`, ContainerRec (the sender resolved this container / corpse: the real items) |
+| 1 | `ReqOpen` | guest -> host | `varu32 txn`, `varu32 cont`, `boolean hasAdopt` [ContainerRec: unregistered container, the opener's contents become the shared ones] |
+| 2 | `ReqMove` | guest -> host | `varu32 txn`, `varu32 cont`, FormRef base, `vari32 count`, `boolean put` (take / put) |
+| 3 | `ReqClose` | guest -> host | `varu32 txn`, `varu32 cont`, `u64 digest` of the closer's contents |
+| 4 | `ReqHold` | guest -> host | `varu32 cont` (lock keep-alive) |
+| 5 | `ReqDrop` | guest -> host | `varu32 txn`, FormRef base, `vari32 count`, `varu32 meta`, `varu32 cell`, pos, rot |
+| 6 | `ReqClaim` | guest -> host | `varu32 txn`, `varu32 item`, `boolean hasAdopt` [WorldItem: a placed item the host has not heard of] |
+| 7 | `ReqResync` | guest -> host | `varu32 cont`, `boolean all` |
+| 8 | `ReqDigest` | guest -> host | `u64 digest`, `varu32 containers`, `varu32 items` |
+| 9 | `ReqTouch` | guest -> host | `varu32 net`, pos, rot (asks for clutter ownership) |
+| 10 | `Result` | host -> guest | `varu32 txn`, `u8 op`, `u8 status`, `varu32 id`, `varu32 rev`, `u8 other`, FormRef base, `vari32 count`, `varu32 newId`, `boolean hasRec` [ContainerRec] |
+| 11 | `MContainer` | host -> guest | ContainerRec (resolve broadcast, resync answer, table, script change) |
+| 12 | `MDelta` | host -> guest | `varu32 cont`, `varu32 rev`, FormRef base, `vari32 newCount` (absolute count of one base after the change) |
+| 13 | `MLock` | host -> guest | `varu32 cont`, `varu32 lockSeq`, `u8 holder` (0xFF none) |
+| 14 | `MItemNew` | host -> guest | WorldItem (a dropped item, or the table) |
+| 15 | `MItemGone` | host -> guest | `varu32 item`, `u8 by`, `varu32 txn` |
+| 16 | `MContainerGone` | host -> guest | `varu32 cont` (the host forgot it: cell reset) |
+| 17 / 18 | `MTableBegin` / `MTableEnd` | host -> guest | `varu32 seq` / `varu32 seq`, `varu32 containers`, `varu32 items` (ids not mentioned between the two are removed, only when the counts match) |
+| 19 | `MClutter` | either, unreliable | `varu32 net`, `varu32 epoch`, `varu32 seq`, pos, rot, `boolean moving` (a guest sends it to the host, the host relays it) |
+| 20 | `MClutterOwn` | host -> guest | `varu32 net`, `u8 owner`, `varu32 epoch`, pos, rot |
+
+ContainerRec = `varu32 id`, `u8 kind` (0 container, 1 corpse), `varu32 cell`, pos, items (`count <= 512` of FormRef + `vari32 count`), `varu32 rev`, `u8 holder`, `varu32 lockSeq`.
+WorldItem = `varu32 id`, FormRef base, `vari32 count`, `varu32 meta`, `varu32 cell`, pos, rot, `u8 dropper`, `varu32 dropTxn`. Dropped items get host-issued ids in
+`[0xFFB00000, 0xFFBFFFFF]`; placed items keep the id every machine derives (`plugin/actors deriveNetId`).
+
+Rules (each has a mutation twin: synccore/loot 101..137, plugin/loot 141..157):
+- **Every request with a txn is idempotent.** The host keeps the last 256 answers per sender; a replay gets the cached answer (with a container record refreshed to the state NOW), a txn
+  older than the window gets `Stale`. The ledger is cleared when the sender joins; the guest restarts its counter on `hostLinkUp`.
+- **One lock per container**, leased (default 10 minutes without a request or `ReqHold`), released by `ReqClose`, by the holder leaving, or by the lease. Take / put from a non-holder: `NotHolder`.
+- **Contents are resolved once.** `ReqRegister` and the adopt record of `ReqOpen` make the FIRST sender's items the shared ones; a later different registration gets `AlreadyResolved` with the
+  shared record, which the sender puts into its engine.
+- **A close compares digests.** `ReqClose.digest` against the host's contents: a mismatch is `DigestMismatch` plus the authoritative record; the lock is released either way.
+- **Pickups are claims.** The first claim of an item wins, later ones get `AlreadyTaken` (+ the winner) or `Unknown`; a placed item stays taken (tombstone, saved with the host table).
+- **Containers are mirrored by revision.** `MDelta` applies only as `rev + 1`; a gap asks `ReqResync`; the client digest (`ReqDigest`, every 2 s while quiet) triggers a table push on mismatch (at most once per 2 s per guest).
+- **Clutter** has one owner per epoch. Only the owner's snapshots at the current epoch and a higher seq are relayed; a second mover takes over only from an owner that is not moving.
+- **Coordination with section 19.** Both modules can handle a pickup or a container open. With `[loot] enabled=1` set `[intents] pickup=0` and `container=0`; the loot module logs a warning when they are not.

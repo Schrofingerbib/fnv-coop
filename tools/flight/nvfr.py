@@ -22,7 +22,7 @@ ROLES = {0: "host", 1: "client", 2: "sim"}
 OWN_OPS = {0: "grant", 1: "transfer", 2: "release", 3: "rejectedStale", 4: "rejectedEcho", 5: "rejectedNonOwner"}
 BUCKETS = 256   # bucket hashes in a bucketed digest (bucket = key & 0xFF)
 CATEGORIES = {0: "story", 1: "actors", 2: "containers", 3: "objects", 4: "other"}
-MARKER_KINDS = {0: "note", 1: "desync", 2: "join", 3: "leave", 4: "test-step", 5: "save", 6: "load", 7: "rebase"}
+MARKER_KINDS = {0: "note", 1: "desync", 2: "join", 3: "leave", 4: "test-step", 5: "save", 6: "load", 7: "rebase", 8: "heal"}
 NONE_SLOT = 255
 FLAG_TRUNCATED, FLAG_DERIVED, FLAG_DETAIL = 1, 2, 4                      # record flags
 AP_SNAPSHOT, AP_REPAIR, AP_BASELINE, AP_CATCHUP = 1, 2, 4, 8   # TxnApplied appliedFlags

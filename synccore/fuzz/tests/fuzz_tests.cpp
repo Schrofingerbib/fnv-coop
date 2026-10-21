@@ -286,9 +286,14 @@ TEST(fuzz, saved_regression_scenarios) {
         std::stringstream ss; ss << f.rdbuf();
         Scenario s; std::string err;
         CHECK_MSG(fromJson(ss.str(), s, &err), e.path().string() + ": " + err);
+#ifdef FNVCOOP_FUZZ_EM
+        if (s.target != "mini" && s.target != "em") continue;
+#else
         if (s.target != "mini") continue;
+#endif
+        RunOptions ro; ro.target = s.target;
         std::string name = e.path().filename().string();
-        RunResult broken = run(s, mini());
+        RunResult broken = run(s, ro);
         CHECK_MSG(s.bugs.empty() || !broken.ok, name + ": no longer reproduces its bug");
         if (!s.expect.empty() && !broken.ok) {
             bool found = false;
@@ -296,12 +301,16 @@ TEST(fuzz, saved_regression_scenarios) {
             CHECK_MSG(found, name + ": expected invariant " + s.expect + " but got " + broken.violations[0].invariant);
         }
         s.bugs.clear();
-        RunResult clean = run(s, mini());
+        RunResult clean = run(s, ro);
         CHECK_MSG(clean.ok, name + ": fails without the bug: " + (clean.ok ? "" : clean.violations[0].detail));
         ++n;
     }
     std::printf("    %d saved scenarios\n", n);
+#ifdef FNVCOOP_FUZZ_EM
+    CHECK(n >= 13);   // 11 for the mini target, 2 shrunk repros for the engine-model fixes
+#else
     CHECK(n >= 11);
+#endif
 }
 
 TEST(fuzz, chaos_profiles_clean_and_twins) {
@@ -355,4 +364,93 @@ TEST(fuzz, network_shaper_hook_drops_duplicates_and_delays) {
     net.advance(200);
     CHECK(b->poll(from, d) && d[0] == 2);
     CHECK(net.stats().lost == 1 && net.stats().duplicated == 1);
+}
+
+TEST(fuzz, generator_schedules_pickup_races) {
+    // Every scenario has bursts where two or three machines reach for the same item within one link round trip.
+    for (uint64_t sd = 1; sd <= 12; ++sd) {
+        Scenario s = generate(sd, 2 + static_cast<int>(sd % 3), 8000);
+        int races = 0;
+        for (size_t i = 0; i < s.ops.size(); ++i) {
+            if (s.ops[i].kind != OpKind::Pickup) continue;
+            for (size_t j = i + 1; j < s.ops.size() && s.ops[j].t <= s.ops[i].t + 25; ++j)
+                if (s.ops[j].kind == OpKind::Pickup && s.ops[j].a == s.ops[i].a && s.ops[j].m != s.ops[i].m) { ++races; break; }
+        }
+        CHECK_MSG(races >= 2, "seed " + std::to_string(sd) + ": only " + std::to_string(races) + " pickup races generated");
+    }
+}
+
+#ifdef FNVCOOP_FUZZ_EM
+namespace {
+RunOptions em() { RunOptions o; o.target = "em"; return o; }
+}  // namespace
+
+TEST(fuzz, em_pickup_no_arbitration_is_caught_and_clean_runs_hold) {
+    // The host that grants every pickup claim leaves two players holding one item; only a race exposes it. The race ops in the generator do.
+    int caught = 0, cleanFailed = 0;
+    for (uint64_t sd = 1; sd <= 30; ++sd) {
+        Scenario s = generate(sd, 2 + static_cast<int>(sd % 3), 8000, "em");
+        s.target = "em";
+        if (!run(s, em()).ok) ++cleanFailed;
+        s.bugs = {"pickup_no_arbitration"};
+        if (!run(s, em()).ok) ++caught;
+    }
+    CHECK_MSG(cleanFailed == 0, std::to_string(cleanFailed) + " clean em sessions failed");
+    CHECK_MSG(caught > 0, "pickup_no_arbitration is not caught by any of 30 seeds");
+}
+
+TEST(fuzz, replay_uses_the_target_recorded_in_the_scenario) {
+    Scenario s = generate(3, 3, 4000);
+    s.target = "em";
+    Scenario back;
+    std::string err;
+    REQUIRE(fromJson(toJson(s), back, &err));
+    CHECK(back.target == "em");
+    RunOptions o = em();
+    CHECK(run(back, o).ok);
+}
+#endif
+
+TEST(fuzz, generator_em_extras_only_for_em) {
+    // The extra ops (silent corruption, companions, container races, strikes, targeted replays, slow-link windows) exist for the engine-model target only.
+    for (uint64_t sd = 1; sd <= 6; ++sd) {
+        const uint32_t dur = 8000;
+        Scenario plain = generate(sd, 4, dur), mini = generate(sd, 4, dur, "mini"), em = generate(sd, 4, dur, "em");
+        CHECK(toJson(plain) == toJson(mini));
+        std::map<OpKind, int> kinds;
+        for (auto& o : em.ops) ++kinds[o.kind];
+        CHECK_MSG(kinds[OpKind::Corrupt] >= 2 && kinds[OpKind::Recruit] >= 1 && kinds[OpKind::Container] >= 6, "seed " + std::to_string(sd) + ": missing em extras");
+        int replays = 0, strikes = 0;
+        for (auto& o : em.ops) {
+            replays += o.kind == OpKind::Stale && o.d >= 1;
+            strikes += o.kind == OpKind::Hit && (o.c == 1 || o.c == 2);
+        }
+        CHECK_MSG(replays >= 4 && strikes >= 4, "seed " + std::to_string(sd) + ": too few targeted replays or strikes");
+        for (auto& o : mini.ops) CHECK(o.kind != OpKind::Corrupt && o.kind != OpKind::Recruit && o.kind != OpKind::Container);
+        // the extras survive a JSON round trip
+        Scenario back;
+        std::string err;
+        REQUIRE(fromJson(toJson(em), back, &err));
+        CHECK(toJson(back) == toJson(em));
+    }
+}
+
+TEST(fuzz, generator_adds_combat_ops_to_even_em_seeds_only) {
+    // combat-core: fights are generated for the even seeds of the em target (the odd ones keep exactly the sessions older bug classes were tuned on)
+    for (uint64_t sd = 1; sd <= 8; ++sd) {
+        Scenario em = generate(sd, 4, 8000, "em"), mini = generate(sd, 4, 8000, "mini");
+        std::map<OpKind, int> kinds;
+        for (auto& o : em.ops) ++kinds[o.kind];
+        const int combat = kinds[OpKind::Projectile] + kinds[OpKind::Explosion] + kinds[OpKind::LimbHit] + kinds[OpKind::SimulKill];
+        if (sd % 2 == 0) {
+            CHECK_MSG(kinds[OpKind::Projectile] >= 1 && kinds[OpKind::Explosion] >= 1 && kinds[OpKind::LimbHit] >= 4 && kinds[OpKind::SimulKill] >= 1, "seed " + std::to_string(sd) + ": missing combat ops");
+        } else {
+            CHECK_MSG(combat == 0, "seed " + std::to_string(sd) + ": combat ops in an odd session");
+        }
+        for (auto& o : mini.ops) CHECK(o.kind != OpKind::Projectile && o.kind != OpKind::Explosion && o.kind != OpKind::LimbHit && o.kind != OpKind::SimulKill);
+        Scenario back;
+        std::string err;
+        REQUIRE(fromJson(toJson(em), back, &err));
+        CHECK(toJson(back) == toJson(em));
+    }
 }

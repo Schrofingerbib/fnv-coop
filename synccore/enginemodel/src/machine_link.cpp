@@ -21,6 +21,7 @@ uint64_t get64(const uint8_t* p) { uint64_t v = 0; for (int i = 0; i < 8; ++i) v
 Machine::Machine(const MachineConfig& cfg)
     : cfg_(cfg), rng_(cfg.seed * 0x2545F4914F6CDD1Dull + cfg.self * 1315423911ull + 5),
       world_(World::build(cfg.spec)), view_(cfg.self) {
+    initCombat();
     world_.player(cfg_.self).slot = cfg_.self;
     if (!isHost()) for (auto& kv : world_.actors()) kv.second.aiOn = false;
     if (isHost()) {
@@ -177,7 +178,7 @@ void Machine::peerConnected(PeerId peer, uint32_t connEpoch) {
     if (!isHost()) {
         connEpoch_ = connEpoch;
         synced_ = false;
-        handingOff_.clear(); acked_.clear(); pendingClaims_.clear(); pendingPuts_.clear(); rolledSites_.clear();
+        handingOff_.clear(); acked_.clear(); awaitOld_.clear(); pendingClaims_.clear(); pendingPuts_.clear(); rolledSites_.clear();
         return;
     }
     svc_->playerJoined(p);
@@ -187,6 +188,7 @@ void Machine::peerConnected(PeerId peer, uint32_t connEpoch) {
     ps.poseSeq = connEpoch * 100000u;
     ps.vitalsSeq = connEpoch * 100000u;
     mismatch_.clear();
+    for (auto it = digestSeen_.begin(); it != digestSeen_.end();) it = it->first.first == p ? digestSeen_.erase(it) : std::next(it);   // a new incarnation numbers its reports from 1
     sendBody(buildFullState(), p);
     MPose pose;
     pose.slot = p; pose.present = true; pose.cell = ps.cell; pose.pos = ps.pos; pose.seq = ps.poseSeq;
@@ -201,6 +203,7 @@ void Machine::peerDisconnected(PeerId peer) {
     if (!isHost()) { synced_ = false; return; }
     PlayerState& ps = world_.player(p);
     ps.present = false;
+    releaseHoldsFrom(p);
     MPose pose;
     pose.slot = p; pose.present = false; pose.cell = ps.cell; pose.pos = ps.pos; pose.seq = ps.poseSeq + 1;
     ps.poseSeq = pose.seq;
@@ -220,10 +223,13 @@ void Machine::peerDisconnected(PeerId peer) {
 
 void Machine::dispatch(PeerId from, const Envelope& e) {
     const bool isFull = std::holds_alternative<MFullState>(e.body);
-    if (e.sess < sess_ && !engineFaults().noSessionEpoch) {
-        ++stats_.droppedStaleSession;
-        if (obs_) obs_->onDrop(cfg_.self, now_, from, "stale session");
-        return;
+    if (e.sess < sess_) {
+        if (!engineFaults().noSessionEpoch) {
+            ++stats_.droppedStaleSession;
+            if (obs_) obs_->onDrop(cfg_.self, now_, from, "stale session");
+            return;
+        }
+        breach("stale_session_applied", "a message from host session " + std::to_string(e.sess) + " was applied in session " + std::to_string(sess_));
     }
     if (isHost() && e.src != from) { ++stats_.undecodable; return; }   // a client may only speak as itself
     if (!isHost() && !isFull && !synced_) return;                       // nothing applies before the full state
@@ -253,6 +259,8 @@ void Machine::dispatch(PeerId from, const Envelope& e) {
     else if (auto* m = std::get_if<MActivate>(&b)) onActivate(e, *m);
     else if (auto* m = std::get_if<MDigest>(&b)) onDigest(e, *m);
     else if (auto* m = std::get_if<MRepair>(&b)) { if (!isHost()) onRepair(*m); }
+    else if (auto* m = std::get_if<MProjectile>(&b)) doRelay = onProjectile(e, *m);
+    else if (auto* m = std::get_if<MExplosion>(&b)) doRelay = onExplosion(e, *m);
     if (doRelay && isHost() && e.src != cfg_.self) relay(e);
     if (!ackAfterRelay_.empty()) { auto ids = std::move(ackAfterRelay_); ackAfterRelay_.clear(); for (NetId id : ids) maybeAck(id); }
     if (!diedAfterRelay_.empty()) { auto dead = std::move(diedAfterRelay_); diedAfterRelay_.clear(); for (NetId id : dead) onActorDiedHost(id); }
@@ -297,10 +305,18 @@ void Machine::tick(uint64_t nowMs) {
         }
     }
 
+    // safety net: a previous owner whose final state never comes (a handoff message that was lost for good) cannot freeze the actor forever
+    for (auto it = awaitOld_.begin(); it != awaitOld_.end();) {
+        const NetId id = it->first;
+        const bool expired = now_ >= it->second.second + cfg_.holdAiMaxMs;
+        ++it;
+        if (expired) releaseAiHold(id);
+    }
+
     // ownership drives AI: owner runs it, everybody else shows a remote-driven copy
     for (auto& kv : world_.actors()) {
         ActorState& a = kv.second;
-        const bool mine = view_.ownerOf(a.id) == cfg_.self && !handingOff_.count(a.id) && !a.dead && a.enabled;
+        const bool mine = drivesAi(a);
         a.aiOn = mine;
         if (mine) aiStep(a, dt);
         else if (engineFaults().ownerKeepsPublishing && lastOwnedEpoch_.count(a.id) && !a.dead && view_.ownerOf(a.id) != cfg_.self &&
@@ -313,15 +329,19 @@ void Machine::tick(uint64_t nowMs) {
         }
     }
 
+    stepShots();
+    projectiles_.expire(now_);
     publishPose(false);
 
     if (now_ >= nextDigestMs_) {
         nextDigestMs_ = now_ + cfg_.digestMs;
+        ++digestSeq_;
         for (int c = 0; c < static_cast<int>(Category::Count_); ++c) {
             const Category cat = static_cast<Category>(c);
             if (!isHost() || obs_) {
                 MDigest d;
                 d.cat = static_cast<uint8_t>(c);
+                d.seq = seqBase() + digestSeq_;   // numbered across incarnations like poses and vitals: a stale report from an earlier life ranks below the new one
                 auto keys = world_.keyHashes(cat);
                 d.keys.assign(keys.begin(), keys.end());
                 uint64_t h = 1469598103934665603ull;

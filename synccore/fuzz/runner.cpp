@@ -68,7 +68,7 @@ static bool hasInvariant(const RunResult& r, const std::string& inv) {
     return false;
 }
 
-Scenario shrink(const Scenario& s0, const RunOptions& opt0, const std::string& invariant, int* runsOut) {
+Scenario shrink(const Scenario& s0, const RunOptions& opt0, const std::string& invariant, int* runsOut, bool onlyWithBugs) {
     RunOptions opt = opt0;
     opt.traceDir.clear();
     int runs = 0;
@@ -76,7 +76,12 @@ Scenario shrink(const Scenario& s0, const RunOptions& opt0, const std::string& i
     auto fails = [&](const Scenario& c) {
         if (runs >= kMaxRuns) return false;
         ++runs;
-        return hasInvariant(run(c, opt), invariant);
+        if (!hasInvariant(run(c, opt), invariant)) return false;
+        if (!onlyWithBugs || c.bugs.empty()) return true;
+        Scenario clean = c;
+        clean.bugs.clear();
+        ++runs;
+        return run(clean, opt).ok;   // the injected bugs, not the real code, must be what breaks it
     };
     Scenario best = s0;
     // ddmin over ops
@@ -102,6 +107,7 @@ Scenario shrink(const Scenario& s0, const RunOptions& opt0, const std::string& i
     best.ops = ops;
     // simplify the environment
     auto tryScenario = [&](Scenario c) { if (fails(c)) { best = c; return true; } return false; };
+    if (!best.profile.empty()) { Scenario c = best; c.profile.clear(); tryScenario(c); }   // a plain link, if the bug does not need the chaos profile
     { Scenario c = best; c.link = LinkParams(); tryScenario(c); }
     { Scenario c = best; c.link.corrupt = 0; tryScenario(c); }
     { Scenario c = best; c.link.duplicate = 0; tryScenario(c); }
@@ -109,7 +115,7 @@ Scenario shrink(const Scenario& s0, const RunOptions& opt0, const std::string& i
     { Scenario c = best; c.link.maxLatencyMs = c.link.minLatencyMs; tryScenario(c); }
     for (int m = best.machines; m > 2; --m) {
         bool used = false;
-        for (auto& o : best.ops) if (o.m >= m - 1 || (o.kind == OpKind::Stale && o.a >= m - 1)) used = true;
+        for (auto& o : best.ops) if (o.m >= m - 1 || (o.kind == OpKind::Stale && o.a >= m - 1) || (o.kind == OpKind::SimulKill && o.b >= m - 1)) used = true;
         if (used) break;
         Scenario c = best; c.machines = m - 1;
         if (!tryScenario(c)) break;

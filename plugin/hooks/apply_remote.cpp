@@ -2,8 +2,10 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
+#include <vector>
 
 #include "GameAPI.h"
 #include "GameExtraData.h"
@@ -12,6 +14,7 @@
 #include "apply_lines.h"
 #include "effect_json.h"
 #include "engine_addrs.h"
+#include "ref_ops.h"
 
 using namespace fnvcoop;
 
@@ -39,6 +42,17 @@ inline float& repField(void* rep, int type) {
 }
 inline float repMax(void* rep) { return *reinterpret_cast<float*>(reinterpret_cast<char*>(rep) + 0x40); }
 
+}  // namespace
+
+namespace {
+std::vector<RemoteApplier*>& instances() {
+    static std::vector<RemoteApplier*> v;
+    return v;
+}
+std::function<bool(uint32_t)>& defaultRemoteDriven() {
+    static std::function<bool(uint32_t)> f;
+    return f;
+}
 }  // namespace
 
 const char* applyStatusName(ApplyStatus s) {
@@ -82,6 +96,7 @@ ApplyStatus RemoteApplier::apply(const Effect& e) {
     std::unique_ptr<ScriptGate> gate;  // and no result script may run as a side effect
     if (useGate_) gate.reset(new ScriptGate);
     err_.clear();
+    const ExecFn exec = pickExec(exec_, consoleExec());   // coop_module.cpp builds its applier without an executor of its own
 
     auto form = [&](const FormRef& r) -> void* {
         uint32_t id = res_.fromRef(r);
@@ -114,10 +129,10 @@ ApplyStatus RemoteApplier::apply(const Effect& e) {
     if (auto* x = std::get_if<EnableRef>(&e)) {
         void* r = form(x->ref);
         if (!r) return ApplyStatus::FormMissing;
-        if (exec_) {
+        if (exec) {
             gate.reset();
             ApplierExecScope scope;
-            return exec_("Enable", res_.fromRef(x->ref)) ? ApplyStatus::Ok : ApplyStatus::EngineRejected;
+            return exec("Enable", res_.fromRef(x->ref)) ? ApplyStatus::Ok : ApplyStatus::EngineRejected;
         }
         tc<void, bool>(addr::RefSetDisabled.target, r, false);
         return ApplyStatus::Ok;
@@ -125,10 +140,10 @@ ApplyStatus RemoteApplier::apply(const Effect& e) {
     if (auto* x = std::get_if<DisableRef>(&e)) {
         void* r = form(x->ref);
         if (!r) return ApplyStatus::FormMissing;
-        if (exec_) {
+        if (exec) {
             gate.reset();
             ApplierExecScope scope;
-            return exec_("Disable", res_.fromRef(x->ref)) ? ApplyStatus::Ok : ApplyStatus::EngineRejected;
+            return exec("Disable", res_.fromRef(x->ref)) ? ApplyStatus::Ok : ApplyStatus::EngineRejected;
         }
         tc<void, bool>(addr::RefSetDisabled.target, r, true);
         return ApplyStatus::Ok;
@@ -232,10 +247,10 @@ ApplyStatus RemoteApplier::apply(const Effect& e) {
         tc<void, bool>(addr::QuestSetRunning.target, q, false);
         return ApplyStatus::Ok;
     }
-    if (exec_) {
+    if (exec) {
         auto run = [&](const std::string& cmd, uint32_t refID) {
             ApplierExecScope scope;  // not a leaked result script: counted separately
-            if (exec_(cmd, refID)) return ApplyStatus::Ok;
+            if (exec(cmd, refID)) return ApplyStatus::Ok;
             err_ = "console command failed: " + cmd;
             return ApplyStatus::EngineRejected;
         };
@@ -338,36 +353,110 @@ ApplyStatus RemoteApplier::apply(const Effect& e) {
             gate.reset();
             return run(setAngleCmd("XYZ"[x->axis], x->degrees), id);
         }
-        if (auto* x = std::get_if<MoveRef>(&e)) {
-            uint32_t id = res_.fromRef(x->ref), cellOrMarker = res_.fromRef(x->cell);
-            TESObjectREFR* r = id ? static_cast<TESObjectREFR*>(res_.lookup(id)) : nullptr;
-            if (!r) { err_ = "form missing: " + x->ref.plugin; return ApplyStatus::FormMissing; }
-            TESForm* m = cellOrMarker ? static_cast<TESForm*>(res_.lookup(cellOrMarker)) : nullptr;
+        if (auto* x = std::get_if<MoveRef>(&e)) return applyMove(*x, exec, true, &gate);
+        if (auto* x = std::get_if<RefCommand>(&e)) return applyRefCommand(*x, exec, &gate);
+        if (auto* x = std::get_if<ForceActiveQuest>(&e)) {
+            uint32_t q;
+            if (!idOf(x->quest, &q)) return ApplyStatus::FormMissing;
             gate.reset();
-            if (m && isReferenceFormType(m->typeID))  // `cell` carries a marker reference: x/y/z are offsets from it
-                return run(moveToMarkerCmd(cellOrMarker, x->x, x->y, x->z), id);
-            // absolute position: SetPos only works inside the cell the reference already is in. Cross-cell: use any loaded reference of the
-            // destination CELL as the MoveTo anchor and pass the absolute target as an offset from the anchor's position.
-            if (!r->parentCell || r->parentCell->refID != cellOrMarker) {
-                const TESObjectREFR* anchor = m && m->typeID == kFormType_TESObjectCELL ? cellAnchor(static_cast<TESObjectCELL*>(m)) : nullptr;
-                if (!anchor) {
-                    err_ = m && m->typeID == kFormType_TESObjectCELL ? "MoveRef: destination cell has no loaded reference to anchor on"
-                                                                     : "MoveRef: cross-cell move needs a loaded destination cell or a marker reference";
-                    return ApplyStatus::Unsupported;
-                }
-                return run(moveToMarkerCmd(anchor->refID, x->x - anchor->posX, x->y - anchor->posY, x->z - anchor->posZ), id);
-            }
-            const char axes[3] = {'X', 'Y', 'Z'};
-            const float v[3] = {x->x, x->y, x->z};
-            for (int i = 0; i < 3; ++i) {
-                ApplyStatus st = run(setPosCmd(axes[i], v[i]), id);
-                if (st != ApplyStatus::Ok) return st;
-            }
-            return ApplyStatus::Ok;
+            return run(forceActiveQuestCmd(q), 0);
         }
     }
     err_ = std::string("unsupported effect: ") + effectToJson(e).get("type").asString("?");
     return ApplyStatus::Unsupported;  // MoveRef, KillActor, ResurrectActor
+}
+
+RemoteApplier::RemoteApplier(CaptureHub& hub, FormResolver& res) : hub_(hub), res_(res) { instances().push_back(this); }
+RemoteApplier::~RemoteApplier() {
+    auto& v = instances();
+    v.erase(std::remove(v.begin(), v.end(), this), v.end());
+}
+
+// MoveRef: `cell` carries a marker reference (x/y/z are offsets from it) or a cell (x/y/z are absolute). Same-cell absolute moves use SetPos per
+// axis; a cross-cell move uses any loaded reference of the destination cell as the MoveTo anchor. When the destination cell has no loaded reference
+// here, the move is PARKED (park = true) and retried by tickPending() until that cell loads: a reference whose cell is away is not simulated on this
+// machine, and where it ends up has to be where the host left it when the cell comes back.
+ApplyStatus RemoteApplier::applyMove(const MoveRef& x, const ExecFn& exec, bool park, std::unique_ptr<ScriptGate>* gate) {
+    auto run = [&](const std::string& cmd, uint32_t refID) {
+        ApplierExecScope scope;
+        if (exec(cmd, refID)) return ApplyStatus::Ok;
+        err_ = "console command failed: " + cmd;
+        return ApplyStatus::EngineRejected;
+    };
+    if (!exec) { err_ = "unsupported effect: MoveRef (no console executor)"; return ApplyStatus::Unsupported; }
+    uint32_t id = res_.fromRef(x.ref), cellOrMarker = res_.fromRef(x.cell);
+    TESObjectREFR* r = id ? static_cast<TESObjectREFR*>(res_.lookup(id)) : nullptr;
+    if (!r) { err_ = "form missing: " + x.ref.plugin; return ApplyStatus::FormMissing; }
+    TESForm* m = cellOrMarker ? static_cast<TESForm*>(res_.lookup(cellOrMarker)) : nullptr;
+    if (gate) gate->reset();
+    if (m && isReferenceFormType(m->typeID))  // `cell` carries a marker reference: x/y/z are offsets from it
+        return run(moveToMarkerCmd(cellOrMarker, x.x, x.y, x.z), id);
+    if (!r->parentCell || r->parentCell->refID != cellOrMarker) {
+        const TESObjectREFR* anchor = m && m->typeID == kFormType_TESObjectCELL ? cellAnchor(static_cast<TESObjectCELL*>(m)) : nullptr;
+        if (!anchor) {
+            if (m && m->typeID == kFormType_TESObjectCELL && park) {
+                moves_.add(x);
+                err_.clear();
+                return ApplyStatus::Ok;   // parked: reported Ok like a held world effect; tickPending() performs it
+            }
+            err_ = m && m->typeID == kFormType_TESObjectCELL ? "MoveRef: destination cell has no loaded reference to anchor on"
+                                                             : "MoveRef: cross-cell move needs a loaded destination cell or a marker reference";
+            return ApplyStatus::Unsupported;
+        }
+        return run(moveToMarkerCmd(anchor->refID, x.x - anchor->posX, x.y - anchor->posY, x.z - anchor->posZ), id);
+    }
+    const char axes[3] = {'X', 'Y', 'Z'};
+    const float v[3] = {x.x, x.y, x.z};
+    for (int i = 0; i < 3; ++i) {
+        ApplyStatus st = run(setPosCmd(axes[i], v[i]), id);
+        if (st != ApplyStatus::Ok) return st;
+    }
+    return ApplyStatus::Ok;
+}
+
+ApplyStatus RemoteApplier::applyRefCommand(const RefCommand& x, const ExecFn& exec, std::unique_ptr<ScriptGate>* gate) {
+    const RefOpSpec* s = storySpecFor(x.op);
+    if (!s) { err_ = "unknown RefCommand op"; return ApplyStatus::Unsupported; }
+    if (!exec) { err_ = "unsupported effect: RefCommand (no console executor)"; return ApplyStatus::Unsupported; }
+    LineResult lr = buildRefCommandLine(x, [&](const FormRef& r) -> uint32_t {
+        uint32_t id = res_.fromRef(r);
+        return id && res_.lookup(id) ? id : 0u;
+    });
+    if (!lr.ok) {
+        err_ = lr.why;
+        return lr.formMissing ? ApplyStatus::FormMissing : ApplyStatus::Unsupported;
+    }
+    if (!opPerformedHere(*s, lr.callingRef, remoteDriven_ ? remoteDriven_ : defaultRemoteDriven())) return ApplyStatus::NotForMe;   // another machine runs this actor's AI
+    if (s->flags & kRoActivate) {
+        const TESObjectREFR* target = lr.callingRef ? static_cast<TESObjectREFR*>(res_.lookup(lr.callingRef)) : nullptr;
+        if (!target || !target->baseForm || !activateTypeSafe(target->baseForm->typeID)) return ApplyStatus::NotForMe;   // a menu / conversation belongs to its player
+    }
+    if (gate) gate->reset();   // the console line is a script: the ScriptGate must be open for it
+    ApplierExecScope scope;
+    if (exec(lr.line, lr.callingRef)) return ApplyStatus::Ok;
+    err_ = "console command failed: " + lr.line;
+    return ApplyStatus::EngineRejected;
+}
+
+void RemoteApplier::setDefaultRemoteDrivenQuery(std::function<bool(uint32_t refID)> f) { defaultRemoteDriven() = std::move(f); }
+
+size_t RemoteApplier::tickPending() {
+    if (moves_.size() == 0) return 0;
+    const ExecFn exec = pickExec(exec_, consoleExec());
+    if (!exec) return 0;
+    EchoGuard echo(&hub_.echo());
+    ApplyScope applyScope;
+    return moves_.run([&](const MoveRef& m) { return applyMove(m, exec, false, nullptr) == ApplyStatus::Ok; });
+}
+
+size_t RemoteApplier::tickAll() {
+    static ULONGLONG last = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - last < 1000) return 0;
+    last = now;
+    size_t n = 0;
+    for (RemoteApplier* a : instances()) n += a->tickPending();
+    return n;
 }
 
 ApplyStatus RemoteApplier::applyForce(const Effect& e) {
@@ -424,6 +513,7 @@ size_t RemoteApplier::applyTxn(const EffectTxn& t, PlayerId me) {
         else if (auto* k = std::get_if<ModKarma>(&e)) r = &k->to;
         else if (auto* p = std::get_if<SetPerk>(&e)) r = &p->to;
         else if (auto* c2 = std::get_if<SetPlayerControls>(&e)) r = &c2->to;
+        else if (auto* rc = std::get_if<RefCommand>(&e)) r = &rc->to;
         if (r && !forMe(*r, t.origin, me)) continue;
         if (apply(e) == ApplyStatus::Ok) ++n;
     }

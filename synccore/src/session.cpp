@@ -593,7 +593,7 @@ bool HostSession::reloadWorld(const ShadowState& baseline, uint64_t contentHash)
 
 namespace {
 constexpr uint32_t kSidecarMagic = 0x43534346;  // 'FCSC'
-constexpr uint8_t kSidecarVersion = 3;
+constexpr uint8_t kSidecarVersion = 4;
 }
 
 Bytes HostSession::saveSidecar() const {
@@ -1024,7 +1024,7 @@ constexpr uint32_t kClientStateMagic = 0x53434346;  // 'FCCS'
 Bytes ClientSession::saveState() const {
     Archive a = Archive::writer();
     uint32_t magic = kClientStateMagic; a.u32(magic);
-    uint8_t ver = 2; a.u8(ver);
+    uint8_t ver = 3; a.u8(ver);
     bool clean = joined_ && intents_.empty() && !baselineActive_ && pending_.empty();
     a.boolean(clean);
     uint8_t sl = slot_; a.u8(sl);
@@ -1051,10 +1051,10 @@ bool ClientSession::loadStateBytes(const Bytes& b) {
         for (size_t i = 0; i < nd && a.ok(); ++i) { uint64_t id = 0; a.varu(id); if (a.ok()) ids.insert(id); }
     ShadowState s;
     io(a, s);
-    if (!a.ok() || !a.atEnd() || magic != kClientStateMagic || ver != 2) return false;
+    if (!a.ok() || !a.atEnd() || magic != kClientStateMagic || ver != 3) return false;
     delivered_ = std::move(ids);   // the save's reward record counts even if the shadow below is not resumable
     if (!clean || sl >= kMaxSlots || we == 0) return false;
-    if (mutations().sidecarLosesLedger) for (auto& l : s.ledger) l = Ledger();
+    if (mutations().sidecarLosesLedger) { for (auto& l : s.ledger) l = Ledger(); delivered_.clear(); }
     shadow_ = s;
     slot_ = sl;
     worldEpoch_ = we;
@@ -1277,6 +1277,14 @@ void ClientSession::handle(const Message& m) {
             }
             std::vector<Effect> diff;
             ShadowState::diffEffects(base, w->snapshot, slot_, diff);
+            // Rewards: after a restart whose sidecar was not resumable the shadow is empty, so the diff would hand over the whole
+            // ledger. Deliver only the rewards the save's world does not hold yet (ids persisted in the sidecar), like the baseline path.
+            // With an intact shadow the diff's net ledger delta is already right (and coalesced), so it is kept.
+            if (!mutations().noRewardIds && shadow_.seq == 0 && !delivered_.empty()) {
+                diff.erase(std::remove_if(diff.begin(), diff.end(), [](const Effect& e) { return isRewardEffect(e); }), diff.end());
+                for (auto& g : w->rewards)
+                    if (!delivered_.count(g.id)) diff.push_back(g.effect);
+            }
             for (auto& e : reassert) reassertState(e, w->snapshot, diff);
             {
                 EchoGuard g(capture_);
@@ -1427,7 +1435,26 @@ void ClientSession::noteDelivered(const EffectTxn& txn) {
 void ClientSession::applyOne(const EffectTxn& txn) {
     uint64_t keep = shadow_.seq;
     std::vector<Effect> out;
-    shadow_.applyTxn(txn, slot_, &out);
+    // A replay after a restart (plain rejoin, empty shadow) re-sends txns whose rewards the loaded save already holds (ids persisted
+    // in the sidecar): the shadow folds them in, but the engine must not get them again.
+    auto held = [&](size_t i) {
+        return isRewardEffect(txn.effects[i]) && delivered_.count(rewardId(worldEpoch_, txn.seq, uint32_t(i))) != 0;
+    };
+    bool anyHeld = false;
+    // (a dedupe as well: the noIdempotency twin turns it off too, so that twin still sees the double apply it injects)
+    if (!mutations().noRewardIds && !mutations().noIdempotency && slot_ < kMaxSlots && !delivered_.empty())
+        for (size_t i = 0; i < txn.effects.size() && !anyHeld; ++i) anyHeld = held(i);
+    if (!anyHeld) {
+        shadow_.applyTxn(txn, slot_, &out);
+    } else {
+        EffectTxn one;
+        one.origin = txn.origin;
+        one.seq = txn.seq;
+        for (size_t i = 0; i < txn.effects.size(); ++i) {
+            one.effects.assign(1, txn.effects[i]);
+            shadow_.applyTxn(one, slot_, held(i) ? nullptr : &out);
+        }
+    }
     shadow_.seq = std::max(keep, txn.seq);
     ++stats_.txnsApplied;
     noteDelivered(txn);

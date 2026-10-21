@@ -10,6 +10,7 @@ namespace fnvcoop {
 // ---- Channel registry (first byte of every datagram) -------------------------------------------------------
 // 0xFC  story/session envelope (this library: Hello/Welcome/TxnBatch/Ack/Intent/IntentAck/AppData)
 // 0xD1  dialogue adapter (plugin/dialogue, L8)
+// 0xDA  area desync digests (synccore/areadigest, kChannelAreaDigest; the full registry is in docs/protocol.md section 2)
 // Everything else is reserved; new users claim a byte here. Datagrams whose first byte has a registered handler are
 // consumed by that handler; all others (including 0xFC) are returned from poll() to the session.
 constexpr uint8_t kChannelStory = 0xFC;

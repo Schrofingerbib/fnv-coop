@@ -61,7 +61,8 @@ TEST(wire, roundtrip_every_effect_type) {
         SpawnRef{0xFF000001, f, g, 1.f, 2.f, 3.f, true}, DespawnRef{0xFF000001},
         ObjectState{f, 15, true, true, 50, true, true}, RefScriptVar{f, 9, 2.5}, RefAddItem{f, g, 3}, RefRemoveItem{f, g, 2},
         RemoveAllItems{f}, AddTopic{g}, AddNote{f}, RemoveNote{f}, SetMapMarker{g, 3}, ForceActiveQuest{f, Recipient::origin()},
-        RequestSave{2}, SetWeather{f, true}, SetTimeScale{20.f}, AdvanceTime{480}, RefAngle{f, kAxisY, -45.5f, true, 10.f}};
+        RequestSave{2}, SetWeather{f, true}, SetTimeScale{20.f}, AdvanceTime{480}, RefAngle{f, kAxisY, -45.5f, true, 10.f},
+        RefCommand{kOpPlayIdle, f, g, f, 1, -2, 3, 4, 2.5f, "IdleWave", Recipient::slots(5)}};
     CHECK(all.size() == std::variant_size_v<Effect>);
     EffectTxn t; t.seq = 77; t.origin = 2; t.cause = {CauseKind::QuestResult, f, 40}; t.effects = all; t.flags = 1; t.originEpoch = 9;
     TxnBatch b{5, {t}};

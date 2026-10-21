@@ -7,7 +7,7 @@
 //
 // Nothing here touches the game: engine access goes through IUiEngine, the network/dialogue side through Bridge. The x86 glue
 // (ui_hooks.cpp) implements IUiEngine; L10 fills Bridge from fnvcoop_dlg::DialogueNode. Mutation twins: build with
-// -DNVUI_MUTANT=<n> (see tests/test_ui.cpp for the list); every one of them must fail the tests.
+// FNVCOOP_MUT=<n> at run time (see tests/test_ui.cpp for the list); every one of them must fail the tests.
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -23,9 +23,8 @@
 #include "fnvcoop_dlg/messages.h"
 #include "showorder.h"
 
-#ifndef NVUI_MUTANT
-#define NVUI_MUTANT 0
-#endif
+// One out-of-line definition (ui_core.cpp) so header-only code and every TU agree: the twins are only live in the *_rt test libs.
+namespace nvui { bool mut(int n); }
 
 namespace nvui {
 
@@ -38,7 +37,7 @@ constexpr PlayerId kNoSlot = fnvcoop::kNoPlayer;
 constexpr uint32_t kPlayerRefID = 0x14;
 constexpr int32_t kNoButton = 0xFF;  // value of ShowMessageBox_button while nothing was pressed (GetButtonPressed then yields -1)
 
-constexpr bool mut(int n) { return NVUI_MUTANT == n; }
+// mut(n) is declared above (showorder.h) and defined in ui_core.cpp
 
 // ------------------------------------------------------------------ origin
 class OriginContext {

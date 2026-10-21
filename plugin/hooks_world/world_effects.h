@@ -62,8 +62,29 @@ struct SetFactionPlayerEnemy {
     bool operator==(const SetFactionPlayerEnemy& o) const { return faction == o.faction && on == o.on; }
 };
 
+// Ownership flags (world-time lane). SetOwnership [owner] / ClearOwnership on a reference. `owner` empty (no plugin) = the command had no
+// argument, which the engine reads as "owned by the player"; clear = ClearOwnership (no owner at all).
+struct SetOwner {
+    fnvcoop::FormRef ref;
+    fnvcoop::FormRef owner;
+    bool clear = false;
+    bool operator==(const SetOwner& o) const { return ref == o.ref && owner == o.owner && clear == o.clear; }
+};
+// SetCellOwnership <cell> <owner>: who owns every unowned thing in the cell.
+struct SetCellOwner {
+    fnvcoop::FormRef cell;
+    fnvcoop::FormRef owner;
+    bool operator==(const SetCellOwner& o) const { return cell == o.cell && owner == o.owner; }
+};
+// SetCellPublicFlag <cell> <0|1>: a public cell (sleeping and waiting are not trespassing).
+struct SetCellPublic {
+    fnvcoop::FormRef cell;
+    bool on = false;
+    bool operator==(const SetCellPublic& o) const { return cell == o.cell && on == o.on; }
+};
+
 using WorldEffect = std::variant<SetActorValueRef, SetEssential, SetRestrained, SetRelation, SetScriptPackage, SetIgnoreCrime,
-                                 SetFactionPlayerEnemy>;
+                                 SetFactionPlayerEnemy, SetOwner, SetCellOwner, SetCellPublic>;
 
 const char* worldEffectName(const WorldEffect& e);
 

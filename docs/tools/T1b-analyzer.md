@@ -50,6 +50,6 @@ Date: 2026-10-20. Owner of `tools/flight/` (Python only) and of the wording of `
   dump) whose differing keys fall in the differing buckets (a key outside them is flagged). With no detail anywhere it says so.
 * Shown in `flight.py diverge` text and in the HTML report ("Narrowing: digest, bucket, key, value" table).
 * Fixed a false `txn-missing`: a host commit (TxnCaptured with a seq) now counts as applied on the host.
-* Real runtime traces: `plugin/flight/tests/check_runtime_traces.py` (run by `pluginlightun_tests.cmd`) narrows the plugin runtime
+* Real runtime traces: `plugin/flight/tests/check_runtime_traces.py` (run by `plugin\flight\run_tests.cmd`) narrows the plugin runtime
   test's desync to bucket 72, key 0xAA650F118B7CB748, host `SetStage 203 = 0` vs client `= 77`.
 * Tests: 41 fast (about 0.1 s), 5 new mutations (cross-digest bucket filter, host commit, value text, report table, report text).

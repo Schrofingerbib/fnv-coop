@@ -55,9 +55,14 @@ if(TARGET nvcoop AND NVCOOP_LINK_SNAPSHOT)
     ${CMAKE_CURRENT_LIST_DIR}/src/baseline_nvse.cpp ${CMAKE_CURRENT_LIST_DIR}/src/baseline_build.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/test_helpers_nvse.cpp
     $<TARGET_OBJECTS:fnvcoop_nvse_gameapi>)
-  # Default volatile-keys file for dev builds (explicit option / env / file beside the dll take precedence).
-  set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/src/baseline_nvse.cpp TARGET_DIRECTORY nvcoop PROPERTIES COMPILE_DEFINITIONS
-    "FNVCOOP_DEFAULT_VOLATILE_KEYS=\"${CMAKE_CURRENT_LIST_DIR}/data/volatile_keys.txt\"")
+  # Default volatile-keys file baked in as an absolute source-tree path: OFF by default, because that path carries the
+  # builder's user name into the dll. Provisioning and the release packager put nvcoop_volatile_keys.txt next to the dll
+  # (the plugin looks there first). Turn on only for a local dev build that is never shared.
+  option(FNVCOOP_EMBED_DEV_PATHS "bake source-tree paths into nvcoop.dll (local dev only, never ship)" OFF)
+  if(FNVCOOP_EMBED_DEV_PATHS)
+    set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/src/baseline_nvse.cpp TARGET_DIRECTORY nvcoop PROPERTIES COMPILE_DEFINITIONS
+      "FNVCOOP_DEFAULT_VOLATILE_KEYS=\"${CMAKE_CURRENT_LIST_DIR}/data/volatile_keys.txt\"")
+  endif()
   # baseline_nvse.cpp uses synccore's shared volatile-keys policy (fnvcoop::volatileKeys, FormRef::make, ...), so
   # nvcoop must link the synccore library. plugin/coop defines it (nvcoop_coop_synccore, resolved at generate time
   # even though the coop directory is added after this one).

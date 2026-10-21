@@ -8,7 +8,9 @@
 //   --replay FILE               run one scenario file; exit 1 and print VIOLATION lines when an invariant breaks
 //   --profile NAME              link from a T5 chaos profile (lan good_wifi bad_wifi mobile_tether transatlantic hell)
 //   --out DIR                   where failures (shrunk scenario + traces) are written (default out/simfuzz)
-//   --fixture BUG               find a failing session for BUG, shrink it and write <out>/regress_BUG.json (a saved regression)
+//   --fixture BUG[,BUG2]        find a failing session for BUG (or several faults injected together), shrink it and write <out>/regress_BUG.json (a saved regression)
+//   --shrink FILE [--save PATH] shrink a failing scenario file (ddmin over ops, then the environment) and write it to PATH (default <out>/shrunk.scenario.json);
+//                               extra --bug flags are injected first, so a repro that needs several faults at once can be saved with them in its mutations
 //   --no-shrink, --max-fail N, --list-bugs, --quiet
 #include <algorithm>
 #include <chrono>
@@ -48,11 +50,11 @@ int main(int argc, char** argv) {
     int count = 200, players = 0, maxFail = 3;
     uint64_t seed = 1;
     uint32_t duration = 15000;
-    std::string out = "out/simfuzz", replay, fixture, profile;
+    std::string out = "out/simfuzz", replay, fixture, profile, shrinkFile, savePath;
     RunOptions opt;
     std::vector<std::string> bugs;
     bool shrinkOn = true, quiet = false;
-    bool countGiven = false;
+    bool countGiven = false, targetGiven = false;
     for (int i = 1; i < argc; ++i) {
         auto a = [&](const char* n) { return !std::strcmp(argv[i], n) && i + 1 < argc; };
         if (a("--minutes")) minutes = std::atof(argv[++i]);
@@ -60,9 +62,11 @@ int main(int argc, char** argv) {
         else if (a("--seed")) seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a("--players")) players = std::atoi(argv[++i]);
         else if (a("--duration")) duration = static_cast<uint32_t>(std::atoi(argv[++i]));
-        else if (a("--target")) opt.target = argv[++i];
+        else if (a("--target")) { opt.target = argv[++i]; targetGiven = true; }
         else if (a("--bug")) bugs.push_back(argv[++i]);
         else if (a("--replay")) replay = argv[++i];
+        else if (a("--shrink")) shrinkFile = argv[++i];
+        else if (a("--save")) savePath = argv[++i];
         else if (a("--fixture")) fixture = argv[++i];
         else if (a("--profile")) profile = argv[++i];   // T5 chaos profile: lan good_wifi bad_wifi mobile_tether transatlantic hell
         else if (a("--out")) out = argv[++i];
@@ -76,17 +80,31 @@ int main(int argc, char** argv) {
     }
 
     if (!fixture.empty()) {
+        std::vector<std::string> fixtureBugs;   // --fixture a,b injects several faults together (file regress_a_b.json)
+        std::string fileTag;
+        for (size_t b = 0; b <= fixture.size();) {
+            size_t e = fixture.find(',', b);
+            if (e == std::string::npos) e = fixture.size();
+            if (e > b) { fixtureBugs.push_back(fixture.substr(b, e - b)); fileTag += (fileTag.empty() ? "" : "_") + fixtureBugs.back(); }
+            b = e + 1;
+        }
         for (uint64_t sd = 1; sd <= 600; ++sd) {
-            Scenario s = generate(sd, 2 + static_cast<int>(sd % 3), 8000);
-            s.bugs = {fixture};
+            Scenario s = generate(sd, 2 + static_cast<int>(sd % 3), 8000, opt.target);
+            s.bugs = fixtureBugs;
             s.target = opt.target;
+            s.profile = profile;   // --profile hell makes slow-link bugs (a forced commit before the old owner heard) reproducible
             RunResult r = run(s, opt);
             if (r.ok) continue;
+            // A repro of the fault must pass without it. A session that fails on the real code too is a different bug (or a stale oracle), not this fault's repro:
+            // saving it would give a "regression" that no longer says anything about the fault.
+            Scenario cleanRun = s;
+            cleanRun.bugs.clear();
+            if (!run(cleanRun, opt).ok) continue;
             // prefer the invariant the bug is meant to break: the first violation after sorting by our priority list
             std::string inv = mainInvariant(r);
-            Scenario small = shrink(s, opt, inv);
+            Scenario small = shrink(s, opt, inv, nullptr, true);
             small.expect = inv;
-            std::string path = out + "/regress_" + fixture + ".json";
+            std::string path = out + "/regress_" + fileTag + ".json";
             std::ofstream f(path, std::ios::binary);
             f << toJson(small);
             std::printf("fixture %s: seed %llu, %s, %zu ops -> %s\n", fixture.c_str(), static_cast<unsigned long long>(sd), inv.c_str(), small.ops.size(), path.c_str());
@@ -94,6 +112,33 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "no failing session found for %s\n", fixture.c_str());
         return 1;
+    }
+
+    if (!shrinkFile.empty()) {
+        bool ok;
+        std::string text = readFile(shrinkFile, &ok);
+        Scenario s;
+        std::string err;
+        if (!ok || !fromJson(text, s, &err)) { std::fprintf(stderr, "cannot read scenario %s: %s\n", shrinkFile.c_str(), err.c_str()); return 2; }
+        for (auto& b : bugs) s.bugs.push_back(b);
+        RunOptions ro = opt;
+        if (!targetGiven && !s.target.empty()) ro.target = s.target;
+        RunResult r = run(s, ro);
+        if (r.ok) { std::fprintf(stderr, "%s passes: nothing to shrink\n", shrinkFile.c_str()); return 1; }
+        const std::string inv = mainInvariant(r);
+        if (!s.bugs.empty()) {   // a repro that needs injected faults must pass without them, or it is not a repro of those faults
+            Scenario cleanRun = s;
+            cleanRun.bugs.clear();
+            if (!run(cleanRun, ro).ok) { std::fprintf(stderr, "%s fails without the injected bugs too: it is a failure of the real code, not a repro of those faults\n", shrinkFile.c_str()); return 1; }
+        }
+        int runs = 0;
+        Scenario small = shrink(s, ro, inv, &runs, !s.bugs.empty());
+        small.expect = inv;
+        const std::string path = savePath.empty() ? out + "/shrunk.scenario.json" : savePath;
+        std::ofstream f(path, std::ios::binary);
+        f << toJson(small);
+        std::printf("shrunk %s: %zu -> %zu ops, %d machines, %u ms in %d runs, breaks %s -> %s\n", shrinkFile.c_str(), s.ops.size(), small.ops.size(), small.machines, small.durationMs, runs, inv.c_str(), path.c_str());
+        return f ? 0 : 2;
     }
 
     if (!replay.empty()) {
@@ -104,6 +149,7 @@ int main(int argc, char** argv) {
         if (!ok || !fromJson(text, s, &err)) { std::fprintf(stderr, "cannot read scenario %s: %s\n", replay.c_str(), err.c_str()); return 2; }
         for (auto& b : bugs) s.bugs.push_back(b);
         RunOptions ro = opt;
+        if (!targetGiven && !s.target.empty()) ro.target = s.target;   // a scenario file knows which target it was recorded on
         if (!out.empty() && out != "out/simfuzz") { ro.traceDir = out; ro.traceName = "replay"; }
         RunResult r = run(s, ro);
         for (auto& v : r.violations) std::printf("VIOLATION %s %s\n", v.invariant.c_str(), v.detail.c_str());
@@ -121,7 +167,7 @@ int main(int argc, char** argv) {
         else if (static_cast<int>(k) >= count) break;
         uint64_t sd = seed + k;
         int mc = players > 0 ? players : 2 + static_cast<int>(sd % 3);
-        Scenario s = generate(sd, mc, duration);
+        Scenario s = generate(sd, mc, duration, opt.target);
         s.bugs = bugs;
         s.target = opt.target;
         s.profile = profile;
@@ -158,7 +204,7 @@ int main(int argc, char** argv) {
     }
     if (!quiet) {
         std::printf("coverage:");
-        for (const char* k : {"op_move", "op_hit", "op_pickup", "op_spawn", "op_leave", "op_join", "op_load", "op_stale", "grants", "transfers", "releases", "deaths", "loot_races_lost",
+        for (const char* k : {"op_move", "op_hit", "op_pickup", "op_spawn", "op_leave", "op_join", "op_load", "op_stale", "op_projectile", "op_explosion", "op_limbhit", "op_simulkill", "hits_applied", "grants", "transfers", "releases", "deaths", "loot_races_lost",
                               "spawn_races_lost", "stale_old_content_injected", "stale_raw_injected", "dup_packets_dropped", "loads", "repairs_served"})
             std::printf(" %s=%llu", k, static_cast<unsigned long long>(total[k]));
         std::printf("\n");

@@ -223,6 +223,14 @@ std::vector<Violation> Cluster::checkAlways() {
     auto add = [&](const std::string& w) { if (have.insert(w).second) violations_.push_back({now_, w}); };
 
     if (totalDoubleApplied() > 0) add("an id was applied twice (doubleApplied=" + std::to_string(totalDoubleApplied()) + ")");
+    for (size_t p = 0; p < machines_.size(); ++p)
+        if (machines_[p]) for (const std::string& b : machines_[p]->breaches()) add("breach " + b);
+    if (const OwnershipService* svc = machines_[0]->service()) {   // a handoff is committed by the new owner's ack, or forced (timeout, old owner gone)
+        const OwnershipStats& os = svc->stats();
+        const uint64_t acked = machines_[0]->stats().acks;
+        if (os.commits > os.forcedCommits && os.commits - os.forcedCommits > acked)
+            add("breach handoff_without_ack: " + std::to_string(os.commits - os.forcedCommits) + " handoffs were committed without a forced timeout but only " + std::to_string(acked) + " were acknowledged");
+    }
 
     std::map<std::pair<NetId, OwnerEpoch>, PlayerId> ownerAt;
     std::map<NetId, int> drivers;
