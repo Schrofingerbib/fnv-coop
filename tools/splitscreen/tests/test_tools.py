@@ -468,6 +468,7 @@ def launcher_cli_plan_matches():
     # seats stayed idle and the smoke playbook's pad step failed)
     a = ap.parse_args(["plan", "--players", "2", "--dev-inject"])
     ok([s.pad for s in launch.make_plan(a, ms, []).seats] == [None, 0], "--dev-inject seats take synthetic pads")
+    ok([s.pad for s in launch.make_plan(a, ms, [2]).seats] == [None, 2], "--dev-inject keeps a detected controller (PR #24 review)")
     a = ap.parse_args(["plan", "--players", "2", "--allow-missing-pads"])
     ok([s.pad for s in launch.make_plan(a, ms, []).seats] == [None, None], "without --dev-inject a seat with no controller stays idle")
     a = ap.parse_args(["plan", "--players", "3"])
