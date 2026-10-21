@@ -613,7 +613,7 @@ class EnemySpawnPlaybook(Playbook):
                     ctx.must(r, f"{n} walks to the start position")
             n0 = ctx.same_everywhere("count before", count)
             if mode != "site":
-                for n, r in ctx.on_all(lambda m: m.bot.goto_ref(marker, 300)).items():
+                for n, r in ctx.on_all(lambda m: goto_or_teleport(ctx, m, marker, 300)).items():
                     ctx.must(r, f"{n} walks to the marker")
             lists = member_lists()
             if all(v is not None for v in lists.values()):
@@ -809,6 +809,19 @@ def fake_enemy_handoff(n: int = 2, bugs: Optional[Set[str]] = None, **kw) -> Tup
 SITE_REFS = ["FalloutNV.esm:D00001", "FalloutNV.esm:D00002", "FalloutNV.esm:D00003"]
 SITE_BASES = ["FalloutNV.esm:DBB5B0", "FalloutNV.esm:DBB5B1"]
 SITE_MARKER = "FalloutNV.esm:D0FFFF"
+
+
+def goto_or_teleport(ctx: Ctx, m: Machine, ref: str, dist: float) -> Any:
+    """Walk to `ref`. When the walk is stuck on terrain, teleport there and add a note. Use it only to place a player before the
+    checks: the sync checks come after. In game 2026-10-21 the host stuck on the slope between GSPG01 and
+    GoodspringsPowderGangMarker (1042 units, 290 up) and enemy_spawn failed at step 01 before it checked anything."""
+    r = m.bot.goto_ref(ref, dist)
+    if getattr(r, "ok", False) or "stuck" not in str(getattr(r, "reason", "")):
+        return r
+    note = f"{m.name}: the walk to {ref} was stuck ({getattr(r, 'reason', '')}), teleported there"
+    ctx.notes.append(note)
+    ctx.log(note)
+    return m.bot.goto_ref(ref, dist, mode="teleport")
 
 
 def fake_enemy_spawn(n: int = 2, bugs: Optional[Set[str]] = None, **kw) -> Tuple[FakeCoop, dict]:

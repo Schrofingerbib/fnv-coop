@@ -664,5 +664,43 @@ class FakeWorldRules(unittest.TestCase):
         self.assertTrue(w.t(pb_enemy.HOSTILES[0])["owner"] == 0)
 
 
+
+class SpawnPlacement(unittest.TestCase):
+    """In game 2026-10-21: enemy_spawn (spawn_mode host) failed at step 01 because the host's walk to the marker was stuck on a
+    slope. Placing the players is not what the test checks, so a stuck walk falls back to a teleport and leaves a note."""
+
+    def run_host_mode(self, blocked, no_fallback=False):
+        self.lines = []
+        w, refs = pb_enemy.fake_enemy_spawn(2)
+        refs = dict(refs, spawn_mode="host")
+        w.walk_blocked = blocked
+        if no_fallback:   # twin: the old placement, a plain walk
+            orig = pb_enemy.goto_or_teleport
+            pb_enemy.goto_or_teleport = lambda ctx, m, ref, dist: m.bot.goto_ref(ref, dist)
+        try:
+            d = tmp()
+            w.flight_dir = os.path.join(d, "flight")
+            r = core.run_playbook(registry.make("enemy_spawn", REPO), fakecoop.make_machines(w), fakecoop.FakeComparer(), d, refs, dict(OPTS), log=self.lines.append)
+        finally:
+            if no_fallback:
+                pb_enemy.goto_or_teleport = orig
+        return r
+
+    def test_a_stuck_walk_to_the_marker_teleports_and_notes_it(self):
+        r = self.run_host_mode(blocked=True)
+        first = r.steps[0]
+        self.assertTrue(first.ok, first.reason)
+        self.assertTrue(any("was stuck" in n and "teleported" in n for n in self.lines), self.lines)
+
+    def test_twin_a_plain_walk_fails_step_one(self):
+        r = self.run_host_mode(blocked=True, no_fallback=True)
+        self.assertFalse(r.steps[0].ok)
+        self.assertIn("walks to the marker: stuck", r.steps[0].reason)
+
+    def test_an_open_walk_needs_no_teleport(self):
+        r = self.run_host_mode(blocked=False)
+        self.assertTrue(r.steps[0].ok, r.steps[0].reason)
+        self.assertFalse(any("teleported" in n for n in self.lines), self.lines)
+
 if __name__ == "__main__":
     unittest.main()
