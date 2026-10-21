@@ -620,11 +620,45 @@ TWINS = [(check_exclusive, "double_lease"), (check_recycle_after_k, "no_recycle_
          (check_reap_state_vanishes, "reap_unlink_strict"), (check_reap_state_vanishes_on_read, "reap_read_strict"), (check_restore_refuses_prefs_without_d3d, "no_d3d_check")]
 
 
+# These drive the real Windows runner (msvcrt job queue, tasklist, a named-pipe fake server); off Windows they are skipped with a reason.
+WINDOWS_ONLY = {
+    "check_nolowcost_restores_provisioned_inis": "needs the Windows runner (msvcrt)",
+    "check_daemon_client": "needs the Windows named-pipe fake server (ctypes.WinDLL)",
+    "check_real_slots_cli": "needs the Windows process list (tasklist)",
+}
+
+
+def skip_reason(fn, platform=None, mutant=None):
+    """Why `fn` cannot run on `platform` (default: this one), or None. The mutant 'skip_everywhere' is a deliberately broken twin."""
+    if mutant == "skip_everywhere":
+        return WINDOWS_ONLY.get(fn.__name__, "broken")
+    if (platform or sys.platform) == "win32":
+        return None
+    return WINDOWS_ONLY.get(fn.__name__)
+
+
+def check_windows_only_skips(m):
+    for name in WINDOWS_ONLY:
+        fn = globals()[name]
+        assert skip_reason(fn, "linux", m), name + " must be skipped off Windows"
+        assert skip_reason(fn, "darwin", m), name + " must be skipped off Windows"
+        assert skip_reason(fn, "win32", m) is None, name + " must run on Windows"
+    assert skip_reason(check_exclusive, "linux", m) is None, "a portable check must never be skipped"
+
+
+REAL.append(check_windows_only_skips)
+TWINS.append((check_windows_only_skips, "skip_everywhere"))
+
+
 def main() -> int:
     bad = []
     n = 0
     for fn in REAL:
         n += 1
+        why = skip_reason(fn)
+        if why:
+            print("skip ", fn.__name__, "-", why)
+            continue
         try:
             fn(None)
             print("ok   ", fn.__name__)
@@ -634,6 +668,10 @@ def main() -> int:
             traceback.print_exc()
     for fn, mut in TWINS:
         n += 1
+        why = skip_reason(fn)
+        if why:
+            print("skip  twin %s[%s] - %s" % (fn.__name__, mut, why))
+            continue
         try:
             fn(mut)
         except AssertionError:

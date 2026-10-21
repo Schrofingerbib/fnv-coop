@@ -29,12 +29,9 @@ import argparse
 import itertools
 import json
 import os
-import msvcrt
 import sys
 import threading
 import time
-import ctypes
-from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -44,13 +41,19 @@ from console_ref import RefLineError, join_ref_line, split_ref_line  # noqa: E40
 
 PROTOCOL_VERSION = 1
 
-_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_k32.OpenProcess.restype = wintypes.HANDLE
-_k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-_k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-_k32.CloseHandle.argtypes = [wintypes.HANDLE]
-_k32.PeekNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
-                               ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+WINDOWS = sys.platform == "win32"
+if WINDOWS:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32.OpenProcess.restype = wintypes.HANDLE
+    _k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _k32.PeekNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                                   ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
 
 
 class BridgeError(Exception):
@@ -75,6 +78,15 @@ class WaitTimeout(BridgeError):
         self.last = last
 
 
+class WindowsOnlyError(BridgeError):
+    """The game and its pipe bridge exist on Windows only; raised instead of an ImportError on other systems."""
+
+
+def require_windows(what: str = "the game bridge") -> None:
+    if not WINDOWS:
+        raise WindowsOnlyError(f"{what} is Windows only (the game and its named pipe run on Windows; this is {sys.platform})")
+
+
 class ConnectionLost(BridgeError):
     pass
 
@@ -88,6 +100,7 @@ class GameCrashed(ConnectionLost):
 
 
 def _pid_alive(pid: int) -> bool:
+    require_windows("checking a game process")
     h = _k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not h:
         return False
@@ -113,12 +126,14 @@ class NvBridge:
         self.lease: Optional[str] = None  # token of the lease we hold; attached to every call
         # A synchronous pipe handle serialises I/O: a thread blocked in ReadFile would block our
         # WriteFile. So no reader thread; recv polls PeekNamedPipe and only reads what is available.
+        require_windows()
         self._h = msvcrt.get_osfhandle(stream.fileno())
 
     # ---- connection ----
     @classmethod
     def connect(cls, instance: int = 0, wait_s: float = 0.0, path: Optional[str] = None) -> "NvBridge":
         """Open the pipe. With wait_s>0, retry until the game creates it (or time runs out)."""
+        require_windows()
         p = path or pipe_path(instance)
         deadline = time.monotonic() + wait_s
         while True:
