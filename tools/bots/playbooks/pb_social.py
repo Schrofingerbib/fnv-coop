@@ -39,8 +39,8 @@ class CompanionRecruitPlaybook(Playbook):
                 ctx.must(P.end_dialogue(recruiter.bot), "recruiter ends the dialogue")
             else:   # the scenario has no recruit INFO id: set the teammate flag on the recruiter's machine instead
                 ctx.notes.append("no recruit_info: recruited with SetPlayerTeammate (tests sync, not the dialogue)")
-                r = recruiter.bot.nv.exec(f"{P.hexid(comp)}.SetPlayerTeammate 1")
-                ctx.expect(r.get("ok", True), f"SetPlayerTeammate failed: {r.get('output')}")
+                r = P.set_teammate(recruiter.bot, comp)
+                ctx.expect(r.ok, f"SetPlayerTeammate failed: {r.reason}")
             ctx.settle()
             ctx.expect(ctx.same_everywhere("is a companion", lambda m: P.is_teammate(m.bot, comp)) is True,
                        "the NPC should be a teammate on every machine")

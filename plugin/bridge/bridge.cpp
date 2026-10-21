@@ -4,6 +4,7 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <functional>
 #include <list>
@@ -34,6 +35,7 @@ constexpr int kMainThreadTimeout = -32001;
 constexpr int kLeaseHeld = -32010;     // lock.acquire refused: someone else holds the lease
 constexpr int kSaveExists = -32012;    // saveGame refused: name exists and overwrite was not requested
 constexpr int kLeaseRequired = -32011; // request needs the lease token of the current holder
+constexpr int kRefNotLoaded = -32013;  // exec {ref}: the ref names no loaded reference (plugin, form or form type)
 constexpr size_t kMaxLine = 4u << 20;
 
 uint64_t NowMs() {
@@ -163,6 +165,39 @@ bool ValidOp(const std::string& op) {
 }  // namespace
 
 std::string Bridge::PipeName(int instance) { return "\\\\.\\pipe\\nvcoop-" + std::to_string(instance); }
+
+// ---------------------------------------------------------------------------------------------
+// exec {cmd, ref}: the calling reference of a console line
+// ---------------------------------------------------------------------------------------------
+
+bool ParseRefSpec(const std::string& text, RefSpec* out, std::string* err) {
+    auto fail = [&](const std::string& why) {
+        if (err) *err = why;
+        return false;
+    };
+    std::string plugin, hex = text;
+    const size_t colon = text.rfind(':');
+    if (colon != std::string::npos) {
+        plugin = text.substr(0, colon);
+        hex = text.substr(colon + 1);
+        if (plugin.empty()) return fail("the plugin name before ':' is empty");
+    }
+    if (hex.size() > 2 && hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) hex.erase(0, 2);
+    if (hex.empty() || hex.size() > 8) return fail("the form id must have 1 to 8 hex digits");
+    uint32_t v = 0;
+    for (char c : hex) {
+        int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+        if (d < 0) return fail("'" + hex + "' is not a hex number");
+        v = (v << 4) | static_cast<uint32_t>(d);
+    }
+    if (!plugin.empty() && v > 0xFFFFFFu)
+        return fail("the id inside a plugin is at most FFFFFF (give a runtime id as bare HEX, without the plugin)");
+    out->plugin = plugin;
+    out->id = v;
+    return true;
+}
+
+bool IsReferenceFormType(int typeId) { return typeId == 0x3A || typeId == 0x3B || typeId == 0x3C; }
 
 // ---------------------------------------------------------------------------------------------
 // pipe-thread side
@@ -482,6 +517,49 @@ void Bridge::Impl::Dispatch(Host& host, const std::shared_ptr<Job>& job) {
     if (m == "exec") {
         const std::string* cmd = needStr("cmd");
         if (!cmd) { job->finishErr(kInvalidParams, "exec requires string param 'cmd'"); return; }
+        if (const Value* refv = p.find("ref")) {
+            // exec {cmd, ref}: run the line with that reference as the console's calling reference (see bridge.h).
+            if (!refv->isString()) {
+                job->finishErr(kInvalidParams, "exec: param 'ref' must be a string (\"Plugin.esm:HEX\", \"HEX\" or \"0xHEX\")");
+                return;
+            }
+            const std::string& text = refv->asString();
+            RefSpec spec;
+            std::string why;
+            if (!ParseRefSpec(text, &spec, &why)) { job->finishErr(kInvalidParams, "exec: bad ref '" + text + "': " + why); return; }
+            uint32_t id = spec.id;
+            if (!spec.plugin.empty()) {
+                const int idx = host.PluginIndex(spec.plugin);
+                if (idx < 0 || idx > 0xFE) {
+                    job->finishErr(kRefNotLoaded, "exec: ref '" + text + "': plugin '" + spec.plugin + "' is not loaded");
+                    return;
+                }
+                id = (static_cast<uint32_t>(idx) << 24) | spec.id;
+            }
+            char hex[16];
+            std::snprintf(hex, sizeof hex, "%08X", id);
+            const int type = host.FormType(id);
+            if (type < 0) {
+                job->finishErr(kRefNotLoaded, "exec: ref '" + text + "' (form " + hex + ") is not a loaded form");
+                return;
+            }
+            if (!IsReferenceFormType(type)) {
+                char t[8];
+                std::snprintf(t, sizeof t, "0x%02X", type);
+                job->finishErr(kRefNotLoaded, "exec: ref '" + text + "' (form " + hex + ", form type " + t +
+                                                  ") is not a reference: only a REFR, ACHR or ACRE can be the calling reference");
+                return;
+            }
+#ifdef NVBRIDGE_MUTANT_EXECREF
+            ExecResult er = host.Exec(*cmd);  // mutation twin: the ref is checked, then ignored (no calling reference)
+#else
+            ExecResult er = host.ExecOn(*cmd, id);
+#endif
+            Value r = Value::object();
+            r.set("ok", er.ok).set("output", er.output).set("ref", std::string(hex));
+            job->finishOk(std::move(r));
+            return;
+        }
         ExecResult er = host.Exec(*cmd);
         Value r = Value::object();
         r.set("ok", er.ok).set("output", er.output);

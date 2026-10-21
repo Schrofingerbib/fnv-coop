@@ -117,10 +117,10 @@ def lose_on(method, exc):
                 raise exc
             return call(m, params, timeout_s)
 
-        def lost_exec(cmd, timeout_ms=None):
+        def lost_exec(cmd, timeout_ms=None, **kw):      # kw: ref= (exec {cmd, ref})
             if method == "exec":
                 raise exc
-            return exe(cmd, timeout_ms)
+            return exe(cmd, timeout_ms, **kw)
         nv.call, nv.exec = lost_call, lost_exec
     return setup
 

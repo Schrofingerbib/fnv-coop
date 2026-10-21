@@ -229,11 +229,14 @@ class Runner:
     def _do(self, nv, act, res):
         kind = act[0]
         if kind == "exec":
-            r = nv.exec(act[1])
+            # ("exec", line) or ("exec", line, ref): ref is the calling reference (exec {cmd, ref}); the game's console
+            # has no "<hex>.Func" form
+            ref = act[2] if len(act) > 2 else None
+            r = nv.exec(act[1]) if ref is None else nv.exec(act[1], ref=ref)
             out = (r.get("output") or "") if isinstance(r, dict) else ""
             low = out.lower()
             if (isinstance(r, dict) and r.get("ok") is False) or any(p in low for p in PARSE_ERRORS):
-                raise ScenarioError("%s -> %s" % (act[1], out.strip()[:120] or r))
+                raise ScenarioError("%s%s -> %s" % (act[1], "" if ref is None else " (ref %s)" % ref, out.strip()[:120] or r))
         elif kind == "call":
             nv.call(act[1], act[2])
         elif kind == "stage":
@@ -254,7 +257,7 @@ class Runner:
     # ---- checks
     def _check(self, sc, st, res):
         idx = scenlib.step_target(st, sc)
-        expr, cmp_, value, agg, tol, timeout = scenlib.check_expr(st, res)
+        expr, cmp_, value, agg, tol, timeout, ref = scenlib.check_expr(st, res)
         if expr is None and st["kind"] not in ("owner", "spawn_count"):
             raise ScenarioError("check kind %s has no expression" % st["kind"])
         if expr is None:
@@ -266,11 +269,12 @@ class Runner:
             elif st["kind"] == "spawn_count":
                 vals = [float(self.nvs[i].call(scenlib.CAPABILITIES["ref_count"]["method"], {"base": res.hex(st["base"])})["count"]) for i in idx]
             else:
-                vals = [self.nvs[i].eval(expr) for i in idx]
+                vals = [self.nvs[i].eval(expr) if ref is None else self.nvs[i].eval(expr, ref=ref) for i in idx]
+            shown = expr if ref is None else "%s (ref %s)" % (expr, ref)
             if scenlib.compare(vals, cmp_, value, agg, tol) or MUTANT == "passall":
-                return {"status": "pass", "values": vals, "expr": expr}
+                return {"status": "pass", "values": vals, "expr": shown}
             if self.now() - t0 >= timeout:
-                return {"status": "fail", "values": vals, "expr": expr,
+                return {"status": "fail", "values": vals, "expr": shown,
                         "detail": "%s %s %s%s (agg %s) not met after %.1fs; values per player %s" % (
                             st["kind"], cmp_, value, " +-%s" % tol if tol else "", agg, timeout, vals)}
             self.sleep(self.poll_s)

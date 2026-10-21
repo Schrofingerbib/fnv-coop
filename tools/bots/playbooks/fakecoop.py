@@ -89,7 +89,22 @@ class FakeNv:
             return {"path": p}
         raise RuntimeError(f"unknown method {method}")
 
-    def exec(self, cmd: str, timeout_ms: Optional[int] = None) -> dict:
+    def exec(self, cmd: str, timeout_ms: Optional[int] = None, *, ref: Optional[str] = None) -> dict:
+        """Like the game's console: "<hex>.Func" fails (Script command ... not found); a line for a reference names it
+        in `ref` (the calling reference of exec {cmd, ref}). 'SetPlayerTeammate 1' on an NPC recruits it for this
+        machine's player (as the recruit INFO does); other ref-targeted lines are accepted without a world effect."""
+        self.calls.append(("exec", {"cmd": cmd, **({} if ref is None else {"ref": ref})}))
+        head = re.match(r"\s*([^\s.]+)\.\w", cmd)
+        if head and head.group(1).lower() != "player":
+            return {"ok": False, "output": f'Script command "{cmd.split()[0]}" not found'}
+        if ref is not None:
+            w = self.bot.world
+            r = w.t(ref)
+            if r is None:
+                raise RuntimeError(f"exec: ref '{ref}' is not a loaded form")     # the bridge's -32013
+            if cmd.strip().lower() == "setplayerteammate 1" and r["follower_of"] is None:
+                w.set_ref(ref, follower_of=self.bot.idx, owner=self.bot.idx)
+            return {"ok": True, "output": ""}
         m = re.match(r"setstage (\w+) (\d+)", cmd)
         if m:
             r = self.bot.set_stage(m.group(1), int(m.group(2)))

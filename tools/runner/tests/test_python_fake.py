@@ -52,6 +52,31 @@ class PythonFake(unittest.TestCase):
         with self.assertRaises(nvbridge.WaitTimeout):
             nv.wait_stage("104C1C", 7, 200)
 
+    def test_exec_ref_on_the_wire(self):
+        srv, nv = self.serve()
+        sent = []
+        orig = nv.send_raw
+        nv.send_raw = lambda line: (sent.append(json.loads(line)), orig(line))[1]
+        self.assertEqual(nv.exec("getref", ref="00103E61")["output"], "REF=00103E61")
+        self.assertEqual(sent[-1]["params"], {"cmd": "getref", "ref": "00103E61"})
+        nv.exec("echo plain")
+        self.assertNotIn("ref", sent[-1]["params"], "exec without ref must not send a ref param")
+        self.assertEqual(nv.eval("refid", ref="0x14"), 20.0)
+        self.assertEqual(sent[-1]["params"], {"cmd": 'printc "NVCOOP_EVAL=%g" (refid)', "ref": "0x14"})
+
+    def test_cli_exec_with_ref(self):
+        inst = fresh_instance()
+        srv = FakeServer(inst).start()
+        self.addCleanup(srv.stop)
+        out = subprocess.run([sys.executable, "-I", str(HERE.parent / "nvbridge.py"), "--instance", str(inst),
+                              "exec", "getref", "--ref", "FalloutNV.esm:103E61"], capture_output=True, text=True, timeout=20)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"ok": True, "output": "REF=00103E61", "ref": "00103E61"})
+        bad = subprocess.run([sys.executable, "-I", str(HERE.parent / "nvbridge.py"), "--instance", str(inst),
+                              "exec", "getref", "--ref", "Nope.esm:1"], capture_output=True, text=True, timeout=20)
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("-32013", bad.stderr)
+
     def test_quit_and_cli(self):
         srv, nv = self.serve()
         self.assertEqual(nv.quit(), {"quitting": True})
@@ -108,6 +133,22 @@ class MutationTwins(unittest.TestCase):
 
     def test_waitfor_timeout_lies(self):
         self.assertCaught("waitfor_no_timeout")
+
+    def test_exec_ref_ignored(self):
+        self.assertCaught("exec_ref_ignored")
+
+    def test_client_that_drops_the_ref_is_caught(self):
+        """Twin of the client side: an NvBridge whose exec forgets `ref` must fail the same conformance run."""
+        class DropsRef(nvbridge.NvBridge):
+            def exec(self, cmd, timeout_ms=None, *, ref=None):
+                return super().exec(cmd, timeout_ms)
+        inst = fresh_instance()
+        srv = FakeServer(inst).start()
+        self.addCleanup(srv.stop)
+        nv = DropsRef.connect(inst)
+        self.addCleanup(nv.close)
+        with self.assertRaises((AssertionError, nvbridge.BridgeError), msg="a client that drops ref was NOT caught"):
+            conformance.check_exec_ref(nv)
 
 
 if __name__ == "__main__":

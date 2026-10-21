@@ -25,45 +25,63 @@ OUT = REPO / "out" / "scenarios"
 STATE = OUT / "proof_state.json"   # runner state, keyed by game process (runner.StateStore.lease_keys)
 
 
+def _resolvers():
+    names = ("door_terminal_container_matrix", "goodsprings_fight", "quest_stage_sync")
+    return [scenlib.Resolver(scenlib.load_scenario(scenlib.SCEN_DIR / (n + ".json"))) for n in names]
+
+
 def probes():
-    """(label, expression) pairs built from real refs of the shipped scenarios; each is evaluated once after loading the start save."""
-    d = scenlib.load_scenario(scenlib.SCEN_DIR / "door_terminal_container_matrix.json")
-    g = scenlib.load_scenario(scenlib.SCEN_DIR / "goodsprings_fight.json")
-    s = scenlib.load_scenario(scenlib.SCEN_DIR / "spawn_once.json")
-    rd, rg, rs = (scenlib.Resolver(x) for x in (d, g, s))
-    q = scenlib.load_scenario(scenlib.SCEN_DIR / "quest_stage_sync.json")
-    rq = scenlib.Resolver(q)
+    """(label, expression, calling ref) triples built from real refs of the shipped scenarios through scenlib's own check
+    translation, so the probe tests the exact console text the scenarios send. A ref-targeted expression runs with
+    eval(expr, ref=<hex>): the game's console has no "<hex>.Func" form (in game, 2026-10-21). ref is None for the rest."""
+    rd, rg, rq = _resolvers()
+
+    def chk(label, res, **st):
+        e = scenlib.check_expr(dict(st, id="probe", op="check"), res)
+        return (label, e[0], e[6])
     return [
-        ("GetStage on a quest", "GetStage %s" % rq.hex("$vcg02")),
-        ("GetStageDone", "GetStageDone %s 10" % rq.hex("$vcg02")),
-        ("ref.GetDead on an actor ref", "%s.GetDead" % rg.hex("$gang1")),
-        ("ref.GetDisabled", "%s.GetDisabled" % rg.hex("$gang1")),
-        ("ref.GetAV Health", "%s.GetAV Health" % rg.hex("$gang1")),
-        ("ref.GetLocked on a door ref", "%s.GetLocked" % rd.hex("$docDoor")),
-        ("ref.GetItemCount on a container ref", "%s.GetItemCount %s" % (rd.hex("$dresser"), rd.hex("$stimpak"))),
-        ("player.GetItemCount", "player.GetItemCount %s" % rd.hex("$stimpak")),
-        ("player.GetDistance ref", "player.GetDistance %s" % rg.hex("$gangMarker")),
-        ("ref.GetPlayerTeammate", "%s.GetPlayerTeammate" % rg.hex("$gang1")),
+        chk("GetStage on a quest", rq, kind="stage", quest="$vcg02"),
+        chk("GetStageDone", rq, kind="stage_done", quest="$vcg02", stage=10),
+        chk("ref.GetDead on an actor ref", rg, kind="dead", ref="$gang1"),
+        chk("ref.GetDisabled", rg, kind="disabled", ref="$gang1"),
+        chk("ref.GetAV Health", rg, kind="av", ref="$gang1", av="Health"),
+        chk("ref.GetLocked on a door ref", rd, kind="locked", ref="$docDoor"),
+        chk("ref.GetItemCount on a container ref", rd, kind="item_count", who="$dresser", item="$stimpak"),
+        chk("player.GetItemCount", rd, kind="item_count", who="player", item="$stimpak"),
+        chk("player.GetDistance ref", rg, kind="distance", a="player", b="$gangMarker"),
+        chk("ref.GetPlayerTeammate", rg, kind="teammate", ref="$gang1"),
     ]
 
 
-def mode_probe():
+def console_probes():
+    """(label, exec action) pairs from scenlib.step_actions: ("exec", line) or ("exec", line, calling ref)."""
+    rd = _resolvers()[0]
+    return [("ref.lock", scenlib.step_actions({"id": "probe", "op": "lock", "ref": "$docDoor", "level": 50}, rd)[0])]
+
+
+def probe_rows(nv):
+    """Run every probe once on the bridge `nv`. -> one row per probe; ok False says the console rejected the form."""
     out = []
+    for label, expr, ref in probes():
+        try:
+            v = nv.eval(expr) if ref is None else nv.eval(expr, ref=ref)
+            out.append({"label": label, "expr": expr, "ref": ref, "ok": True, "value": v})
+        except Exception as e:   # noqa: BLE001
+            out.append({"label": label, "expr": expr, "ref": ref, "ok": False, "error": str(e)[:160]})
+    for label, act in console_probes():
+        cmd, ref = act[1], (act[2] if len(act) > 2 else None)
+        r = nv.exec(cmd) if ref is None else nv.exec(cmd, ref=ref)
+        out.append({"label": label, "expr": cmd, "ref": ref,
+                    "ok": r.get("ok") is not False and "parse" not in (r.get("output") or "").lower(), "value": r.get("output")})
+    return out
+
+
+def mode_probe():
     with lease("scenarios-proof", n=1, ttl_s=900) as L:
         nv = L.bridge(0)
         nv.load_save("autosave")
         time.sleep(3)
-        for label, expr in probes():
-            try:
-                v = nv.eval(expr)
-                out.append({"label": label, "expr": expr, "ok": True, "value": v})
-            except Exception as e:   # noqa: BLE001
-                out.append({"label": label, "expr": expr, "ok": False, "error": str(e)[:160]})
-        for label, cmd in (("ref.lock", "%s.lock 50" % scenlib.Resolver(scenlib.load_scenario(scenlib.SCEN_DIR / "door_terminal_container_matrix.json")).hex("$docDoor")),):
-            r = nv.exec(cmd)
-            out.append({"label": label, "expr": cmd, "ok": r.get("ok") is not False and "parse" not in (r.get("output") or "").lower(),
-                        "value": r.get("output")})
-    return out
+        return probe_rows(nv)
 
 
 def mode_jump(lease_fn=lease, state_path=STATE, **kw):

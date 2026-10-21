@@ -499,6 +499,83 @@ class Adapters(unittest.TestCase):
         self.assertTrue(ctx.notes)
 
 
+def run_with_refs(name, change=None, drop=()):
+    """One clean run of `name` on its fake world, with the scenario refs changed (`change`) or removed (`drop`)."""
+    e = registry.REGISTRY[name]
+    w, refs = e.fake(e.players, set(), lag=1)
+    refs = dict(refs, **(change or {}))
+    for k in drop:
+        refs.pop(k, None)
+    d = tempfile.mkdtemp(prefix="t6b-")
+    w.flight_dir = os.path.join(d, "flight")
+    return core.run_playbook(registry.make(name, REPO), fakecoop.make_machines(w), fakecoop.FakeComparer(), d, refs, OPTS), w
+
+
+def legacy_exec_ref(bot, ref, cmd):
+    """Twin: the old console fallback, '<hex>.<cmd>' (in game, 2026-10-21: Script command ... not found)."""
+    r = bot.nv.exec(f"{probe.hexid(ref)}.{cmd}")
+    return probe.Result(bool(r.get("ok", True)), str(r.get("output", "")))
+
+
+class ConsoleRefLines(unittest.TestCase):
+    """The probe / adapter console fallbacks run with exec {cmd, ref}: the game's console has no '<hexFormID>.Func' form."""
+
+    def world(self):
+        from bots import Bot, FakeBridge, World
+        w = World()
+        w.add_door(0x601, (200, 200, 0), locked=True)
+        w.add_container(0x600, (500, 0, 0), {0x500: 1})
+        w.add_actor(0x602, (300, 0, 0))
+        nv = FakeBridge(w)
+        return nv, Bot(nv, "t")
+
+    def test_fallbacks_over_a_t6a_bot(self):
+        from playbooks.adapter import PlaybookBot
+        nv, bot = self.world()
+        ref = lambda i: f"FalloutNV.esm:{i:X}"      # noqa: E731
+        self.assertTrue(probe.is_locked(bot, ref(0x601)))
+        self.assertFalse(probe.door_open(bot, ref(0x601)))
+        self.assertTrue(PlaybookBot(bot).unlock(ref(0x601)))
+        self.assertFalse(probe.is_locked(bot, ref(0x601)))
+        self.assertFalse(probe.is_teammate(bot, ref(0x602)))
+        self.assertTrue(probe.set_teammate(bot, ref(0x602)))
+        self.assertTrue(probe.is_teammate(bot, ref(0x602)))
+        self.assertTrue(probe.seed_items(bot, ref(0x600), ref(0x500), 4))
+        self.assertEqual(bot.inventory_count(ref(0x500), ref(0x600)), 5)
+        self.assertTrue(probe.spawn(bot, ref(0x700), ref(0x602)))
+        self.assertEqual(bot.count_refs(ref(0x700)), 1)
+        lines = [c for c in nv.calls if c[0] == "exec"]
+        self.assertGreaterEqual(len([c for c in lines if len(c) == 3]), 8, "the fallbacks must pass the reference as ref")
+        self.assertEqual([c for c in lines if __import__("re").search(r"(^|[\s(])[0-9A-Fa-f]+\.\w", c[1])], [])
+
+    def test_legacy_fallbacks_fail_like_in_game(self):
+        """Twin: the old '<hex>.Func' fallbacks fail on the fake console, as they did in game."""
+        nv, bot = self.world()
+        ref = lambda i: f"FalloutNV.esm:{i:X}"      # noqa: E731
+        with self.assertRaises(Exception):
+            bot.nv.eval(f"{probe.hexid(ref(0x601))}.GetLockLevel")
+        self.assertFalse(legacy_exec_ref(bot, ref(0x602), "SetPlayerTeammate 1"))
+        self.assertFalse(probe.is_teammate(bot, ref(0x602)))
+        self.assertFalse(legacy_exec_ref(bot, ref(0x600), "additem 500 4"))
+        self.assertEqual(bot.inventory_count(ref(0x500), ref(0x600)), 1)
+
+    def test_playbook_console_paths_on_the_fake_coop(self):
+        r, _ = run_with_refs("companion_recruit", drop=("recruit_info",))      # recruits with SetPlayerTeammate on the ref
+        self.assertTrue(r.ok, r.reason)
+        r, _ = run_with_refs("container_share", {"seed": {"item": "STIMPAK", "count": 2}})
+        self.assertTrue(r.ok, r.reason)
+        old = probe._exec_ref
+        probe._exec_ref = legacy_exec_ref                                       # twin: the old lines
+        try:
+            r, _ = run_with_refs("companion_recruit", drop=("recruit_info",))
+            self.assertFalse(r.ok, "a '<hex>.SetPlayerTeammate' line must fail")
+            r, _ = run_with_refs("container_share", {"seed": {"item": "STIMPAK", "count": 2}})
+            self.assertFalse(r.ok, "a '<hex>.additem' line must fail")
+            self.assertIn("not found", r.reason)
+        finally:
+            probe._exec_ref = old
+
+
 class Cli(unittest.TestCase):
     def _run(self, *args):
         import subprocess
