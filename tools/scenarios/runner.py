@@ -232,7 +232,7 @@ class Runner:
 
     @staticmethod
     def _bridge_instance(nv):
-        """The pool instance id in the pipe name of a real bridge (\\.\pipe\nvcoop-<n>), else None. Callers that key their runner by
+        r"""The pool instance id in the pipe name of a real bridge (\\.\pipe\nvcoop-<n>), else None. Callers that key their runner by
         position (the playbook adapter does) would otherwise look up prepared saves of instance 0 and 1 for pair 1 (instances 2 and 3)."""
         if MUTANT == "nobridgeid":   # test-only: trust the key only
             return None
