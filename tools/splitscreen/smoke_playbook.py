@@ -54,6 +54,8 @@ class Machine:
     def frames(self) -> int: raise NotImplementedError
     def getpos(self) -> Optional[Tuple[float, float, float]]: raise NotImplementedError
     def wait(self, seconds: float) -> None: raise NotImplementedError
+    def menu_kind(self) -> Optional[str]: return None          # bot.menu kind ("none", "message", ...); None = unknown
+    def dismiss_messages(self) -> str: return "not supported"
 
 
 class BridgeMachine(Machine):
@@ -88,6 +90,18 @@ class BridgeMachine(Machine):
     def wait(self, seconds: float) -> None:
         time.sleep(seconds)
 
+    def menu_kind(self) -> Optional[str]:
+        try:
+            return str(self.nv.call("bot.menu", timeout_s=15).get("kind"))   # needs [dev] bots=1
+        except Exception:
+            return None
+
+    def dismiss_messages(self) -> str:
+        if str(REPO / "tools") not in sys.path:
+            sys.path.insert(0, str(REPO / "tools"))
+        from bots import Bot
+        return str(Bot(self.nv, f"split{self.seat.index + 1}").dismiss_messages())
+
 
 class FakeMachine(Machine):
     """A model of one copy with the same observable behaviour as the plugin. `bug` switches on one fault (the playbook must catch each)."""
@@ -101,6 +115,7 @@ class FakeMachine(Machine):
         self.mode = 0
         self.pos = [100.0 * seat.index, 0.0, 0.0]
         self.frame = 0
+        self.menu = "message" if bug == "msgbox" else "none"     # msgbox: the DLC notices after a load hold the copy in menu mode
 
     def _poll(self) -> None:
         s = self.seat
@@ -120,7 +135,7 @@ class FakeMachine(Machine):
         self.last = {"result": res, "buttons": buttons, "lx": lx}
         self.mode = 1 if res == 0 else 0
         stick_y = self.inj.get(pad, {}).get("ly", 0) if pad is not None else 0
-        if self.mode and stick_y > 16000 and not (self.bug == "frozen_unfocused" and not self.fg):
+        if self.mode and stick_y > 16000 and self.menu == "none" and not (self.bug == "frozen_unfocused" and not self.fg):
             self.pos[1] += 5.0
 
     def wait(self, seconds: float) -> None:
@@ -153,6 +168,13 @@ class FakeMachine(Machine):
 
     def getpos(self) -> Optional[Tuple[float, float, float]]:
         return tuple(self.pos)                                                   # type: ignore[return-value]
+
+    def menu_kind(self) -> Optional[str]:
+        return self.menu
+
+    def dismiss_messages(self) -> str:
+        self.menu = "none"
+        return "dismiss_messages: ok"
 
 
 # ------------------------------------------------------------------------------------------------------ steps
@@ -270,6 +292,11 @@ def step_movement(ms: List[Machine]) -> Result:
     for m in ms:
         if m.getpos() is None:
             return Result("movement", False, f"P{m.seat.index + 1}: no player position (load a save in every copy first)")
+    # In game 2026-10-21 the DLC notices after a load held both copies in menu mode, and the step only said "did not walk".
+    boxed = [f"P{m.seat.index + 1}" for m in ms if m.menu_kind() == "message"]
+    if boxed:
+        return Result("movement", False, f"{', '.join(boxed)}: a message box is open (the DLC notices after a load); "
+                                         f"clear it, or run with --dismiss-messages")
     for s_m in ms:
         s = s_m.seat
         if s.pad is None:
@@ -291,7 +318,11 @@ def step_movement(ms: List[Machine]) -> Result:
     return Result("movement", not bad, "; ".join(bad) or "each seat walked with its own pad only")
 
 
-def run_steps(ms: List[Machine], inject: bool = True, movement: bool = False, out: Callable[[str], None] = print) -> List[Result]:
+def run_steps(ms: List[Machine], inject: bool = True, movement: bool = False, out: Callable[[str], None] = print,
+              dismiss: bool = False) -> List[Result]:
+    if dismiss:
+        for m in ms:
+            out(f"P{m.seat.index + 1}: {m.dismiss_messages()}")
     steps: List[Callable[[List[Machine]], Result]] = [step_windows, step_hooks]
     if inject:
         steps += [step_pads, step_unfocused]
@@ -348,6 +379,12 @@ def selftest() -> int:
     check("a copy that also polls another physical pad is caught by step 'pads'", "pads" in names(rs, False))
     rs = run("crosstalk", pads=[None, 1], fg=0, bug_seat=1, movement=True)
     check("crosstalk moves the wrong player in step 'movement'", "movement" in names(rs, False))
+    rs = run("msgbox", fg=0, bug_seat=1)
+    mv = [r for r in rs if r.step == "movement"]
+    check("an open message box fails step 'movement' and says so", bool(mv) and not mv[0].ok and "message box" in mv[0].detail)
+    p = _plan(2)
+    ms = [FakeMachine(s, foreground=(s.index == 0), bug=("msgbox" if s.index == 1 else "")) for s in p.seats]
+    check("--dismiss-messages clears the box and every step passes", all(r.ok for r in run_steps(ms, True, True, out=lambda _l: None, dismiss=True)))
     if fails:
         print("smoke_playbook selftest FAILED: " + ", ".join(fails))
         return 1
@@ -366,6 +403,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--fit", default="fill")
     ap.add_argument("--base-id", type=int, default=planmod.DEFAULT_BASE_ID)
     ap.add_argument("--movement", action="store_true")
+    ap.add_argument("--dismiss-messages", action="store_true", help="first clear the engine message boxes on every copy (needs [dev] bots=1)")
     ap.add_argument("--no-inject", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
@@ -390,7 +428,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception as e:
         print(f"cannot reach every copy: {e}. Start them with: launch.py up --players {a.players} --dev-inject", file=sys.stderr)
         return 3
-    rs = run_steps(ms, inject=not a.no_inject, movement=a.movement)
+    rs = run_steps(ms, inject=not a.no_inject, movement=a.movement, dismiss=a.dismiss_messages)
     if all(r.ok for r in rs):
         print("ALL OK")
         return 0
