@@ -191,7 +191,7 @@ The job now runs these steps, one tick per frame on the main thread. Each step h
 
 The global limit is 25 s (`timeout (phase ...)`). `bot.status.vats.phase` is one of idle, enter, tutorial, zoom, target, queue,
 execute, playback, done, failed.
-Pins (bots_addrs.h, checked against the unpacked 1.4.0.525 exe by `pins_match_real_exe_if_available` with `BOTS_EXE`):
+Pins (bots_addrs.h, checked against the 1.4.0.525 exe by `pins_match_real_exe_if_available` with `BOTS_EXE`):
 hook VatsAttackButton 0x7EEB50 (6 stolen bytes, plain `ret`), calls GetMenuByType, TutorialClose, VatsMenuHandleClick (ret 8),
 VatsQueueCount, VatsExecute, data pins VATSMenu.vtbl[3] = 0x7EECB0 and VATSMenu.vtbl[13] = 0x720100 (GetID, returns 0x420).
 Not verified in the game: all of it. Static open points: that 0x11DB088 is the tutorial menu pointer that 0x7E8D60 tests; that the
