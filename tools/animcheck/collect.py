@@ -18,6 +18,15 @@ from typing import Any, Dict, List, Optional
 from .model import Stream, stream_from_probes
 
 
+
+def probe_params(radius: float, max_actors: Optional[int] = None) -> dict:
+    """anim.probe parameters for a sample of the player and the actors near it. `near` walks the player's cell reference list, which
+    does not hold the player, so the player must be asked for by name (in game 2026-10-21 `collect` with only `near` never saw the player)."""
+    p: dict = {"near": {"radius": radius}, "refs": ["player"]}
+    if max_actors is not None:
+        p["max"] = max_actors
+    return p
+
 class Collector:
     def __init__(self, bridges: Dict[str, Any], out_dir: Optional[str | Path] = None, clock=time.monotonic):
         self.bridges = bridges
@@ -56,11 +65,12 @@ class Collector:
                     pass
 
     def poll_once(self, params: Optional[dict] = None) -> int:
+        params = params or probe_params(3000)
         n = 0
         for m, b in self.bridges.items():
             t0 = self.clock()
             try:
-                r = b.call("anim.probe", params or {"near": {"radius": 3000}})
+                r = b.call("anim.probe", params)
             except Exception as e:  # keep sampling the other machines
                 self.errors[m] += 1
                 self.last_error[m] = repr(e)

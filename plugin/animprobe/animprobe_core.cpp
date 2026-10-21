@@ -126,6 +126,7 @@ Value ToJson(const ActorSample& a) {
             so.set("slot", s.slot).set("group", s.group).set("state", s.state);
             so.set("t", static_cast<double>(s.t)).set("begin", static_cast<double>(s.begin)).set("end", static_cast<double>(s.end));
             so.set("freq", static_cast<double>(s.freq)).set("weight", static_cast<double>(s.weight));
+            if (s.seqPtr) so.set("ptr", HexId(s.seqPtr)).set("grp_ptr", HexId(s.grpPtr));   // only with scan_animdata
             sq.push(so);
         }
         an.set("seqs", sq);

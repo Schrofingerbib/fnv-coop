@@ -405,6 +405,33 @@ class PlumbingTests(unittest.TestCase):
         self.assertEqual(c2.poll_once(), 1)
         self.assertEqual(c2.errors["a"], 1)
 
+    def test_collect_asks_for_the_player(self):
+        # In game 2026-10-21: anim.probe {near} walks the player's cell list, which does not hold the player, so `collect` never saw it.
+        from animcheck.collect import probe_params
+
+        class EngineLike:
+            """Answers like the plugin: `near` gives the NPCs only, `refs` adds the named refs."""
+            def __init__(self):
+                self.params = []
+
+            def call(self, method, params=None):
+                self.params.append(params)
+                acts = [{"ref": "0x0014C44A"}] if params and "near" in params else []
+                if params and "player" in params.get("refs", []):
+                    acts.insert(0, {"ref": "0x00000014", "player": True})
+                return {"v": 1, "frame": 1, "t_ms": 0.0, "cost_us": 1.0, "actors": acts}
+
+        b = EngineLike()
+        c = Collector({"host": b})
+        c.poll_once()                                         # the default parameters
+        c.poll_once(probe_params(1500, 16))                   # what `cli.py collect` sends
+        for p in b.params:
+            self.assertIn("player", p["refs"])
+            self.assertIn("near", p)
+        self.assertEqual(probe_params(1500, 16)["max"], 16)
+        # twin: the old request (near only) gets no player from the same engine
+        self.assertFalse(any(a.get("player") for a in b.call("anim.probe", {"near": {"radius": 1500}, "max": 16})["actors"]))
+
     def test_animgroups(self):
         self.assertEqual(name(G["Forward"]), "Forward")
         self.assertEqual(category(G["Forward"]), "walk")
@@ -416,6 +443,32 @@ class PlumbingTests(unittest.TestCase):
         self.assertEqual(category(G["JumpLoop"]), "jump")
         self.assertEqual(category(9999), "unknown")
         self.assertEqual(len(synth.NAMES), 245)
+
+    def test_anim_group_offsets_as_measured_in_game(self):
+        # In game 2026-10-21 every sequence reported group 0: the probe read BSAnimGroupSequence+0x68 (0x0000FFFF there, not a pointer).
+        # Measured: the TESAnimGroup pointer is at +0x74, the group id is the low byte of the dword at TESAnimGroup+0x10.
+        import re
+        src = (Path(__file__).resolve().parents[3] / "plugin" / "animprobe" / "animprobe_game.cpp").read_text(encoding="utf-8")
+        self.assertEqual(re.search(r"kSeqAnimGroup = (0x[0-9A-Fa-f]+)", src).group(1).lower(), "0x74")
+        self.assertEqual(re.search(r"kAnimGroupId = (0x[0-9A-Fa-f]+)", src).group(1).lower(), "0x10")
+        self.assertIn("id & 0xFF", src)
+        # twin: the measured bytes decoded the old way (byte at +0x08 of the group object) give 10 and 30, not Idle 0 and FastForward 7
+        idle = bytes.fromhex("e8840401050000000a000a0a0000000a0000000002000000")
+        fast = bytes.fromhex("e8840401050000001e1e1e1e0000001e0700000002000000")
+        self.assertEqual((idle[8], fast[8]), (10, 30))
+        self.assertEqual((int.from_bytes(idle[0x10:0x14], "little") & 0xFF, int.from_bytes(fast[0x10:0x14], "little") & 0xFF), (0, 7))
+        self.assertEqual((name(0), name(7)), ("Idle", "FastForward"))
+
+    def test_move_flags_as_measured_in_game(self):
+        # 2026-10-21, player in game: idle in run mode 0x240, walk 0x141, run 0x241, sneak idle 0x640, sneak walk 0x541
+        from animcheck import model
+        cases = {0x240: False, 0x141: False, 0x241: False, 0x640: True, 0x541: True}
+        for flags, sneaking in cases.items():
+            a = parse_actor({"ref": "0x14", "player": True, "move_flags": flags}, 0.0)
+            self.assertEqual(a.sneaking, sneaking, hex(flags))
+        # twin: the old constants (sneak = 1 << 9) call plain run mode "sneaking"
+        self.assertTrue(bool(0x241 & (1 << 9)))
+        self.assertEqual(model.MOVE_SNEAK, 0x400)
 
     def test_cpp_golden_sample_parses(self):
         """plugin/animprobe/tests/golden_sample.json is what the C++ side emits (checked byte for byte by its test)."""
