@@ -58,8 +58,8 @@ def run_door(door_pos=(3000, 3000, 0), load_to=0, reach=150.0, **extra):
 
 
 class QueryFails(FakeBridge):
-    """Every health read fails with an RPC error: world.query (it refused every actor in game, 2026-10-21) and a
-    'GetAV Health' line (a fallback read)."""
+    """Every health read fails with an RPC error: world.query (its GetActorValue failed for every ref in game, 2026-10-21)
+    and a 'GetAV Health' line (a fallback read)."""
     WHY = "query failed (unknown fn, ref not loaded or evaluator drifted)"
 
     def call(self, method, params=None, timeout_s=35.0):
