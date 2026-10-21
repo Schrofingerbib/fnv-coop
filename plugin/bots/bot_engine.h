@@ -33,6 +33,7 @@
 // bot.vats queue and execute (49..56):
 //  49 the accept detour is never armed      50 execute is called with an empty queue     51 the tutorial box is never closed
 //  52 the target cycle is skipped           53 the tutorial box (0x423) is reported as "vats"
+//  57 a tutorial box that opens after the tutorial step is ignored
 //  54 the accept gate forces every slot and the held query     55 the VATSMenu vtable check is skipped    56 the hit-chance gate is skipped
 
 namespace nvbots {
@@ -615,6 +616,7 @@ private:
 class VatsJob {
 public:
     enum Phase { kIdle, kEnter, kTutorial, kZoom, kTarget, kQueue, kExecute, kPlayback, kDone, kFailed };
+    static constexpr uint64_t kSettleMs = 1500;   // kQueue: how long a 0 hit chance / missing body part may last before it is a failure
     static constexpr int kMaxCycles = 12;
     bool start(IEngine& e, const std::string& ref, const std::string& limb, uint64_t now, std::string* err) {
         if (!FNV_MUT(22)) {
@@ -643,6 +645,13 @@ public:
             return fail(e, b);
         }
         if (phase_ != kEnter && phase_ != kExecute && phase_ != kPlayback && mode == 0) return fail(e, "vats_closed (camera mode 0 before the attack was queued)");
+        // In game 2026-10-21 the VATS tutorial box (1059) opened AFTER the job had passed the tutorial step, and the hit chance then read 0
+        // (VATSMenu::Update does nothing while it is open). So a tutorial box sends the job back to the tutorial step from any later step.
+        if ((phase_ == kZoom || phase_ == kTarget || phase_ == kQueue) && !FNV_MUT(57) && e.menuByType(eng::kMenuIdTutorial)) {
+            if (armed_) disarm(e);
+            armed_ = false;
+            return to(kTutorial, now);
+        }
         switch (phase_) {
             case kEnter:
                 if (!tapped_) { tap(16); tapped_ = true; tPhase_ = now; }
@@ -697,9 +706,11 @@ public:
                     if (!vatsMenu(e, &menu)) return;
                     uint32_t part = 0;
                     e.rd32(menu + eng::kVatsMenuPart, &part);
-                    if (!part) return fail(e, "attack_not_queued (no body part is selected)");
+                    // the menu fills the body part and its hit chance on its next updates (after a zoom or a closed tutorial box): wait a little
+                    if (!part) { if (now - tPhase_ < kSettleMs) break; return fail(e, "attack_not_queued (no body part is selected)"); }
                     hit_ = rdf(e, part + eng::kPartHitChance);
                     ap_ = rdf(e, menu + eng::kVatsMenuAp);
+                    if (!(hit_ > 0.0f) && now - tPhase_ < kSettleMs) break;
                     if (!(hit_ > 0.0f) && !FNV_MUT(56)) {   // twin 56: the hit-chance gate is skipped
                         std::snprintf(b, sizeof b, "attack_not_queued (hit chance %.1f, AP %.1f: the engine refuses a 0 hit chance)", hit_, ap_);
                         return fail(e, b);
