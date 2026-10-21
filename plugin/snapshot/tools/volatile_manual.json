@@ -34,6 +34,11 @@
         "owner": "FalloutNV.esm:10C721",
         "name": "Time",
         "reason": "vDialogueGomorrahScript sets it to GameDaysPassed: a per-machine clock (two-copy enemy_fight 2026-10-21: host 6.333857, guest 5.959093)"
+      },
+      {
+        "owner": "FalloutNV.esm:059C85",
+        "name": "VATSTimer",
+        "reason": "CGTutorialSCRIPT VATS-tutorial message repeat timer: counts down on the machine that showed the message (in game 2026-10-21/22, enemy tests step 01: host 25, 22.95, 17.0, 5.0 over four runs, guest 0). A per-machine UI timer, not story state (the stage difference CGTutorial 70 is a separate desync)"
       }
     ],
     "fields": [

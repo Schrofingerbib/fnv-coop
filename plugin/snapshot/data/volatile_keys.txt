@@ -27,3 +27,4 @@ owner FalloutNV.esm:17912D   # VDLCPackQuest (manual add: DLC setup, run per mac
 field FalloutNV.esm:17912D running   # VDLCPackQuest (manual add: DLC setup, run per machine)
 field FalloutNV.esm:17912D stage   # VDLCPackQuest (manual add: DLC setup, run per machine)
 field FalloutNV.esm:17912D objectives   # VDLCPackQuest (manual add: DLC setup, run per machine)
+var FalloutNV.esm:059C85 vatstimer   # CGTutorial (manual add: tutorial message repeat timer, per machine)
