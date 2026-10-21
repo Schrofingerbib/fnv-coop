@@ -39,7 +39,8 @@ PLACEHOLDER_RE = re.compile(r"\{([A-Za-z][A-Za-z0-9_]*)\}")
 ON_NAMED = ("host", "guest", "all")
 
 # Engine objects that are not in forms.json.gz but whose ids are fixed by the game itself.
-BUILTIN = {"FalloutNV.esm:000014": ("REFR", "PlayerRef"), "FalloutNV.esm:00000F": ("MISC", "Caps001")}
+BUILTIN = {"FalloutNV.esm:000014": ("REFR", "PlayerRef"), "FalloutNV.esm:00000F": ("MISC", "Caps001"),
+           "FalloutNV.esm:08ED03": ("AMMO", "Ammo9mm")}   # no quest names it, so the questdata index lacks it; arms the fight bots
 
 REF_SIGS = {"REFR", "ACHR", "ACRE"}
 ACTOR_SIGS = {"ACHR", "ACRE"}
@@ -303,6 +304,8 @@ def validate(sc, name=None, root=QDATA, order=None):
         e("start.save is required (a save name, without .fos)")
     elif not re.fullmatch(r"[A-Za-z0-9_\-]+", start["save"]):
         e("start.save has odd characters")
+    if "prepared" in start and not isinstance(start["prepared"], bool):
+        e("start.prepared must be true or false (false = always load the plain start.save, not nvcoop_<save>_ready)")
 
     # forms glossary
     gl = sc.get("forms") or {}

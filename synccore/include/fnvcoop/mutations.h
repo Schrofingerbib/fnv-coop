@@ -49,6 +49,7 @@ struct Mutations {
     bool refCmdPlayerShared = false;  // a RefCommand on the player is shared with the whole party whatever the cause (a vending machine would pay everybody)
     bool refCmdAllState = false;      // RefCommand events are remembered like state ops (a late joiner replays them, an event fires twice)
     bool noGuestSuppression = false;  // guests keep script-originated effects (ghost-death double fire)
+    bool overfullShardRequest = false; // a digest repair asks for every bad shard at once (the client's reply is cut off, the drift beyond it is never fixed)
     // Host-load revert twins, one effect at a time (originsIgnored above switches all of them off at once). Bits of PreimageBit.
     uint32_t preimageOff = 0;
 };

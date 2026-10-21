@@ -29,6 +29,23 @@ from playbooks.questlines import model as QM, plan as QP  # noqa: E402
 from questsweep import checks, common, gen_plans, rules_overlay as RO, rulesview  # noqa: E402
 from questsweep.lines import LINES  # noqa: E402
 
+# The plans (questlines/<line>/playthrough.json) are generated from the game's own data files by gen_plans.py, so the public
+# repository does not ship them. Without them every test here would only report the missing files: skip with that reason.
+MISSING_PLANS = [l.slug for l in LINES if not os.path.exists(gen_plans.plan_path(l.slug))]
+
+
+def load_tests(loader, tests, pattern):
+    if not MISSING_PLANS:
+        return tests
+
+    class NoPlans(unittest.TestCase):
+        @unittest.skip(f"no playthrough plans for {len(MISSING_PLANS)} of {len(LINES)} lines: generate them from your game with "
+                       f"python -I tools/questsweep/gen_plans.py")
+        def test_needs_the_generated_plans(self):
+            pass
+    return loader.loadTestsFromTestCase(NoPlans)
+
+
 OPTS = {"fast": True, "anim": False, "ui_s": 0.2, "barrier_s": 0.2, "stage_s": 0.2, "handoff_s": 0.2, "spawn_s": 0.2, "settle_s": 0.3,
         "settle_poll_s": 0.0, "repo_root": REPO}
 _TMP = tempfile.mkdtemp(prefix="qs-tests-")

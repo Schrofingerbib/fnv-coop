@@ -178,6 +178,13 @@ private:
 // ignores them: they are stopped and joined by their owners, everything else running our code must have left it.
 std::vector<unsigned long> managedThreadIds();
 
+// A thread a core module owns but does not start through ManagedThread (a library's worker, e.g. the co-op session's ThreadWorker,
+// parked waiting for jobs inside our code). Its owner stops and joins it in its participant's shutdown, which runs after the drain,
+// so the drain ignores it like a ManagedThread. Without this every reload with a co-op session running was refused by the drain
+// (in game 2026-10-21: "thread ... is still inside the code that would be unloaded", the worker's wait on its queue).
+void adoptThread(unsigned long tid);
+void releaseThread(unsigned long tid);
+
 // Probe helpers.
 LeakProbe threadProbe();
 

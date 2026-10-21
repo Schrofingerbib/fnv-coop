@@ -1,6 +1,7 @@
 """Run every generated flight regression fixture in a directory through the replay program.
 
 Usage: python -I tools/flight/regress.py DIR --replay-cmd "build\\L4\\fnvcoop_replay.exe {fixture}"
+Fixtures of format "trace-1" (written by from_failure.py) replay in process, so --replay-cmd is only needed for the others.
 Prints one line per fixture and ALL OK when every fixture converges (exit 0). A fixture that diverges is a
 reproduced bug. A fixture whose "expect" says converges=false is expected to diverge (used by the mutation twin).
 """
@@ -12,6 +13,18 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shrink as S  # noqa: E402
+import trace_replay as TR  # noqa: E402
+
+
+def _replay(fx, oracle):
+    if fx.get("format") == TR.FORMAT:
+        try:
+            return TR.oracle(fx)
+        except TR.BadFixture as e:
+            raise S.OracleError(str(e))
+    if oracle is None:
+        raise S.OracleError("no --replay-cmd given for a non-trace fixture")
+    return oracle(fx)
 
 
 def run_dir(d, oracle):
@@ -22,7 +35,7 @@ def run_dir(d, oracle):
             fx = json.load(f)
         want = (fx.get("expect") or {}).get("converges", True)
         try:
-            r = oracle(fx)
+            r = _replay(fx, oracle)
         except S.OracleError as e:
             print("ERROR %s: %s" % (os.path.basename(p), e))
             bad += 1
@@ -39,10 +52,10 @@ def run_dir(d, oracle):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("dir")
-    ap.add_argument("--replay-cmd", required=True)
+    ap.add_argument("--replay-cmd")
     ap.add_argument("--tmpdir")
     args = ap.parse_args(argv)
-    n, bad = run_dir(args.dir, S.CommandOracle(args.replay_cmd, tmpdir=args.tmpdir))
+    n, bad = run_dir(args.dir, S.CommandOracle(args.replay_cmd, tmpdir=args.tmpdir) if args.replay_cmd else None)
     if n == 0:
         print("no fixtures found in " + args.dir)
         return 2

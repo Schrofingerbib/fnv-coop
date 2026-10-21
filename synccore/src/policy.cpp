@@ -22,6 +22,7 @@ uint64_t VolatileKeys::contentHash() const {
     for (auto& f : globals_) fold("g" + f.plugin + ":" + std::to_string(f.localId));
     for (auto& [f, n] : declaredNames_) fold("n" + f.plugin + ":" + std::to_string(f.localId) + ":" + n);
     for (auto& [f, k] : fields_) fold("f" + f.plugin + ":" + std::to_string(f.localId) + ":" + std::to_string(k));
+    for (auto& f : factions_) fold("r" + f.plugin + ":" + std::to_string(f.localId));
     return h;
 }
 
@@ -57,6 +58,8 @@ bool VolatileKeys::isVolatile(const Effect& e) const {
     if (auto* x = std::get_if<StopQuest>(&e)) return fields_.count({x->quest, kFieldRunning}) > 0;
     if (auto* x = std::get_if<SetStage>(&e)) return fields_.count({x->quest, kFieldStage}) > 0;
     if (auto* x = std::get_if<SetObjective>(&e)) return fields_.count({x->quest, kFieldObjectives}) > 0;
+    // a DLC setup script (GuestLocalRun) ranks each machine's own player in the DLC's player faction: per-machine by definition
+    if (auto* x = std::get_if<SetFactionRank>(&e)) return factions_.count(x->faction) > 0;
     return false;
 }
 
@@ -91,9 +94,9 @@ bool VolatileKeys::loadFromText(const std::string& text, std::string* err) {
         size_t pos = 1;
         FormRef f;
         if (!parseForm(t, pos, f)) return fail("bad form");
-        if (kind == "owner" || kind == "global") {
+        if (kind == "owner" || kind == "global" || kind == "faction") {
             if (pos != t.size()) return fail("trailing tokens");
-            if (kind == "owner") tmp.addOwner(f); else tmp.addGlobal(f);
+            if (kind == "owner") tmp.addOwner(f); else if (kind == "global") tmp.addGlobal(f); else tmp.addFaction(f);
         } else if (kind == "var") {
             if (pos + 1 != t.size()) return fail("expected one index or name");
             const std::string& v = t[pos];
@@ -121,6 +124,7 @@ bool VolatileKeys::loadFromText(const std::string& text, std::string* err) {
     names_.insert(tmp.names_.begin(), tmp.names_.end());
     declaredNames_.insert(tmp.names_.begin(), tmp.names_.end());
     fields_.insert(tmp.fields_.begin(), tmp.fields_.end());
+    factions_.insert(tmp.factions_.begin(), tmp.factions_.end());
     return true;
 }
 

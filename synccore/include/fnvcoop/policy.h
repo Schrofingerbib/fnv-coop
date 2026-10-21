@@ -45,9 +45,10 @@ public:
     void addOwner(const FormRef& owner) { owners_.insert(owner); }   // every var of this quest/ref
     void addGlobal(const FormRef& global) { globals_.insert(global); }
     void addField(const FormRef& quest, uint8_t field) { fields_.insert({quest, field}); }
-    void clear() { vars_.clear(); owners_.clear(); globals_.clear(); names_.clear(); declaredNames_.clear(); fromName_.clear(); fields_.clear(); }
+    void addFaction(const FormRef& faction) { factions_.insert(faction); }   // ranks in it are per-machine (DLC player factions)
+    void clear() { vars_.clear(); owners_.clear(); globals_.clear(); names_.clear(); declaredNames_.clear(); fromName_.clear(); fields_.clear(); factions_.clear(); }
     uint64_t contentHash() const;   // order-independent hash of every entry (handshake)
-    size_t size() const { return vars_.size() + owners_.size() + globals_.size() + names_.size() + fields_.size(); }
+    size_t size() const { return vars_.size() + owners_.size() + globals_.size() + names_.size() + fields_.size() + factions_.size(); }
     static constexpr uint8_t kFieldRunning = 1, kFieldStage = 2, kFieldObjectives = 3;
     // Named-variable entries ("var <form> <name>") become index entries once the engine can map names to indexes.
     // Returns how many were resolved; unresolved ones stay pending (see unresolvedNames()).
@@ -58,7 +59,7 @@ public:
     bool isVolatileVar(const FormRef& owner, uint16_t index) const;
     bool isVolatileGlobal(const FormRef& g) const;
     // Text format (shared with L7's out/snapshot/volatile_keys.txt), '#' comments, <form> = `Plugin.esm:HEX` or `Plugin.esm HEX`:
-    //   var <form> <index|name>   owner <form>   global <form>   field <form> running|stage|objectives
+    //   var <form> <index|name>   owner <form>   global <form>   field <form> running|stage|objectives   faction <form>
     // Whole-quest exclusion for story quests is the producer's job (L7's tool enforces it); `owner` here is for non-story owners.
     bool loadFromText(const std::string& text, std::string* err = nullptr);
 private:
@@ -68,6 +69,7 @@ private:
     std::set<std::pair<FormRef, std::string>> declaredNames_; // every named declaration ever loaded (stable handshake hash)
     std::set<std::pair<FormRef, uint16_t>> fromName_;         // vars_ entries that came from resolving a name
     std::set<std::pair<FormRef, uint8_t>> fields_;
+    std::set<FormRef> factions_;
 };
 VolatileKeys& volatileKeys();
 

@@ -36,7 +36,38 @@
         "reason": "vDialogueGomorrahScript sets it to GameDaysPassed: a per-machine clock (two-copy enemy_fight 2026-10-21: host 6.333857, guest 5.959093)"
       }
     ],
-    "fields": [],
+    "fields": [
+      {
+        "quest": "GunRunnersArsenal.esm:00093C",
+        "field": "running",
+        "reason": "NVDLC05MQ00: DLC setup quest (GuestLocalRun): each machine runs its own copy after a load (intro signal, level cap note, pack items); shared, it was reset on one machine and replayed all its message boxes on every load (two-copy fight test 2026-10-21: host stage 10, guest 0)"
+      },
+      {
+        "quest": "GunRunnersArsenal.esm:00093C",
+        "field": "stage",
+        "reason": "NVDLC05MQ00: DLC setup quest (GuestLocalRun): each machine runs its own copy after a load (intro signal, level cap note, pack items); shared, it was reset on one machine and replayed all its message boxes on every load (two-copy fight test 2026-10-21: host stage 10, guest 0)"
+      },
+      {
+        "quest": "GunRunnersArsenal.esm:00093C",
+        "field": "objectives",
+        "reason": "NVDLC05MQ00: DLC setup quest (GuestLocalRun): each machine runs its own copy after a load (intro signal, level cap note, pack items); shared, it was reset on one machine and replayed all its message boxes on every load (two-copy fight test 2026-10-21: host stage 10, guest 0)"
+      },
+      {
+        "quest": "FalloutNV.esm:17912D",
+        "field": "running",
+        "reason": "VDLCPackQuest: DLC setup quest (GuestLocalRun): each machine runs its own copy after a load (intro signal, level cap note, pack items); shared, it was reset on one machine and replayed all its message boxes on every load (two-copy fight test 2026-10-21: host stage 10, guest 0)"
+      },
+      {
+        "quest": "FalloutNV.esm:17912D",
+        "field": "stage",
+        "reason": "VDLCPackQuest: DLC setup quest (GuestLocalRun): each machine runs its own copy after a load (intro signal, level cap note, pack items); shared, it was reset on one machine and replayed all its message boxes on every load (two-copy fight test 2026-10-21: host stage 10, guest 0)"
+      },
+      {
+        "quest": "FalloutNV.esm:17912D",
+        "field": "objectives",
+        "reason": "VDLCPackQuest: DLC setup quest (GuestLocalRun): each machine runs its own copy after a load (intro signal, level cap note, pack items); shared, it was reset on one machine and replayed all its message boxes on every load (two-copy fight test 2026-10-21: host stage 10, guest 0)"
+      }
+    ],
     "globals": []
   }
 }

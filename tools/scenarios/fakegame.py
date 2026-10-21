@@ -8,6 +8,7 @@ The console behaves like the game's (in game, 2026-10-21): "<hex>.Func" fails wi
 "player.Func" works, and a line for another reference runs as exec(cmd, ref=<hex>) / eval(expr, ref=<hex>).
 """
 import re
+from pathlib import Path
 
 HEX = r"([0-9A-Fa-f]{8})"
 
@@ -31,6 +32,13 @@ class World:
         self.nplayers = 2
         self.loads = []
         self.saves = {}
+        self.sim = None                # CoopSim: answers coop.status when set (else the fake has no co-op module)
+        self.box_offsets = None        # seconds after a load at which each message box appears, e.g. [2, 3, 4, 5, 18, ...]
+        self.box_loaded_at, self.box_pressed = {}, {}
+        self.clean_saves = set()       # saves written after all boxes were pressed: loading them raises none
+        self.saves_root = None         # a folder: save_game writes <root>/<instance>/<name>.fos there (an empty file)
+        self.refuse_loads = set()      # save names the game refuses to load (RpcError)
+        self.save_log = []             # (instance, name) of every save_game
         self.reset_world()
         self.calls = []                # (player, kind, text)
 
@@ -187,6 +195,13 @@ class FakeNv:
             w.stage[w.flags["vcg02"]] = 25
             w.stage_done.setdefault(w.flags["vcg02"], set()).add(25)
             return {"said": True}
+        if method == "coop.status" and w.sim is not None:
+            return w.sim.status(i, self.clock.now())
+        if method == "bot.menu" and w.box_offsets is not None:
+            return {"kind": "message" if self._open_boxes() > 0 else "none"}
+        if method == "bot.menu.press" and w.box_offsets is not None and self._open_boxes() > 0:
+            w.box_pressed[i] = w.box_pressed.get(i, 0) + 1
+            return {"pressed": True}
         if method == "bot.menu.press":
             w.pending_confirm = params["button"] == 1
             return {"pressed": True}
@@ -206,21 +221,49 @@ class FakeNv:
             return {"ok": True}
         raise RuntimeError("fake has no method %s" % method)
 
+    def _open_boxes(self):
+        """Message boxes that have appeared since this copy loaded and are not pressed yet (a box stays up until pressed)."""
+        w = self.w
+        if self.i not in w.box_loaded_at:
+            return 0
+        shown = sum(1 for off in w.box_offsets if off <= self.clock.now() - w.box_loaded_at[self.i])
+        return max(0, shown - w.box_pressed.get(self.i, 0))
+
     def wait_stage(self, q, stage, timeout_ms=0):
         return {"satisfied": True}
 
     def load_save(self, name, timeout_ms=0):
         self._log("load", name)
+        if name in self.w.refuse_loads:
+            from nvbridge import RpcError
+            raise RpcError(-32000, "load failed: no such save %s" % name, "loadSave")
         self.w.loads.append((self.i, name))
         self.w.reset_world()
         snap = self.w.saves.get(name)
         if snap:
             self.w.stage, self.w.stage_done = dict(snap[0]), {k: set(v) for k, v in snap[1].items()}
+        if self.w.box_offsets is not None:   # a clean save raises no boxes; every other save raises all of them again
+            self.w.box_loaded_at[self.i] = self.clock.now()
+            self.w.box_pressed[self.i] = 0
+            if name in self.w.clean_saves and not self.w.flags.get("boxes_persist"):
+                self.w.box_loaded_at.pop(self.i)
+        if self.w.sim is not None:
+            self.w.sim.on_load(self.clock.now())
         return {"loaded": True}
 
     def save_game(self, name, timeout_ms=0, overwrite=False):
         self._log("save", name)
         self.w.saves[name] = (dict(self.w.stage), {k: set(v) for k, v in self.w.stage_done.items()})
+        if self.w.box_offsets is not None:
+            # clean = every box of this copy has appeared and was pressed (a box that is still to come would be missing from the save)
+            done = self.w.box_loaded_at.get(self.i) is None or (
+                self.w.box_pressed.get(self.i, 0) >= len(self.w.box_offsets) and self._open_boxes() == 0)
+            (self.w.clean_saves.add if done else self.w.clean_saves.discard)(name)
+        self.w.save_log.append((self.i, name))
+        if self.w.saves_root is not None:
+            d = Path(self.w.saves_root) / str(self.i)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / (name + ".fos")).write_bytes(b"fos")
         return {"saved": True}
 
 
@@ -228,3 +271,61 @@ def make(n=2, **flags):
     w = World(**flags)
     clock = Clock()
     return w, clock, [FakeNv(w, i, clock) for i in range(n)]
+
+
+class CoopSim:
+    """coop.status of a host (instance 0) and clients (the others), as a function of the time since the last load.
+
+    join_at: s until the clients have joined; catch_up_s: s until they applied the host head; digests start at digest_from and then one
+    arrives every `every` s. digests picks the host's judgement of them:
+      "ok" every digest ok | "mismatch_same" every digest mismatches on the same keys and the repair never fixes it |
+      "mismatch_once" the first digest mismatches (a repair), the rest are ok | "stale" every digest is stale | "silent" none arrives |
+      "mismatch_moving" every digest mismatches on other keys (the repairs make progress, so it is not given up on)
+    stuck_at: client applied stops at this count (None = catches up). rejected: the clients refuse the join. disconnected: their
+    transport is down. joined=False: they never join."""
+
+    def __init__(self, join_at=2.0, catch_up_s=4.0, head=100, digest_from=6.0, every=2.0, digests="ok", stuck_at=None,
+                 rejected=False, disconnected=False, joined=True):
+        self.join_at, self.catch_up_s, self.head, self.digest_from, self.every = join_at, catch_up_s, head, digest_from, every
+        self.digests, self.stuck_at, self.rejected, self.disconnected, self.joined = digests, stuck_at, rejected, disconnected, joined
+        self.t0 = 0.0
+
+    def on_load(self, t):
+        self.t0 = t
+
+    def _digests(self, t):
+        n = max(0, int((t - self.t0 - self.digest_from) / self.every) + 1) if t - self.t0 >= self.digest_from else 0
+        d = dict(received=0, ok=0, mismatch=0, rateLimited=0, stale=0, repairs=0, effectsRepaired=0, deferredByBudget=0)
+        reports = []
+        if self.digests == "silent":
+            return d, reports
+        d["received"] = n
+        if self.digests == "ok":
+            d["ok"] = n
+        elif self.digests in ("mismatch_same", "mismatch_moving"):
+            d["mismatch"] = d["repairs"] = n
+            for k in range(1, n + 1):
+                key = "actor:00104C70.dead" if self.digests == "mismatch_same" else "actor:00104C%02X.dead" % k
+                reports.append({"id": k, "repaired": False, "entries": [{"key": key, "host": "1", "client": "0"}]})
+        elif self.digests == "mismatch_once":
+            d["mismatch"] = d["repairs"] = min(n, 1)
+            d["ok"] = max(0, n - 1)
+            if n:
+                reports.append({"id": 1, "repaired": True, "entries": [{"key": "quest:0010A214.stage", "host": "25", "client": "0"}]})
+        elif self.digests == "stale":
+            d["stale"] = n
+        return d, reports
+
+    def status(self, i, t):
+        dt = t - self.t0
+        if i == 0:
+            d, reports = self._digests(t)
+            return {"role": "host", "host": {"lastSeq": self.head}, "desyncs": {"digests": d, "desyncs": reports}}
+        applied = -1
+        if dt >= self.join_at:
+            applied = min(self.head, int((dt - self.join_at) / self.catch_up_s * self.head))
+            if self.stuck_at is not None:
+                applied = min(applied, self.stuck_at)
+        return {"role": "client", "transport": {"connected": not self.disconnected},
+                "client": {"joined": self.joined and dt >= self.join_at, "syncing": False, "applied": applied,
+                           "rejected": self.rejected, "rejectText": "version mismatch" if self.rejected else ""}}

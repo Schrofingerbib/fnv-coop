@@ -1,6 +1,6 @@
 @echo off
 rem One-command T3b reload tests (x86), using the SHARED build tree (build\all, tools\build\build.py: build lock + MSVC env):
-rem   1. registry unit tests  (nvreload_unit):      real must pass; twins FNVCOOP_MUT=1..8 must each fail
+rem   1. registry unit tests  (nvreload_unit):      real must pass; twins FNVCOOP_MUT=1..8 and 15 (adoptThread ignored) must each fail
 rem   2. drain unit tests     (nvreload_drain):     real must pass; twins 7,8,10..14 must each fail
 rem        (7 no drain, 8 instruction pointer only, 10 timeout counts as success, 11 ignore list not honoured,
 rem         12 only the first thread inspected, 13 no waiting, 14 JSON not escaped)
@@ -17,7 +17,7 @@ set "OUT=%REPO%\out\T3b"
 set "SCR=%OUT%\tmp"
 if not exist "%SCR%" mkdir "%SCR%"
 "%PYTHON%" -I "%REPO%\tools\build\build.py" --target nvreload_unit nvreload_drain nvreload_host_test nvtestcore --label "T3b reload" || (echo BUILD FAILED & exit /b 1)
-"%PYTHON%" -I "%REPO%\tools\mut\run_twins.py" --label "T3b registry" --twins 1-8 --real-regex ", 0 failed" --caught-regex ", [1-9][0-9]* failed" -- "%OUT%\nvreload_unit.exe" || exit /b 1
+"%PYTHON%" -I "%REPO%\tools\mut\run_twins.py" --label "T3b registry" --twins 1-8,15 --real-regex ", 0 failed" --caught-regex ", [1-9][0-9]* failed" -- "%OUT%\nvreload_unit.exe" || exit /b 1
 "%PYTHON%" -I "%REPO%\tools\mut\run_twins.py" --label "T3b drain" --twins 7,8,10-14 --real-regex ", 0 failed" --caught-regex ", [1-9][0-9]* failed" -- "%OUT%\nvreload_drain.exe" || exit /b 1
 "%PYTHON%" -I "%REPO%\tools\mut\run_twins.py" --label "T3b host" --twins 1-9 --real-regex ", 0 failed" --timeout 1200 --jobs 2 -- "%OUT%\nvreload_host_test.exe" "%OUT%\nvtestcore.dll" "%SCR%\host_{n}" || exit /b 1
 rem Loader twins 25 (noconfig) and 26 (configonce) of plugin/loader/loader_host.cpp: the same host test, real core, config not copied to the

@@ -65,6 +65,12 @@ class ActionResult:
     def __bool__(self) -> bool:
         return self.ok
 
+    @property
+    def code(self) -> str:
+        """The short failure code ('stuck', 'timeout', 'too_close', ...). `reason` is 'code: what the bot saw' when the action could say why,
+        so compare codes with this, never with the whole reason."""
+        return self.reason.split(":", 1)[0]
+
     def __str__(self) -> str:
         return f"{self.action}: {'ok' if self.ok else 'FAILED ' + self.reason} ({self.elapsed_s:.2f}s) {self.data or ''}"
 
@@ -76,9 +82,12 @@ class ActionFailed(Exception):
 
 
 class _Fail(Exception):
-    def __init__(self, reason: str, **data: Any):
-        super().__init__(reason)
-        self.reason = reason
+    def __init__(self, reason: str, say: str = "", **data: Any):
+        """`reason` is the short code. `say` is what the bot saw (distance left, a menu in the way, ammo): the result's reason
+        becomes 'code: say', which is the text a playbook prints when its step fails."""
+        full = f"{reason}: {say}" if say else reason
+        super().__init__(full)
+        self.reason = full
         self.data = data
 
 
@@ -103,6 +112,8 @@ class Bot:
         self.strict = strict
         self.speed = speed          # units per second while walking
         self.step_s = step_s        # seconds between position steps
+        self.auto_dismiss = False   # fire() presses away a message box first (playbooks turn it on; proofs report boxes instead)
+        self.ammo_item: Optional[Ref] = None   # the equipped weapon's ammo form: set it and fire() reports the reserve count before and after
         self.clock = clock or getattr(nv, "clock", None) or RealClock()
         self._plugins: Optional[List[str]] = None
         self._input: Optional[bool] = None
@@ -179,6 +190,13 @@ class Bot:
             return self.nv.eval(expr.cmd) if expr.ref is None else self.nv.eval(expr.cmd, ref=expr.ref)
         return self.nv.eval(expr)
 
+    def _optional_eval(self, expr: Union[str, P.Line]) -> Optional[float]:
+        """_eval for a check that is only a diagnostic: None when the game (or a fake) cannot evaluate it."""
+        try:
+            return self._eval(expr)
+        except Exception:  # noqa: BLE001
+            return None
+
     def _optional_call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Call a dev-only bridge method; None if the plugin does not have it."""
         try:
@@ -210,6 +228,78 @@ class Bot:
             if self.clock.monotonic() >= end:
                 return False
             self.clock.sleep(poll_s)
+
+    # ------------------------------------------------------------------ say why
+    # A failed input action names its cause: the distance left, the menu that ate the input, the weapon and the ammo. These reads only
+    # look (bot.menu, an expression); they never press, dismiss or move anything, so a proof that did not opt in still leaves boxes alone.
+    def _menu_note(self) -> Dict[str, Any]:
+        """What the game shows now: {menu: kind, menu_open: bool, msgs_queued?: n}; {} when bot.menu is missing or cannot answer.
+        msgs_queued = boxes still waiting in the engine queue (msgCount - msgIdx of bot.menu)."""
+        try:
+            m = self._optional_call(P.M_BOT_MENU)
+        except ConnectionLost:
+            raise
+        except (RpcError, BridgeError):
+            return {}
+        if not m:
+            return {}
+        kind = str(m.get("kind", "?"))
+        note: Dict[str, Any] = {"menu": kind, "menu_open": kind not in P.MENU_FREE}
+        if "id" in m:
+            note["menu_id"] = m["id"]
+        if "msgCount" in m:
+            left = max(0, int(m["msgCount"]) - int(m.get("msgIdx", 0)))
+            if left:
+                note["msgs_queued"] = left
+        return note
+
+    def _menu_blocks(self) -> bool:
+        """True when a menu that stops the player is up (P.MENU_BLOCKING; an unknown 'other' menu does not count)."""
+        return self._menu_note().get("menu") in P.MENU_BLOCKING
+
+    @staticmethod
+    def _menu_words(note: Dict[str, Any]) -> str:
+        """The menu part of a failure text: 'no menu is open', 'a message box is up (3 queued)', 'the terminal menu is open'."""
+        kind = note.get("menu")
+        if kind is None:
+            return "menu state unknown"
+        if not note.get("menu_open"):
+            return "no menu is open"
+        if kind == "message":
+            q = note.get("msgs_queued")
+            return "a message box is up" + (f" ({q} queued)" if q else "") + " and eats the input"
+        if kind in P.MENU_BLOCKING:
+            return f"the {kind} menu is open and eats the input"
+        return f"the {kind} menu is open" + (f" (id {note['menu_id']:#x})" if isinstance(note.get("menu_id"), int) else "")
+
+    def _weapon_note(self) -> Dict[str, Any]:
+        """{weapon_out, weapon_equipped}: only the keys the game could answer. Both are diagnostics (UNVERIFIED expressions)."""
+        out: Dict[str, Any] = {}
+        drawn = self._optional_eval(P.is_weapon_out())
+        if drawn is not None:
+            out["weapon_out"] = drawn != 0
+        slot = self._optional_eval(P.equipped_weapon())
+        if slot is not None:
+            out["weapon_equipped"] = slot != 0
+        return out
+
+    def _ammo_now(self) -> Optional[int]:
+        """The reserve count of ammo_item (the loaded clip is not in it, so a shot can leave it unchanged until a reload); None when unknown."""
+        if self.ammo_item is None:
+            return None
+        v = self._optional_eval(P.item_count("player", self._item(self.ammo_item)))
+        return None if v is None else int(v)
+
+    def _clear_message_boxes(self) -> None:
+        """Opt-in pre-flight shared by the input actions: with auto_dismiss, press away a message box that would eat the input.
+        Does nothing (not even a bot.menu read) when auto_dismiss is off."""
+        if self.auto_dismiss and self.has_input_driver():
+            # a message box (a script's ShowMessage, the DLC notices) keeps the game in menu mode and eats every Attack and Activate pulse
+            if (self._optional_call(P.M_BOT_MENU) or {}).get("kind") == "message":
+                d = self.dismiss_messages(quiet_s=0.0, max_s=15.0)
+                if not d.ok:
+                    raise _Fail("menu", say="a message box is up and would not close: " + d.reason, why="a message box is up and would not close",
+                                dismiss=d.reason)
 
     # ------------------------------------------------------------------ queries
     def pos(self, ref: Optional[Ref] = None) -> Pos:
@@ -298,16 +388,21 @@ class Bot:
                 tol = max(radius, 250.0) if is_ref else radius
                 d = dist(self.pos(), self.target_pos(target))
                 if d > tol:
-                    raise _Fail("postcondition", distance=d, wanted=tol)
+                    raise _Fail("postcondition", say=f"{d:.0f} units from the target after the teleport (wanted within {tol:g})", distance=d, wanted=tol)
                 return {"distance": d}
             if mode == "input" and not self.has_input_driver():
                 raise _Fail("unsupported", need="bot.move (ini [dev] bots=1)")
             use_input = mode == "input" or (mode == "walk" and self.has_input_driver())
             data = self._walk_input(target, radius, timeout_s) if use_input else self._walk_step(target, radius, timeout_s)
             if is_ref and self.cell(target) != self.cell():
-                raise _Fail("postcondition", why="different cell on arrival")
+                raise _Fail("postcondition", say="arrived in a different cell than the target", why="different cell on arrival")
             return data
         return self._act("goto", run)
+
+    def _walk_fail(self, code: str, d: float, radius: float, **data: Any) -> _Fail:
+        """A walk that did not arrive: how far it still was and whether a menu is open (a message box eats Forward, so the avatar stands still)."""
+        note = self._menu_note()
+        return _Fail(code, say=f"{d:.0f} units left (wanted within {radius:g}), {self._menu_words(note)}", distance=d, **note, **data)
 
     def _walk_step(self, target: Target, radius: float, timeout_s: float) -> Dict[str, Any]:
         end = self.clock.monotonic() + timeout_s
@@ -319,7 +414,7 @@ class Bot:
             if d <= radius:
                 return {"distance": d, "via": "step"}
             if self.clock.monotonic() >= end:
-                raise _Fail("timeout", distance=d)
+                raise self._walk_fail("timeout", d, radius)
             step = min(self.speed * self.step_s, d - radius * 0.5)
             f = step / d
             nxt = (cur[0] + (dest[0] - cur[0]) * f, cur[1] + (dest[1] - cur[1]) * f, cur[2] + (dest[2] - cur[2]) * f)
@@ -329,7 +424,7 @@ class Bot:
             if dist(self.pos(), cur) < 1.0:
                 stuck += 1
                 if stuck >= 4:
-                    raise _Fail("stuck", at=tuple(cur), distance=d)
+                    raise self._walk_fail("stuck", d, radius, at=tuple(cur))
             else:
                 stuck = 0
 
@@ -348,7 +443,7 @@ class Bot:
                 if d <= radius:
                     return {"distance": d, "via": "input", "unstick": tries}
                 if self.clock.monotonic() >= end:
-                    raise _Fail("timeout", distance=d, unstick=tries)
+                    raise self._walk_fail("timeout", d, radius, unstick=tries)
                 want, _ = heading_deg(cur, dest)
                 delta = (want - yaw + 180.0) % 360.0 - 180.0
                 maxturn = turn_dps * self.step_s
@@ -359,9 +454,11 @@ class Bot:
                 if self.clock.monotonic() - w_start >= window_s:
                     moved = dist(self.pos(), w_pos)
                     if moved < 0.25 * 200.0 * window_s and abs(delta) < 45.0:
+                        if self._menu_blocks():   # standing still under a menu: sidesteps and jumps cannot help, say so now
+                            raise self._walk_fail("stuck", d, radius, at=tuple(cur), unstick=tries)
                         tries += 1
                         if tries > 4:
-                            raise _Fail("stuck", at=tuple(cur), distance=d, unstick=tries)
+                            raise self._walk_fail("stuck", d, radius, at=tuple(cur), unstick=tries)
                         if tries % 2:  # sidestep one way, later the other
                             side = 1 if (tries // 2) % 2 == 0 else -1
                             self.nv.call(P.M_BOT_MOVE, {"forward": 1, "strafe": side, "run": True})
@@ -438,12 +535,14 @@ class Bot:
         return self._act("sneak_toggle", run)
 
     def activate_crosshair(self) -> ActionResult:
-        """Press Activate on whatever the crosshair is on (aim with look first). Engine key path, like a real key press."""
+        """Press Activate on whatever the crosshair is on (aim with look first). Engine key path, like a real key press.
+        data carries the menu state after the press (a box that ate it shows as menu 'message'); with auto_dismiss a box is pressed away first."""
         def run():
             self._need_driver()
+            self._clear_message_boxes()
             self.nv.call(P.M_BOT_ACTIVATE)
             self.clock.sleep(0.3)
-            return {"verified": False}
+            return {"verified": False, **self._menu_note()}
         return self._act("activate_crosshair", run)
 
     def follow(self, target: Ref, keep: float = 150.0, duration_s: float = 10.0) -> ActionResult:
@@ -454,7 +553,7 @@ class Bot:
                 d = dist(self.pos(), self.pos(target))
                 if d > keep:
                     r = self.goto(target, radius=keep * 0.8, timeout_s=max(1.0, end - self.clock.monotonic()))
-                    if not r.ok and r.reason != "timeout":
+                    if not r.ok and r.code != "timeout":
                         raise _Fail(r.reason, **r.data)
                 else:
                     self.clock.sleep(self.step_s)
@@ -498,26 +597,42 @@ class Bot:
             return {"item": h}
         return self._act("unequip", run)
 
-    def aim_at(self, ref: Ref, tolerance_deg: float = 3.0, eye_height: float = 120.0, target_height: float = 60.0) -> ActionResult:
-        """Set view angles toward `ref`. Post: the player's angles read back within tolerance."""
+    def aim_at(self, ref: Ref, tolerance_deg: float = 3.0, eye_height: float = 120.0, target_height: float = 60.0,
+               min_dist: float = 100.0, max_pitch: float = 80.0) -> ActionResult:
+        """Set view angles toward `ref`. Post: the player's angles read back within tolerance.
+        Refuses, with the reason, a target closer than `min_dist` units (a player standing inside the target aims at the floor, every
+        shot misses) or one that needs more than `max_pitch` degrees of pitch (straight up or down). Codes: too_close, pitch."""
         def run():
             me = self.pos()
             tp = self.pos(ref)
+            d = dist(me, tp)
+            if d < min_dist:
+                raise _Fail("too_close", say=f"the player is {d:.0f} units from the target (minimum {min_dist:g}); standing inside it "
+                                             "aims at the floor, step back first", distance=d, min_dist=min_dist)
             z, x = heading_deg((me[0], me[1], me[2] + eye_height), (tp[0], tp[1], tp[2] + target_height))
+            if abs(x) > max_pitch:
+                raise _Fail("pitch", say=f"aiming at the target needs {x:.0f} degrees of pitch (limit {max_pitch:g}), distance {d:.0f}, "
+                                         f"height difference {tp[2] + target_height - me[2] - eye_height:.0f}", pitch=x, distance=d, max_pitch=max_pitch)
             self._exec(P.setangle("Z", z), "setangle")
             self._exec(P.setangle("X", x), "setangle")
             gz = self._eval(P.get_angle("Z"))
             gx = self._eval(P.get_angle("X"))
             if angle_diff(gz, z) > tolerance_deg or angle_diff(gx, x) > tolerance_deg:
-                raise _Fail("postcondition", wanted=(z, x), got=(gz, gx))
-            return {"z": z, "x": x}
+                note = self._menu_note()
+                raise _Fail("postcondition", say=f"asked for angles Z {z:.1f} X {x:.1f}, the game reports Z {gz:.1f} X {gx:.1f}; {self._menu_words(note)}",
+                            wanted=(z, x), got=(gz, gx), **note)
+            return {"z": z, "x": x, "distance": d}
         return self._act("aim_at", run)
 
     def fire(self, ref: Optional[Ref] = None, shots: int = 1, expect_hit: bool = False) -> ActionResult:
         """Fire the equipped weapon. With `ref`: aim first and refuse a dead target. expect_hit=True requires the
-        target's health to drop. Without bridge method bot.fire this falls back to a console line that cannot report ammo."""
+        target's health to drop. Without bridge method bot.fire this falls back to a console line that cannot report ammo.
+        A failure says why: the menu in the way, whether the weapon is drawn and equipped, and (with `ammo_item` set, or the bridge's own
+        `ammo` in its reply) the ammo before and after, all in data and in the reason. data['ammo_before'] / ['ammo_after'] are reserve counts."""
         def run():
             before = None
+            ammo_before: Optional[int] = None
+            ammo_after: Optional[int] = None
             if ref is not None:
                 if not self.alive(ref):
                     raise _Fail("dead", ref=str(ref))
@@ -525,6 +640,33 @@ class Bot:
                 if not a.ok:
                     raise _Fail(a.reason, **a.data)
                 before = self.health(ref)
+            self._clear_message_boxes()
+            ammo_before = self._ammo_now()
+
+            def ammo_text() -> str:
+                if ammo_before is None and ammo_after is None:
+                    return ""
+                return f"ammo {'?' if ammo_before is None else ammo_before} -> {'?' if ammo_after is None else ammo_after}"
+
+            def ammo_data() -> Dict[str, Any]:
+                return {k: v for k, v in (("ammo_before", ammo_before), ("ammo_after", ammo_after)) if v is not None}
+
+            def diagnosis() -> Tuple[str, Dict[str, Any]]:
+                """(text, data) for a shot that did nothing: menu, weapon drawn / equipped, ammo."""
+                nonlocal ammo_after
+                ammo_after = self._ammo_now()
+                note = self._menu_note()
+                weapon = self._weapon_note()
+                parts = [self._menu_words(note)]
+                if "weapon_out" in weapon:
+                    parts.append("weapon drawn" if weapon["weapon_out"] else "weapon holstered")
+                if weapon.get("weapon_equipped") is False:
+                    parts.append("no weapon equipped")
+                at = ammo_text()
+                if at:
+                    parts.append(at)
+                return "; ".join(parts), {**note, **weapon, **ammo_data()}
+
             r = self._optional_call(P.M_BOT_FIRE, {"shots": shots, **({"ref": self._norm(ref)[0]} if ref is not None else {})})
             data: Dict[str, Any] = {}
             if r is None:
@@ -534,18 +676,33 @@ class Bot:
                 data["verified_shots"] = False
             else:
                 n = int(r.get("fired", r.get("queued", 0)))
+                if "ammo" in r:
+                    data["ammo"] = r["ammo"]    # the bridge's own count after the shots
                 if n < shots:
-                    raise _Fail("postcondition", why="fewer shots fired", fired=n, wanted=shots)
+                    text, extra = diagnosis()
+                    raise _Fail("postcondition", say=f"the bridge fired {n} of {shots} shots; {text}", why="fewer shots fired", fired=n,
+                                wanted=shots, **extra)
                 if "queued" in r:  # input driver: the pulses are played out over the next frames
                     if not self._poll(lambda: int(self.nv.call(P.M_BOT_STATUS).get("shotsLeft", 0)) == 0, shots * 0.5 + 3.0):
-                        raise _Fail("timeout", why="shots still queued")
+                        text, extra = diagnosis()
+                        raise _Fail("timeout", say=f"shots still queued after {shots * 0.5 + 3.0:g} s; {text}", why="shots still queued", **extra)
                     self.clock.sleep(0.3)
+                    # post-flight: an Attack pulse that reached the game drew the weapon; still holstered means no shot was taken
+                    out = self._optional_eval(P.is_weapon_out())
+                    if out is not None and out == 0:
+                        text, extra = diagnosis()
+                        raise _Fail("postcondition", say=f"weapon still holstered after the shots, the pulses never reached the game; {text}",
+                                    why="weapon still holstered after the shots: the pulses never reached the game", **extra)
                 data["fired"] = n
+            ammo_after = self._ammo_now()
+            data.update(ammo_data())
             if expect_hit:
                 if before is None:
                     raise _Fail("bad_args", why="expect_hit needs ref")
                 if not self._poll(lambda: self.health(ref) < before or not self.alive(ref), 3.0):
-                    raise _Fail("postcondition", why="target health did not drop", health=before)
+                    text, extra = diagnosis()
+                    raise _Fail("postcondition", say=f"target health did not drop (stayed {before:g}); {text}", why="target health did not drop",
+                                health=before, **extra)
                 data["health"] = self.health(ref)
             return data
         return self._act("fire", run)
@@ -770,7 +927,14 @@ class Bot:
         """Activate a ref as the player. Post: the engine accepted it. Use open/pickup/talk for state checks."""
         def run():
             self._info(ref)  # not_found if the ref is not loaded
-            self._do_activate(ref)
+            self._clear_message_boxes()
+            try:
+                self._do_activate(ref)
+            except _Fail as f:
+                if f.reason != "activate_failed":
+                    raise
+                note = self._menu_note()
+                raise _Fail("activate_failed", say=f"the engine did not accept the activation; {self._menu_words(note)}", **f.data, **note)
             return {}
         return self._act("activate", run)
 
@@ -795,7 +959,9 @@ class Bot:
             if m is None:
                 raise _Fail("unsupported", need=P.M_BOT_MENU, why="cannot verify a container/terminal menu opened")
             if not self._poll(lambda: (self._optional_call(P.M_BOT_MENU) or {}).get("kind") in ("container", "terminal"), timeout_s):
-                raise _Fail("postcondition", menu=m.get("kind"))
+                note = self._menu_note()
+                raise _Fail("postcondition", say=f"the container or terminal menu did not open; {self._menu_words(note)}",
+                            **{"menu": m.get("kind"), **note})
             return {"menu": self._optional_call(P.M_BOT_MENU).get("kind")}
         return self._act("open", run)
 
@@ -889,9 +1055,13 @@ class Bot:
                 raise _Fail("dead", ref=str(npc))
             if self.dialogue_open():
                 raise _Fail("already_in_dialogue")
+            self._clear_message_boxes()
             self._do_activate(npc)
             if not self._poll(self.dialogue_open, timeout_s):
-                raise _Fail("postcondition", why="dialogue menu did not open")
+                note = self._menu_note()
+                d = dist(self.pos(), self.pos(npc))
+                raise _Fail("postcondition", say=f"the dialogue menu did not open; the NPC is {d:.0f} units away, {self._menu_words(note)}",
+                            why="dialogue menu did not open", distance=d, **note)
             return {}
         return self._act("talk", run)
 

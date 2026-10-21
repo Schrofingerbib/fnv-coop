@@ -150,6 +150,9 @@ void ReadInto(const BaselineDumpOptions* o, BaselineInput* in, Filter* flt) {
 	for (auto it = dh->factionList.Begin(); !it.End(); ++it) {
 		TESFaction* f = it.Get();
 		if (!f) continue;
+		// per-machine factions (volatile list: DLC player factions ranked by each machine's own setup script) are never baselined,
+		// or the digest of this world never matches the host's and every round is a mismatch with nothing to repair
+		if (fnvcoop::volatileKeys().isVolatile(fnvcoop::Effect(fnvcoop::SetFactionRank{fnvcoop::FormRef(), Fr(Ref(f->refID)), 0}))) continue;
 		auto r = ranks.find(f->refID);
 		BaselineFactionIn b;
 		b.faction = Ref(f->refID);

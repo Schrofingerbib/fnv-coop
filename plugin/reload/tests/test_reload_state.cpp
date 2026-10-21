@@ -1,5 +1,6 @@
 // Game-free tests for the reload state registry. Exit code != 0 on any failure.
 // Built once (FNVCOOP_RUNTIME_MUT); run once for real and once per FNVCOOP_MUT=1..8; every twin MUST fail.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -335,6 +336,23 @@ TEST(managed_threads_stop_and_are_counted) {
     CHECK(liveThreads() == base);
 }
 
+TEST(an_adopted_thread_is_ignored_by_the_drain_until_released) {
+    // the co-op session's ThreadWorker is a plain std::thread: adopted, the drain skips it like a ManagedThread (in game 2026-10-21 every
+    // reload with a session running was refused because the worker waits on its queue inside the core)
+    auto has = [](unsigned long tid) { auto v = managedThreadIds(); return std::find(v.begin(), v.end(), tid) != v.end(); };
+    const unsigned long tid = 0x7FFF1234ul;
+    CHECK(!has(tid));
+    adoptThread(tid);
+    adoptThread(tid);   // twice: still one entry
+    CHECK(has(tid));
+    auto v = managedThreadIds();
+    CHECK(std::count(v.begin(), v.end(), tid) == 1);
+    releaseThread(tid);
+    CHECK(!has(tid));
+    adoptThread(0);     // no thread: nothing adopted
+    CHECK(!has(0));
+}
+
 TEST(a_hundred_reload_cycles_keep_state_and_leak_nothing) {
     Registry reg;
     Mod a{"session", 1, 50}, b{"ui", 1, 80};
@@ -389,6 +407,7 @@ int main() {
     run("shutdown_runs_in_reverse_order_and_survives_a_throwing_participant", shutdown_runs_in_reverse_order_and_survives_a_throwing_participant);
     run("leak_probes_are_read_after_shutdown_and_report_the_leak", leak_probes_are_read_after_shutdown_and_report_the_leak);
     run("managed_threads_stop_and_are_counted", managed_threads_stop_and_are_counted);
+    run("an_adopted_thread_is_ignored_by_the_drain_until_released", an_adopted_thread_is_ignored_by_the_drain_until_released);
     run("a_hundred_reload_cycles_keep_state_and_leak_nothing", a_hundred_reload_cycles_keep_state_and_leak_nothing);
     std::printf("%d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

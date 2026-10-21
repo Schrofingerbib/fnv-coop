@@ -25,6 +25,11 @@ for %%N in (1 2) do (
   echo   twin %%N killed
 )
 set "COOP_LEAVE_MUTANT="
+echo === guest presence reports never run as activations (twin 7) ===
+set "FNVCOOP_MUT=7"
+"%REPO%\out\L10\coop_tests.exe" >nul 2>&1
+if !errorlevel! EQU 0 ( echo TWIN SURVIVED: FNVCOOP_MUT=7 & exit /b 1 )
+echo   twin 7 killed
 set "FNVCOOP_MUT="
 echo === two-process integration + mutation twins (FNVCOOP_MUT=1..4 peers) ===
 "%PYTHON%" -I "%~dp0tests\test_integration.py" || exit /b 1

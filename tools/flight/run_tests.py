@@ -3,6 +3,7 @@
   (default)   fast tests only, under 20 s
   --full      also the slow shrink/generation/CLI tests and the mutation twin
   --no-twin   with --full: skip the mutation twin
+  --only A,B  run only the test classes A and B (e.g. --only TraceReplayTests,FromFailureTests)
   The twin copies the tool sources to out/T1b/tmp, breaks one thing at a time and requires this suite to fail.
   NVFLIGHT_SRC=<dir> makes the suite test the sources in <dir> (used by the twin).
 """
@@ -25,6 +26,8 @@ import shrink as S  # noqa: E402
 import gentest as G  # noqa: E402
 import report as R  # noqa: E402
 import regress as RG  # noqa: E402
+import trace_replay as TR  # noqa: E402
+import from_failure as FF  # noqa: E402
 
 FULL = "--full" in sys.argv
 slow = unittest.skipUnless(FULL, "slow: run with --full")
@@ -724,6 +727,436 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(rc, 0)
 
 
+# ---------------------------------------------------------------- failure dir -> offline repro (from_failure.py, trace_replay.py)
+
+BS = chr(92)
+
+
+def pair(skip=(), heal=False, marker=False, digest_bad=False, n=6, bad_seq=None, far=False):
+    """Host and one client. skip: seqs the client never applies. heal: a snapshot apply after the last txn. marker: the host's own desync marker, early.
+    far: plenty of unrelated note markers minutes later (the part of a long recording a shrink should cut away)."""
+    h, c = TB(0), TB(1)
+    if marker:
+        h.add(N.T_MARKER, 5, kind=1, text="host: a client digest did not match (mismatches=1)")
+    for seq in range(1, n + 1):
+        t = seq * 100
+        raw = bytes([4, seq, 1, 0xAB])
+        h.txn(N.T_TXN_CAPTURED, t - 1, seq, good_hash(seq))
+        h.txn(N.T_TXN_APPLIED, t, seq, good_hash(seq))
+        h.net(True, t, 1, 4, seq, raw)
+        if seq in skip:
+            continue
+        c.net(False, t + 5, 0, 4, seq, raw)
+        c.txn(N.T_TXN_APPLIED, t + 6, seq, 0xBAD if bad_seq == seq else good_hash(seq))
+    if heal:
+        c.txn(N.T_TXN_APPLIED, n * 100 + 50, 0, 0x77, flags=N.AP_SNAPSHOT)
+    if far:
+        for k in range(40):
+            h.add(N.T_MARKER, 5000 + 5000 * k, kind=0, text="note %d" % k)
+    h.digest(900, 0, 1, 0xAAAA, keys={0x10: 5})
+    c.digest(900, 0, 1, 0xBBBB if digest_bad else 0xAAAA, keys={0x10: 6 if digest_bad else 5})
+    return [h, c]
+
+
+def make_run(root, tbs, run="fight-x", fail="FAIL-1-01-the_step", status=None, same_names=False, dump_paths=True):
+    """Lay out what run_fight leaves behind: <root>/instances/<n>/nvcoop_flight/*.nvfr and <root>/out/<run>/enemy_fight/<fail>/failure.json.
+    -> (failure_dir, instances_dir)."""
+    inst = os.path.join(root, "instances")
+    fdir = os.path.join(root, "out", run, "enemy_fight", fail)
+    os.makedirs(fdir, exist_ok=True)
+    machines = []
+    for i, tb in enumerate(tbs):
+        d = os.path.join(inst, str(i), "nvcoop_flight")
+        os.makedirs(d, exist_ok=True)
+        fn = "same.nvfr" if same_names else "nvcoop-manual-%d.nvfr" % i
+        with open(os.path.join(d, fn), "wb") as f:
+            f.write(tb.data())
+        m = {"name": "host" if i == 0 else "client%d" % i, "role": "host" if i == 0 else "client", "instance": i, "status": (status or {}).get(i, {})}
+        if dump_paths:
+            m["flight_dump"] = {"path": "nvcoop_flight" + BS + fn}
+        else:
+            m["flight_dump_error"] = "flight.dump: [-32000] dump failed (no dir configured or not writable)"
+        machines.append(m)
+    with open(os.path.join(fdir, "failure.json"), "w", encoding="utf-8") as f:
+        json.dump({"playbook": "enemy_fight", "step": "01-the step", "reason": "desync counters rose", "kind": "counters", "machines": machines}, f)
+    return fdir, inst
+
+
+def run_ff(*args):
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = FF.main(list(args))
+    return rc, buf.getvalue()
+
+
+class TraceReplayTests(unittest.TestCase):
+    def test_split_roundtrip_and_truncated_tail(self):
+        data = pair()[0].data()
+        hdr, recs, h = TR.split_nvfr(data)
+        self.assertEqual(hdr + b"".join(recs), data)
+        self.assertEqual(len(recs), len(N.loads(data)["records"]))
+        self.assertEqual(h["slot"], 0)
+        self.assertGreater(len(recs[0]), 18)
+        hdr2, recs2, _ = TR.split_nvfr(data + recs[0][:18])      # a half-written record at the end (whole header, cut payload) is dropped
+        self.assertEqual(recs2, recs)
+
+    def classify(self, **kw):
+        return TR.classify([t.trace() for t in pair(**kw)])
+
+    def test_classes(self):
+        cl = self.classify(bad_seq=3)
+        self.assertEqual((cl["primary"]["class"], cl["primary"]["key"]), ("divergence", "txn:3[0]"))
+        cl = self.classify(digest_bad=True)
+        self.assertEqual(cl["primary"]["class"], "digest-mismatch")
+        self.assertEqual(cl["primary"]["suspects"], [0, 1])
+        cl = self.classify(skip={2})
+        self.assertEqual((cl["primary"]["class"], cl["primary"]["key"], cl["primary"]["suspects"]), ("stuck-sync", "txn:2", [1]))
+        self.assertFalse(cl["primary"]["healed"])
+        self.assertFalse(self.classify()["found"])
+        self.assertEqual(self.classify()["counts"], {})
+
+    def test_gap_healed_by_a_snapshot_is_not_a_failure(self):
+        cl = self.classify(skip={2}, heal=True)
+        self.assertFalse(cl["found"])
+        self.assertIsNone(cl["primary"])
+        self.assertEqual(cl["counts"], {"transient-gap": 1})
+        self.assertTrue(cl["items"][0]["healed"])
+        # a snapshot BEFORE the missing txn heals nothing
+        h, c = pair(skip={5})
+        c.txn(N.T_TXN_APPLIED, 20, 0, 0x77, flags=N.AP_SNAPSHOT)
+        cl = TR.classify([h.trace(), c.trace()])
+        self.assertEqual(cl["primary"]["class"], "stuck-sync")
+
+    def test_own_marker_leads_only_when_nothing_else_is_found(self):
+        cl = self.classify(marker=True)
+        self.assertEqual((cl["primary"]["class"], cl["primary"]["key"]), ("desync-marker", "marker:host"))
+        cl = self.classify(marker=True, digest_bad=True)       # the marker comes first in time, the digest explains it
+        self.assertEqual(cl["primary"]["class"], "digest-mismatch")
+        self.assertEqual(cl["counts"]["desync-marker"], 1)
+        res = TR.result_of(cl)
+        self.assertTrue(res["violations"][0].startswith("digest-mismatch"), res["violations"])
+        self.assertEqual(res["first"]["category"], "digest-mismatch")
+
+    def fixture(self, **kw):
+        tbs = pair(**kw)
+        trs = [t.trace() for t in tbs]
+        raw = [(t.h["slot"],) + TR.split_nvfr(t.data())[:2] for t in tbs]
+        return FF.build_fixture(raw, trs, {}), trs
+
+    def test_fixture_replays_like_the_traces(self):
+        fx, trs = self.fixture(skip={2})
+        self.assertEqual(TR.run(fx), TR.result_of(TR.classify(trs)))
+        self.assertTrue(TR.run(fx)["diverged"])
+        fx["steps"].append({"op": "quiesce", "pin": True})        # steps that are not records are ignored
+        self.assertTrue(TR.run(fx)["diverged"])
+        self.assertTrue(all(st["op"] == "rec" for st in fx["steps"][:-1]))
+        clean, _ = self.fixture()
+        self.assertEqual(TR.run(clean), {"diverged": False, "violations": [], "first": None, "counts": {}})
+
+    def test_bad_and_thin_fixtures(self):
+        for bad in ({}, {"format": "trace-1"}, {"format": "toy", "steps": [], "headers": {}}, {"format": "trace-1", "steps": [{"op": "rec", "slot": 7, "hex": "00"}], "headers": {"0": "00"}}):
+            with self.assertRaises(TR.BadFixture):
+                TR.run(bad)
+        fx, _ = self.fixture(skip={2})
+        thin = dict(fx, steps=[s for s in fx["steps"] if s["slot"] == 0])     # a machine with no records left: nothing to compare, no crash
+        res = TR.run(thin)
+        self.assertFalse(res["diverged"])
+        real_align = TR.A.align
+        TR.A.align = lambda traces: [][0]         # an analysis that cannot cope with a thin candidate counts as "no failure", not a crash
+        try:
+            res = TR.run(fx)
+        finally:
+            TR.A.align = real_align
+        self.assertFalse(res["diverged"])
+        self.assertIn("IndexError", res["error"])
+
+    @slow
+    def test_command_line_contract(self):
+        d = tempfile.mkdtemp(dir=TMP_ROOT)
+        try:
+            fx, _ = self.fixture(skip={2})
+            p = os.path.join(d, "a.json")
+            with open(p, "w") as f:
+                json.dump(fx, f)
+            r = subprocess.run([sys.executable, "-I", os.path.join(SRC, "trace_replay.py"), p], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1)
+            self.assertTrue(json.loads(r.stdout)["diverged"])
+            with open(p, "w") as f:
+                f.write("{")
+            r = subprocess.run([sys.executable, "-I", os.path.join(SRC, "trace_replay.py"), p], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2)
+            clean, _ = self.fixture()
+            with open(p, "w") as f:
+                json.dump(clean, f)
+            r = subprocess.run([sys.executable, "-I", os.path.join(SRC, "trace_replay.py"), p], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class FromFailureTests(unittest.TestCase):
+    def setUp(self):
+        os.makedirs(TMP_ROOT, exist_ok=True)
+        self.tmp = tempfile.mkdtemp(dir=TMP_ROOT)
+        self.cases = os.path.join(self.tmp, "cases")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_on(self, fdir, inst, *extra):
+        return run_ff(fdir, "--instances", inst, "--out", self.cases, *extra)
+
+    def test_end_to_end_reproduce_shrink_and_regress(self):
+        fdir, inst = make_run(self.tmp, pair(skip={2}))
+        rc, out = self.run_on(fdir, inst)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("REPRODUCED: stuck-sync (txn:2)", out)
+        cases = os.listdir(self.cases)
+        self.assertEqual(len(cases), 1)         # one json, no cmake: trace cases replay in process
+        self.assertTrue(cases[0].endswith(".json"))
+        with open(os.path.join(self.cases, cases[0])) as f:
+            text = f.read()
+        fx = json.loads(text)
+        self.assertEqual(fx["format"], "trace-1")
+        self.assertEqual(fx["expect"]["converges"], False)
+        self.assertEqual(fx["expect"]["bug_signature"], "stuck-sync txn:#")
+        self.assertLessEqual(len(fx["steps"]), 3)
+        self.assertGreater(fx["shrunk"]["original_steps"], 30)
+        self.assertEqual(fx["source"]["playbook"], "enemy_fight")
+        self.assertNotIn(self.tmp.replace(BS, "/"), text.replace(BS + BS, "/").replace(BS, "/"))     # no machine paths in a case that gets shared
+        self.assertNotIn("nvcoop_flight", text)
+        self.assertEqual(RG.run_dir(self.cases, None), (1, 0))      # the regression runner picks it up with no replay command
+        self.assertEqual(RG.main([self.cases]), 0)
+
+    def test_a_fixed_run_does_not_reproduce(self):
+        fdir, inst = make_run(self.tmp, pair())
+        rc, out = self.run_on(fdir, inst)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NOT REPRODUCED", out)
+        self.assertFalse(os.path.isdir(self.cases))
+        # healed by a snapshot: also not a failure
+        fdir, inst = make_run(os.path.join(self.tmp, "b"), pair(skip={2}, heal=True))
+        rc, out = self.run_on(fdir, inst)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("transient gap", out)
+
+    def test_expectation_flag_and_regress_flip(self):
+        fdir, inst = make_run(self.tmp, pair(digest_bad=True))
+        self.assertEqual(self.run_on(fdir, inst, "--expect-converges")[0], 0)
+        self.assertEqual(RG.run_dir(self.cases, None), (1, 1))      # the recordings still show the failure, so a "converges" case fails
+        shutil.rmtree(self.cases)
+        self.assertEqual(self.run_on(fdir, inst)[0], 0)
+        self.assertEqual(RG.run_dir(self.cases, None), (1, 0))
+        p = os.path.join(self.cases, os.listdir(self.cases)[0])
+        with open(p) as f:
+            fx = json.load(f)
+        fx["steps"] = [s for s in fx["steps"] if s["slot"] == 0]    # a case that stops reproducing is reported
+        with open(p, "w") as f:
+            json.dump(fx, f)
+        self.assertEqual(RG.run_dir(self.cases, None), (1, 1))
+
+    def test_shrink_keeps_the_same_failure(self):
+        # a marker alone would also "fail", with fewer records; the shrink must keep the stuck sync it started from
+        fdir, inst = make_run(self.tmp, pair(skip={2}, marker=True, far=True))
+        rc, out = self.run_on(fdir, inst)
+        self.assertEqual(rc, 0, out)
+        fx = json.load(open(os.path.join(self.cases, os.listdir(self.cases)[0])))
+        self.assertEqual(fx["shrunk"]["signature"], "stuck-sync txn:#")
+        self.assertEqual(len(fx["steps"]), 2)
+        self.assertEqual({s["ty"] for s in fx["steps"]}, {"TxnApplied"})
+        self.assertTrue(any(s.startswith("window") for s in fx["shrunk"]["stages"]), fx["shrunk"]["stages"])
+        self.assertTrue(any(s.startswith("dropped all NetIn") for s in fx["shrunk"]["stages"]), fx["shrunk"]["stages"])
+        self.assertTrue(fx["shrunk"]["complete"])
+
+    def test_a_stage_that_changes_the_failure_is_refused(self):
+        fx, trs = TraceReplayTests("test_classes").fixture(skip={2}, digest_bad=True)
+        primary = TR.classify(trs)["primary"]
+        self.assertEqual(primary["class"], "stuck-sync")        # earlier than the digest mismatch
+        old = FF.DROP_ORDER
+        FF.DROP_ORDER = ("TxnApplied",)       # dropping them would leave only the digest mismatch: another failure
+        try:
+            out = FF.reduce_fixture(fx, primary, 500, 10)
+        finally:
+            FF.DROP_ORDER = old
+        self.assertEqual(out["shrunk"]["signature"], "stuck-sync txn:#")
+        self.assertEqual({s["ty"] for s in out["steps"]}, {"TxnApplied"})
+        self.assertFalse(any(s.startswith("dropped") for s in out["shrunk"]["stages"]))
+
+    def test_no_shrink_and_no_write(self):
+        fdir, inst = make_run(self.tmp, pair(skip={2}))
+        rc, out = self.run_on(fdir, inst, "--no-shrink")
+        self.assertEqual(rc, 0, out)
+        fx = json.load(open(os.path.join(self.cases, os.listdir(self.cases)[0])))
+        self.assertEqual(len(fx["steps"]), fx["shrunk"]["original_steps"])
+        self.assertGreater(len(fx["steps"]), 30)
+        self.assertEqual(RG.run_dir(self.cases, None), (1, 0))
+        shutil.rmtree(self.cases)
+        rc, out = self.run_on(fdir, inst, "--no-write")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.isdir(self.cases))
+        self.assertNotIn("wrote ", out)
+
+    def test_case_names_are_stable_and_distinct(self):
+        a = FF.case_name("fight-base", "FAIL-1-04-both_kill_enemy_1_every_hit_once_one_death_one_credit")
+        b = FF.case_name("fight-base", "FAIL-1-04-both_kill_enemy_1_every_hit_once_one_death_one_credit_x")
+        self.assertEqual(a, FF.case_name("fight-base", "FAIL-1-04-both_kill_enemy_1_every_hit_once_one_death_one_credit"))
+        self.assertNotEqual(a, b)
+        self.assertEqual(a[:30], b[:30])        # the readable part is cut short, the tag keeps them apart
+        self.assertLessEqual(len(a), 48)
+        self.assertEqual(FF.case_name("r", "f", "My Case!"), "my_case")
+
+    def test_same_file_name_in_both_instances(self):
+        fdir, inst = make_run(self.tmp, pair(skip={2}), same_names=True)
+        rc, out = self.run_on(fdir, inst, "--no-write")
+        self.assertEqual(rc, 0, out)            # each machine's recording is taken from its own instance folder
+        self.assertIn("REPRODUCED", out)
+
+    def test_missing_recordings_are_reported(self):
+        fdir, inst = make_run(self.tmp, pair(skip={2}), dump_paths=False)
+        for i in (0, 1):      # recordings far older than the failure are nobody's
+            p = os.path.join(inst, str(i), "nvcoop_flight", "nvcoop-manual-%d.nvfr" % i)
+            os.utime(p, (1_000_000, 1_000_000))
+        rc, out = self.run_on(fdir, inst, "--no-write")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("NO REPRO", out)
+        self.assertIn("no dir configured", out)
+        # one machine unreadable, the other fine: still not enough
+        fdir, inst = make_run(os.path.join(self.tmp, "b"), pair(skip={2}))
+        with open(os.path.join(inst, "1", "nvcoop_flight", "nvcoop-manual-1.nvfr"), "wb") as f:
+            f.write(b"junk")
+        rc, out = self.run_on(fdir, inst, "--no-write")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("cannot read nvcoop-manual-1.nvfr", out)
+        self.assertIn("got 1", out)
+
+    def test_dump_guessed_from_file_time(self):
+        import time
+        fdir, inst = make_run(self.tmp, pair(skip={2}), dump_paths=False)
+        now = time.time()
+        for i in (0, 1):       # an old recording and a recent one per machine: the recent one is the failure's
+            d = os.path.join(inst, str(i), "nvcoop_flight")
+            old = os.path.join(d, "old.nvfr")
+            shutil.copy(os.path.join(d, "nvcoop-manual-%d.nvfr" % i), old)
+            os.utime(old, (now - 7200, now - 7200))
+            os.utime(os.path.join(d, "nvcoop-manual-%d.nvfr" % i), (now - 60, now - 60))
+        os.utime(os.path.join(fdir, "failure.json"), (now, now))
+        c = FF.collect(os.path.join(fdir, "failure.json"), inst)
+        self.assertEqual([os.path.basename(m["path"]) for m in c["machines"]], ["nvcoop-manual-0.nvfr", "nvcoop-manual-1.nvfr"])
+        self.assertEqual({m["how"] for m in c["machines"]}, {"guessed from file time"})
+        newer = os.path.join(inst, "0", "nvcoop_flight", "newer.nvfr")      # of two recent ones, the newest
+        shutil.copy(os.path.join(inst, "0", "nvcoop_flight", "nvcoop-manual-0.nvfr"), newer)
+        os.utime(newer, (now - 10, now - 10))
+        c = FF.collect(os.path.join(fdir, "failure.json"), inst)
+        self.assertEqual(os.path.basename(c["machines"][0]["path"]), "newer.nvfr")
+        os.utime(newer, (now + 3600, now + 3600))        # written long after the failure: not its recording
+        c = FF.collect(os.path.join(fdir, "failure.json"), inst)
+        self.assertEqual(os.path.basename(c["machines"][0]["path"]), "nvcoop-manual-0.nvfr")
+
+    def test_finding_failures(self):
+        import time
+        a, _ = make_run(self.tmp, pair(), run="fight-a")
+        b, _ = make_run(self.tmp, pair(), run="fight-b")
+        now = time.time()
+        os.utime(os.path.join(a, "failure.json"), (now - 100, now - 100))
+        os.utime(os.path.join(b, "failure.json"), (now, now))
+        out_dir = os.path.join(self.tmp, "out")
+        self.assertEqual(FF.find_failures([out_dir]), [os.path.join(b, "failure.json"), os.path.join(a, "failure.json")])      # newest first
+        self.assertEqual(FF.find_failures([a]), [os.path.join(a, "failure.json")])
+        self.assertEqual(FF.find_failures([os.path.join(a, "failure.json")]), [os.path.join(a, "failure.json")])
+        old_root = FF.ROOT
+        FF.ROOT = self.tmp
+        try:
+            self.assertEqual(FF.find_failures([]), [os.path.join(b, "failure.json")])        # no argument: the newest one
+        finally:
+            FF.ROOT = old_root
+        rc, out = run_ff(os.path.join(self.tmp, "nowhere"))
+        self.assertEqual(rc, 2)
+
+    def test_recordings_given_directly(self):
+        _, inst = make_run(self.tmp, pair(skip={2}))
+        files = [os.path.join(inst, str(i), "nvcoop_flight", "nvcoop-manual-%d.nvfr" % i) for i in (0, 1)]
+        rc, out = run_ff(*files, "--out", self.cases)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(os.listdir(self.cases)), 1)
+        rc, out = run_ff(files[0], files[0], "--no-write")      # the same machine twice is not a pair
+        self.assertEqual(rc, 2, out)
+        self.assertIn("recorded twice", out)
+
+    def test_status_evidence_and_agreement(self):
+        sick = {"desyncs": {"digests": {"mismatch": 2, "ok": 5, "repairs": 2, "effectsRepaired": 11},
+                            "desyncs": [{"entries": [{"key": "SetStage 1@x.esm = 5", "host": "SetStage 1@x.esm = 5", "client": "SetStage 1@x.esm = 0"}]}]}}
+        host = {"name": "host", "role": "host", "status": dict(sick, host={"lastSeq": 16, "allSynced": False, "peers": [{"slot": 1, "acked": 12}, {"slot": 2, "acked": 16}]})}
+        cli = {"name": "client1", "role": "client", "status": dict(sick, connected=0)}
+        ev = FF.status_evidence({"machines": [host, cli]})
+        self.assertEqual((ev["digest_mismatch"], ev["digest_ok"], ev["repairs"], ev["effects_repaired"]), (4, 10, 4, 22))
+        self.assertEqual(ev["lag"], ["slot 1 acked 12 of 16"])
+        self.assertEqual(ev["disconnected"], ["client1"])
+        self.assertEqual(len(ev["desync_keys"]), 1)
+        self.assertEqual(len(ev["symptoms"]), 4)
+        quiet = FF.status_evidence({"machines": [{"name": "host", "role": "host", "status": {"host": {"lastSeq": 3, "allSynced": True, "peers": [{"slot": 1, "acked": 3}]}}}]})
+        self.assertEqual(quiet["symptoms"], [])
+        unsure = FF.status_evidence({"machines": [{"name": "host", "role": "host", "status": {"host": {"lastSeq": 3, "allSynced": False, "peers": [{"slot": 1, "acked": 3}]}}}]})
+        self.assertEqual(unsure["lag"], ["host reports allSynced=false"])
+        self.assertEqual(FF.status_evidence({})["symptoms"], [])
+        found = {"found": True, "items": [{"class": "digest-mismatch"}]}
+        self.assertIn("digest mismatch in status and in recordings", FF.agreement(ev, found))
+        self.assertIn("sync lag in status but not in recordings", FF.agreement(ev, found))
+        self.assertIn("NOT visible", FF.agreement(ev, {"found": False, "items": []}))
+        self.assertIn("no sync symptoms", FF.agreement(quiet, found))
+
+    def test_status_symptoms_reach_the_report(self):
+        sick = {"desyncs": {"digests": {"mismatch": 1, "repairs": 1, "effectsRepaired": 3}}}
+        fdir, inst = make_run(self.tmp, pair(digest_bad=True), status={0: sick})
+        rc, out = self.run_on(fdir, inst, "--no-write")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("live status: digest mismatch x1", out)
+        self.assertIn("check: digest mismatch in status and in recordings", out)
+
+    def test_json_output_and_report(self):
+        fdir, inst = make_run(self.tmp, pair(skip={2}))
+        html = os.path.join(self.tmp, "r.html")
+        rc, out = run_ff(fdir, "--instances", inst, "--no-write", "--json", "--report", html)
+        self.assertEqual(rc, 0, out)
+        rep = json.loads(out[:out.rindex("]") + 1])
+        self.assertEqual(rep[0]["verdict"], "reproduced")
+        self.assertEqual(rep[0]["primary"]["class"], "stuck-sync")
+        self.assertNotIn("_traces", rep[0])
+        self.assertTrue(os.path.getsize(html) > 100)
+
+    @slow
+    def test_flight_cli_subcommand(self):
+        fdir, inst = make_run(self.tmp, pair(skip={2}))
+        r = subprocess.run([sys.executable, "-I", os.path.join(SRC, "flight.py"), "from-failure", fdir, "--instances", inst, "--out", self.cases],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("REPRODUCED", r.stdout)
+        r = subprocess.run([sys.executable, "-I", os.path.join(SRC, "flight.py"), "regress", self.cases], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ALL OK", r.stdout)
+
+    def test_trace_cases_do_not_get_cmake(self):
+        fx, _ = TraceReplayTests("test_classes").fixture(skip={2})
+        fx["shrunk"] = {"signature": "stuck-sync txn:#"}
+        paths = G.generate(fx, "Case A", self.tmp, expect={"converges": False, "bug_signature": "x"})
+        self.assertEqual([os.path.basename(p) for p in paths], ["case_a.json"])
+        self.assertEqual(json.load(open(paths[0]))["expect"], {"converges": False, "bug_signature": "x"})
+        plain = dict(fx, format="other")
+        self.assertEqual(len(G.generate(plain, "Case B", self.tmp)), 2)
+        self.assertEqual(json.load(open(os.path.join(self.tmp, "case_b.json")))["expect"]["converges"], True)
+
+    def test_regress_needs_no_command_for_trace_cases_only(self):
+        fx, _ = TraceReplayTests("test_classes").fixture(skip={2})
+        os.makedirs(self.cases)
+        with open(os.path.join(self.cases, "t.json"), "w") as f:
+            json.dump(dict(fx, expect={"converges": False}), f)
+        with open(os.path.join(self.cases, "u.json"), "w") as f:
+            json.dump({"version": 1, "steps": [{"op": "quiesce"}]}, f)
+        self.assertEqual(RG.run_dir(self.cases, None), (2, 1))       # the toy-style fixture has nobody to replay it
+        self.assertEqual(RG.run_dir(self.cases, S.CommandOracle(REPLAY, tmpdir=self.tmp)), (2, 0))
+
+
 # ---------------------------------------------------------------- mutation twin
 
 MUTATIONS = [
@@ -763,6 +1196,40 @@ MUTATIONS = [
     ("report", "e(hd[\"instance\"])", "hd[\"instance\"]", "report not escaped"),
     ("report", "e(_step_text(st))", "_step_text(st)", "steps not escaped"),
     ("regress", "ok = got == want", "ok = got", "expected-divergence fixtures fail"),
+    ("trace_replay", 'if c["kind"] == "txn-missing" and later:', "if False:", "gap healed by a snapshot counted as a failure"),
+    ("trace_replay", 'any(t >= c["aligned_us"] for s', 'any(t <= c["aligned_us"] for s', "snapshot before the gap heals it"),
+    ("trace_replay", 'own = [i for i in real if i["class"] != "desync-marker"]', "own = []", "own desync marker leads over a real finding"),
+    ("trace_replay", "real = ([p] + [i for i in real if i is not p]) if p else real", "real = real", "failure signature taken from the marker"),
+    ("trace_replay", "if len(data) - pos - N.RECORD_HEADER < plen:\n            break\n        end", "if False:\n            break\n        end", "half-written record kept"),
+    ("trace_replay", 'if st.get("op") == "rec":', "if True:", "non-record steps replayed"),
+    ("trace_replay", 'fx.get("format") != FORMAT or', "False or", "foreign fixture format accepted"),
+    ("trace_replay", "except Exception as ex:   # noqa: BLE001", "except ZeroDivisionError as ex:   # noqa: BLE001", "thin shrink candidate crashes the replay"),
+    ("trace_replay", 'return 1 if res["diverged"] else 0', "return 0", "replay exit code ignores divergence"),
+    ("trace_replay", '"diverged": cl["found"],', '"diverged": True,', "clean traces reported as failing"),
+    ("from_failure", "cands.append(os.path.join(root, str(instance), rel))", "pass", "recording taken from the wrong instance folder"),
+    ("from_failure", "return max(near)[1] if near else None", "return min(near)[1] if near else None", "oldest recording guessed"),
+    ("from_failure", "0 <= failure_time - os.path.getmtime(f) <= GUESS_WINDOW_S or abs(failure_time - os.path.getmtime(f)) < 5", "True", "any recording guessed"),
+    ("from_failure", 'if h["slot"] in slots:', "if False:", "same machine accepted twice"),
+    ("from_failure", 'ev["digest_mismatch"] += int(dg.get("mismatch") or 0)', 'ev["digest_mismatch"] = int(dg.get("mismatch") or 0)', "digest mismatches not summed over machines"),
+    ("from_failure", 'if (p.get("acked") or 0) < last:', 'if (p.get("acked") or 0) > last:', "sync lag not seen"),
+    ("from_failure", 'if host.get("allSynced") is False and not ev["lag"]:', "if False:", "allSynced=false not seen"),
+    ("from_failure", 'if m.get("role") != "host" and st.get("connected") in (0, False):', "if False:", "lost link not seen"),
+    ("from_failure", '"and" if "digest-mismatch" in classes else "but not"', '"and" if False else "but not"', "status/recording agreement wrong for digests"),
+    ("from_failure", '"and" if "stuck-sync" in classes else "but not"', '"and" if True else "but not"', "status/recording agreement wrong for lag"),
+    ("from_failure", 'expect = {"converges": bool(opts.get("expect_converges")),', 'expect = {"converges": True,', "case expectation ignores the flag"),
+    ("from_failure", 'return bool(r.get("diverged")) and S.signature(r) == sig', 'return bool(r.get("diverged"))', "shrink accepts a different failure"),
+    ("from_failure", 'tag = hashlib.sha1(("%s/%s" % (run, fail)).encode()).hexdigest()[:8]', 'tag = ""', "case names collide"),
+    ("from_failure", "found.sort(key=lambda f: (-os.path.getmtime(f), f))", "found.sort(key=lambda f: (os.path.getmtime(f), f))", "oldest failure first"),
+    ("from_failure", "if len(traces) < 2:", "if len(traces) < 1:", "one recording treated as enough"),
+    ("from_failure", 'return 1 if any(r["verdict"] == "not-reproduced" for r in reps) else 0', "return 0", "exit code ignores not-reproduced"),
+    ("from_failure", '    if any(r["verdict"] == "no-recordings" for r in reps):\n        return 2', '    if any(r["verdict"] == "no-recordings" for r in reps):\n        return 0', "exit code ignores missing recordings"),
+    ("from_failure", "for m in MARGINS_MS:", "for m in ():", "time window stage skipped"),
+    ("from_failure", 'abs(s["at_ms"] - at) <= m', 'abs(s["at_ms"] - at) <= -1', "time window keeps nothing"),
+    ("from_failure", "for ty in DROP_ORDER:", "for ty in ():", "record-type stage skipped"),
+    ("regress", "if fx.get(\"format\") == TR.FORMAT:", "if False:", "trace cases need a replay command"),
+    ("gentest", 'if fx.get("format") == "trace-1":', "if False:", "trace cases get a cmake file"),
+    ("gentest", "dict(expect) if expect else", "None if expect else", "expectation override ignored"),
+    ("flight", 'if argv and argv[0] == "from-failure":', "if False:", "from-failure subcommand missing"),
 ]
 
 
@@ -779,7 +1246,8 @@ def _one_mutation(i, mod, old, new, why):
         with open(p, "w", encoding="utf-8") as f:
             f.write(text.replace(old, new))
         env = dict(os.environ, NVFLIGHT_SRC=d)
-        r = subprocess.run([sys.executable, "-I", os.path.join(d, "run_tests.py"), "--full", "--no-twin"], capture_output=True, text=True, env=env, errors="replace")
+        only = ["--only", ONLY_NEW] if mod in ("trace_replay", "from_failure") else []   # their tests are all in these classes: no need to run the rest per mutation
+        r = subprocess.run([sys.executable, "-I", os.path.join(d, "run_tests.py"), "--full", "--no-twin"] + only, capture_output=True, text=True, env=env, errors="replace")
         if r.returncode == 0:
             return "SURVIVED: %s: %s" % (mod, why), False
         return "caught  : %s: %s" % (mod, why), True
@@ -787,7 +1255,8 @@ def _one_mutation(i, mod, old, new, why):
         shutil.rmtree(d, ignore_errors=True)
 
 
-TWIN_MODS = ["nvfr", "analyze", "shrink", "gentest", "report", "regress", "flight", "toy_replay", "run_tests"]
+ONLY_NEW = "TraceReplayTests,FromFailureTests"
+TWIN_MODS = ["nvfr", "analyze", "shrink", "gentest", "report", "regress", "flight", "toy_replay", "trace_replay", "from_failure", "run_tests"]
 
 
 def twin():
@@ -804,6 +1273,9 @@ def twin():
 
 def main():
     suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    if "--only" in sys.argv:    # --only ClassA,ClassB : run just those test classes (used by the twin, handy while working on one tool)
+        want = sys.argv[sys.argv.index("--only") + 1].split(",")
+        suite = unittest.TestSuite(t for group in suite for t in group if type(t).__name__ in want)
     res = unittest.TextTestRunner(verbosity=1, failfast="--no-twin" in sys.argv).run(suite)
     if not res.wasSuccessful():
         print("TESTS FAILED")

@@ -7,7 +7,8 @@
   fixture FILE FILE [...] -o fixture.json         build a replay fixture from the traces
   shrink fixture.json --replay-cmd "exe {fixture}" -o shrunk.json [--max-runs N] [--max-seconds S]
   gentest shrunk.json --name NAME [--out DIR]     emit a regression test (JSON fixture + cmake add_test)
-  regress DIR --replay-cmd "exe {fixture}"        run every generated regression fixture
+  regress DIR [--replay-cmd "exe {fixture}"]      run every generated regression fixture (trace-1 cases need no command)
+  from-failure [PATH ...] [options]               in-game failure -> offline repro, shrink, regression case (see from_failure.py)
 """
 import argparse
 import json
@@ -49,6 +50,10 @@ def _json_div(d):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "from-failure":
+        import from_failure  # noqa: E402
+        return from_failure.main(argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("print"); p.add_argument("file"); p.add_argument("--type"); p.add_argument("--limit", type=int)
@@ -59,7 +64,7 @@ def main(argv=None):
     p = sub.add_parser("shrink"); p.add_argument("fixture"); p.add_argument("--replay-cmd", required=True); p.add_argument("-o", required=True)
     p.add_argument("--max-runs", type=int, default=2000); p.add_argument("--max-seconds", type=float); p.add_argument("--tmpdir")
     p = sub.add_parser("gentest"); p.add_argument("shrunk"); p.add_argument("--name", required=True); p.add_argument("--out", default=DEFAULT_REGRESS)
-    p = sub.add_parser("regress"); p.add_argument("dir"); p.add_argument("--replay-cmd", required=True); p.add_argument("--tmpdir")
+    p = sub.add_parser("regress"); p.add_argument("dir"); p.add_argument("--replay-cmd"); p.add_argument("--tmpdir")
     a = ap.parse_args(argv)
 
     if a.cmd == "print":
@@ -119,7 +124,7 @@ def main(argv=None):
             print("wrote " + path)
         return 0
     if a.cmd == "regress":
-        return regress.main([a.dir, "--replay-cmd", a.replay_cmd] + (["--tmpdir", a.tmpdir] if a.tmpdir else []))
+        return regress.main([a.dir] + (["--replay-cmd", a.replay_cmd] if a.replay_cmd else []) + (["--tmpdir", a.tmpdir] if a.tmpdir else []))
     return 2
 
 

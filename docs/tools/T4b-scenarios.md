@@ -17,7 +17,7 @@ Status 2026-10-20: code and tests done, game-free. Nothing was run in a game. Ru
 
 ## The scenario format (schema 1)
 One JSON file per scenario, file name = `name`. Keys: `schema`, `name`, `title`, `description`, `players` (1 to 4), `tags`,
-`start.save` (save name without .fos; `start.reload: true` forces a reload), `reset` (`{"group":"goodsprings"}` uses the L7 sweep
+`start.save` (save name without .fos; `start.reload: true` forces a reload; `start.prepared: false` always loads the plain save, see "Prepared save"), `reset` (`{"group":"goodsprings"}` uses the L7 sweep
 config's reset ids, and/or `{"quests":[...]}`), `forms`, `setup` (steps run during the jump), `steps` (the test).
 
 `forms` is a glossary `alias -> {ref, edid, sig}`. Steps use `"$alias"`; console text uses `{alias}`. Every ref is checked against
@@ -61,6 +61,29 @@ console lines; quest stages whose script changes the world, from L3's `effects_s
 raw console line counts as "unnameable" and forces a reload next). `scen.py plan NAME --prev OTHER` shows the decision.
 Expected cost: in place is a few bridge calls and console lines (the test measures that it stays under 20 calls on the fake);
 the real time is unknown until `proof.py jump` is run. A reload is a save load, which L7 measured at the sweep's usual load time.
+
+## Prepared save and event-driven waits (fix-round speed)
+**Prepared save.** The test save is older than the DLC intros, so each load raises 14 message boxes over about 50 s (4 pre-order
+pack notices, then each DLC's intro and level-cap note). `python -I tools/scenarios/prepare_save.py NAME ...` leases the pool
+instances, loads the scenario's start save, presses the boxes away until none shows for 20 s, saves the game on each copy as
+`nvcoop_<start save>_ready` (a second try uses `autosave_nvcoop_<start save>_ready` in case the engine only takes autosave names),
+loads that save once more and checks that no box comes up, and writes `<Saves>/nvcoop_prepared.json` in the instance. `--status` shows what is
+prepared without a game. `Runner.jump()` loads the prepared save on every instance that has a usable one and otherwise the plain
+`start.save`; the result has `loadedSaves` (per instance: the save loaded, whether it was prepared, and why not) and the run log
+carries it in `jump`. A prepared save is used only when its file is there, its reload check passed, and the source save has not changed since
+(sizes and times; `autosave` and `quicksave` are exempt because the game rewrites them). The runner state still says `save: <start.save>`,
+so the jump plan does not see a different save. The box clearing stays as a safety net, with a 4 s quiet window when every
+instance loaded a prepared save (20 s otherwise). `NVCOOP_NO_PREPARED=1` or `Runner(prepared=False)` turns it off. A Runner
+built without game process keys (the fake-world tests) never looks for prepared saves.
+
+**Event-driven waits.** `_wait_coop_synced()` returns the moment every client has joined, finished its baseline and applied the host
+head, and then the moment the host counts one more ok digest. It gives up early, with a reason in the result (`reason` for the sync part,
+`settleReason` for the digest part): a client that rejected the join (at once, with its text); client progress (joined, applied, baseline,
+link) that stood still for 30 s, naming the client and the numbers; no digest received for 20 s; 3 stale digests; or the same mismatch
+(same keys, same host and client values) 3 times in a row while the repair did not fix it. A mismatch on changing keys is healing and is
+not given up on. A failed digest wait lists the mismatching entries from `coop.status` (`desyncEntries`: key, host value, client value) and
+the digest counters it saw (`digestDelta`). The limits stay as the outer bounds (180 s sync, 60 s digest). A digest that does not match does not
+stop the steps, as before; the run log just says why in `jump.coopSync`.
 
 ## State keys
 The runner remembers, per game process, which save is loaded and what the last scenario dirtied. `scen.py run` and
@@ -163,6 +186,7 @@ copy of a key in one store does not replace the newer key on disk; a plan sees a
 after this store was made, and reloads; a failure between the write and the replace leaves the old valid file and no
 temporary file; a held lock gives `StateLockTimeout`; two Python processes that each put 200 different keys end with all
 400 keys.
+Prepared save and waits (`PreparedSave` 14 tests, `EventDrivenWaits` 12 tests, on `fakegame.CoopSim` and the fake message boxes): see above. Twins `noprepared`, `longquiet`, `nostale`, `unverified`, `noverify`, `earlysave`, `fullwait`, `latesuccess`, `hairtrigger`, `nodesyncs`, `nostall`.
 Twin: the suite is re-run under nine mutants (`SCEN_MUTANT=` `noresolve`, `noreload`, `nodirty`, `passall`, `firsthost`,
 `oldkey`, `wholedict`, `noreread`, `inplace`); each must make the suite fail, and the run prints `caught` for each.
 `oldkey` brings back the `instance@generation` key; all 6 `GameProcessKeys` tests fail under it. `wholedict` brings back

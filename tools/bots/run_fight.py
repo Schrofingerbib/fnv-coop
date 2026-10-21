@@ -11,6 +11,17 @@ In a game (Track B helper; this tool never launches a game or takes the game slo
     python -I tools/bots/run_fight.py --instances 0,1 --chaos bad_wifi --chaos-seed 7 --chaos-rpc runs/chaos.json
     python -I tools/bots/run_fight.py --instances 0,1 --keep-going --outdir out/fight-run1
 
+Fix rounds (a failing step is rerun alone, on the world it left, and the game runs faster):
+
+    python -I tools/bots/run_fight.py --instances 0,1 --which fight --from-step 4     # steps 1 to 3 are skipped, no scenario reload
+    python -I tools/bots/run_fight.py --instances 0,1 --which fight --only-step 4     # just step 4
+    python -I tools/bots/run_fight.py --instances 0,1 --which fight --from-step 4 --reload   # same, but jump to the scenario first
+    python -I tools/bots/run_fight.py --instances 0,1 --timescale 4                   # "sgtm 4" on every copy, back to 1 at the end
+
+The first step that runs in a partial run arranges the world it expects (players at a standoff, weapon equipped, targets alive and
+owned) with the bot's own operations; a target that is already dead cannot be arranged and stops the step with "reload the scenario".
+The summary prints the exact command that reruns the failed step. Step numbers are the ones in the step log (01-, 02- ...).
+
 Game-free (the fake world, what the unit tests use):
 
     python -I tools/bots/run_fight.py --fake
@@ -27,8 +38,10 @@ this build: nothing was run; see the table). Nothing here has run in a game yet.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +54,7 @@ from playbooks import fakecoop, registry  # noqa: E402
 
 SHORT = {"fight": "enemy_fight", "handoff": "enemy_handoff", "spawn": "enemy_spawn", "loot": "corpse_loot_race"}
 EXIT_BLOCKED = 3
+MAX_TIMESCALE = 20.0
 METHOD_NOT_FOUND = -32601
 
 # (bridge method, harmless params, what it is for, required). A method counts as PRESENT when calling it does not answer
@@ -131,6 +145,63 @@ def pick(which: str) -> List[str]:
     return out
 
 
+def check_step_args(a: argparse.Namespace, names: Sequence[str]) -> str:
+    """'' when --from-step / --only-step / --timescale make sense together, else the usage error."""
+    if a.from_step < 0 or a.only_step < 0:
+        return "--from-step and --only-step count steps from 1"
+    if a.from_step and a.only_step:
+        return "use --from-step or --only-step, not both"
+    if not (0.01 <= a.timescale <= MAX_TIMESCALE):
+        return f"--timescale must be between 0.01 and {MAX_TIMESCALE:g}"
+    if a.from_step > 1 or a.only_step:
+        if len(names) != 1:
+            return "--from-step / --only-step need exactly one test (--which fight): step numbers are per test"
+        if not registry.make(names[0], REPO).resumable:
+            ok = [n for n in registry.ENEMY_TESTS if registry.make(n, REPO).resumable]
+            return f"{names[0]} cannot start from a later step yet; these can: {', '.join(ok)}"
+    return ""
+
+
+def rerun_command(raw: Sequence[str], step: int) -> str:
+    """The command line that reruns the failed step: the same arguments, without a previous step selection or output directory."""
+    out: List[str] = []
+    skip = False
+    for x in raw:
+        if skip:
+            skip = False
+            continue
+        if x in ("--from-step", "--only-step", "--outdir"):
+            skip = True
+            continue
+        if x.startswith(("--from-step=", "--only-step=", "--outdir=")) or x == "--reload":
+            continue
+        out.append(f'"{x}"' if " " in x else x)
+    return "python -I tools/bots/run_fight.py " + " ".join(out) + f" --from-step {step}"
+
+
+def finish(code: int, outdir: str, raw: Sequence[str]) -> int:
+    """After the run: say how to rerun a failed step alone, and say loudly if a copy may still be running at another speed."""
+    try:
+        with open(os.path.join(outdir, "summary.json"), encoding="utf-8") as f:
+            summary = json.load(f)
+    except (OSError, ValueError):
+        return code
+    for r in summary.get("results", []):
+        ts = r.get("timescale")
+        if ts:
+            stuck = {k: v for k, v in (ts.get("reset") or {}).items() if v}
+            tail = f"FAILED on {stuck}: type sgtm 1 in that copy" if stuck else "on every copy"
+            print(f"timescale {ts.get('requested'):g} (sgtm), reset to 1 {tail}")
+        bad = [s for s in r.get("steps", []) if not s.get("ok")]
+        if r.get("ok") or not bad:
+            continue
+        last = bad[-1]
+        if last.get("index") and last.get("kind") not in ("anim", "arrange") and registry.make(r["playbook"], REPO).resumable:
+            print(f"rerun only the failed step ({last['index']:02d}-{last['name']}), on the world as it is:")
+            print("  " + rerun_command(raw, last["index"]))
+    return code
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--which", default="all", help="fight, handoff, spawn, loot, a comma list, or all (default)")
@@ -150,6 +221,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--chaos-rpc", default="")
     ap.add_argument("--outdir", default="")
     ap.add_argument("--keep-going", action="store_true")
+    ap.add_argument("--from-step", type=int, default=0, metavar="N",
+                    help="run step N and the ones after it (one test only; no scenario reload unless --reload)")
+    ap.add_argument("--only-step", type=int, default=0, metavar="N", help="run step N only (one test only; no scenario reload unless --reload)")
+    ap.add_argument("--reload", action="store_true", help="with --from-step / --only-step: still jump to the scenario first")
+    ap.add_argument("--timescale", type=float, default=1.0, metavar="X",
+                    help="game speed: 'sgtm X' on every copy after the setup, 'sgtm 1' at the end and on failure (default 1)")
+    raw = list(sys.argv[1:] if argv is None else argv)
     a = ap.parse_args(argv)
 
     if a.list_bugs:
@@ -165,6 +243,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     if ids is not None:
         a.instances = ",".join(str(i) for i in ids)
+    problem = check_step_args(a, names)
+    if problem:
+        print(problem, file=sys.stderr)
+        return 2
+    if (a.only_step > 0 or a.from_step > 1) and not a.reload:
+        a.no_scenario = True            # the world is still in place: reloading the scenario would throw it away
+    if not a.outdir:
+        a.outdir = os.path.join(REPO, "out", "bots", time.strftime("%Y%m%dT%H%M%S"))
+    extra: Dict[str, Any] = {}
+    if a.from_step:
+        extra["from_step"] = a.from_step
+    if a.only_step:
+        extra["only_step"] = a.only_step
+    if a.timescale != 1.0:
+        extra["timescale"] = a.timescale
+        if not a.no_anim:
+            print(f"note: the animation / pose thresholds are tuned for speed 1; if only that check fails at --timescale {a.timescale:g}, "
+                  f"rerun at 1 or add --no-anim")
 
     import run_coop
     args: List[str] = ["--playbook", ",".join(names)]
@@ -181,7 +277,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"unknown fake bug {b!r}; use --list-bugs", file=sys.stderr)
                 return 2
             args += ["--bug", b]
-        return run_coop.main(["--fake"] + args)
+        return finish(run_coop.main(["--fake"] + args, extra), a.outdir, raw)
 
     import contextlib
     with contextlib.ExitStack() as stack:
@@ -208,7 +304,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             args += ["--instances", a.instances, "--wait", str(a.wait)]
     # the bridges above are closed again; run_coop opens its own (one pipe client per instance at a time)
-    return run_coop.main(args)
+    return finish(run_coop.main(args, extra), a.outdir, raw)
 
 
 if __name__ == "__main__":

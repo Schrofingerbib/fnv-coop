@@ -75,6 +75,12 @@ FLAG_DISABLED = 0x800          # UNVERIFIED TESForm flag bit for "initially disa
 # read 5 after SetRestrained 1.
 LIFE_DEAD = frozenset({1, 2, 6})
 
+# bot.menu kinds in which the game takes input normally. Any other kind (message, dialogue, pipboy, loading, ...) means a menu is open.
+MENU_FREE = frozenset({"none", "hud"})
+# bot.menu kinds that stop the player from moving, shooting and activating. Not "other" (a menu id the plugin does not know): that may be a
+# HUD overlay, so a walk that stands still under it still tries its sidesteps.
+MENU_BLOCKING = frozenset({"message", "dialogue", "container", "terminal", "pipboy", "barter", "hacking", "lockpick", "pause", "loading", "vats"})
+
 # GetOpenState return values, UNVERIFIED
 OPEN_STATES = {1: "open", 2: "opening", 3: "closed", 4: "closing"}
 
@@ -105,6 +111,14 @@ def unequip(item: str) -> str:                # UNVERIFIED
 
 def is_equipped(item: str) -> str:            # UNVERIFIED (expression)
     return f"player.GetEquipped {item}"
+
+
+def is_weapon_out() -> str:                   # expression: 1 while the player's weapon is drawn (checked in game 2026-10-21)
+    return "player.IsWeaponOut"
+
+
+def equipped_weapon() -> str:                 # UNVERIFIED (expression): NVSE GetEquippedObject, slot 5 = weapon; 0 = nothing equipped.
+    return "player.GetEquippedObject 5"       # Only used to explain a failure (the form id loses digits in %g, so only 0 / not 0 is read).
 
 
 def item_count(holder: str, item: str) -> Line:  # UNVERIFIED (expression); holder is "player" or the holder's ref

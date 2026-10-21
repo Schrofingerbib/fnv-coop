@@ -11,7 +11,15 @@
         (the same as in instances.py). A --plugin-dll or --core-dll path that does not exist is an error
         (exit 2). --core-dll needs an explicit --plugin-dll (the split loader), else it is an error (exit 2).
     run.py up --n 2 [--wait-pipe 180]       launch instances (host=0, client=1..)
+    run.py provision --pairs 3 [--port-base 27960] [--ini coop.enable=1 ...]
+    run.py up --pairs 3                     three two-copy pairs at once: pair k = instances 2k (host) + 2k+1 (client) on
+        co-op port base+k; `up --pairs` refuses when the free RAM cannot hold the copies (--no-ram-check overrides);
+        then tools/bots/run_parallel.py runs one test per pair.
     run.py status
+    run.py swap --instances 0,1 [--dll out/L1split/nvcoop_mod.dll] [--force] [--dry-run]
+        hot DLL swap: copies the freshly built core next to each RUNNING copy and has its loader reload it, then checks
+        that the copy runs exactly that build (no game restart; split build only). Exit 2 = refused, nothing changed.
+        Details: tools/runner/hotswap.py.
     run.py down
     run.py job --id vms01 --n 2 [--timeout 900] -- python tools/runner/scenario.py ...
         leases n free instances (file locks), verifies pinned hashes, runs the command with
@@ -41,6 +49,8 @@ from typing import Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import instances  # noqa: E402
 import jobqueue  # noqa: E402
+import hotswap  # noqa: E402
+import pairs  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 STEAM_ENV = {"SteamAppId": instances.STEAM_APPID, "SteamGameId": instances.STEAM_APPID, "SteamClientLaunch": "1"}
@@ -306,7 +316,8 @@ def provision_argv(a) -> List[str]:
     """The `instances.py provision` argv for the options of `run.py provision`. The --x=value form keeps a value
     that starts with '-' from being read as an option. --plugin-dll goes on whenever it was given, also as "",
     so that instances.py applies its default and "" means no plugin in both tools."""
-    argv = ["provision", "--n", str(a.n)] + ([f"--plugin-dll={a.plugin_dll}"] if a.plugin_dll is not None else [])
+    argv = ["provision"] + ([f"--pairs={a.pairs}", f"--port-base={a.port_base}", f"--first-pair={getattr(a, 'first_pair', 0)}"] if getattr(a, "pairs", 0)
+                            else ["--n", str(a.n)]) + ([f"--plugin-dll={a.plugin_dll}"] if a.plugin_dll is not None else [])
     argv += ([f"--nvse-dir={a.nvse_dir}"] if a.nvse_dir else []) + ([f"--autoload={a.autoload}"] if a.autoload else [])
     argv += [f"--core-dll={a.core_dll}"] if a.core_dll else []
     argv += [f"--ini={spec}" for spec in a.ini]
@@ -318,6 +329,9 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("provision")
     p.add_argument("--n", type=int, default=2)
+    p.add_argument("--pairs", type=int, default=0, help="N two-copy pairs (2N instances), one co-op port per pair (see instances.py)")
+    p.add_argument("--port-base", type=int, default=pairs.PORT_BASE, help="--pairs: co-op port of pair 0")
+    p.add_argument("--first-pair", type=int, default=0, help="--pairs: provision only pairs K.. (running copies stay untouched)")
     # No default here: instances.py applies the default, so it can tell "not given" from "given".
     p.add_argument("--plugin-dll", default=None,
                    help="plugin dll; \"\" means no plugin (default: out/L1/nvcoop.dll if it exists, else no plugin)")
@@ -330,6 +344,8 @@ def main(argv=None) -> int:
                         "the per-instance keys bridge.instance, coop.instanceId, coop.pipe and coop.role are an error")
     p = sub.add_parser("up")
     p.add_argument("--n", type=int, default=2)
+    p.add_argument("--pairs", type=int, default=0, help="N two-copy pairs: --n 2N, and refuse when the free RAM is too small")
+    p.add_argument("--no-ram-check", action="store_true", help="--pairs: launch even if the free RAM looks too small")
     p.add_argument("--wait-pipe", type=float, default=0)
     p.add_argument("--stagger", type=float, default=2.0)
     p.add_argument("--ttl", type=int, default=1800, help="game slot lease seconds (released by `down`)")
@@ -338,6 +354,7 @@ def main(argv=None) -> int:
     p.add_argument("--allow-foreign", action="store_true")
     sub.add_parser("down")
     sub.add_parser("status")
+    hotswap.add_arguments(sub.add_parser("swap", help="hot-swap the core DLL into running copies (no restart)"))
     p = sub.add_parser("job")
     p.add_argument("--id", required=True)
     p.add_argument("--n", type=int, default=2)
@@ -350,13 +367,26 @@ def main(argv=None) -> int:
     p.add_argument("cmd_", nargs=argparse.REMAINDER)
     a = ap.parse_args(argv)
     if a.cmd == "provision":
+        if a.pairs and a.n not in (2, 2 * a.pairs):  # 2 is the default of --n
+            ap.error(f"--n {a.n} does not match --pairs {a.pairs} (that is {2 * a.pairs} instances); give only one")
         return instances.main(provision_argv(a))
     if a.cmd == "up":
+        if a.pairs:
+            a.n = 2 * a.pairs
+            import winproc
+            st = load_state()
+            up = sum(1 for i in range(a.n) if str(i) in st["pids"] and winproc.pid_alive(st["pids"][str(i)]))
+            why = None if a.no_ram_check else pairs.ram_problem(a.pairs, up, pairs.free_ram_bytes())
+            if why:
+                print(why, file=sys.stderr)
+                return 2
         return cmd_up(a)
     if a.cmd == "down":
         return cmd_down(a)
     if a.cmd == "status":
         return cmd_status(a)
+    if a.cmd == "swap":
+        return hotswap.run_cli(a)
     cmd = [c for c in a.cmd_ if c != "--"]
     if not cmd:
         ap.error("job needs a command after --")

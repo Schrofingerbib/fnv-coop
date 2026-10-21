@@ -59,6 +59,16 @@
       "ref": "FalloutNV.esm:015169",
       "edid": "Stimpak",
       "sig": "ALCH"
+    },
+    "pistol": {
+      "ref": "FalloutNV.esm:0E3778",
+      "edid": "WeapNV9mmPistol",
+      "sig": "WEAP"
+    },
+    "ammo9mm": {
+      "ref": "FalloutNV.esm:08ED03",
+      "edid": "Ammo9mm",
+      "sig": "AMMO"
     }
   },
   "setup": [
@@ -111,6 +121,20 @@
       "cmd": "player.setav Health 5000",
       "on": "all",
       "note": "UNVERIFIED console line: the fight must not be able to kill a bot"
+    },
+    {
+      "id": "ammo_9mm",
+      "op": "console",
+      "cmd": "player.additem {ammo9mm} 300",
+      "on": "all",
+      "note": "Ammo9mm (FalloutNV.esm:08ED03): the save carries 21 rounds, too few for a whole fight"
+    },
+    {
+      "id": "equip_pistol",
+      "op": "console",
+      "cmd": "player.equipitem {pistol}",
+      "on": "all",
+      "note": "WeapNV9mmPistol: the save starts with nothing equipped, so the bots' shots were bare-handed swings at range"
     },
     {
       "id": "stimpaks_on_gang1",

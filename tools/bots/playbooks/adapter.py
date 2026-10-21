@@ -16,6 +16,8 @@ class PlaybookBot:
     def __init__(self, bot: Any):
         self._b = bot
         self._aim: Optional[str] = None
+        if hasattr(bot, "auto_dismiss"):
+            bot.auto_dismiss = True     # a script's message box mid-fight must not swallow the shots
         self.name = getattr(bot, "name", "bot")
 
     def __getattr__(self, item):          # everything not overridden: the wrapped Bot

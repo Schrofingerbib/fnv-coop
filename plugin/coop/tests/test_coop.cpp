@@ -344,6 +344,14 @@ static void testActions() {
     a.rt->submitAction(fnvcoop::IntentKind::PickUp, R("FalloutNV.esm", 0xDEF));
     CHECK(pumpUntil(fr, [&] { return a.rt->client()->applied() == 2 && host.rt->host()->allSynced(); }));
     CHECK(a.world.inventory.at("falloutnv.esm:000DEF") == 1 && host.rt->counters().actions == 2);   // exactly once each
+    // A presence report (the guest entered cell 0x1234) is not an interaction: it must never reach the executor, which would run
+    // "Activate" with a cell as the calling reference (that hung the host in game). Twin 7: reports are executed like activations.
+    const size_t actingBefore = actingEvents.size();
+    a.rt->submitAction(fnvcoop::IntentKind::ReportCell, R("FalloutNV.esm", 0x1234));
+    CHECK(pumpUntil(fr, [&] { return host.rt->counters().actions == 3; }));
+    for (int i = 0; i < 50; ++i) fr();
+    CHECK(actingEvents.size() == actingBefore);               // the executor did not run
+    CHECK(host.rt->counters().reportsDropped == 1);
 }
 
 static void testDialogue() {

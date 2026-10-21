@@ -331,6 +331,17 @@ void HostSession::handle(PeerId from, const Message& m) {
                 for (size_t i = 0; i < kSyncShards; ++i)
                     if ((cls >> (i / 16) & 1u) && hh[i] != theirs[i]) bad.push_back(i);
                 if (bad.size() > maxShards) bad.resize(maxShards);
+                // Ask for no more shards than the client's reply can hold (kMaxShardEntries, judged by our own counts): a truncated reply
+                // drops entries in no shard order, so the real drift could sit in the part cut off and never be repaired, while every
+                // key cut off looks missing and is resent each round (two-copy fight test 2026-10-21: 24 digests, 1244 effects each).
+                // The shards left out are still bad at the next digest and are asked for then. At least one shard is always asked for.
+                if (!mutations().overfullShardRequest && bad.size() > 1) {
+                    std::vector<size_t> perShard(kSyncShards, 0);
+                    for (auto& e : baselineEntries(*st)) ++perShard[shardOf(e)];
+                    size_t sum = 0, keep = 0;
+                    while (keep < bad.size() && (keep == 0 || sum + perShard[bad[keep]] <= kMaxShardEntries)) sum += perShard[bad[keep++]];
+                    bad.resize(keep);
+                }
                 return bad;
             },
             [this, cp, st, sess, dgId, ep, dseq](std::vector<size_t> bad) {
@@ -357,7 +368,7 @@ void HostSession::handle(PeerId from, const Message& m) {
         const uint32_t sess = c->session;
         const bool truncated = se->truncated;
         runAsync<std::vector<RepairItem>>(worker_, mq_,
-            [sy, clientEffects = se->entries, touched = std::move(touched)]() {
+            [sy, clientEffects = se->entries, touched = std::move(touched), truncated = se->truncated]() {
                 std::set<size_t> shardSet(sy->shards.begin(), sy->shards.end());
                 std::map<uint64_t, BaselineEntry> hostE, clientE;
                 for (auto& e : baselineEntries(*sy->state)) if (shardSet.count(shardOf(e))) hostE.emplace(e.key, e);
@@ -366,6 +377,7 @@ void HostSession::handle(PeerId from, const Message& m) {
                 for (auto& [key, he] : hostE) {
                     auto it = clientE.find(key);
                     if (it != clientE.end() && it->second.value == he.value) continue;
+                    if (it == clientE.end() && truncated && !mutations().overfullShardRequest) continue;   // cut off, not missing
                     RepairItem r;
                     r.key = key; r.fix = he.effect;
                     r.revertToo = it != clientE.end() && (std::holds_alternative<RefAddItem>(he.effect) || std::holds_alternative<RefRemoveItem>(he.effect));

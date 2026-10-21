@@ -144,11 +144,33 @@ def check_in_sync(ctx: Ctx, refs: List[Any], tol: float, what: str = "") -> Dict
     return out
 
 
+STANDOFF_MIN = 150.0            # a shooter closer than this stands inside the target: the aim points at the floor and every shot misses
+STANDOFF_DIST = 350.0
+
+
+def standoff(ctx: Ctx, target: Any, shooters: List[Machine]) -> None:
+    """Every shooter that stands on top of `target` (the setup's MoveTo puts the players right on the NPC) steps back to STANDOFF_DIST,
+    each to its own side so they do not block each other's line of fire."""
+    for i, m in enumerate(shooters):
+        tp = P.actor_pos(m.bot, ref_on(target, m))
+        me = tuple(float(x) for x in m.bot.pos())
+        if dist3(me[:2], tp[:2]) >= STANDOFF_MIN:
+            continue
+        a = math.radians(90.0 * i)
+        x, y = tp[0] + STANDOFF_DIST * math.cos(a), tp[1] + STANDOFF_DIST * math.sin(a)
+        try:            # a hop, not a walk: the NPC's own collision traps a player standing inside it
+            r = m.bot.goto_pos(x, y, me[2], mode="teleport")
+        except TypeError:           # the fake world's bot has no modes
+            r = m.bot.goto_pos(x, y, me[2])
+        ctx.must(r, f"{m.name} steps back from {key_of(target)} to shoot it")
+
+
 def volley(ctx: Ctx, target: Any, ledger: Ledger, shooters: Optional[List[Machine]] = None, max_volleys: int = 25,
            gap_s: float = 0.3) -> None:
     """The shooters aim at `target` and fire at the same time, volley after volley, until it is dead on every machine."""
     ms = list(shooters if shooters is not None else ctx.present)
     ctx.equip_all()
+    standoff(ctx, target, ms)
     for _ in range(max_volleys):
         def shoot(m: Machine):
             r = m.bot.aim_at(ref_on(target, m))
@@ -338,6 +360,84 @@ def settled_pairs(ctx: Ctx, refs: List[str]) -> Optional[Dict[str, Tuple[int, in
     return out
 
 
+# ---- arrange: put the world into the state a step expects, so one step can run alone (--from-step / --only-step) ----------------------
+# Only used by a partial run (Ctx.run_step); a full run never calls them. They use the bot's own operations (hop next to a ref, equip, read
+# state) and never fake anything: what cannot be arranged (a target that is already dead, machines that disagree) is reported as an
+# "arrange" failure that says to reload the scenario, instead of being papered over.
+def arrange_failure(msg: str) -> StepFailure:
+    return StepFailure(f"cannot arrange this step: {msg}", "arrange")
+
+
+RELOAD_HINT = "reload the scenario (rerun without --from-step / --only-step, or add --reload)"
+
+
+def require_alive(ctx: Ctx, refs: List[Any]) -> None:
+    """Every ref in `refs` must be alive on every machine now; a dead or disagreeing one needs a scenario reload."""
+    for r in refs:
+        k = key_of(r)
+        views = {m.name: m.bot.target_alive(ref_on(r, m)) for m in ctx.present}
+        if len(set(views.values())) != 1:
+            raise arrange_failure(f"{k} is alive on some machines and dead on others {views}: that is the desync, not a start state; {RELOAD_HINT}")
+        if not all(views.values()):
+            raise arrange_failure(f"{k} is already dead and this step needs it alive; {RELOAD_HINT}")
+
+
+def place_near(ctx: Ctx, ref: Any, dist: float = 600.0, slack: float = 1.5) -> None:
+    """Hop every player that is farther than `dist * slack` from `ref` to `dist` from it (teleport; a walk across the map costs a minute).
+    Players already close are left where they are, so a rerun in place does not move anybody."""
+    def one(m: Machine):
+        target = ref_on(ref, m)
+        tp = P.actor_pos(m.bot, target)
+        me = tuple(float(x) for x in m.bot.pos())
+        if dist3(me[:2], tp[:2]) <= dist * slack:
+            return None
+        try:
+            return m.bot.goto_ref(target, dist, mode="teleport")
+        except TypeError:           # the fake world's bot has no modes
+            return m.bot.goto_ref(target, dist)
+    with ctx.teleporting():
+        for name, r in ctx.on_all(one).items():
+            if r is not None:
+                ctx.must(r, f"{name} hops next to {key_of(ref)}")
+
+
+def owners_settled(ctx: Ctx, refs: List[Any]) -> None:
+    """Wait until every machine knows who owns each living ref, nothing is pending and they agree (the state check_in_sync demands)."""
+    alive = [r for r in refs if ctx.host.bot.target_alive(ref_on(r, ctx.host))]
+    if not alive:
+        return
+    try:
+        ctx.wait_until("every machine agrees on who owns the living enemies", lambda: settled_pairs(ctx, alive) is not None,
+                       timeout_s=ctx.opts.get("arrange_s", 15.0))
+    except StepFailure as e:
+        raise arrange_failure(e.reason) from None
+
+
+class FightState:
+    """What enemy_fight's steps hand to each other. A partial run rebuilds it from the world (rebaseline_fight)."""
+
+    def __init__(self) -> None:
+        self.c0: Optional[Dict[str, int]] = None
+        self.hp_start: Dict[str, float] = {}
+        self.taken_start: Optional[Dict[str, int]] = None
+        self.trace = EnemyTrace()
+        self.killed: List[str] = []
+
+
+def rebaseline_fight(ctx: Ctx, st: FightState, hostiles: List[str]) -> None:
+    """Take the start-of-test numbers from the world as it is now: who is dead, how many live refs there were before the dead ones fell,
+    the players' health and the hits they have taken so far."""
+    capture_stats(ctx, "enemy_fight start")
+    st.killed = [r for r in hostiles if not ctx.host.bot.target_alive(r)]
+    counts = dup_counts(ctx, hostiles)
+    if counts is not None:
+        base_of = ctx.refs.get("hostile_base_of") or {}
+        st.c0 = {b: n + sum(1 for r in st.killed if base_of.get(r) == b) for b, n in counts.items()}
+    for m in ctx.present:
+        st.hp_start[m.name] = float(m.bot.health())
+    st.taken_start = ctx.optional("hits taken", lambda: {m.name: P.hits_taken(m.bot) for m in ctx.present})
+
+
 # =================================================================================================================================
 class EnemyFightPlaybook(Playbook):
     name = "enemy_fight"
@@ -346,54 +446,71 @@ class EnemyFightPlaybook(Playbook):
     needs_scenario_refs = ("hostiles",)
     anim = True
     anim_profile = "fight"
+    resumable = True
     ENGAGE_ROUNDS = 4
 
     def run(self, ctx: Ctx) -> None:
         hostiles: List[str] = list(ctx.refs["hostiles"])
         tol = float(ctx.refs.get("pos_tol", DEFAULT_POS_TOL))
-        c0: Optional[Dict[str, int]] = None
-        hp_start: Dict[str, float] = {}
-        taken_start: Optional[Dict[str, int]] = None
-        trace = EnemyTrace()
-        killed: List[str] = []
+        st = FightState()
+        trace = st.trace
 
-        with ctx.step("everyone walks to the enemies"):
+        def arrange(alive: List[str], near: bool = True, owners: bool = True, rebaseline: bool = True) -> Any:
+            """The arrange part of a step: the `alive` refs must be alive, the players stand near the first living enemy with the weapon
+            equipped, the owners are settled, and the numbers the later checks compare against are taken from the world."""
+            def go() -> None:
+                require_alive(ctx, alive)
+                if near:
+                    place_near(ctx, (living(ctx, hostiles) or hostiles)[0])
+                    ctx.equip_all()
+                if owners:
+                    owners_settled(ctx, hostiles)
+                if rebaseline:
+                    rebaseline_fight(ctx, st, hostiles)
+            return go
+
+        def walk() -> None:
             capture_stats(ctx, "enemy_fight start")
             gather(ctx, hostiles[0])
             for r in hostiles:
                 ctx.same_everywhere(f"{r} alive", lambda m, r=r: m.bot.target_alive(r))
                 ctx.expect(ctx.host.bot.target_alive(r), f"{r} should start alive")
-            c0 = dup_counts(ctx, hostiles)
-        with ctx.step("the enemies are one set everywhere: owner, AI, health, positions"):
+            st.c0 = dup_counts(ctx, hostiles)
+
+        def in_sync() -> None:
             check_in_sync(ctx, hostiles, tol)
             for m in ctx.present:
-                hp_start[m.name] = float(m.bot.health())
-            taken_start = ctx.optional("hits taken", lambda: {m.name: P.hits_taken(m.bot) for m in ctx.present})
+                st.hp_start[m.name] = float(m.bot.health())
+            st.taken_start = ctx.optional("hits taken", lambda: {m.name: P.hits_taken(m.bot) for m in ctx.present})
             trace.sample(ctx, hostiles)
-        with ctx.step("the enemies engage: they move and attack, positions and health stay in step", compare=True):
+
+        def engage() -> None:
             for _ in range(self.ENGAGE_ROUNDS):
                 ctx.advance(0.75)
                 ctx.settle()
                 check_in_sync(ctx, hostiles, tol, " while engaging")
                 trace.sample(ctx, hostiles)
-            check_no_duplicates(ctx, c0, hostiles)
-        for i, r in enumerate(hostiles):
-            with ctx.step(f"both kill enemy {i + 1}: every hit once, one death, one credit"):
+            check_no_duplicates(ctx, st.c0, hostiles)
+
+        def kill(r: str):
+            def body() -> None:
                 hp_before = current_hp(ctx, r)
                 seg = Ledger()
                 volley(ctx, r, seg)
                 ctx.settle()
                 check_kill(ctx, r, hp_before, seg)
-                killed.append(r)
-                rest = [x for x in hostiles if x not in killed]
+                st.killed.append(r)
+                rest = [x for x in hostiles if x not in st.killed]
                 check_in_sync(ctx, rest, tol, " after a kill")
-                check_no_duplicates(ctx, c0, hostiles)
+                check_no_duplicates(ctx, st.c0, hostiles)
                 if rest:
                     trace.sample(ctx, rest)
-        with ctx.step("after the fight: all dead, nothing duplicated, the dead stay calm"):
+            return body
+
+        def after() -> None:
             for r in hostiles:
                 ctx.expect(not any(m.bot.target_alive(r) for m in ctx.present), f"{r} is alive somewhere")
-            check_no_duplicates(ctx, c0, hostiles)
+            check_no_duplicates(ctx, st.c0, hostiles)
             taken0 = ctx.optional("hits taken", lambda: {m.name: P.hits_taken(m.bot) for m in ctx.present})
             ctx.advance(2.0)
             ctx.settle()
@@ -401,10 +518,10 @@ class EnemyFightPlaybook(Playbook):
             if taken0 is not None and taken1 is not None:
                 ctx.expect(taken0 == taken1, f"players were hit after every enemy was dead: {taken0} -> {taken1} (a dead NPC kept attacking)")
             npc_dmg = ctx.refs.get("npc_damage")
-            if npc_dmg is not None and taken1 is not None and taken_start is not None:
+            if npc_dmg is not None and taken1 is not None and st.taken_start is not None:
                 for m in ctx.present:
-                    lost = hp_start[m.name] - float(m.bot.health())
-                    n_hits = taken1[m.name] - taken_start[m.name]
+                    lost = st.hp_start[m.name] - float(m.bot.health())
+                    n_hits = taken1[m.name] - st.taken_start[m.name]
                     ctx.expect(abs(lost - n_hits * float(npc_dmg)) < 1e-6,
                                f"{m.name} lost {lost:g} health from {n_hits} enemy hits of {npc_dmg} damage "
                                f"(each hit must land exactly once on the victim)")
@@ -417,6 +534,15 @@ class EnemyFightPlaybook(Playbook):
             problem = trace.ai_conflict()
             ctx.expect(problem is None, problem or "")
             capture_stats(ctx, "enemy_fight end")
+
+        ctx.run_step("everyone walks to the enemies", walk, arrange=arrange(hostiles, near=False, owners=False, rebaseline=False))
+        ctx.run_step("the enemies are one set everywhere: owner, AI, health, positions", in_sync, arrange=arrange(hostiles))
+        ctx.run_step("the enemies engage: they move and attack, positions and health stay in step", engage, arrange=arrange(hostiles),
+                     compare=True)
+        for i, r in enumerate(hostiles):
+            ctx.run_step(f"both kill enemy {i + 1}: every hit once, one death, one credit", kill(r), arrange=arrange([r]))
+        ctx.run_step("after the fight: all dead, nothing duplicated, the dead stay calm", after,
+                     arrange=arrange([], near=False, owners=False))
 
 
 # =================================================================================================================================

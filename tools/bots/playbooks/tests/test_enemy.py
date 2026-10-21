@@ -14,10 +14,17 @@ What is proven (against T6b's fake co-op world with the NPC layer, fakenpc.py; N
   * the FIGHT animation thresholds see a 600 ms missing stagger that the default thresholds cannot, and the NPC pose comparison follows
     the owner across a handoff (without the owner windows the same clean run fails);
   * the scenario goodsprings_enemies is valid and its refs reach the playbooks; tools/bots/run_fight.py's exit codes and preflight.
+  * fix rounds (each with a twin): --from-step / --only-step run one step of enemy_fight alone on the world the earlier ones left (arrange
+    puts the players next to the enemies, finds the weapon, checks the targets are alive and the owners agreed, and rebuilds the start
+    numbers from the world); a full run never calls an arrange part; a dead target is reported, not papered over; Ctx.settle() fails early
+    with the stuck sequence numbers and acks when nothing moves, but not for slow or ack-only progress; --timescale sends "sgtm X" to
+    every copy after the setup, shrinks fixed sleeps by 1/X (not timeouts), resets to 1 after a pass, a failure and an interrupt.
 """
 from __future__ import annotations
 
 import atexit
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -664,6 +671,516 @@ class FakeWorldRules(unittest.TestCase):
         self.assertTrue(w.t(pb_enemy.HOSTILES[0])["owner"] == 0)
 
 
+class StepRun(core.Playbook):
+    """Three steps that only record what ran: the engine's selection and arrange rules, without a game or a fake world rule in the way."""
+    name = "steps3"
+    resumable = True
+
+    def __init__(self, fail_at: int = 0):
+        self.calls = []
+        self.fail_at = fail_at
+
+    def run(self, ctx):
+        for i in (1, 2, 3):
+            def body(i=i):
+                self.calls.append(("body", i))
+                if i == self.fail_at:
+                    raise core.StepFailure("boom", "check")
+            ctx.run_step(f"s{i}", body, arrange=lambda i=i: self.calls.append(("arrange", i)), compare=False)
+
+
+def run_steps(pb, **o):
+    w, refs = pb_enemy.fake_enemy_fight(2)
+    return core.run_playbook(pb, fakecoop.make_machines(w), fakecoop.FakeComparer(), tmp("enemy-steps-"), refs, dict(OPTS, anim=False, **o))
+
+
+def run_fight_step(w, refs, **o):
+    """enemy_fight on an existing world (the game's world is still there between two runs)."""
+    return core.run_playbook(registry.make("enemy_fight", REPO), fakecoop.make_machines(w), fakecoop.FakeComparer(), tmp(), refs,
+                             dict(OPTS, anim=False, **o))
+
+
+class ResumableSteps(unittest.TestCase):
+    """--from-step N / --only-step N: a failing step is rerun without the steps before it, on the world they left."""
+
+    def test_engine_skips_and_arranges_once_for_the_first_step_that_runs(self):
+        pb = StepRun()
+        r = run_steps(pb)
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(pb.calls, [("body", 1), ("body", 2), ("body", 3)], "a full run never calls arrange")
+        self.assertEqual((r.skipped, [s.index for s in r.steps]), ([], [1, 2, 3]))
+        pb = StepRun()
+        r = run_steps(pb, from_step=2)
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(pb.calls, [("arrange", 2), ("body", 2), ("body", 3)], "arrange for the first step only: step 3 follows step 2")
+        self.assertEqual((r.skipped, [s.index for s in r.steps]), (["01-s1"], [2, 3]))
+        pb = StepRun()
+        r = run_steps(pb, only_step=3)
+        self.assertEqual(pb.calls, [("arrange", 3), ("body", 3)])
+        self.assertEqual(r.skipped, ["01-s1", "02-s2"])
+        self.assertEqual((r.only_step, r.to_json()["only_step"], r.to_json()["skipped"]), (3, 3, ["01-s1", "02-s2"]))
+        pb = StepRun()
+        run_steps(pb, from_step=1)
+        self.assertEqual(pb.calls, [("body", 1), ("body", 2), ("body", 3)], "--from-step 1 is a full run")
+
+    def test_a_failure_keeps_the_real_step_number(self):
+        r = run_steps(StepRun(fail_at=3), from_step=2)
+        self.assertFalse(r.ok)
+        self.assertEqual([(s.index, s.ok) for s in r.steps], [(2, True), (3, False)])
+        self.assertTrue(os.path.basename(r.steps[-1].fail_dir).startswith("FAIL-1-03-"), r.steps[-1].fail_dir)
+
+    def test_no_step_selected_and_non_resumable_playbooks_are_refused(self):
+        r = run_steps(StepRun(), only_step=9)
+        self.assertFalse(r.ok)
+        self.assertIn("no step was selected", r.reason)
+        w, refs = pb_enemy.fake_enemy_handoff(2)
+        r = core.run_playbook(registry.make("enemy_handoff", REPO), fakecoop.make_machines(w), fakecoop.FakeComparer(), tmp(), refs,
+                              dict(OPTS, only_step=2))
+        self.assertFalse(r.ok)
+        self.assertIn("cannot run from a later step", r.reason)
+        self.assertEqual(r.steps, [], "nothing ran")
+
+    def test_full_run_never_arranges(self):
+        calls = []
+        orig = {n: getattr(pb_enemy, n) for n in ("place_near", "require_alive", "owners_settled", "rebaseline_fight")}
+        try:
+            for n, f in orig.items():
+                setattr(pb_enemy, n, lambda *a, _f=f, _n=n, **k: (calls.append(_n), _f(*a, **k))[1])
+            r, _ = run("enemy_fight", opts={"anim": False})
+            self.assertTrue(r.ok, r.reason)
+            self.assertEqual(calls, [], "a full run behaves exactly as before: no arrange part runs")
+            w, refs = pb_enemy.fake_enemy_fight(2)
+            self.assertTrue(run_fight_step(w, refs, only_step=2).ok)
+            self.assertEqual(set(calls), set(orig), "a partial run uses all of them")
+        finally:
+            for n, f in orig.items():
+                setattr(pb_enemy, n, f)
+
+    def test_every_enemy_fight_step_runs_alone_on_the_world_the_one_before_left(self):
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        for n in range(1, 8):
+            r = run_fight_step(w, refs, only_step=n)
+            self.assertTrue(r.ok, f"step {n} alone: {r.reason}")
+            self.assertEqual([s.index for s in r.steps], [n])
+        self.assertTrue(all(not w.bots[0].target_alive(h) for h in pb_enemy.HOSTILES), "the seven single-step runs killed all three")
+
+    def test_from_step_after_an_earlier_partial_run(self):
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        self.assertTrue(run_fight_step(w, refs, only_step=4).ok)               # enemy 1 is dead, the others fight on
+        r = run_fight_step(w, refs, from_step=5)
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual([s.index for s in r.steps], [5, 6, 7])
+
+    def test_every_step_starts_from_a_cold_world(self):
+        """The first run in a fresh world (players 2500 units away, nothing walked): steps 1 to 6 arrange it themselves; step 7 needs
+        the dead and says so instead of passing."""
+        for n in range(1, 7):
+            with self.subTest(n):
+                w, refs = pb_enemy.fake_enemy_fight(2)
+                r = run_fight_step(w, refs, only_step=n)
+                self.assertTrue(r.ok, f"step {n} on a cold world: {r.reason}")
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        r = run_fight_step(w, refs, only_step=7)
+        self.assertFalse(r.ok)
+        self.assertIn("alive somewhere", r.reason)
+
+    def test_arrange_puts_the_players_next_to_the_enemies(self):
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        far = [fakecoop.math.dist(w.players[s]["pos"], w.t(pb_enemy.HOSTILES[0])["pos"]) for s in range(2)]
+        self.assertGreater(min(far), 2000)
+        self.assertTrue(run_fight_step(w, refs, only_step=4).ok)
+        near = [fakecoop.math.dist(w.players[s]["pos"], w.t(pb_enemy.HOSTILES[0])["pos"]) for s in range(2)]
+        self.assertLess(max(near), 900, "arrange hopped both players to the fight")
+        # twin: without the placement the players stay where they were (the fake has no range rule, so the position is what shows it)
+        orig = pb_enemy.place_near
+        pb_enemy.place_near = lambda *a, **k: None
+        try:
+            w, refs = pb_enemy.fake_enemy_fight(2)
+            run_fight_step(w, refs, only_step=4)
+            stayed = [fakecoop.math.dist(w.players[s]["pos"], w.t(pb_enemy.HOSTILES[0])["pos"]) for s in range(2)]
+        finally:
+            pb_enemy.place_near = orig
+        self.assertGreater(min(stayed), 2000, "twin: no placement, no hop")
+
+    def test_place_near_leaves_players_who_are_close_where_they_are(self):
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        ctx = core.Ctx(fakecoop.make_machines(w), None, tmp(), refs, dict(OPTS))
+        pb_enemy.place_near(ctx, pb_enemy.HOSTILES[0])
+        where = [tuple(p["pos"]) for p in w.players]
+        pb_enemy.place_near(ctx, pb_enemy.HOSTILES[0])
+        self.assertEqual([tuple(p["pos"]) for p in w.players], where)
+
+    def test_a_dead_target_cannot_be_arranged(self):
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        self.assertTrue(run_fight_step(w, refs, only_step=4).ok)
+        r = run_fight_step(w, refs, only_step=4)               # enemy 1 is dead already
+        self.assertFalse(r.ok)
+        self.assertEqual(r.steps[-1].kind, "arrange")
+        self.assertIn("already dead", r.reason)
+        self.assertIn("reload the scenario", r.reason)
+        # twin: without the alive check the same run goes on and shoots a corpse without a word
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        run_fight_step(w, refs, only_step=4)
+        orig = pb_enemy.require_alive
+        pb_enemy.require_alive = lambda *a, **k: None
+        try:
+            r2 = run_fight_step(w, refs, only_step=4)
+        finally:
+            pb_enemy.require_alive = orig
+        self.assertNotEqual(r2.steps[-1].kind, "arrange")
+
+    def test_machines_that_disagree_about_a_target_cannot_be_arranged(self):
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        k = fakecoop.norm(pb_enemy.HOSTILES[0])
+        w.views[1]["refs"][k]["dead"] = True               # the client thinks it is dead, the host does not
+        r = run_fight_step(w, refs, only_step=4)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.steps[-1].kind, "arrange")
+        self.assertIn("alive on some machines and dead on others", r.reason)
+
+    def test_rebaseline_counts_the_dead_so_the_duplicate_check_stays_exact(self):
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        self.assertTrue(run_fight_step(w, refs, only_step=4).ok)
+        r = run_fight_step(w, refs, only_step=5)
+        self.assertTrue(r.ok, r.reason)
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        run_fight_step(w, refs, only_step=4)
+        orig = pb_enemy.rebaseline_fight
+
+        def forgets_the_dead(ctx, st, hostiles):
+            orig(ctx, st, hostiles)
+            base_of = ctx.refs.get("hostile_base_of") or {}
+            st.c0 = {b: n - sum(1 for x in st.killed if base_of.get(x) == b) for b, n in (st.c0 or {}).items()}
+        pb_enemy.rebaseline_fight = forgets_the_dead
+        try:
+            bad = run_fight_step(w, refs, only_step=5)
+        finally:
+            pb_enemy.rebaseline_fight = orig
+        self.assertFalse(bad.ok, "twin: a baseline that forgets the dead makes the next step see a phantom duplicate or vanish")
+        self.assertRegex(bad.reason, "live refs")
+
+    def test_a_bug_still_fails_the_step_it_belongs_to_when_that_step_runs_alone(self):
+        r, _ = run("enemy_fight", bugs={"double_damage"}, opts={"anim": False})
+        self.assertFalse(r.ok)
+        failed = r.steps[-1].index
+        self.assertEqual(failed, 4)
+        w, refs = pb_enemy.fake_enemy_fight(2, {"double_damage"})
+        r = run_fight_step(w, refs, only_step=failed)
+        self.assertFalse(r.ok)
+        self.assertIn("applied twice", r.reason)
+        self.assertEqual(r.steps[-1].index, failed)
+
+
+class FightCli(unittest.TestCase):
+    def _run(self, *args):
+        p = subprocess.run([sys.executable, "-I", os.path.join(REPO, "tools", "bots", "run_fight.py"), *args], capture_output=True, text=True,
+                           errors="replace")
+        return p.returncode, p.stdout + p.stderr
+
+    def test_only_step_and_from_step_on_the_fake_world(self):
+        d = tmp()
+        code, out = self._run("--fake", "--which", "fight", "--only-step", "4", "--outdir", d)
+        self.assertEqual(code, 0, out)
+        res = json.load(open(os.path.join(d, "summary.json"), encoding="utf-8"))["results"][0]
+        self.assertEqual((res["only_step"], len(res["skipped"])), (4, 6))
+        self.assertEqual([s["index"] for s in res["steps"]], [4, 8])               # 8: the animation check after the playbook
+        code, out = self._run("--fake", "--which", "fight", "--from-step", "6", "--outdir", d)
+        res = json.load(open(os.path.join(d, "summary.json"), encoding="utf-8"))["results"][0]
+        self.assertEqual(res["from_step"], 6)
+        self.assertEqual([s["index"] for s in res["steps"]][:2], [6, 7])
+
+    def test_a_failure_prints_the_command_that_reruns_that_step(self):
+        d = tmp()
+        code, out = self._run("--fake", "--which", "fight", "--bug", "double_damage", "--outdir", d)
+        self.assertEqual(code, 1, out)
+        self.assertIn("rerun only the failed step (04-", out)
+        line = [x for x in out.splitlines() if x.strip().startswith("python -I tools/bots/run_fight.py")][0]
+        self.assertIn("--from-step 4", line)
+        self.assertIn("--which fight", line)
+        self.assertNotIn("--outdir", line)
+
+    def test_usage_errors(self):
+        for args in (("--which", "fight", "--from-step", "2", "--only-step", "3"), ("--only-step", "2"), ("--from-step", "3"),
+                     ("--which", "handoff", "--only-step", "2"), ("--which", "fight", "--only-step", "-1"),
+                     ("--which", "fight", "--timescale", "0"), ("--which", "fight", "--timescale", "500")):
+            with self.subTest(args):
+                code, out = self._run("--fake", *args)
+                self.assertEqual(code, 2, out)
+        code, out = self._run("--fake", "--which", "handoff", "--only-step", "2")
+        self.assertIn("enemy_fight", out, "the error names the tests that can")
+
+    def test_rerun_command_replaces_the_old_selection(self):
+        import run_fight
+        cmd = run_fight.rerun_command(["--instances", "0,1", "--which", "fight", "--only-step", "2", "--outdir", "x y", "--reload",
+                                       "--timescale", "4"], 5)
+        self.assertEqual(cmd, "python -I tools/bots/run_fight.py --instances 0,1 --which fight --timescale 4 --from-step 5")
+        self.assertEqual(run_fight.rerun_command(["--from-step=3", "--which", "fight"], 6),
+                         "python -I tools/bots/run_fight.py --which fight --from-step 6")
+
+    def test_a_partial_run_in_a_game_does_not_reload_the_scenario(self):
+        """In a game the scenario jump is what costs a minute: --from-step / --only-step skip it, --reload brings it back."""
+        import types
+        import run_coop
+        import run_fight
+
+        class Nv:
+            def call(self, method, params=None, timeout_s=0):
+                return {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        mod = types.ModuleType("nvbridge")
+        mod.NvBridge = types.SimpleNamespace(connect=lambda instance, wait_s: Nv())
+        old_mod, old_main = sys.modules.get("nvbridge"), run_coop.main
+        seen = []
+        sys.modules["nvbridge"] = mod
+        run_coop.main = lambda args, extra=None: (seen.append((list(args), dict(extra or {}))), 0)[1]
+        base = ["--instances", "0,1", "--which", "fight", "--outdir", tmp()]
+        try:
+            for extra_args, no_scenario, want in ((["--only-step", "4"], True, {"only_step": 4}),
+                                                  (["--from-step", "3", "--timescale", "4"], True, {"from_step": 3, "timescale": 4.0}),
+                                                  (["--from-step", "3", "--reload"], False, {"from_step": 3}),
+                                                  ([], False, {}), (["--from-step", "1"], False, {"from_step": 1})):
+                seen.clear()
+                with contextlib.redirect_stdout(io.StringIO()):         # the preflight table mentions 'skipped': keep the runner's output clean
+                    self.assertEqual(run_fight.main(base + extra_args), 0)
+                args, extra = seen[0]
+                self.assertEqual(("--no-scenario" in args), no_scenario, extra_args)
+                self.assertEqual(extra, want, extra_args)
+        finally:
+            run_coop.main = old_main
+            if old_mod is None:
+                sys.modules.pop("nvbridge", None)
+            else:
+                sys.modules["nvbridge"] = old_mod
+
+
+class ScriptBot:
+    """A bot that only answers coop.status, from a function of the manual clock: stuck, creeping or catching up, as the test wants."""
+
+    def __init__(self, name, status_fn):
+        self.name = name
+        self._status = status_fn
+        self.nv = type("Nv", (), {"call": staticmethod(self._call)})()
+
+    def _call(self, method, params=None, timeout_s=0):
+        raise RuntimeError("unknown method " + method)
+
+    def coop_status(self):
+        return self._status()
+
+
+def settle_ctx(host_status, client_status, **opts):
+    clock = clocks.ManualClock()
+    machines = [core.Machine(0, "host", ScriptBot("host", lambda: host_status(clock.now()))),
+                core.Machine(1, "client1", ScriptBot("client1", lambda: client_status(clock.now())))]
+    o = {"clock": clock, "load_scale": False, "settle_s": 24.0, "settle_poll_s": 0.5}
+    o.update(opts)
+    return core.Ctx(machines, None, tmp("settle-"), {}, o), clock
+
+
+def host_st(head, acked, synced, mismatch=0, desyncs=()):
+    return {"role": "host", "lastSeq": head, "counters": {}, "host": {"lastSeq": head, "allSynced": synced, "badMessages": 0,
+            "peers": [{"slot": 1, "joined": True, "acked": acked}]},
+            "desyncs": {"digests": {"mismatch": mismatch, "repairs": mismatch, "effectsRepaired": 0}, "desyncs": list(desyncs)}}
+
+
+class FailFastSettle(unittest.TestCase):
+    """Ctx.settle() stops when nothing moves, with the reason, instead of waiting the whole budget for the same answer."""
+
+    def stuck(self, **opts):
+        return settle_ctx(lambda t: host_st(10, 7, False), lambda t: {"role": "client", "lastSeq": 7}, **opts)
+
+    def test_stuck_machines_fail_early_and_the_reason_says_what_is_stuck(self):
+        ctx, clock = self.stuck()
+        with self.assertRaises(core.StepFailure) as cm:
+            ctx.settle()
+        self.assertEqual(cm.exception.kind, "settle")
+        self.assertLess(clock.now(), 8.0, "gave up after the 6 s stall window, not the 24 s budget")
+        msg = cm.exception.reason
+        for want in ("did not converge", "no progress for", "stopped early", "lastSeq per machine {'host': 10, 'client1': 7}",
+                     "allSynced=False", "client acks {'1': 7}"):
+            self.assertIn(want, msg)
+
+    def test_twin_without_the_stall_window_the_whole_budget_is_spent(self):
+        ctx, clock = self.stuck(settle_stall_s=0)
+        with self.assertRaises(core.StepFailure) as cm:
+            ctx.settle()
+        self.assertGreaterEqual(clock.now(), 24.0)
+        self.assertIn("within 24s", cm.exception.reason)
+        self.assertNotIn("no progress", cm.exception.reason)
+
+    def test_the_window_follows_the_budget_unless_set(self):
+        ctx, _ = self.stuck()
+        self.assertEqual(ctx._stall_window(20.0), 6.0)
+        self.assertEqual(ctx._stall_window(180.0), 45.0, "a chaos profile with a long budget gets a long window")
+        ctx, _ = self.stuck(settle_stall_s=2.5)
+        self.assertEqual(ctx._stall_window(180.0), 2.5)
+        ctx, clock = self.stuck(settle_stall_s=2.5)
+        with self.assertRaises(core.StepFailure):
+            ctx.settle()
+        self.assertLess(clock.now(), 4.0)
+
+    def test_a_repeating_digest_mismatch_is_named(self):
+        n = [0]
+
+        def host(t):
+            n[0] += 1                                   # the counter rises on every poll, the stuck mismatch is always the same one
+            return host_st(10, 7, False, mismatch=n[0], desyncs=[{"key": "quest:VCG02", "digest": "ab12"}])
+        ctx, clock = settle_ctx(host, lambda t: {"role": "client", "lastSeq": 7})
+        with self.assertRaises(core.StepFailure) as cm:
+            ctx.settle()
+        self.assertLess(clock.now(), 8.0, "a repair loop is not progress")
+        self.assertIn("digest mismatch counter rose by", cm.exception.reason)
+        self.assertIn("quest:VCG02", cm.exception.reason)
+
+    def test_slow_but_moving_machines_are_not_stopped(self):
+        def client(t):
+            return {"role": "client", "lastSeq": 7 + min(3, int(t // 4))}       # one more message every 4 s (window 6 s)
+        ctx, clock = settle_ctx(lambda t: host_st(10, 7 + min(3, int(t // 4)), 7 + min(3, int(t // 4)) == 10), client)
+        ctx.settle()
+        self.assertGreaterEqual(clock.now(), 12.0)
+
+    def test_only_the_acks_moving_counts_as_progress(self):
+        """lastSeq of every machine is frozen for 20 s while the host's view of the client's acks creeps up: still moving."""
+        def host(t):
+            late = t >= 20.0
+            return host_st(10, 10 if late else 4 + int(t // 4), late)
+        ctx, clock = settle_ctx(host, lambda t: {"role": "client", "lastSeq": 10 if t >= 20.0 else 7})
+        ctx.settle()
+        self.assertGreaterEqual(clock.now(), 20.0)
+
+    def test_twin_progress_that_ignores_acks_or_everything_stops_moving_runs_early(self):
+        def acks_only(t):
+            late = t >= 20.0
+            return host_st(10, 10 if late else 4 + int(t // 4), late)
+        orig = core.Ctx.__dict__["_progress"]
+        try:
+            core.Ctx._progress = staticmethod(lambda st, host: tuple(sorted((n, core.last_seq(s)) for n, s in st.items())))
+            ctx, _ = settle_ctx(acks_only, lambda t: {"role": "client", "lastSeq": 10 if t >= 20.0 else 7})
+            with self.assertRaisesRegex(core.StepFailure, "no progress"):
+                ctx.settle()
+            core.Ctx._progress = staticmethod(lambda st, host: ())
+            ctx, _ = settle_ctx(lambda t: host_st(10, 7 + min(3, int(t // 4)), 7 + min(3, int(t // 4)) == 10),
+                                lambda t: {"role": "client", "lastSeq": 7 + min(3, int(t // 4))})
+            with self.assertRaisesRegex(core.StepFailure, "no progress"):
+                ctx.settle()
+        finally:
+            core.Ctx._progress = orig
+
+    def test_converged_machines_pass_at_once(self):
+        ctx, clock = settle_ctx(lambda t: host_st(10, 10, True), lambda t: {"role": "client", "lastSeq": 10})
+        ctx.settle()
+        self.assertLess(clock.now(), 2.0)
+
+    def test_fake_world_that_never_delivers_fails_early_in_virtual_time(self):
+        r, w = run("loot_race", lag=10 ** 6, opts={"anim": False, "settle_s": 60.0, "settle_stall_s": 1.0})
+        self.assertFalse(r.ok)
+        self.assertRegex(r.reason, r"no progress for 1(\.\d+)? simulated s")
+        self.assertIn("budget was 60", r.reason)
+        r, w = run("loot_race", lag=10 ** 6, opts={"anim": False, "settle_s": 5.0, "settle_stall_s": 0})
+        self.assertIn("did not converge", r.reason)
+        self.assertNotIn("no progress", r.reason)
+
+
+class Timescale(unittest.TestCase):
+    """--timescale X: "sgtm X" on every copy after the setup, fixed sleeps shrink by X, sgtm 1 at the end and on every failure."""
+
+    @staticmethod
+    def sgtm(world):
+        return {b.name: [c["cmd"] for m, c in b.nv.calls if m == "exec" and c["cmd"].startswith("sgtm")] for b in world.bots}
+
+    def test_fixed_sleeps_shrink_by_the_timescale_but_budgets_do_not(self):
+        def took(scale, fn, *a):
+            clock = clocks.ManualClock()
+            w, refs = pb_enemy.fake_enemy_fight(2)
+            ctx = core.Ctx(fakecoop.make_machines(w), None, tmp(), refs, {"clock": clock, "load_scale": False, "timescale": scale})
+            fn(ctx, *a)
+            return clock.now()
+        self.assertAlmostEqual(took(1.0, core.Ctx.advance, 4.0), 4.0, delta=0.2)
+        self.assertAlmostEqual(took(4.0, core.Ctx.advance, 4.0), 1.0, delta=0.2)
+        self.assertAlmostEqual(took(4.0, core.Ctx.pause, 2.0), 0.5, delta=0.2)
+        self.assertAlmostEqual(took(0.5, core.Ctx.advance, 1.0), 2.0, delta=0.2, msg="slow motion waits longer")
+        clock = clocks.ManualClock()
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        ctx = core.Ctx(fakecoop.make_machines(w), None, tmp(), refs, {"clock": clock, "load_scale": False, "timescale": 4.0})
+        self.assertEqual(ctx.budget(10.0), 10.0, "timeouts stay real time")
+        with self.assertRaisesRegex(core.StepFailure, "timed out after 10s"):
+            ctx.wait_until("never", lambda: False, timeout_s=10.0)
+        self.assertGreaterEqual(clock.now(), 10.0)
+        # twin: sleeps that ignore the timescale take the full time
+        orig = core.Ctx.game_wall_s
+        core.Ctx.game_wall_s = lambda self, s: s
+        try:
+            self.assertAlmostEqual(took(4.0, core.Ctx.advance, 4.0), 4.0, delta=0.2)
+        finally:
+            core.Ctx.game_wall_s = orig
+
+    def test_a_fake_world_clock_is_game_time_already(self):
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        ctx = core.Ctx(fakecoop.make_machines(w), None, tmp(), refs, dict(OPTS, timescale=4.0))
+        t0 = w.vt
+        ctx.advance(1.0)
+        self.assertAlmostEqual(w.vt - t0, 1.0, delta=0.1)
+
+    def test_run_sets_the_speed_after_setup_and_resets_it_afterwards(self):
+        r, w = run("enemy_fight", opts={"anim": False, "timescale": 4.0})
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(self.sgtm(w), {"host": ["sgtm 4", "sgtm 1"], "client1": ["sgtm 4", "sgtm 1"]})
+        first = [i for i, (m, c) in enumerate(w.bots[0].nv.calls) if m == "exec"][0]
+        self.assertTrue(all(m != "coop.owner" for m, _ in w.bots[0].nv.calls[:first]), "set before any step looked at the world")
+        self.assertEqual(r.timescale, {"requested": 4.0, "set": {"host": "", "client1": ""}, "reset": {"host": "", "client1": ""}})
+        res = json.load(open(os.path.join(r.outdir, "result.json"), encoding="utf-8"))
+        self.assertEqual(res["timescale"]["requested"], 4.0)
+
+    def test_default_speed_sends_nothing(self):
+        r, w = run("enemy_fight", opts={"anim": False})
+        self.assertTrue(r.ok, r.reason)
+        self.assertEqual(self.sgtm(w), {"host": [], "client1": []})
+        self.assertIsNone(r.timescale)
+        self.assertNotIn("timescale", r.to_json())
+
+    def test_the_speed_is_reset_after_a_failed_step(self):
+        r, w = run("enemy_fight", bugs={"double_damage"}, opts={"anim": False, "timescale": 2.5})
+        self.assertFalse(r.ok)
+        self.assertEqual(self.sgtm(w), {"host": ["sgtm 2.5", "sgtm 1"], "client1": ["sgtm 2.5", "sgtm 1"]})
+        self.assertEqual(r.timescale["reset"], {"host": "", "client1": ""})
+
+    def test_the_speed_is_reset_when_the_run_is_interrupted(self):
+        class Interrupted(core.Playbook):
+            name = "interrupted"
+
+            def run(self, ctx):
+                raise KeyboardInterrupt
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        with self.assertRaises(KeyboardInterrupt):
+            core.run_playbook(Interrupted(), fakecoop.make_machines(w), fakecoop.FakeComparer(), tmp(), refs, dict(OPTS, timescale=3.0))
+        self.assertEqual(self.sgtm(w), {"host": ["sgtm 3", "sgtm 1"], "client1": ["sgtm 3", "sgtm 1"]})
+
+    def test_a_copy_that_refuses_stops_the_run_and_the_others_go_back_to_1(self):
+        w, refs = pb_enemy.fake_enemy_fight(2)
+        real = w.bots[0].nv.exec
+        w.bots[0].nv.exec = lambda cmd, *a, **k: ({"ok": False, "output": "no such command"} if cmd.startswith("sgtm 4") else real(cmd, *a, **k))
+        r = core.run_playbook(registry.make("enemy_fight", REPO), fakecoop.make_machines(w), fakecoop.FakeComparer(), tmp(), refs,
+                              dict(OPTS, anim=False, timescale=4.0))
+        self.assertFalse(r.ok)
+        self.assertIn("could not set the game speed", r.reason)
+        self.assertIn("host", r.reason)
+        self.assertEqual([s for s in r.steps if s.name != "(outside step)"], [], "no step ran at mixed speeds")
+        self.assertEqual(self.sgtm(w)["client1"], ["sgtm 4", "sgtm 1"])
+
+    def test_cli_records_the_speed_in_the_summary(self):
+        d = tmp()
+        p = subprocess.run([sys.executable, "-I", os.path.join(REPO, "tools", "bots", "run_fight.py"), "--fake", "--which", "loot",
+                            "--timescale", "4", "--outdir", d], capture_output=True, text=True, errors="replace")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("timescale 4 (sgtm), reset to 1 on every copy", p.stdout)
+        res = json.load(open(os.path.join(d, "summary.json"), encoding="utf-8"))["results"][0]
+        self.assertEqual(res["timescale"]["requested"], 4.0)
+
 
 class SpawnPlacement(unittest.TestCase):
     """In game 2026-10-21: enemy_spawn (spawn_mode host) failed at step 01 because the host's walk to the marker was stuck on a
@@ -712,6 +1229,7 @@ class SpawnPlacement(unittest.TestCase):
         r = self.run_host_mode(blocked=False)
         self.assertTrue(r.steps[0].ok, r.steps[0].reason)
         self.assertFalse(any("teleported" in n for n in self.lines), self.lines)
+
 
 if __name__ == "__main__":
     unittest.main()

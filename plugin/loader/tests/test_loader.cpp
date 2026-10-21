@@ -1,6 +1,6 @@
 // Game-free tests for the hot-reload loader (CoreHost) using stub core DLLs. No NVSE, no game.
 // Usage: nvloader_test <dir with nvstub_*.dll>   (a scratch dir "run" is created inside it)
-// Exit 0 = every check passed. Run with FNVCOOP_MUT=21..32 (runtime twins of loader_host.cpp) it must fail.
+// Exit 0 = every check passed. Run with FNVCOOP_MUT=21..33 (runtime twins of loader_host.cpp) it must fail.
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -79,6 +79,27 @@ static int HandleCount() {
     DWORD n = 0;
     GetProcessHandleCount(GetCurrentProcess(), &n);
     return static_cast<int>(n);
+}
+// Build id as the loader reports it and tools/runner/hotswap.py expects it: CRC-32 of the file (hex, 8 digits), "-", size.
+// Written bitwise and separately from loader_host.cpp, so a mistake in one of them shows up as a difference.
+static std::string BuildOf(const std::string& path) {
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return "unreadable";
+    unsigned crc = 0xFFFFFFFFu;
+    unsigned long long total = 0;
+    char b[4096];
+    DWORD n = 0;
+    while (ReadFile(h, b, sizeof b, &n, nullptr) && n) {
+        for (DWORD i = 0; i < n; ++i) {
+            crc ^= static_cast<unsigned char>(b[i]);
+            for (int k = 0; k < 8; ++k) crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320u : (crc >> 1);
+        }
+        total += n;
+    }
+    CloseHandle(h);
+    char o[48];
+    std::snprintf(o, sizeof o, "%08x-%llu", crc ^ 0xFFFFFFFFu, total);
+    return o;
 }
 static std::string Info() {
     std::string o;
@@ -177,6 +198,13 @@ int main(int argc, char** argv) {
         CHECK(sp && Contains(sp("abc"), "\"stub\":1"), "state provider routes to core");
         CHECK(Has("dev.reload") && Has("dev.status"), "dev methods registered");
         CHECK(CacheFiles() == 1, "exactly one cache copy while loaded");
+        const std::string idV1 = BuildOf(g_core);
+        {
+            std::string st;
+            CHECK(host.coreBuildId() == idV1, ("the running core's build id is the id of the file it was loaded from: " + host.coreBuildId() + " vs " + idV1).c_str());
+            CHECK(Call("dev.status", "{}", st) && Contains(st, ("\"buildId\":\"" + idV1 + "\"").c_str()) && Contains(st, "\"hotReload\":true"),
+                  ("dev.status reports buildId and hotReload: " + st).c_str());
+        }
 
         // ---- the core finds its config beside its own module (the cache copy) ----
         {
@@ -193,12 +221,17 @@ int main(int argc, char** argv) {
 
         // ---- the build can overwrite the original while the game runs (needs the private copy) ----
         CHECK(Put("nvstub_v2"), "overwrite core file while loaded");
+        const std::string idV2 = BuildOf(g_core);
+        CHECK(idV2 != idV1, "the two stub builds have different ids");
+        CHECK(host.coreBuildId() == idV1, "overwriting the file does not change the id of the running core");
         SetIni("second-changed-" + g_tag);   // config edited between reloads
         SetJson("{\"v\":\"two-" + g_tag + "\"}");
         const std::string cfg2 = Want("second-changed-" + g_tag, "{\"v\":\"two-" + g_tag + "\"}");
         ReloadResult r = host.Reload("test");
         CHECK(r.ok, ("reload to v2: " + r.error).c_str());
         CHECK(host.generation() == 2, "generation 2");
+        CHECK(r.buildId == idV2 && host.coreBuildId() == idV2, ("a reload reports the build id of the new core: " + r.buildId + " vs " + idV2).c_str());
+        { std::string st; CHECK(Call("dev.status", "{}", st) && Contains(st, ("\"buildId\":\"" + idV2 + "\"").c_str()), "dev.status shows the new build id"); }
         CHECK(Contains(Info(), "v2:frames=3"), "v2 running, frames blob preserved");
         CHECK(Cfg() == cfg2, ("an ini and a json edited before the reload reach the new core: " + Cfg()).c_str());
         CHECK(!Has("stub.only_v1"), "old core's methods are gone");
@@ -229,6 +262,7 @@ int main(int argc, char** argv) {
             r = host.Reload(b);
             CHECK(!r.ok && r.rolledBack && !r.coreDead, (std::string("rollback after ") + b + ": " + r.error).c_str());
             CHECK(host.generation() == 2 && host.loaded(), "generation unchanged after failed reload");
+            CHECK(host.coreBuildId() == idV2 && r.buildId == idV2, ("a rolled-back reload keeps the build id of the core that runs again: " + host.coreBuildId()).c_str());
             CHECK(Contains(Info(), "v2:frames=4"), "previous core running again with its state");
             CHECK(Has("stub.only_v2"), "previous core's methods back");
             CHECK(Cfg() == cfg2, ("the rolled-back core reads the current config: " + Cfg()).c_str());
@@ -313,7 +347,8 @@ int main(int argc, char** argv) {
         // ---- bridge methods ----
         {
             std::string o;
-            CHECK(Call("dev.reload", "{\"reason\":\"bridge test\"}", o) && Contains(o, "generation"), "dev.reload via bridge");
+            CHECK(Call("dev.reload", "{\"reason\":\"bridge test\"}", o) && Contains(o, "generation") &&
+                      Contains(o, ("\"buildId\":\"" + BuildOf(g_core) + "\"").c_str()), ("dev.reload via bridge answers with the new build id: " + o).c_str());
             CHECK(Call("dev.status", "{}", o) && Contains(o, "\"loaded\":true") && Contains(o, "bridge test"), "dev.status");
             SetEnvironmentVariableA("NVSTUB_VETO", "1");
             CHECK(!Call("dev.reload", "{}", o) && Contains(o, "vetoed"), "dev.reload reports a veto");

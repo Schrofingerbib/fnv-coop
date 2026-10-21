@@ -16,13 +16,18 @@ import tempfile
 import time
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1] / "tools" / "pool"))
+# Runners given game process keys look for prepared saves in the instance folders: keep these tests off the real ones.
+_INST_ROOT = tempfile.TemporaryDirectory()
+os.environ["FNV_INSTANCES_ROOT"] = _INST_ROOT.name
 import scenlib  # noqa: E402
 import runner  # noqa: E402
+import prepare_save  # noqa: E402
 import fakegame  # noqa: E402
 import proof  # noqa: E402
 import scen  # noqa: E402
@@ -769,6 +774,293 @@ class SharedStateFile(unittest.TestCase):
         self.assertEqual([x for x in os.listdir(self.dir) if x.endswith(".tmp")], [])
 
 
+BOX_OFFSETS = [2, 3, 4, 5, 18, 19, 32, 33, 34, 35, 48, 49, 50, 51]   # 14 message boxes in waves over ~50 s (measured 2026-10-21)
+
+
+def boxed(n=2, sim=None, root=None, **flags):
+    """A fake world whose plain save raises 14 message boxes after each load, and whose coop.status is the CoopSim `sim`."""
+    w, clock, nvs = fakegame.make(n, **flags)
+    prime(w)
+    w.box_offsets = list(BOX_OFFSETS)
+    w.sim = sim
+    w.saves_root = root
+    return w, clock, nvs
+
+
+def saves_of(root):
+    return prepare_save.PreparedSaves(lambda inst: Path(root) / str(inst))
+
+
+def runner_on(nvs, clock, **kw):
+    return runner.Runner(nvs, runner.StateStore(), sleep=clock.sleep, now=clock.now, log=lambda *a: None, order=ORDER, **kw)
+
+
+class PreparedSave(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def prepare(self, w, clock, nvs, save="autosave", **kw):
+        return prepare_save.prepare(nvs, save, saves_of(self.root), log=lambda *a: None, sleep=clock.sleep, now=clock.now, **kw)
+
+    def test_prepare_presses_every_box_before_it_saves_and_the_manifest_says_so(self):
+        w, clock, nvs = boxed(root=self.root)
+        r = self.prepare(w, clock, nvs)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["boxesPressed"], 28)                      # 14 boxes on each of the two copies
+        self.assertEqual(sorted(w.save_log), [(0, "nvcoop_autosave_ready"), (1, "nvcoop_autosave_ready")])
+        self.assertIn("nvcoop_autosave_ready", w.clean_saves)        # saved after the last box was pressed
+        self.assertEqual(saves_of(self.root).pick(1, "autosave")[0], "nvcoop_autosave_ready")
+
+    def test_direct_mode_prepares_the_given_instances_on_their_own_pipes_without_a_pool(self):
+        # run_fight.py --instances 2,3 talks to the pipes itself; prepare_save --direct 2,3 must do the same and record per instance id
+        w, clock, nvs = boxed(root=self.root)
+        store = prepare_save.PreparedSaves(lambda inst: Path(self.root) / str(inst - 2))   # the fake writes <root>/<position>
+        opened = []
+
+        @contextlib.contextmanager
+        def connect(i):
+            opened.append(i)
+            yield nvs[len(opened) - 1]
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = prepare_save.main(["--direct", "2,3", "--save", "autosave"], store=store, connect_fn=connect,
+                                   sleep=clock.sleep, now=clock.now, log=lambda *a: None)
+        self.assertEqual(rc, 0)
+        self.assertEqual(opened, [2, 3])
+        self.assertEqual(store.pick(2, "autosave")[0], "nvcoop_autosave_ready")
+        self.assertEqual(store.pick(3, "autosave")[0], "nvcoop_autosave_ready")
+        self.assertIsNone(store.pick(4, "autosave")[0])
+
+    def test_jump_loads_the_prepared_save_and_skips_the_long_quiet_window(self):
+        w, clock, nvs = boxed(root=self.root)
+        plain = runner_on(nvs, clock, prepared=False).jump(load("quest_stage_sync"))
+        self.assertGreater(plain["seconds"], 60)                      # the waves plus the 20 s quiet window
+        self.assertEqual(plain["loadMessages"]["pressed"], 28)
+        self.assertEqual([x["prepared"] for x in plain["loadedSaves"]], [False, False])
+        self.prepare(w, clock, nvs)
+        w.loads.clear()
+        rn = runner_on(nvs, clock, prepared=saves_of(self.root))
+        j = rn.jump(load("quest_stage_sync"), force_reload=True)
+        self.assertEqual(sorted(w.loads), [(0, "nvcoop_autosave_ready"), (1, "nvcoop_autosave_ready")])
+        self.assertEqual([x["prepared"] for x in j["loadedSaves"]], [True, True])
+        self.assertIn("nvcoop_autosave_ready", j["loadedSaves"][0]["why"])
+        self.assertEqual(j["loadMessages"]["pressed"], 0)
+        self.assertLess(j["seconds"], 12)                             # 1.5 s load sleep + a 4 s quiet window, not 70 s
+
+    def test_state_still_names_the_plain_start_save(self):
+        # the jump plan compares the loaded save with start.save: loading nvcoop_autosave_ready must not look like a different save
+        w, clock, nvs = boxed(root=self.root)
+        self.prepare(w, clock, nvs)
+        rn = runner_on(nvs, clock, prepared=saves_of(self.root))
+        sc = load("quest_stage_sync")
+        rn.jump(sc, force_reload=True)
+        self.assertEqual(rn._state()["save"], "autosave")
+        self.assertFalse(rn.jump(load("door_terminal_container_matrix"))["reload"])
+
+    def test_without_a_prepared_save_the_plain_one_loads_with_the_full_quiet_window(self):
+        w, clock, nvs = boxed(root=self.root)
+        j = runner_on(nvs, clock, prepared=saves_of(self.root)).jump(load("quest_stage_sync"))
+        self.assertEqual(sorted(w.loads), [(0, "autosave"), (1, "autosave")])
+        self.assertIn("no prepared save", j["loadedSaves"][0]["why"])
+        self.assertEqual(j["loadMessages"]["pressed"], 28)
+
+    def test_one_copy_without_a_prepared_save_keeps_the_long_window_for_both(self):
+        w, clock, nvs = boxed(root=self.root)
+        self.prepare(w, clock, nvs)
+        (Path(self.root) / "1" / "nvcoop_autosave_ready.fos").unlink()
+        w.loads.clear()
+        j = runner_on(nvs, clock, prepared=saves_of(self.root)).jump(load("quest_stage_sync"), force_reload=True)
+        self.assertEqual(sorted(w.loads), [(0, "nvcoop_autosave_ready"), (1, "autosave")])
+        self.assertEqual(j["loadMessages"]["pressed"], 14)
+        self.assertGreater(j["seconds"], 60)
+
+    def test_a_prepared_save_the_game_refuses_falls_back_to_the_plain_save(self):
+        w, clock, nvs = boxed(root=self.root)
+        self.prepare(w, clock, nvs)
+        w.refuse_loads.add("nvcoop_autosave_ready")
+        w.loads.clear()
+        j = runner_on(nvs, clock, prepared=saves_of(self.root)).jump(load("quest_stage_sync"), force_reload=True)
+        self.assertEqual(sorted(w.loads), [(0, "autosave"), (1, "autosave")])
+        self.assertIn("refused", j["loadedSaves"][0]["why"])
+        self.assertEqual([x["prepared"] for x in j["loadedSaves"]], [False, False])
+
+    def test_scenario_can_opt_out(self):
+        w, clock, nvs = boxed(root=self.root)
+        self.prepare(w, clock, nvs)
+        w.loads.clear()
+        sc = copy.deepcopy(load("quest_stage_sync"))
+        sc["start"]["prepared"] = False
+        self.assertEqual(scenlib.validate(sc), [])
+        j = runner_on(nvs, clock, prepared=saves_of(self.root)).jump(sc, force_reload=True)
+        self.assertEqual(sorted(w.loads), [(0, "autosave"), (1, "autosave")])
+        self.assertIn("start.prepared", j["loadedSaves"][0]["why"])
+        sc["start"]["prepared"] = "no"
+        self.assertTrue(any("start.prepared" in e for e in scenlib.validate(sc)))
+
+    def test_a_source_save_that_changed_makes_the_prepared_one_stale(self):
+        w, clock, nvs = boxed(root=self.root)
+        src = [Path(self.root) / str(i) / "mysave.fos" for i in (0, 1)]
+        for p in src:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"one")
+        self.prepare(w, clock, nvs, save="mysave")
+        store = saves_of(self.root)
+        self.assertEqual(store.pick(0, "mysave")[0], "nvcoop_mysave_ready")
+        src[0].write_bytes(b"a different world")
+        name, why = store.pick(0, "mysave")
+        self.assertIsNone(name)
+        self.assertIn("changed", why)
+        self.assertEqual(store.pick(1, "mysave")[0], "nvcoop_mysave_ready")     # the other copy is untouched
+
+    def test_autosave_source_is_exempt_from_the_stale_check(self):
+        # the game rewrites "autosave" itself, so its size and time prove nothing about the prepared copy
+        w, clock, nvs = boxed(root=self.root)
+        src = Path(self.root) / "0" / "autosave.fos"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_bytes(b"one")
+        self.prepare(w, clock, nvs)
+        src.write_bytes(b"the game autosaved again")
+        self.assertEqual(saves_of(self.root).pick(0, "autosave")[0], "nvcoop_autosave_ready")
+
+    def test_a_save_whose_reload_still_raised_boxes_is_not_used(self):
+        w, clock, nvs = boxed(root=self.root, boxes_persist=True)     # the prepared save raises the boxes again
+        r = self.prepare(w, clock, nvs)
+        self.assertFalse(r["ok"])
+        self.assertTrue(all(not x["verified"] and "still raised" in x["error"] for x in r["perInstance"]), r)
+        name, why = saves_of(self.root).pick(0, "autosave")
+        self.assertIsNone(name)
+        self.assertIn("reload check", why)
+
+    def test_a_missing_file_is_not_used(self):
+        w, clock, nvs = boxed(root=self.root)
+        self.prepare(w, clock, nvs)
+        (Path(self.root) / "0" / "nvcoop_autosave_ready.fos").unlink()
+        name, why = saves_of(self.root).pick(0, "autosave")
+        self.assertIsNone(name)
+        self.assertIn("gone", why)
+
+    def test_without_bot_menu_nothing_is_saved(self):
+        w, clock, nvs = fakegame.make(2)
+        w.saves_root = self.root
+        with self.assertRaises(RuntimeError):
+            self.prepare(w, clock, nvs)
+        self.assertEqual(w.save_log, [])
+
+    def test_engine_that_only_takes_autosave_names_gets_the_second_name(self):
+        w, clock, nvs = boxed(root=self.root)
+        real = fakegame.FakeNv.save_game
+
+        def picky(self_, name, timeout_ms=0, overwrite=False):
+            if not name.startswith("autosave"):
+                raise RuntimeError("engine refused " + name)
+            return real(self_, name, timeout_ms, overwrite)
+        with unittest.mock.patch.object(fakegame.FakeNv, "save_game", picky):
+            r = self.prepare(w, clock, nvs)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(saves_of(self.root).pick(0, "autosave")[0], "autosave_nvcoop_autosave_ready")
+
+    def test_runner_with_game_process_keys_looks_for_prepared_saves_and_one_without_does_not(self):
+        w, clock, nvs = fakegame.make(2)
+        self.assertIsNone(runner_on(nvs, clock).prepared)
+        self.assertIsNotNone(runner_on(nvs, clock, keys=["3@pid-1", "4@pid-2"]).prepared)
+        self.assertEqual(runner_on(nvs, clock, keys=["3@pid-1", "4@pid-2"]).instance_ids, [3, 4])
+        self.assertIsNone(runner_on(nvs, clock, keys=["3@pid-1", "4@pid-2"], prepared=False).prepared)
+
+    def test_instance_ids_come_from_the_pipe_name_when_the_key_only_has_a_position(self):
+        # run_parallel pair 1 drives instances 2 and 3; the playbook adapter keys its Runner "0@pid-x", "1@pid-y" by position
+        w, clock, nvs = fakegame.make(2)
+        for nv, n in zip(nvs, (2, 3)):
+            nv.name = "pipe-nvcoop-%d" % n
+        self.assertEqual(runner_on(nvs, clock, keys=["0@pid-1", "1@pid-2"]).instance_ids, [2, 3])
+
+
+class EventDrivenWaits(unittest.TestCase):
+    def jump(self, sim, **flags):
+        w, clock, nvs = boxed(sim=sim, **flags)
+        j = runner_on(nvs, clock, prepared=False).jump(load("quest_stage_sync"))
+        return j, j["coopSync"]
+
+    def test_synced_world_returns_the_moment_the_digest_is_ok(self):
+        j, cs = self.jump(fakegame.CoopSim())
+        self.assertTrue(cs["synced"] and cs["digestOk"], cs)
+        self.assertEqual(cs["settleReason"], "ok")
+        self.assertLess(cs["settleSeconds"], 10)               # the first digest comes 6 s after the load; the old wait took 60 s here
+        self.assertLess(cs["seconds"], 25)
+
+    def test_slow_but_moving_client_is_not_given_up_on(self):
+        _, cs = self.jump(fakegame.CoopSim(catch_up_s=100.0, head=400))   # 100 s to catch up, applied changes at every poll
+        self.assertTrue(cs["synced"], cs)
+
+    def test_client_stuck_half_way_fails_fast_and_names_the_numbers(self):
+        _, cs = self.jump(fakegame.CoopSim(stuck_at=50))
+        self.assertFalse(cs["synced"])
+        self.assertIn("no client progress", cs["reason"])
+        self.assertIn("applied 50 of 100", cs["reason"])
+        self.assertLess(cs["seconds"], 45)                      # not the 180 s limit
+
+    def test_client_that_never_joins_fails_fast(self):
+        _, cs = self.jump(fakegame.CoopSim(joined=False))
+        self.assertFalse(cs["synced"])
+        self.assertIn("not joined", cs["reason"])
+        self.assertLess(cs["seconds"], 45)
+
+    def test_client_with_a_dead_link_fails_fast(self):
+        _, cs = self.jump(fakegame.CoopSim(disconnected=True))
+        self.assertFalse(cs["synced"])
+        self.assertIn("transport not connected", cs["reason"])
+        self.assertLess(cs["seconds"], 45)
+
+    def test_rejected_join_fails_at_once_with_the_text(self):
+        _, cs = self.jump(fakegame.CoopSim(rejected=True, joined=False))
+        self.assertFalse(cs["synced"])
+        self.assertIn("version mismatch", cs["reason"])
+        self.assertLess(cs["seconds"], 3)
+
+    def test_same_mismatch_again_fails_fast_and_lists_the_desync_entries(self):
+        j, cs = self.jump(fakegame.CoopSim(digests="mismatch_same"))
+        self.assertTrue(cs["synced"])
+        self.assertFalse(cs["digestOk"])
+        self.assertIn("same mismatch", cs["settleReason"])
+        self.assertLess(cs["settleSeconds"], 15)                # 3 digests, not the 60 s limit
+        e = cs["desyncEntries"][0]
+        self.assertEqual((e["key"], e["host"], e["client"]), ("actor:00104C70.dead", "1", "0"))
+        self.assertEqual(cs["digestDelta"]["mismatch"], 3)
+
+    def test_one_mismatch_that_the_repair_fixes_is_a_success(self):
+        _, cs = self.jump(fakegame.CoopSim(digests="mismatch_once", digest_from=10.0))
+        self.assertTrue(cs["digestOk"], cs)
+        self.assertEqual(cs["settleRepairs"], 1)
+
+    def test_mismatches_on_changing_keys_are_not_called_the_same(self):
+        _, cs = self.jump(fakegame.CoopSim(digests="mismatch_moving"))
+        self.assertFalse(cs["digestOk"])
+        self.assertIn("no ok digest within", cs["settleReason"])      # healing still moves: only the outer limit ends it
+        self.assertGreater(len(cs["desyncEntries"]), 1)
+
+    def test_stale_digests_fail_fast(self):
+        _, cs = self.jump(fakegame.CoopSim(digests="stale"))
+        self.assertFalse(cs["digestOk"])
+        self.assertIn("stale", cs["settleReason"])
+        self.assertLess(cs["settleSeconds"], 15)
+
+    def test_silent_client_fails_after_the_digest_stall_window(self):
+        _, cs = self.jump(fakegame.CoopSim(digests="silent"))
+        self.assertFalse(cs["digestOk"])
+        self.assertIn("no digest arrived", cs["settleReason"])
+        self.assertTrue(20 <= cs["settleSeconds"] < 30, cs)
+
+    def test_run_result_carries_the_reasons(self):
+        w, clock, nvs = boxed(sim=fakegame.CoopSim(digests="mismatch_same"))
+        r = runner_on(nvs, clock, prepared=False).run(load("quest_stage_sync"))
+        cs = r["jump"]["coopSync"]
+        self.assertIn("same mismatch", cs["settleReason"])
+        self.assertIn("loadedSaves", r["jump"])
+        self.assertEqual(r["status"], "pass")                    # a digest that never matches does not block the steps, as before
+
+
 class Cli(unittest.TestCase):
     def test_validate_and_list_exit_codes(self):
         py = [sys.executable, "-I", "-X", "utf8", str(HERE / "scen.py")]
@@ -795,6 +1087,19 @@ MUTANTS = {
     "inplace": "put writes into the state file itself, no temp file and replace",
     "hexprefix": "console lines name a reference as '<hex>.Func' again",
     "refline": "the validator accepts a {alias}.Func call that is not first",
+    "noprepared": "jump never loads the prepared save",
+    "longquiet": "a prepared save still waits the 20 s quiet window of the plain save",
+    "nostale": "a prepared save is used although its source save changed",
+    "unverified": "a prepared save that failed its reload check is used",
+    "noverify": "prepare_save skips the reload check",
+    "earlysave": "prepare_save saves before the boxes are pressed away",
+    "fullwait": "the digest wait never gives up early (60 s every time)",
+    "latesuccess": "the digest wait notices an ok digest only at its time limit",
+    "hairtrigger": "the first mismatch already ends the digest wait",
+    "nodesyncs": "a failed digest wait leaves out the desync entries",
+    "nobridgeid": "instance ids come from the key only (pair 1 would use the prepared saves of instances 0 and 1)",
+    "directpos": "prepare_save --direct records instances by position, not by the ids given (pair 1 would write into instances 0 and 1)",
+    "nostall": "the sync wait never gives up on a client that stopped (180 s)",
 }
 
 

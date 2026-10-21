@@ -2,7 +2,8 @@
 """One command for the enemy / NPC sync tests: python -I tools/bots/playbooks/tests/run_enemy_tests.py  (prints ALL OK).
 
 Covers pb_enemy.py (enemy_fight, enemy_handoff, enemy_spawn, corpse_loot_race) with all their mutation twins, the load-robust playbook
-clock (clocks.py) with its twins, the FIGHT animation thresholds, scenarios/goodsprings_enemies.json and tools/bots/run_fight.py.
+clock (clocks.py) with its twins, the FIGHT animation thresholds, scenarios/goodsprings_enemies.json, tools/bots/run_fight.py, and the
+fix-round speed-ups (resumable steps, fail-fast settle, game timescale) with their twins.
 """
 import os
 import re
@@ -10,7 +11,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MIN_TESTS = 25
+MIN_TESTS = 60
 
 
 def main() -> int:

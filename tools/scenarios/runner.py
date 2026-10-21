@@ -26,9 +26,17 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1] / "tools" / "runner"))
 import scenlib  # noqa: E402
+import prepare_save  # noqa: E402
+
+try:
+    import nvbridge   # tools/runner: RpcError (the game refused a call; a lost game raises ConnectionLost, never caught here)
+    _REFUSED = (nvbridge.RpcError,)
+except Exception:   # noqa: BLE001 - not importable off Windows
+    _REFUSED = ()
 
 PARSE_ERRORS = ("could not parse", "error line", "unknown", "invalid")   # same list as the L7 sweep
 # test-only: "noreload" | "passall" | "firsthost" | "nodirty" | "oldkey" | "wholedict" | "noreread" | "inplace"
+#            | "noprepared" | "longquiet" | "fullwait" | "nostall" | "hairtrigger" | "latesuccess" | "nodesyncs"
 MUTANT = os.environ.get("SCEN_MUTANT", "")
 
 
@@ -199,7 +207,7 @@ class StateStore:
 
 class Runner:
     def __init__(self, bridges, store=None, keys=None, capabilities=None, sleep=time.sleep, now=time.monotonic,
-                 frames=90, log=print, order=None, poll_s=0.25):
+                 frames=90, log=print, order=None, poll_s=0.25, prepared=None):
         self.nvs = list(bridges)
         self.store = store or StateStore()
         if keys:
@@ -214,6 +222,28 @@ class Runner:
         self.caps = set(capabilities) if capabilities is not None else set(scenlib.PRESENT)
         self.sleep, self.now, self.frames, self.log, self.poll_s = sleep, now, frames, log, poll_s
         self.order = order or scenlib.load_order()
+        # Prepared saves (prepare_save.py): None = use them when the runner knows its game processes (keys given) and the file is there;
+        # False = never; or a PreparedSaves-like object with pick(instance, save) -> (name or None, why).
+        if prepared is None and keys and not os.environ.get("NVCOOP_NO_PREPARED"):
+            prepared = prepare_save.PreparedSaves()
+        self.prepared = prepared or None
+        self.instance_ids = [self._bridge_instance(nv) if self._bridge_instance(nv) is not None else self._instance_of(k, i)
+                             for i, (nv, k) in enumerate(zip(self.nvs, self.keys))]
+
+    @staticmethod
+    def _bridge_instance(nv):
+        """The pool instance id in the pipe name of a real bridge (\\.\pipe\nvcoop-<n>), else None. Callers that key their runner by
+        position (the playbook adapter does) would otherwise look up prepared saves of instance 0 and 1 for pair 1 (instances 2 and 3)."""
+        if MUTANT == "nobridgeid":   # test-only: trust the key only
+            return None
+        m = re.search(r"nvcoop-(\d+)$", str(getattr(nv, "name", "") or ""))
+        return int(m.group(1)) if m else None
+
+    @staticmethod
+    def _instance_of(key, index):
+        """The pool instance id in a key "instance@process"; the position of the bridge when the key says none."""
+        head = str(key).split("@", 1)[0]
+        return int(head) if head.isdigit() else index
 
     # ---- state of the (shared-world) scenario: stored on the host's key
     def _state(self):
@@ -334,22 +364,36 @@ class Runner:
         plan = scenlib.plan_jump(st, sc, fp, force_reload)
         if MUTANT == "noreload":
             plan = {"reload": False, "reasons": []}
+        # In a co-op session story state only moves forward (stage = max): an in-place quest reset on the host changes its world
+        # but not the session's shared state, so the guests get "healed" back to the old stages. Reload instead: a load starts a
+        # new world epoch and everyone rejoins from it (two-copy fight test 2026-10-21: VCG00 stage 0 on the host, 100 on the guest).
+        if not plan["reload"] and scenlib.reset_ids(sc, self.order) and self._in_coop():
+            plan = {"reload": True, "reasons": list(plan.get("reasons") or []) + ["co-op session: quest resets need a reload"]}
         save = sc["start"]["save"]
         coop_sync = None
+        loaded = None
         if plan["reload"]:
-            for nv in self.nvs:
-                nv.load_save(save)
+            loaded = self._load_start_save(sc)
             self.sleep(self.frames / 60.0)
             # Every client reloaded its own save, so it rejoins the co-op session. Setup steps the host runs before a client has
             # finished that are applied to a game that is still loading, and the load then overwrites them (seen in the two-copy
             # fight test 2026-10-21: the geckos the host enabled stayed disabled on the guest). Wait until the session is synced.
             coop_sync = self._wait_coop_synced()
+        # A prepared save has its boxes pressed away already: a short quiet window is only a safety net for a stray notice.
+        all_prepared = bool(loaded) and all(x["prepared"] for x in loaded) and MUTANT != "longquiet"
+        boxes = self._clear_load_messages(quiet_s=prepare_save.PREPARED_QUIET_S if all_prepared else prepare_save.PLAIN_QUIET_S)             if plan["reload"] else None
         ids = scenlib.reset_ids(sc, self.order)
         prev = set((st or {}).get("quest_hex") or [])
         # quests left changed by the previous scenario are reset too (in-place jumps must not inherit stage/var state)
         ids = sorted(set(ids) | (prev if not plan["reload"] else set()))
         for nv in self.nvs:
             nv.call("test.quest.reset", {"quests": ids})
+        if ids and self._in_coop():
+            # The reset changed every machine's world outside the session, and story state only moves forward (stage = max),
+            # so the host's shared state still has the old stages and would heal the guests back to them. Re-dump the host world as
+            # a new epoch (coop.rebaseline, test builds only): the guests rebase onto the reset state.
+            coop_sync = dict(coop_sync or {}, rebaseline=self._rebaseline_host())
+            coop_sync["afterRebaseline"] = self._wait_coop_synced()
         out = []
         for s in sc.get("setup") or []:
             rec = self._step(sc, s, res)
@@ -359,15 +403,94 @@ class Runner:
         new = {"loaded": True, "save": save, "dirty": sorted(fp["dirty"]), "failed": False, "quest_hex": ids, "scenario": sc["name"]}
         self.store.put_many({k: new for k in self.keys})
         return {"reload": plan["reload"], "reasons": plan["reasons"], "seconds": round(self.now() - t0, 2), "setup": out,
-                "reset": ids, "coopSync": coop_sync}
+                "reset": ids, "coopSync": coop_sync, "loadMessages": boxes, "loadedSaves": loaded}
 
-    def _wait_coop_synced(self, timeout_s=180.0, poll_s=0.5):
-        """After a reload: wait until every co-op client has rejoined and applied everything the host committed. A no-op (None)
-        when the instances are not in a co-op session (no coop.status method, or role off)."""
+    def _load_start_save(self, sc):
+        """Load the scenario's start save on every instance, the prepared one where the instance has one (prepare_save.py) and it
+        works. -> [{"instance", "save" (what was loaded), "prepared", "why"}], so a run log says which save each copy came from."""
+        save = sc["start"]["save"]
+        wanted = (sc.get("start") or {}).get("prepared", True)
+        out = []
+        for k, nv in enumerate(self.nvs):
+            name, why = None, "prepared saves are off"
+            if self.prepared and not wanted:
+                why = "scenario sets start.prepared false"
+            elif self.prepared and MUTANT != "noprepared":
+                name, why = self.prepared.pick(self.instance_ids[k], save)
+            used = save
+            if name:
+                try:
+                    nv.load_save(name)
+                    used = name
+                except _REFUSED as e:   # the game refused the prepared save: the plain one still works
+                    name, why = None, "prepared save refused (%s); loaded %s" % (str(e)[:80], save)
+            if not name:
+                nv.load_save(save)
+            out.append({"instance": self.instance_ids[k], "save": used, "prepared": bool(name), "why": why})
+        return out
+
+    def _clear_load_messages(self, quiet_s=prepare_save.PLAIN_QUIET_S, max_s=150.0, poll_s=0.5):
+        """After a reload: press away the message boxes a load raises, until none has shown on any instance for `quiet_s`.
+        With the pre-order packs and all five DLC a load raises 14 (4 pack notices, then each DLC's intro and level-cap note) in waves
+        over about 50 s, with 12-16 s gaps (measured 2026-10-21). An open box keeps the game in menu mode and every bot input is lost,
+        so a fight that starts under one shoots nothing. Returns {pressed, seconds, quiet} or None without bot.menu (older builds)."""
+        t0 = last = self.now()
+        pressed = 0
+        while True:
+            seen = False
+            for nv in self.nvs:
+                try:
+                    kind = nv.call("bot.menu").get("kind")
+                except Exception:  # noqa: BLE001 - no bot module ([dev] bots=0) or a fake bridge
+                    return None if not pressed else {"pressed": pressed, "seconds": round(self.now() - t0, 2), "quiet": False}
+                if kind == "message":
+                    seen = True
+                    try:
+                        nv.call("bot.menu.press", {"button": 0})
+                        pressed += 1
+                    except Exception:  # noqa: BLE001 - a box that is closing refuses the press: try again next poll
+                        pass
+            now = self.now()
+            if seen:
+                last = now
+            if now - last >= quiet_s or now - t0 >= max_s:
+                return {"pressed": pressed, "seconds": round(now - t0, 2), "quiet": now - last >= quiet_s}
+            self.sleep(poll_s)
+
+    def _rebaseline_host(self):
+        for nv in self.nvs:
+            try:
+                if nv.call("coop.status").get("role") == "host":
+                    return nv.call("coop.rebaseline")
+            except Exception as e:  # noqa: BLE001 - an older build without the method: report it, the jump goes on
+                return {"ok": False, "error": str(e)}
+        return None
+
+    def _in_coop(self):
+        """True when these instances form a co-op session (a host and at least one client)."""
+        if len(self.nvs) < 2:
+            return False
+        try:
+            roles = [nv.call("coop.status").get("role") for nv in self.nvs]
+        except Exception:  # noqa: BLE001 - no co-op module
+            return False
+        return "host" in roles and "client" in roles
+
+    def _wait_coop_synced(self, timeout_s=180.0, poll_s=0.5, digest_timeout_s=60.0, stall_s=30.0, digest_stall_s=20.0):
+        """After a reload: wait until every co-op client has rejoined and applied everything the host committed, then until the
+        host has judged one desync digest as ok after that (a rejoin may be healed first: those repairs belong to the jump, not to
+        the test that runs next, and are reported here as settleRepairs). A no-op (None) when the instances are not in a co-op
+        session (no coop.status method, or role off).
+
+        Event-driven: it returns the moment the condition holds. It also gives up early, with a reason, when nothing moves:
+        a client that rejected the join, or client progress (joined, applied, baseline, connection) that stood still for stall_s,
+        or (digest part, _wait_digest_ok) no digest, stale digests, or the same mismatch again and again. timeout_s and
+        digest_timeout_s stay as the outer limits. The result has synced (bool) and, when false, reason."""
         if len(self.nvs) < 2:
             return None
         t0 = self.now()
         last = {}
+        sig, sig_at = None, t0
         while True:
             try:
                 sts = [nv.call("coop.status") for nv in self.nvs]
@@ -378,16 +501,126 @@ class Runner:
             if not hosts or not clients:
                 return None
             head = (hosts[0].get("host") or {}).get("lastSeq", 0)
-            ready = all((c.get("client") or {}).get("joined") and not (c.get("client") or {}).get("baselineActive")
-                        and (c.get("client") or {}).get("applied", -1) >= head
-                        and (c.get("transport") or {}).get("connected", True) for c in clients)
-            last = {"head": head, "applied": [(c.get("client") or {}).get("applied") for c in clients]}
+            cl = [c.get("client") or {} for c in clients]
+            conn = [(c.get("transport") or {}).get("connected", True) for c in clients]
+            # the plugin names it "syncing" (client.baselineActive()); older fakes and notes say baselineActive
+            syncing = [bool(x.get("baselineActive", x.get("syncing"))) for x in cl]
+            ready = all(x.get("joined") and not sy and x.get("applied", -1) >= head and cn for x, sy, cn in zip(cl, syncing, conn))
+            last = {"head": head, "applied": [x.get("applied") for x in cl]}
+            now = self.now()
             if ready:
                 self.sleep(1.0)  # let the last applied effects reach the engine
-                return dict(last, synced=True, seconds=round(self.now() - t0, 2))
-            if self.now() - t0 > timeout_s:
-                return dict(last, synced=False, seconds=round(self.now() - t0, 2))
+                return dict(last, synced=True, seconds=round(self.now() - t0, 2), **self._wait_digest_ok(digest_timeout_s, poll_s, digest_stall_s))
+            rej = [x for x in cl if x.get("rejected")]
+            if rej:
+                return dict(last, synced=False, seconds=round(now - t0, 2),
+                            reason="client rejected the join: %s" % (rej[0].get("rejectText") or rej[0].get("rejectReason") or "no text"))
+            # progress = anything on the client side that changed; the host head moving alone is not progress for a stuck client
+            cur = (tuple(x.get("applied") for x in cl), tuple(bool(x.get("joined")) for x in cl), tuple(syncing), tuple(conn))
+            if cur != sig:
+                sig, sig_at = cur, now
+            elif now - sig_at >= stall_s and MUTANT != "nostall":
+                why = []
+                for n, (x, sy, cn) in enumerate(zip(cl, syncing, conn)):
+                    if not cn:
+                        why.append("client %d: transport not connected" % n)
+                    elif not x.get("joined"):
+                        why.append("client %d: not joined" % n)
+                    elif sy:
+                        why.append("client %d: baseline still running" % n)
+                    elif x.get("applied", -1) < head:
+                        why.append("client %d: applied %s of %s" % (n, x.get("applied"), head))
+                return dict(last, synced=False, seconds=round(now - t0, 2),
+                            reason="no client progress for %.0f s (%s)" % (now - sig_at, "; ".join(why) or "unknown"))
+            if now - t0 > timeout_s:
+                return dict(last, synced=False, seconds=round(now - t0, 2), reason="timeout after %.0f s" % timeout_s)
             self.sleep(poll_s)
+
+    @staticmethod
+    def _new_desync_entries(desyncs, since_id, limit=8):
+        """The mismatching entries of the desync reports newer than since_id, newest first: [{id, key, host, client, repaired}]."""
+        out = []
+        for r in sorted((desyncs or {}).get("desyncs") or [], key=lambda r: r.get("id", 0), reverse=True):
+            if r.get("id", 0) <= since_id:
+                break
+            for e in r.get("entries") or []:
+                out.append({"id": r.get("id"), "key": e.get("key"), "host": e.get("host"), "client": e.get("client"),
+                            "repaired": bool(r.get("repaired"))})
+        return out[:limit]
+
+    def _wait_digest_ok(self, timeout_s, poll_s, stall_s=20.0, repeat_limit=3, stale_limit=3):
+        """Wait until the host's desync digests (coop.status desyncs.digests) count one more 'ok' than now; return the moment they do.
+        Gives up early, with settleReason and the mismatching entries (desyncEntries, from coop.status desyncs.desyncs), when:
+          * the same mismatch comes back repeat_limit times (the same keys with the same host and client values: the repair is not working),
+          * stale_limit digests were stale (the host cannot judge them),
+          * no digest arrived for stall_s (the client does not send, or the link is down).
+        Rate-limited digests are normal and count as arrived. timeout_s is the outer limit."""
+        host = None
+        for nv in self.nvs:
+            try:
+                if nv.call("coop.status").get("role") == "host":
+                    host = nv
+                    break
+            except Exception:  # noqa: BLE001
+                return {}
+        if host is None:
+            return {}
+
+        def status():
+            return host.call("coop.status").get("desyncs") or {}
+
+        try:
+            ds0 = status()
+        except Exception:  # noqa: BLE001
+            return {}
+        d0 = ds0.get("digests") or {}
+        if not d0:
+            return {}
+        base_id = max([r.get("id", 0) for r in ds0.get("desyncs") or []] or [0])
+        t0 = self.now()
+        rx, rx_at = d0.get("received", 0), t0
+        mismatch, repeats, prev_sig = d0.get("mismatch", 0), 0, None
+        limit = 1 if MUTANT == "hairtrigger" else repeat_limit
+
+        def failed(reason, ds):
+            d = ds.get("digests") or {}
+            out = {"digestOk": False, "settleReason": reason, "settleRepairs": d.get("repairs", 0) - d0.get("repairs", 0),
+                   "settleSeconds": round(self.now() - t0, 2),
+                   "digestDelta": {k: d.get(k, 0) - d0.get(k, 0) for k in ("received", "ok", "mismatch", "stale", "rateLimited")}}
+            if MUTANT != "nodesyncs":
+                out["desyncEntries"] = self._new_desync_entries(ds, base_id)
+            return out
+
+        ds = ds0
+        while self.now() - t0 <= timeout_s:
+            ds = status()
+            d = ds.get("digests") or {}
+            now = self.now()
+            if d.get("ok", 0) > d0.get("ok", 0):
+                if MUTANT == "latesuccess":   # test-only: notice the success only when the whole timeout has passed
+                    self.sleep(max(0.0, timeout_s - (self.now() - t0)))
+                return {"digestOk": True, "settleReason": "ok", "settleRepairs": d.get("repairs", 0) - d0.get("repairs", 0),
+                        "settleSeconds": round(self.now() - t0, 2)}
+            if MUTANT != "fullwait":
+                if d.get("received", 0) != rx:
+                    rx, rx_at = d.get("received", 0), now
+                grown = d.get("mismatch", 0) - mismatch
+                if grown > 0:
+                    mismatch = d.get("mismatch", 0)
+                    newest = self._new_desync_entries(ds, base_id, limit=1000)
+                    top = max([e["id"] for e in newest] or [0])
+                    sig = frozenset((e["key"], e["host"], e["client"]) for e in newest if e["id"] == top)
+                    repeats = repeats + grown if sig == prev_sig else 1
+                    prev_sig = sig
+                    if repeats >= limit:
+                        return failed("same mismatch %d times in a row and the repair did not fix it (%d repairs so far)" % (
+                            repeats, d.get("repairs", 0) - d0.get("repairs", 0)), ds)
+                if d.get("stale", 0) - d0.get("stale", 0) >= stale_limit:
+                    return failed("%d stale digests: the host cannot judge them" % (d.get("stale", 0) - d0.get("stale", 0)), ds)
+                if now - rx_at >= stall_s:
+                    return failed("no digest arrived for %.0f s" % (now - rx_at), ds)
+            self.sleep(poll_s)
+        return failed("no ok digest within %.0f s" % timeout_s, ds)
 
     # ---- run
     def run(self, sc, force_reload=False):
@@ -426,7 +659,7 @@ class Runner:
         st = {"loaded": True, "save": sc["start"]["save"], "dirty": sorted(fp["dirty"]),
               "failed": status in ("fail", "error"), "quest_hex": j["reset"], "scenario": sc["name"]}
         self.store.put_many({k: st for k in self.keys})
-        return {"scenario": sc["name"], "status": status, "jump": {k: j[k] for k in ("reload", "reasons", "seconds")},
+        return {"scenario": sc["name"], "status": status, "jump": {k: j[k] for k in ("reload", "reasons", "seconds", "loadedSaves", "coopSync", "loadMessages")},
                 "steps": steps, "seconds": round(self.now() - t0, 2)}
 
 

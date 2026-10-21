@@ -189,6 +189,7 @@ public:
     // fresh engine dump -> epoch+1, clients rebase. Client: onLocalSaveLoaded (resume from its sidecar or re-baseline). Returns false
     // when nothing could be done (client policy Block, or host without dumper). `what` describes the path taken.
     bool onGameLoaded(const fnvcoop::Bytes* sidecar, std::string* what);
+    bool rebaselineHost(std::string* what);   // test tooling: re-dump the host world as a new epoch (guests rebase)
     // Client: may a load happen now? (false once joined under clientload=block; the engine layer must refuse it)
     bool clientLoadAllowed() const { return !client_ || client_->clientLoadAllowed(); }
 
@@ -206,6 +207,7 @@ public:
     bool join(const std::string& host, uint16_t port, std::string* err);   // empty host / port 0 keep the configured ones
     bool left() const { return left_; }
     bool running() const { return running_; }
+    void* workerHandle() { return worker_ ? reinterpret_cast<void*>(worker_->nativeHandle()) : nullptr; }   // null: no worker thread
     void frame();                  // one tick on the main thread
 
     // coop.inject: host = commit as if captured; client = deliver as if received (applied through the sink path).
@@ -229,6 +231,7 @@ public:
     struct Counters {
         uint64_t frames = 0, captured = 0, committed = 0, droppedEmpty = 0;
         uint64_t applied = 0, applyFailed = 0, injected = 0, actions = 0, rulesActions = 0, disconnects = 0, baselineEffects = 0, saves = 0, loads = 0, loadsBlocked = 0;
+        uint64_t reportsDropped = 0;   // host: guest presence reports no rules engine consumed (never run as an activation)
         uint64_t reconnects = 0;   // client: link re-created after the transport dropped (a stall, a long load, a network blip)
     };
     static constexpr uint64_t kReconnectDelayMs = 2000;

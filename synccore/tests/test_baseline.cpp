@@ -294,6 +294,22 @@ TEST(baseline, volatile_keys_replicator_and_text_format) {
     volatileKeys().clear();
 }
 
+// DLC player factions: each machine's own DLC setup script ranks its own player, so ranks in them are per-machine. Without this the
+// host's digest "repaired" the guest's rank every round and the guest's script set it again (two-copy fight test 2026-10-21).
+TEST(baseline, volatile_faction_ranks_are_per_machine) {
+    volatileKeys().clear();
+    std::string err;
+    const uint64_t h0 = volatileKeys().contentHash();
+    CHECK(volatileKeys().loadFromText("faction OldWorldBlues.esm:016154   # NVDLC03PlayerFaction\n", &err));
+    CHECK(volatileKeys().size() == 1);
+    CHECK(volatileKeys().contentHash() != h0);   // the handshake sees the faction list
+    const FormRef owb("oldworldblues.esm", 0x016154), other("falloutnv.esm", 0x01B2A4);
+    CHECK(volatileKeys().isVolatile(SetFactionRank{FormRef("falloutnv.esm", 0x14), owb, 1}));
+    CHECK(!volatileKeys().isVolatile(SetFactionRank{FormRef("falloutnv.esm", 0x14), other, 1}));   // other factions stay shared
+    CHECK(!volatileKeys().loadFromText("faction OldWorldBlues.esm:016154 extra", &err));
+    volatileKeys().clear();
+}
+
 TEST(twin, unit_volatile) {
     Mutations m; m.ignoreVolatile = true;
     MutationScope s(m);

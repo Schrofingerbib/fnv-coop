@@ -32,6 +32,7 @@ public:
     void post(std::function<void()> job) override;
     size_t pending() const;       // queued + running
     void waitIdle();              // blocks until everything posted so far has run (tests)
+    std::thread::native_handle_type nativeHandle() { return th_.native_handle(); }   // the plugin's hot reload adopts this thread
 private:
     void run();
     mutable std::mutex m_;

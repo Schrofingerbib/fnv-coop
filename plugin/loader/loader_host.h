@@ -46,6 +46,7 @@ struct ReloadResult {
     bool coreDead = false;     // nothing is running (rollback failed too)
     std::string error;
     uint32_t generation = 0;   // generation now running (0 if dead)
+    std::string buildId;       // build id of the core now running (see BuildIdOfFile); "" if dead
     double msUnload = 0, msLoad = 0;
 };
 
@@ -78,6 +79,9 @@ public:
     uint32_t generation() const { return generation_; }
     uint32_t reloadCount() const { return reloadCount_; }
     const std::string& cachePathInUse() const { return cachePath_; }
+    // Build id of the running core ("a1b2c3d4-1981440": CRC-32 of the mapped file, then its size). The swap tool
+    // (tools/runner/hotswap.py) compares it with the id of the DLL it copied. dev.status and dev.reload report it.
+    const std::string& coreBuildId() const { return cur_.buildId; }
     std::string StatusJson() const;   // includes configDir and configFiles (the names copied by the last load)
 
     // ---- internal: api callbacks need these ----
@@ -102,6 +106,7 @@ private:
     struct LoadedCore {
         void* module = nullptr;       // HMODULE
         std::string cachePath;
+        std::string buildId;          // CRC-32 and size of the cache copy that was mapped
         NvCoreApi core{};
     };
     bool LoadCoreFrom(const std::string& sourcePath, bool isReload, uint32_t generation, LoadedCore& out,

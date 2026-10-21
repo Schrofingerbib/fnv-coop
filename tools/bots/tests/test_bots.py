@@ -102,7 +102,8 @@ class Movement(unittest.TestCase):
     def test_timeout(self):
         nv, b = make()
         r = b.goto((50000, 0, 0), timeout_s=2)
-        self.assertEqual(r.reason, "timeout")
+        self.assertEqual(r.code, "timeout")
+        self.assertIn("units left", r.reason)       # the reason says how far it still was (tests/test_sayswhy.py has the rest)
 
     def test_follow(self):
         nv, b = make()
@@ -283,7 +284,7 @@ class InputDriver(unittest.TestCase):
         nv, b = make()
         nv.world.add_wall(-5000, 400, 5000, 420)
         r = b.goto((0, 1000, 0), radius=80, timeout_s=60)
-        self.assertEqual(r.reason, "stuck")
+        self.assertEqual(r.code, "stuck")
         self.assertEqual(nv.held, set())
 
     def test_walk_path_visits_waypoints_in_order(self):

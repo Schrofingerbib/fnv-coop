@@ -22,6 +22,12 @@ build's reloadable core next to the loader and writes [loader] core=<its file na
 --core-dll needs an explicit --plugin-dll (the split loader), else it is an error (exit 2). The default
 out/L1/nvcoop.dll can be the monolith, which never reads [loader] core.
 
+--pairs N provisions N two-copy pairs at once (2N instances) so that several pairs can run on one PC: pair k is
+instances 2k (host) and 2k+1 (client) on co-op port <port-base>+k (default 27960+k, 127.0.0.1), see pairs.py.
+--first-pair K (with --pairs N) provisions only pairs K..N-1, so running copies of the earlier pairs stay untouched.
+Without --pairs the port is not written and every client joins the plugin's default port, as before. With --pairs,
+--ini coop.port / coop.host are an error (exit 2), and --n must match or be left out. show and destroy take --pairs too.
+
 Environment overrides: FNV_GAME_DIR, FNV_INSTANCES_ROOT.
 """
 from __future__ import annotations
@@ -39,6 +45,7 @@ from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mygames  # noqa: E402
+import pairs  # noqa: E402
 
 DEFAULT_GAME = r"C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas"
 DEFAULT_ROOT = str(Path(__file__).resolve().parents[3] / "fnv-instances")
@@ -332,10 +339,15 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
               plugin_dll: Optional[Path] = None, plugin_files: Optional[List[Path]] = None,
               autoload: str = "", autoload_delay_frames: int = 600, modes=LINK_MODES,
               root: Optional[Path] = None, appid: Optional[str] = STEAM_APPID,
-              extra_ini: Optional[Dict[str, Dict[str, str]]] = None, core_dll: Optional[Path] = None) -> Dict:
+              extra_ini: Optional[Dict[str, Dict[str, str]]] = None, core_dll: Optional[Path] = None,
+              port_base: Optional[int] = None) -> Dict:
     # Check every input before the first write: a missing dll or a bad ini entry must not leave a half instance.
     sources, plan_ini = plugin_plan(plugin_dll, core_dll, plugin_files)
     ini_extra = provision_ini(plan_ini, extra_ini)
+    if port_base is not None:  # pair mode: instance i joins pair i//2 on its own port (pairs.py); role follows from i
+        pairs.check_pair_ini(extra_ini)
+        role = pairs.role_of(i)
+        merge_ini(ini_extra, pairs.pair_ini(i, port_base))
     check_ini_entry("bridge", "autoload", autoload)  # autoload goes into nvcoop.ini too
     g = game_dir()
     if not (g / "FalloutNV.exe").exists():
@@ -390,6 +402,7 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
         "instance": i, "role": role, "dir": str(d), "pipe": rf"\\.\pipe\nvcoop-{i}",
         "exe": str(d / "FalloutNV.exe"), "link_counts": counts, "installed": installed, "removed": removed,
         "ini": cfg, "game_dir": str(g),
+        **({"pair": pairs.pair_of(i), "port": int(cfg["coop"].get("port") or 0)} if port_base is not None else {}),
         "pinned": {p: sha256_file(d / p) for p in PINNED_FILES if (d / p).exists()},
     }
     (d / "instance.json").write_text(json.dumps(meta, indent=1))
@@ -583,7 +596,12 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("provision")
-    p.add_argument("--n", type=int, default=2)
+    p.add_argument("--n", type=int, default=None, help="number of instances (default 2); not with --pairs")
+    p.add_argument("--pairs", type=int, default=0,
+                   help="N two-copy pairs (2N instances): pair k = instances 2k (host) + 2k+1 (client) on port "
+                        "--port-base + k, so pairs never talk to each other")
+    p.add_argument("--port-base", type=int, default=pairs.PORT_BASE, help="--pairs: co-op port of pair 0 (default 27960)")
+    p.add_argument("--first-pair", type=int, default=0, help="--pairs: skip pairs below K (their copies may be running)")
     p.add_argument("--nvse-dir")
     p.add_argument("--plugin-dll", default=None,
                    help="plugin dll to install; a path that does not exist is an error; \"\" means no plugin "
@@ -600,14 +618,28 @@ def main(argv=None) -> int:
     p.add_argument("--modes", default=",".join(LINK_MODES))
     for c in ("show", "destroy"):
         q = sub.add_parser(c)
-        q.add_argument("--n", type=int, default=2)
+        q.add_argument("--n", type=int, default=None)
+        q.add_argument("--pairs", type=int, default=0)
     a = ap.parse_args(argv)
+    try:
+        a.n = pairs.resolve_n(a.n, a.pairs)
+        if a.cmd == "provision" and a.pairs:
+            pairs.check_port_base(a.port_base, a.pairs)
+            if not 0 <= a.first_pair < a.pairs:
+                raise ValueError(f"--first-pair {a.first_pair} must be 0..{a.pairs - 1}")
+        elif a.cmd == "provision" and a.first_pair:
+            raise ValueError("--first-pair needs --pairs")
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if a.cmd == "provision":
         try:  # fail before the first write
             dll, core = plugin_args(a.plugin_dll, a.core_dll)
             _, plan_ini = plugin_plan(dll, core)
             extra_ini = ini_overrides(a.ini)
             check_per_instance_ini(extra_ini, a.n)
+            if a.pairs:
+                pairs.check_pair_ini(extra_ini)
             provision_ini(plan_ini, extra_ini)  # checks the [loader] core entry too
             check_ini_entry("bridge", "autoload", a.autoload)
         except (OSError, ValueError) as e:
@@ -620,17 +652,19 @@ def main(argv=None) -> int:
         if free < 2 * 2**30:
             print("refusing: <2 GiB free", file=sys.stderr)
             return 2
-        for i in range(a.n):
+        for i in range(2 * a.first_pair, a.n):
             try:
                 m = provision(i, role="host" if i == 0 else "client",
                               nvse_dir=Path(a.nvse_dir) if a.nvse_dir else None,
                               plugin_dll=dll, core_dll=core, extra_ini=extra_ini,
                               autoload=a.autoload, modes=tuple(a.modes.split(",")),
-                              appid=None if a.no_appid else STEAM_APPID)
+                              appid=None if a.no_appid else STEAM_APPID,
+                              port_base=a.port_base if a.pairs else None)
             except UnsafeInstance as e:
                 print(f"error: instance {i}: {e}", file=sys.stderr)
                 return 2
-            print(f"instance {i}: {m['dir']} links={m['link_counts']}")
+            tag = f" pair={m['pair']} port={m['port']}" if "pair" in m else ""
+            print(f"instance {i}: {m['dir']} links={m['link_counts']}{tag}")
     elif a.cmd == "show":
         for i in range(a.n):
             print(json.dumps(load_meta(i), indent=1))

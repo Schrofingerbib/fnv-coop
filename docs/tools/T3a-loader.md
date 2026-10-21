@@ -134,7 +134,7 @@ Wired into `tools/test_all.py` as "T3a loader" (compiles, so skipped by `--quick
 - Process exit does not unload the core (same as the monolith). `CoreHost::Unload` exists for tests.
 
 ## Update 2026-10-20 (T3-reload)
-- Canonical build, split build, `plugin\loader\run_tests.cmd` (215 checks, 12 run-time twins, FNVCOOP_MUT=21..32) and `plugin\reload\run_tests.cmd` (registry, drain and host-process tests with run-time twins, prints ALL OK) are green as of the last update below.
+- Canonical build, split build, `plugin\loader\run_tests.cmd` (215 checks, 12 run-time twins, FNVCOOP_MUT=21..32; 13 twins, 21..33, since the hot swap update below) and `plugin\reload\run_tests.cmd` (registry, drain and host-process tests with run-time twins, prints ALL OK) are green as of the last update below.
 - The in-flight detour drain and the crash filter removal are in T3b-state.md. The core's full split build is no longer a blocker.
 
 ## Update 2026-10-20 (reload-drain)
@@ -173,3 +173,22 @@ Wired into `tools/test_all.py` as "T3a loader" (compiles, so skipped by `--quick
   scratch folder). `plugin\reload\run_tests.cmd`: 1727 host checks; host twins 1-9, loader twins 25 and 26 (each must fail with
   "read the ini" / "read nvcoop.ini"). Not run in the game.
 
+## Update 2026-10-21 (hot swap: `run.py swap`)
+- New: `python -I tools/runner/run.py swap --instances 0,1 [--dll out/L1split/nvcoop_mod.dll] [--force] [--dry-run] [--no-data]`
+  (code: `tools/runner/hotswap.py`). It talks only to the bridge pipe of copies that are already running; it launches, stops and leases nothing.
+  Per copy it asks `dev.status` for `corePath`, copies the new DLL beside it under the temporary name `nvcoop_mod.dll.swap` and renames it over
+  the core file (the loader copies the core to `nvcoop_cache\` before mapping it, so the file is not locked; the `.swap` name does not end in `.dll`,
+  so xNVSE and the file watcher never see a half-written core), copies changed `nvcoop_*.json` / `.txt` data files from the DLL's folder, calls
+  `dev.reload` (with `timeoutMs`, because the bridge gives up on a main-thread request after 30 s otherwise), waits for the pipe, and proves the build.
+- Build id: the loader now reports `buildId` in `dev.status` and in the `dev.reload` answer, plus `"hotReload":true` in `dev.status`. It is the CRC-32 of the
+  cache copy that was mapped (hex, 8 digits), a dash, and the size in bytes ("a1b2c3d4-1981440"). `hotswap.py` computes the same text for the DLL it copies
+  (`zlib.crc32`); the swap counts only if the running core's id equals it, the generation went up, nothing rolled back, and `reload.state` lists no failure or leak.
+  A loader built before this change has no `buildId`; the tool then reads the CRC of `cachePath` itself. A running game keeps its old loader, so the
+  first swap into such a copy is verified that way. Loader code (`nvcoop.dll`) cannot be swapped: a change there needs one normal restart.
+- Refused with exit 2, before any copy is touched: no pipe, no `dev.status` (monolithic build or an old loader), a DLL without the `NvCore_Init` export, a core
+  file outside the instance folder, `--dll` being the copy's own core file. A swap stops at the first copy that fails (exit 1); an unchanged build is not reloaded
+  (`--force` does). A co-op session that ran before must run again within `--settle-s` (default 20 s) of the reload: the transport is closed and reopened.
+- Tests: `loader_host.cpp` twin `FNV_MUT(33)` STALEID (the reload keeps the previous id) is caught by the new build-id checks in `nvloader_test` (13 twins now);
+  `python -I -m unittest discover -s tools/runner/tests -p test_hotswap.py` runs the swap against fake copies with a real core file and cache copy
+  (35 tests, 14 of them twins of broken tool code, plus broken fake loaders inside the checks).
+- Not run in a game: the whole in-game reload path (see the T3b "Limits") and the swap itself. The first real swap is the proof.

@@ -99,7 +99,7 @@ _BASES: Dict[str, Dict[str, str]] = {}
 
 def _hostiles(f, repo):
     hs = [f["gang1"], f["gang2"], f["gecko1"], f["gecko2"]]
-    return {"hostiles": hs, "hostile_base_of": {h: _base_of(repo, h) for h in hs}}
+    return {"hostiles": hs, "hostile_base_of": {h: _base_of(repo, h) for h in hs}, "weapon": f["pistol"]}
 
 
 def _m_enemy_fight(f, repo):

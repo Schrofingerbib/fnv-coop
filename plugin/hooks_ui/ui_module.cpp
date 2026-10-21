@@ -124,7 +124,8 @@ bool MStatus(const std::string&, std::string& out) {
     const auto& c = nvui::counters();
     Value cn = Value::object();
     cn.set("showMessage", (int64_t)c.seenShowMessage).set("boxes", (int64_t)c.seenBoxes).set("service", (int64_t)c.seenService)
-        .set("cond", (int64_t)c.seenCond).set("forced", (int64_t)c.seenForced).set("swap", (int64_t)c.seenSwap);
+        .set("cond", (int64_t)c.seenCond).set("forced", (int64_t)c.seenForced).set("swap", (int64_t)c.seenSwap)
+        .set("engineBoxes", (int64_t)c.seenEngineBoxes);
     Value st = Value::object();
     if (g_router) {
         const auto& s = g_router->stats();
@@ -133,8 +134,18 @@ bool MStatus(const std::string&, std::string& out) {
             .set("condViews", (int64_t)s.condViews).set("condChanged", (int64_t)s.condChanged).set("forced", (int64_t)s.forced)
             .set("vetoes", (int64_t)s.vetoes).set("slides", (int64_t)s.slides).set("pendingBoxes", (int64_t)g_router->pendingBoxes());
     }
+    Value rb = Value::array();
+    for (auto& b : nvui::recentBoxes()) {
+        char sc[16], th[16];
+        std::snprintf(sc, sizeof sc, "%08X", b.scriptRefID);
+        std::snprintf(th, sizeof th, "%08X", b.thisObj);
+        Value e = Value::object();
+        e.set("seq", (int64_t)b.seq).set("script", std::string(sc)).set("thisObj", std::string(th))
+            .set("message", b.message.plugin.empty() ? std::string() : b.message.plugin + ":" + std::to_string(b.message.localId)).set("text", b.text);
+        rb.push(e);
+    }
     o.set("role", g_host ? "host" : "guest").set("inited", g_inited).set("selftest", g_selftest).set("installed", g_report.ok)
-        .set("failed", g_report.failed).set("hooks", hs).set("counters", cn).set("router", st);
+        .set("failed", g_report.failed).set("hooks", hs).set("counters", cn).set("router", st).set("recentBoxes", rb);
     out = o.dump();
     return true;
 }

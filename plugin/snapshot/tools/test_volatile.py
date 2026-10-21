@@ -152,7 +152,8 @@ class ShippedData(unittest.TestCase):
         entries, errs = vp.parse_entries(text)
         self.assertEqual(errs, [])
         self.assertGreater(len(entries), 0)
-        self.assertTrue(all(e[0] in ("var", "owner", "global", "field") for e in entries))
+        # "faction" (2026-10-21): per-machine DLC player factions, see synccore VolatileKeys::isVolatile
+        self.assertTrue(all(e[0] in ("var", "owner", "global", "field", "faction") for e in entries))
         with open(os.path.join(self.DATA, "volatile_keys.json"), encoding="utf-8") as f:
             prov = json.load(f)
         for k in ("generated", "launches", "dumpsPerLaunch", "intervalSeconds", "gameVersion", "pluginsHash", "todo"):

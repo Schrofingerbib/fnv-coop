@@ -154,6 +154,8 @@ inline bool menuInfo(IEngine& e, Value* out, std::string* err) {
     }
     *out = Value::object();
     out->set("kind", kind).set("id", (int64_t)id).set("vatsMode", (int64_t)mode);
+    uint32_t qIdx = 0, qCount = 0;      // the engine's message box queue: a backlog (idx climbing to a fixed count) or a feed (count growing)
+    if (e.rd32(eng::kMsgQueueIdx, &qIdx) && e.rd32(eng::kMsgQueue + 8, &qCount)) out->set("msgIdx", (int64_t)qIdx).set("msgCount", (int64_t)qCount);
     uint32_t dlg = 0;
     if (e.rd32(eng::kDialogMenuPtr, &dlg) && dlg) {
         uint32_t st = 0;

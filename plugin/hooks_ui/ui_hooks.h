@@ -36,8 +36,20 @@ void setInfoReader(InfoReader f);
 
 struct Counters {
     uint64_t seenShowMessage = 0, seenBoxes = 0, seenService = 0, seenCond = 0, seenForced = 0, seenSwap = 0, seenActivate = 0;
+    uint64_t seenEngineBoxes = 0;   // ShowMessageBox outside ShowMessage (the engine's own boxes; script 0 in recentBoxes)
 };
 const Counters& counters();
+
+// The last kRecentBoxes script message boxes (ShowMessage) this machine raised, oldest first: which MESG, which script, what text.
+// A diagnostic for tests (a box keeps the game in menu mode and swallows the bots' input), shown by ui.status.
+struct RecentBox {
+    uint64_t seq = 0;
+    uint32_t scriptRefID = 0, thisObj = 0;
+    FormRef message;
+    std::string text;
+};
+constexpr size_t kRecentBoxes = 16;
+std::vector<RecentBox> recentBoxes();
 
 // ---- origin-player side: what L8's EngineGlue stubs (openMenu / closeMenu / forceCloseDialog / resumeTalk) call -----------------
 namespace ops {

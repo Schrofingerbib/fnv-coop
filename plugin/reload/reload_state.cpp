@@ -28,6 +28,7 @@ namespace nvreload {
 #define kMutThreadNotJoined FNV_MUT(6)      // ManagedThread detaches instead of joining
 #define kMutThrowStopsShutdown FNV_MUT(7)   // one throwing shutdown skips the rest
 #define kMutPreflightIgnored FNV_MUT(8)     // canUnload refusals are logged but do not veto
+#define kMutAdoptIgnored FNV_MUT(15)        // adoptThread() does nothing: an owned library thread blocks the drain
 
 // ---- bytes ---------------------------------------------------------------------------------------------------------
 void Writer::f64(double v) {
@@ -381,6 +382,17 @@ unsigned long selfTid() {
 std::vector<unsigned long> managedThreadIds() {
     std::lock_guard<std::mutex> g(g_tidMu);
     return tids();
+}
+void adoptThread(unsigned long tid) {
+    if (!tid || kMutAdoptIgnored) return;
+    std::lock_guard<std::mutex> g(g_tidMu);
+    auto& v = tids();
+    if (std::find(v.begin(), v.end(), tid) == v.end()) v.push_back(tid);
+}
+void releaseThread(unsigned long tid) {
+    std::lock_guard<std::mutex> g(g_tidMu);
+    auto& v = tids();
+    v.erase(std::remove(v.begin(), v.end(), tid), v.end());
 }
 int liveThreads() { return g_threads.load(); }
 LeakProbe threadProbe() { return LeakProbe{"threads", [] { return liveThreads(); }, 0}; }

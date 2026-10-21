@@ -262,3 +262,49 @@ TEST(twin, unit_heal_disabled) {
     CHECK(!bad.healed);          // the drift persists ...
     CHECK(bad.reports >= 1);     // ... but it is detected and reported
 }
+
+namespace {
+// A world bigger than one shard reply (kMaxShardEntries): 6000 script vars spread over the 16 script-var shards, ~375 each, and a
+// drifted value in every shard. When the host asked for all 8 bad shards at once the guest's reply was cut at 1000 entries and every
+// key cut off counted as "(missing)" and was resent each round, eating the repair budget (two-copy fight test 2026-10-21: 24 digests
+// in a row, 1244 effects each, never settled).
+struct BigDriftResult { bool healed = false; uint64_t falseMissing = 0; };
+BigDriftResult bigWorldDrift() {
+    Rig r(1, 500);
+    r.connectAll(); r.run(400);
+    for (int b = 0; b < 60; ++b) {
+        Cause c; c.kind = CauseKind::Script; c.source = Q(1);
+        std::vector<Effect> fx;
+        for (int i = 0; i < 100; ++i) fx.push_back(SetScriptVar{Q(0x1000 + b * 100 + i), 0, double(b * 100 + i)});
+        r.host.commit(0, c, fx);
+        r.run(20);
+    }
+    r.run(2000);
+    BigDriftResult out;
+    if (!r.inSync()) return out;
+    for (int i = 0; i < 6000; i += 50) r.eng[0]->w.scriptVars[{Q(0x1000 + i), 0}] = -1.0;   // 120 drifted values, spread over every shard
+    for (int i = 0; i < 1500 && !out.healed; ++i) {
+        r.run(20);
+        out.healed = r.inSync();
+    }
+    for (auto& rep : r.host.desyncs())
+        for (auto& e : rep.entries)
+            if (e.client == "(missing)") ++out.falseMissing;
+    return out;
+}
+}  // namespace
+
+TEST(desync, drift_in_a_world_bigger_than_one_shard_reply_is_healed_without_false_missing_keys) {
+    BigDriftResult h = bigWorldDrift();
+    std::printf("    healed=%d falseMissing=%llu\n", int(h.healed), (unsigned long long)h.falseMissing);
+    CHECK(h.healed);
+    CHECK(h.falseMissing == 0);
+}
+
+TEST(desync, twin_asking_for_every_bad_shard_at_once_resends_the_cut_off_keys_as_missing) {
+    Mutations m; m.overfullShardRequest = true;
+    MutationScope s(m);
+    BigDriftResult bad = bigWorldDrift();
+    std::printf("    twin: healed=%d falseMissing=%llu\n", int(bad.healed), (unsigned long long)bad.falseMissing);
+    CHECK(bad.falseMissing > 0);
+}

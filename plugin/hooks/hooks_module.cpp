@@ -92,6 +92,16 @@ void InitHooks() {
     auto exec = [](const std::string& line, uint32_t refID) {
         void* ref = refID ? nvhooks::resolver().lookup(refID) : nullptr;
         if (refID && !ref) return false;
+        // The calling reference must be a reference (REFR / ACHR / ACRE). Running a line "on" any other form (a cell, a quest)
+        // makes the engine treat it as a TESObjectREFR: a guest's cell report run as `Activate` on a cell hung the host's main
+        // thread after a save load (two-copy fight test 2026-10-21).
+        if (ref) {
+            const uint8_t t = static_cast<TESForm*>(ref)->typeID;
+            if (t != kFormType_TESObjectREFR && t != kFormType_Character && t != kFormType_Creature) {
+                nvcoop::Log("hooks: console line '%s' refused: form %08X is type %02X, not a reference", line.c_str(), refID, t);
+                return false;
+            }
+        }
         return RunLineSEH(line.c_str(), ref) == 1;
     };
     if (g_console) nvhooks::setConsoleExec(exec);

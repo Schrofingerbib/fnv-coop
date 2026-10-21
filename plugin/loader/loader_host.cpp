@@ -31,6 +31,7 @@
 //   30 COREDIRCONFIG take the config from the core's folder also when gameDir is set (core= with a folder part)
 //   31 RETRYALL  retry every config copy error but "not found", and wait after the last try (the old loop)
 //   32 NORETRY   retry no config copy error (a file that an editor holds open for a moment is not copied)
+//   33 STALEID   keep the previous core's build id after a reload (tools/runner/hotswap.py could not tell the swap worked)
 
 namespace nvcoop::loader {
 namespace {
@@ -60,6 +61,42 @@ std::string JsonEsc(const std::string& s) {
         }
     }
     return o;
+}
+
+// Build id of a core file: CRC-32 of its bytes (hex, 8 digits) and the size, "a1b2c3d4-1981440". tools/runner/hotswap.py
+// computes the same id (zlib.crc32 + file size) for the DLL it copies, to prove the running core is that build. "" = unreadable.
+uint32_t Crc32Update(uint32_t crc, const unsigned char* p, size_t n) {
+    static uint32_t table[256];
+    static bool ready = false;
+    if (!ready) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            table[i] = c;
+        }
+        ready = true;
+    }
+    for (size_t i = 0; i < n; ++i) crc = table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    return crc;
+}
+std::string BuildIdOfFile(const std::string& path) {
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return std::string();
+    unsigned char buf[1 << 16];
+    uint32_t crc = 0xFFFFFFFFu;
+    unsigned long long total = 0;
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(h, buf, sizeof buf, &got, nullptr)) { CloseHandle(h); return std::string(); }
+        if (got == 0) break;
+        crc = Crc32Update(crc, buf, got);
+        total += got;
+    }
+    CloseHandle(h);
+    char b[48];
+    std::snprintf(b, sizeof b, "%08x-%llu", crc ^ 0xFFFFFFFFu, total);
+    return b;
 }
 
 std::string DirOf(const std::string& path) {
@@ -410,6 +447,7 @@ bool CoreHost::LoadCoreFrom(const std::string& sourcePath, bool isReload, uint32
     }
     out.module = m;
     out.cachePath = cache;
+    out.buildId = BuildIdOfFile(cache);   // the exact bytes that were mapped (the cache copy, not the file the build may overwrite)
     out.core = core;
     // core.init() runs the module onLoad / restore step; calls into the core count as "inside core".
     int iok = 0;
@@ -467,6 +505,7 @@ ReloadResult CoreHost::Reload(const char* reason) {
         res.ok = Load(e);
         res.error = e;
         res.generation = generation_;
+        res.buildId = cur_.buildId;
         res.msLoad = MsSince(t0);
         return finish(res);
     }
@@ -508,6 +547,7 @@ ReloadResult CoreHost::Reload(const char* reason) {
         // something else still holds the module (a leaked thread or hook): the old code is still mapped.
         res.error = "core DLL is still mapped after FreeLibrary (leaked thread or hook?)";
         res.coreDead = true;
+        cur_.buildId.clear();
         res.generation = 0;
         return finish(res);
     }
@@ -517,6 +557,7 @@ ReloadResult CoreHost::Reload(const char* reason) {
     LoadedCore n;
     std::string err;
     if (LoadCoreFrom(env_.corePath, true, generation_ + 1, n, err)) {
+        if (FNV_MUT(33)) n.buildId = prev.buildId;
         cur_ = n;
         cachePath_ = n.cachePath;
         ++generation_;
@@ -525,8 +566,9 @@ ReloadResult CoreHost::Reload(const char* reason) {
         if (prev.cachePath != n.cachePath) DeleteFileA(prev.cachePath.c_str());
         res.ok = true;
         res.generation = generation_;
+        res.buildId = cur_.buildId;
         res.msLoad = MsSince(t1);
-        nvcoop::Log("loader: reload ok, generation %u (%s)", generation_, lastReason_.c_str());
+        nvcoop::Log("loader: reload ok, generation %u, build %s (%s)", generation_, cur_.buildId.c_str(), lastReason_.c_str());
         return finish(res);
     }
     nvcoop::Log("loader: reload failed: %s", err.c_str());
@@ -542,6 +584,7 @@ ReloadResult CoreHost::Reload(const char* reason) {
             if (prev.cachePath != back.cachePath) DeleteFileA(prev.cachePath.c_str());
             res.rolledBack = true;
             res.generation = generation_;
+            res.buildId = cur_.buildId;
             res.msLoad = MsSince(t1);
             return finish(res);
         }
@@ -549,6 +592,7 @@ ReloadResult CoreHost::Reload(const char* reason) {
     }
     res.coreDead = true;
     res.generation = 0;
+    cur_.buildId.clear();
     return finish(res);
 }
 
@@ -645,7 +689,7 @@ std::string CoreHost::StatusJson() const {
     for (const std::string& f : configFiles_) files += (files.empty() ? "\"" : ",\"") + JsonEsc(f) + "\"";
     std::string s = "{\"loaded\":" + std::string(loaded_ ? "true" : "false") + ",\"generation\":" + std::to_string(generation_) +
                     ",\"reloadCount\":" + std::to_string(reloadCount_) + ",\"corePath\":\"" + JsonEsc(env_.corePath) +
-                    "\",\"cachePath\":\"" + JsonEsc(cachePath_) + "\",\"configDir\":\"" + JsonEsc(env_.configDir) +
+                    "\",\"cachePath\":\"" + JsonEsc(cachePath_) + "\",\"buildId\":\"" + JsonEsc(cur_.buildId) + "\",\"hotReload\":true,\"configDir\":\"" + JsonEsc(env_.configDir) +
                     "\",\"configFiles\":[" + files + "],\"watching\":" + (watcher_.joinable() ? "true" : "false") +
                     ",\"pending\":" + (reloadPending.load() ? "true" : "false") + ",\"last\":{\"ok\":" + (last_.ok ? "true" : "false") +
                     ",\"rolledBack\":" + (last_.rolledBack ? "true" : "false") + ",\"coreDead\":" + (last_.coreDead ? "true" : "false") +
@@ -669,7 +713,7 @@ void CoreHost::RegisterDevMethods() {
             }
             ReloadResult r = Reload(reason.c_str());
             if (!r.ok) { out = r.error + (r.rolledBack ? " (rolled back to the previous core)" : ""); return false; }
-            out = "{\"generation\":" + std::to_string(r.generation) + ",\"msUnload\":" + std::to_string(r.msUnload) +
+            out = "{\"generation\":" + std::to_string(r.generation) + ",\"buildId\":\"" + JsonEsc(r.buildId) + "\",\"msUnload\":" + std::to_string(r.msUnload) +
                   ",\"msLoad\":" + std::to_string(r.msLoad) + "}";
             return true;
         },

@@ -297,6 +297,13 @@ bool Runtime::start(std::string* err) {
         host_->onAction = [this](PlayerId slot, IntentKind kind, const FormRef& ref, uint32_t, uint32_t) {
             ++counters_.actions;
             if (rules_ && rules_->handleAction(slot, kind, ref)) { ++counters_.rulesActions; return; }
+            // Only interactions are run on the host. Presence reports (ReportCell / ReportNear / ReportFar) and ScenePass only feed the
+            // rules engine: without one (or when it does not consume them) they are dropped. Their ref is a cell, an anchor or a quest,
+            // and running "Activate" on a cell hung the host (two-copy fight test 2026-10-21).
+            if (!FNV_MUT(7) && kind != IntentKind::ActivateRef && kind != IntentKind::PickUp && kind != IntentKind::TriggerEnter) {
+                ++counters_.reportsDropped;
+                return;
+            }
             if (FNV_MUT(3)) {
                 (void)slot; (void)kind; (void)ref;   // twin: host ignores guest actions
             } else {
@@ -491,6 +498,28 @@ void Runtime::bindPlayerRefs(std::function<uint32_t(PlayerId)> ghostOf, std::fun
         if (!id) return false;
         return idToRef_ ? idToRef_(id, out) : false;
     };
+}
+
+// Test tooling: the host's world was changed outside the session (a test helper reset quests), so its shared state no longer
+// describes the world. Re-dump it as a new world epoch, exactly like a host load: guests rebase onto it.
+bool Runtime::rebaselineHost(std::string* what) {
+    std::string w;
+    bool ok = false;
+    if (!running_ || !host_) w = "not a running host";
+    else if (!dumper_) w = "no world dumper";
+    else {
+        ShadowState st;
+        uint64_t hash = 0;
+        std::string derr;
+        if (dumper_->dump(&st, &hash, &derr) && host_->reloadWorld(st, hash)) {
+            ok = true;
+            usedBaseline_.reset(new ShadowState(host_->world()));
+            if (replicator_) replicator_->clear();
+            w = "host: world re-dumped (epoch " + std::to_string(host_->epoch()) + ")";
+        } else w = "host: re-dump failed: " + derr;
+    }
+    if (what) *what = w;
+    return ok;
 }
 
 bool Runtime::onGameLoaded(const Bytes* sidecar, std::string* what) {

@@ -7,6 +7,7 @@
 // DeferredInit message does not matter. All of it runs on the game main thread.
 #include <Windows.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <unordered_map>
@@ -442,6 +443,20 @@ void TryStart() {
     nvcoop::PushEvent("coop.started", g_rt->statusJson());
 }
 
+// coop.rebaseline (host, test tooling only: needs env NVCOOP_TEST_HELPERS=1): a test helper changed the host world outside the
+// session (test.quest.reset), so re-dump it as a new world epoch; guests rebase onto it like after a host load.
+bool MRebaseline(const std::string&, std::string& out) {
+    const char* gate = std::getenv("NVCOOP_TEST_HELPERS");
+    if (!gate || gate[0] != '1') { out = "test helpers disabled (start the game with NVCOOP_TEST_HELPERS=1)"; return false; }
+    if (!g_rt) { out = "co-op runtime not running"; return false; }
+    std::string what;
+    const bool ok = g_rt->rebaselineHost(&what);
+    nvcoop::Log("coop: rebaseline: %s", what.c_str());
+    if (!ok) { out = what; return false; }
+    out = std::string("{\"ok\":true,\"what\":\"") + what + "\"}";
+    return true;
+}
+
 bool MStatus(const std::string&, std::string& out) {
     if (g_rt) { out = g_rt->statusJson(); return true; }
     nvcoop::json::Value o = nvcoop::json::Value::object();
@@ -628,11 +643,23 @@ void OnLoad(void*) {
     nvcoop::RegisterMethod("coop.leave", MLeave, true);
     nvcoop::RegisterMethod("coop.join", MJoin, true);
     nvcoop::RegisterMethod("coop.owner", MOwner, true);
+    nvcoop::RegisterMethod("coop.rebaseline", MRebaseline, true);
     nvcoop::RegisterMethod("coop.scenePass", MScenePass, true);
     nvcoop::RegisterMethod("coop.stageRequested", MStageRequested, true);   // client: {kind:"activate|pickup|trigger", ref:"falloutnv.esm:00ABCD"}
 }
 
 fnvcoop::Bytes g_reloadSidecar;   // hot reload: the previous core's session sidecar, applied once the new runtime is running
+
+// The session's ThreadWorker waits for jobs inside the core: adopted, the hot-reload drain ignores it, and ReloadShutdown joins it
+// (g_rt->stop()) right after the drain. Without it every reload with a co-op session running was refused (in game 2026-10-21).
+unsigned long g_adoptedWorker = 0;
+void AdoptWorkerThread(void* handle) {
+    const unsigned long tid = handle ? GetThreadId(reinterpret_cast<HANDLE>(handle)) : 0;
+    if (tid == g_adoptedWorker) return;
+    if (g_adoptedWorker) nvreload::releaseThread(g_adoptedWorker);
+    if (tid) nvreload::adoptThread(tid);
+    g_adoptedWorker = tid;
+}
 
 void OnFrame() {
     if (!g_rt) TryStart();
@@ -651,6 +678,7 @@ void OnFrame() {
         }
 #endif
         g_rt->frame();
+        AdoptWorkerThread(g_rt->workerHandle());   // a session (re)start or leave swaps the worker: keep the drain's ignore list current
 #if defined(NVCOOP_WITH_ACTORS) && !defined(NVCOOP_WITH_LIVE)
         nvcoop::actors::glueFrame(g_rt.get());   // actor ownership: after the session ticked (it polls the mux; ours is a channel on it)
 #endif
@@ -782,6 +810,7 @@ void ReloadShutdown() {
         g_rt->stop();
     }
     g_rt.reset();
+    AdoptWorkerThread(nullptr);   // joined by stop(): off the drain's ignore list
     g_applier.reset();
 #ifdef NVCOOP_WITH_WORLD
     g_worldApplier.reset();

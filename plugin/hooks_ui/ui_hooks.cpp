@@ -51,6 +51,7 @@ std::unique_ptr<nvhooks::HookRegistry> g_reg;
 UiRouter* g_router = nullptr;
 bool g_host = false;
 Counters g_cnt;
+std::deque<RecentBox> g_recentBoxes;
 InfoReader g_infoReader;
 std::vector<std::string> g_installed;
 
@@ -162,6 +163,12 @@ Fn_ShowMessageBox o_ShowMessageBox;
 bool __cdecl h_ShowMessageBox(const char* msg, uint32_t u1, uint32_t u2, void* cb, uint32_t u4, uint32_t u5, float f6, float f7, const char* b0,
                               const char* b1, const char* b2, const char* b3, const char* b4, const char* b5, const char* b6,
                               const char* b7, const char* b8, const char* b9) {
+    if (g_inShowMessage == 0) {     // the engine's own box (load notices, errors): not routed, but logged for the tests
+        RecentBox rb;
+        rb.seq = ++g_cnt.seenEngineBoxes, rb.text = safeStr(msg).substr(0, 160);
+        g_recentBoxes.push_back(std::move(rb));
+        if (g_recentBoxes.size() > kRecentBoxes) g_recentBoxes.pop_front();
+    }
     if (g_inShowMessage > 0 && g_host && g_router) {
         ++g_cnt.seenBoxes;
         MessageBoxCall c;
@@ -171,6 +178,10 @@ bool __cdecl h_ShowMessageBox(const char* msg, uint32_t u1, uint32_t u2, void* c
         c.text = safeStr(msg);
         const char* bs[10] = {b0, b1, b2, b3, b4, b5, b6, b7, b8, b9};
         for (int i = 0; i < 10 && bs[i]; ++i) c.buttons.push_back(safeStr(bs[i]));
+        RecentBox rb;
+        rb.seq = g_cnt.seenBoxes, rb.scriptRefID = c.scriptRefID, rb.thisObj = c.thisObj, rb.message = c.message, rb.text = c.text.substr(0, 160);
+        g_recentBoxes.push_back(std::move(rb));
+        if (g_recentBoxes.size() > kRecentBoxes) g_recentBoxes.pop_front();
         if (g_router->onMessageBox(c) == Route::Suppressed) return true;
     }
     return o_ShowMessageBox(msg, u1, u2, cb, u4, u5, f6, f7, b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, nullptr);
@@ -412,6 +423,7 @@ void Shutdown() {
 UiRouter* router() { return g_router; }
 void setInfoReader(InfoReader f) { g_infoReader = std::move(f); }
 const Counters& counters() { return g_cnt; }
+std::vector<RecentBox> recentBoxes() { return {g_recentBoxes.begin(), g_recentBoxes.end()}; }
 bool installedByName(const std::string& n) {
     for (auto& s : g_installed)
         if (s == n) return true;

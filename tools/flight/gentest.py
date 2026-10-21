@@ -22,17 +22,20 @@ def safe_name(s):
     return s[:48] or "case"
 
 
-def generate(shrunk, name, out_dir):
+def generate(shrunk, name, out_dir, expect=None):
+    """expect replaces the default {"converges": true}: from_failure.py cases pin recorded evidence, so they expect divergence."""
     name = safe_name(name)
     sig = (shrunk.get("shrunk") or {}).get("signature") or "unknown"
     fx = dict(shrunk)
-    fx["expect"] = {"converges": True, "bug_signature": sig}
+    fx["expect"] = dict(expect) if expect else {"converges": True, "bug_signature": sig}
     os.makedirs(out_dir, exist_ok=True)
     jp = os.path.join(out_dir, name + ".json")
     cp = os.path.join(out_dir, name + ".cmake")
     with open(jp, "w") as f:
         json.dump(fx, f, indent=1, sort_keys=True)
         f.write("\n")
+    if fx.get("format") == "trace-1":    # recorded traces replay in process (regress.py + trace_replay.py): no binary, so no add_test
+        return [jp]
     simfuzz = fx.get("format") == "simfuzz-1"
     with open(cp, "w") as f:
         f.write(CMAKE_TEMPLATE.format(sig=sig.replace("\n", " "), n=len(fx.get("ops" if simfuzz else "steps", [])), name=name,

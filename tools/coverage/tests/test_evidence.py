@@ -152,6 +152,8 @@ class ShippedEvidenceTests(unittest.TestCase):
                 toks = g.get('capture_tokens', []) + g.get('apply_tokens', [])
             for f, rx in toks:
                 re.compile(rx)
+                if f.startswith('questlines/') and not os.path.exists(os.path.join(LS.ROOT, f)):
+                    continue   # generated from the game's own data and not in the public repository (census, sweeps): nothing to check
                 self.assertTrue(LS.token_ok(LS.ROOT, f, rx), '%s: token %r not found in %s' % (g['fns'][:2], rx, f))
 
     @unittest.skipUnless(os.path.exists(os.path.join(LS.ROOT, LS.EVIDENCE_FILE)), 'no evidence.json')

@@ -76,8 +76,9 @@ def _bridges(a, stack: contextlib.ExitStack):
     return out, inst
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def main(argv=None, extra_opts=None) -> int:
+    """extra_opts: Ctx options a caller adds that have no flag here (run_fight.py: from_step, only_step, timescale)."""
+    ap =argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list", action="store_true", help="list playbooks and exit")
     ap.add_argument("--playbook", default="", help="name, comma list, or 'all'")
     ap.add_argument("--players", type=int, default=0, help="number of bots (default: the playbook's own default)")
@@ -114,6 +115,7 @@ def main(argv=None) -> int:
     opts: Dict[str, Any] = {"repo_root": REPO, "chaos": a.chaos or None, "chaos_seed": a.chaos_seed}
     opts.update(chaos_adapter.relaxed_options(a.chaos, REPO))
     opts["anim"] = not a.no_anim
+    opts.update(extra_opts or {})
 
     results: List[core.RunResult] = []
     meta: Dict[str, Any] = {"stamp": stamp, "mode": "fake" if a.fake else "live", "chaos": a.chaos or None,

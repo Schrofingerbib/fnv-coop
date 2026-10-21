@@ -34,7 +34,7 @@ function(loader_flags tgt)
   target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
 endfunction()
 
-# nvloader_host = CoreHost. Its mutation twins (21..32, see the list at the top of loader_host.cpp) are RUNTIME-switchable
+# nvloader_host = CoreHost. Its mutation twins (21..33, see the list at the top of loader_host.cpp) are RUNTIME-switchable
 # (tools/mut/fnvcoop_mut.h, FNVCOOP_MUT=<n>): nvloader_host_rt is the same source compiled ONCE with FNVCOOP_RUNTIME_MUT for the tests.
 # The production library nvloader_host never reads the environment.
 function(loader_host_lib name)
@@ -89,5 +89,5 @@ if(LOADER_STANDALONE OR NVCOOP_LOADER_TESTS)
     add_dependencies(${name} nvstub_v1 nvstub_v2 nvstub_failinit nvstub_noexport nvstub_badabi)
   endfunction()
   loader_host_lib(nvloader_host_rt FNVCOOP_RUNTIME_MUT)
-  loader_test(nvloader_test nvloader_host_rt)   # real run, and FNVCOOP_MUT=21..32 for the twins (plugin\loader\run_tests.cmd)
+  loader_test(nvloader_test nvloader_host_rt)   # real run, and FNVCOOP_MUT=21..33 for the twins (plugin\loader\run_tests.cmd)
 endif()

@@ -230,7 +230,7 @@ def _parse_form(tok, pos):
 
 
 def parse_entries(text):
-    """-> (entries, errors). entries: list of (kind, ref, arg) with kind in var/owner/global/field.
+    """-> (entries, errors). entries: list of (kind, ref, arg) with kind in var/owner/global/field/faction.
     Same acceptance rules as L4's loader; refs are normalised to lower-case plugin + 6 upper-case hex."""
     entries, errors = [], []
     for n, line in enumerate(text.splitlines(), 1):
@@ -243,7 +243,7 @@ def parse_entries(text):
             errors.append("line %d: bad form" % n)
             continue
         ref, pos = r
-        if kind in ("owner", "global"):
+        if kind in ("owner", "global", "faction"):
             if pos != len(tok):
                 errors.append("line %d: trailing tokens" % n)
             else:

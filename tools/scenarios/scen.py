@@ -7,6 +7,8 @@
     python -I tools/scenarios/scen.py run NAME [NAME ...] [--json out.json] [--force-reload]   needs the pool (tools/pool)
     python -I tools/scenarios/scen.py jump NAME                        leave the instance(s) in the scenario's starting state
 
+    python -I tools/scenarios/prepare_save.py NAME [NAME ...]          once per test save: a prepared save without the 14 DLC message boxes (jump loads it)
+
 `run` and `jump` lease instances from the warm pool (`pool up` first); this tool never launches a game itself.
 """
 import argparse
@@ -100,7 +102,7 @@ def cmd_run(a, **kw):
 def cmd_jump(a, **kw):
     def go(rn, scs):
         j = rn.jump(scs[0], a.force_reload)
-        print(json.dumps({k: j[k] for k in ("reload", "reasons", "seconds")}, indent=1))
+        print(json.dumps({k: j.get(k) for k in ("reload", "reasons", "seconds", "loadedSaves", "coopSync")}, indent=1))
         return 0
     return _with_lease(a, go, **kw)
 
