@@ -56,12 +56,14 @@ docs/CONTRACTS.md):
   `exec(cmd, ref=...)` runs the line on that reference. A bad ref raises the bridge's errors (-32602, -32013).
 - Twins: the fake mutant `exec_ref_ignored` (the host checks the ref, then drops it) and `LegacyBot` in
   tests/test_bots.py (a bot that still builds `<hex>.Func` lines) must both fail.
-- `Bot.health`: in game (2026-10-21) `world.query` failed for every actor query on Doc Mitchell (`GetActorValue`,
-  `GetDead`, `GetDisabled`: "query failed (unknown fn, ref not loaded or evaluator drifted)") and worked for a door
-  (`GetLocked` -> 0). `eval("GetAV Health", ref=...)` gave 65.0. So `health()` tries `world.query` first and on an RPC
-  error reads `GetAV Health` with the actor as the calling reference (`P.get_health`). The fake's `query_actors=False`
-  models the game. Twins: with that fallback, `health_stuck`, `fire_miss` and `exec_ref_ignored` must still fail
-  `fire(expect_hit=True)`.
+- `Bot.health`: in game (2026-10-21) `world.query {fn: "GetActorValue"}` failed for every ref (the player, Doc Mitchell,
+  a door): "query failed (unknown fn, ref not loaded or evaluator drifted)". Other functions worked, also on actors
+  (`GetRestrained` on Doc Mitchell -> 1). The cause is in Track A: `plugin/hooks` detours `Cond_GetActorValue` (0x59C4F0),
+  so the live bytes start with `E9` (a jump into nvcoop.dll), and `queryCondition` refuses an evaluator without its
+  `55 8B EC` prologue. `GetItemCount` (0x59D8E0) fails the same way. `eval("GetAV Health", ref=...)` gave 65.0.
+  So `health()` tries `world.query` first and on an RPC error reads `GetAV Health` with the ref as the calling reference
+  (`P.get_health`). The fake's `query_av=False` models the game. Twins: with that fallback, `health_stuck`, `fire_miss`
+  and `exec_ref_ignored` must still fail `fire(expect_hit=True)`.
 
 ## Unverified grammar (fix in tools/bots/primitives.py only)
 All of primitives.py except `GetStage`. In particular: `player.SetPos/SetAngle/GetAngle`, `EquipItem/UnequipItem/GetEquipped`, `RemoveItemTarget item target count silent` argument order, `Drop`, `GetOpenState` values (1 open, 3 closed), `GetLocked`, the FLAG_DISABLED bit 0x800, Health = actor value 16 for `world.query p1`, angle sign conventions in `heading_deg`, and whether an expression inside `printc` uses the calling reference that exec's `ref` gives it (`eval(expr, ref=...)`). Update fake.py to the same grammar if you change a string.
