@@ -107,10 +107,13 @@ jobs:
       - name: Soak (em, plain link)
         run: ./build/fnvcoop_simfuzz --target em --seed "$SEED_BASE" --count "$COUNT" --duration 8000 --out out/em-plain
       - name: Soak (em, bad_wifi)
+        if: ${{ !cancelled() }}   # a failing sweep must not hide the others
         run: ./build/fnvcoop_simfuzz --target em --profile bad_wifi --seed "$SEED_BASE" --count "$COUNT" --duration 8000 --out out/em-badwifi
       - name: Soak (em, hell)
+        if: ${{ !cancelled() }}   # a failing sweep must not hide the others
         run: ./build/fnvcoop_simfuzz --target em --profile hell --seed "$SEED_BASE" --count "$COUNT" --duration 8000 --out out/em-hell
       - name: Soak (mini)
+        if: ${{ !cancelled() }}   # a failing sweep must not hide the others
         run: ./build/fnvcoop_simfuzz --target mini --seed "$SEED_BASE" --count "$(( COUNT * 10 ))" --duration 8000 --out out/mini
       - name: Keep shrunk repros and traces of a failure
         if: failure()
