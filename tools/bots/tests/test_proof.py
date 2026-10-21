@@ -301,7 +301,39 @@ class Proof(unittest.TestCase):
 
 
 
+def load_glue():
+    spec = importlib.util.spec_from_file_location("proof_glue", ROOT / "tools" / "bots" / "proof_glue.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def glue_rows(**over):
+    """proof_glue.run over its fake world with FAKE_ARGS, `over` replacing arguments. -> {check: row}, in run order."""
+    g = load_glue()
+    a = g.parser().parse_args([])
+    for k, v in dict(g.FAKE_ARGS, **over).items():
+        setattr(a, k, v)
+    return {r["check"]: r for r in g.run(g.fake_bridge(), a)}
+
+
 class GlueProof(unittest.TestCase):
+    def test_fast_travel_from_an_interior_needs_ft_from(self):
+        # in game 2026-10-21: from the Prospector Saloon the engine refused, from the cemetery marker it travelled
+        self.assertEqual(glue_rows()["fasttravel"]["result"], "PASS")
+        no_from = glue_rows(ft_from=None)["fasttravel"]
+        self.assertEqual(no_from["result"], "SKIP")
+        self.assertIn("interior", no_from["why"])
+        inside = glue_rows(ft_from="FalloutNV.esm:602")["fasttravel"]   # the NPC, in the interior
+        self.assertEqual(inside["result"], "FAIL")
+        self.assertIn("--ft-from is in an interior", inside["why"])
+
+    def test_fast_travel_runs_after_the_cell_checks(self):
+        rows = glue_rows()
+        self.assertEqual(list(rows)[-1], "fasttravel")
+        self.assertEqual(rows["countrefs"]["result"], "PASS")
+        self.assertEqual(rows["drop_ref"]["result"], "PASS")
+
     def test_glue_proof_script_runs_over_the_fake(self):
         import subprocess
         p = subprocess.run([sys.executable, "-I", str(ROOT / "tools" / "bots" / "proof_glue.py"), "--fake", "--out",
