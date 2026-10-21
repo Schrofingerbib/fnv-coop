@@ -161,6 +161,7 @@ A missing game, and a game lost in the middle of the run (`ConnectionLost` and `
 A game lost during the `player.IsSneaking` read must also give 2: the sneak FAIL is for a failed read only, so proof_input lets `ConnectionLost` through to the run guard.
 `--info FalloutNV.esm:1800 --other-info FalloutNV.esm:800` must pass on a fake whose NPC offers 1800. A `form_key` table and the load-order refusals (exit 2 before the first check) check the runtime id rule.
 Twins: in-process copies of the scripts with each check removed or with the old code put back (text and suffix matching, the number-only same-INFO check, empty values let through, `ap.error` exits, an unguarded run, low 24 bits compared without the plugin, a sneak check that also catches a lost game).
+proof_input activate: the proof walks back to `--door-dist` units (default 100) from the door first, and a cell change (a load door) also passes. The fake's `activate_reach` (the game's reach is about 150) and `Thing.load_to` (a load door) model the game. Twins: `--door-dist 0` (the door must already be in reach) fails after the movement checks, and the state-only rule fails a load door. An RPC error in the fire or activate check gives a FAIL row. Its twin (no guard) stops the run with the error.
 
 ## For T6b
 FakeBridge.pair() gives two bridges on one World (host and client views are not synchronised by the fake; a playbook that needs sync behaviour must simulate it on top). Agreed API was sent by message; any requested change goes to T6a-actions.

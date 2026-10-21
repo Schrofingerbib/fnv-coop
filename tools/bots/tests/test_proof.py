@@ -11,7 +11,7 @@ spec = importlib.util.spec_from_file_location("proof_input", ROOT / "tools" / "b
 proof = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(proof)
 from bots import FakeBridge, World  # noqa: E402
-from bots.bot import BridgeError  # noqa: E402
+from bots.bot import BridgeError, RpcError  # noqa: E402
 
 
 def run_with(mutant=None, always_run=True):
@@ -46,7 +46,78 @@ def run_with_waves(**dismiss_kw):
     return proof.run(nv, args), nv
 
 
+def run_door(door_pos=(3000, 3000, 0), load_to=0, reach=150.0, **extra):
+    """The proof with the door far from where the movement checks leave the player, and the game's activation reach."""
+    w = World()
+    w.add_actor(0x603, (0, 400, 0))
+    w.add_door(0x601, door_pos).load_to = load_to
+    nv = FakeBridge(w)
+    nv.activate_reach = reach
+    args = argparse.Namespace(target="FalloutNV.esm:603", door="FalloutNV.esm:601", fake=True, **extra)
+    return next(r for r in proof.run(nv, args).rows if r["check"] == "activate"), nv
+
+
+class QueryFails(FakeBridge):
+    """world.query refuses every actor (seen in game, 2026-10-21) and the bridge has no other health read."""
+
+    def call(self, method, params=None, timeout_s=35.0):
+        if method == "world.query":
+            raise RpcError(-32000, "query failed (unknown fn, ref not loaded or evaluator drifted)", method)
+        return super().call(method, params, timeout_s)
+
+
 class Proof(unittest.TestCase):
+    def test_activate_walks_back_into_reach_first(self):
+        row, nv = run_door()
+        self.assertEqual(row["result"], "PASS", row)
+        self.assertEqual((row["before"], row["after"]), ("closed", "open"))
+        self.assertGreaterEqual(row["door_dist"], proof.DOOR_DIST - 5)
+        self.assertLess(row["door_dist"], 150)
+        # twin: the old check (the door must already be in reach). After the movement checks it is not, and the row fails.
+        row, nv = run_door(door_dist=0)
+        self.assertEqual(row["result"], "FAIL", row)
+        self.assertEqual(row["after"], "closed")
+
+    def test_activate_passes_through_a_load_door(self):
+        # in game: Doc Mitchell's front door (103E61) moved the player outside, and GetOpenState stayed 3 (closed)
+        row, nv = run_door(load_to=7)
+        self.assertEqual(row["result"], "PASS", row)
+        self.assertEqual((row["before"], row["after"], row["cell_after"]), ("closed", "closed", 7))
+        # twin: the old rule (the door state must change) fails a load door that worked
+        old = proof.door_activated
+        proof.door_activated = lambda before, after, c0, c1: before != after
+        try:
+            row, nv = run_door(load_to=7)
+        finally:
+            proof.door_activated = old
+        self.assertEqual(row["result"], "FAIL", row)
+
+    def test_an_rpc_error_in_a_check_is_a_fail_row(self):
+        w = World()
+        w.add_actor(0x603, (0, 400, 0))
+        w.add_door(0x601, (50, 50, 0))
+        args = argparse.Namespace(target="FalloutNV.esm:603", door="FalloutNV.esm:601", fake=True)
+        rows = {r["check"]: r for r in proof.run(QueryFails(w), args).rows}
+        self.assertEqual(rows["fire"]["result"], "FAIL", rows["fire"])
+        self.assertIn("query failed", rows["fire"]["error"])
+        self.assertEqual(rows["activate"]["result"], "PASS", rows["activate"])     # the proof went on after the error
+        # twin: no guard. The first in-game fire run stopped with a traceback here.
+        old = proof.CHECK_ERRORS
+        proof.CHECK_ERRORS = ()
+        try:
+            with self.assertRaises(RpcError):
+                proof.run(QueryFails(w), args)
+        finally:
+            proof.CHECK_ERRORS = old
+
+    def test_door_dist_must_not_be_negative(self):
+        for bad in ("-1", "nan"):
+            with self.subTest(value=bad):
+                args = proof.parser().parse_args(["--door", "FalloutNV.esm:601", "--door-dist", bad])
+                self.assertTrue(any("--door-dist" in p for p in proof.check_args(args)))
+        args = proof.parser().parse_args(["--door", "FalloutNV.esm:601", "--door-dist", "0"])
+        self.assertEqual(proof.check_args(args), [])
+
     def test_passes_on_a_healthy_fake(self):
         rep = run_with()
         self.assertEqual([r for r in rep.rows if r["result"] != "PASS"], [])

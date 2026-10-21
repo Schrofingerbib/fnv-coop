@@ -23,8 +23,14 @@ Checks (each prints measured values so a failure says what the game did):
   jump      Z rises > 5 units (control 12, an edge-only control: proves the edge is served exactly once)
   sneak     two taps toggle crouch on then off (edge fires exactly once per tap, or the state would not alternate), read with
             player.IsSneaking (the console has no GetSneaking); a failed read is a FAIL
-  fire      with --target: pulses Attack at the target; its health drops (needs an equipped, loaded weapon)
-  activate  with --door: look at it and press Activate; the door state changes
+  fire      with --target: pulses Attack at the target; its health drops (needs an equipped, loaded weapon). Bot.fire aims once, so
+            the target must stay still and in line of sight: an NPC that walks away makes the shots miss (SetRestrained 1 holds it)
+  activate  with --door: the movement checks leave the player anywhere, so the proof first teleports to the door, faces it and
+            walks backward until --door-dist units away (default 100, inside the game's activation reach of about 150; 0 keeps
+            the player where it is). Then it looks at the door and presses Activate. PASS when the door state changes, or when
+            the player's cell changes: a load door (in game, Doc Mitchell's front door FalloutNV.esm:103E61) moves the player
+            to the other cell and its open state stays "closed"
+An RPC or bridge error in the fire or activate check gives a FAIL row with the error. It does not stop the proof.
 """
 import argparse
 import json
@@ -36,7 +42,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tools" / "runner"))
 from bots import Bot, FakeBridge, World, proof_args  # noqa: E402
-from bots.bot import ConnectionLost  # noqa: E402
+from bots.bot import BridgeError, ConnectionLost  # noqa: E402
 
 # No argument is required (--target and --door only add checks). FORMS: every dest that holds a form id.
 REQUIRED = {}
@@ -45,6 +51,25 @@ FORMS = ("target", "door")
 # The sneak state as a console expression. The game's console has IsSneaking. "player.GetSneaking" gave "Unknown variable" (2026-10-21).
 SNEAK_EXPR = "player.IsSneaking"
 SETTLE_AFTER_JUMP_S = 2.5  # > the ~2 s after a jump in which only one crouch toggle takes effect
+DOOR_DIST = 100.0          # units from the door for the activate check (the game's activation reach is about 150)
+# Errors of the fire and activate checks that give a FAIL row. ConnectionLost (a BridgeError) is re-raised first: a lost game is exit 2.
+CHECK_ERRORS = (BridgeError,)
+
+
+def door_activated(before: str, after: str, cell_before: int, cell_after: int) -> bool:
+    """The door state changed, or the player went through a load door (cell change, the open state stays 'closed')."""
+    return before != after or cell_before != cell_after
+
+
+def walk_back_from(b, nv, ref, dist: float, timeout_s: float = 4.0) -> float:
+    """Teleport to `ref`, face it and walk backward until `dist` units away (the engine's collisions apply). -> the distance."""
+    b.goto(ref, mode="teleport")
+    b.look(ref=ref)
+    nv.call("bot.move", {"forward": -1, "strafe": 0, "run": False})
+    b.wait_until(lambda: math.dist(b.pos(), b.pos(ref)) >= dist, timeout_s, 0.05)
+    nv.call("bot.stop")
+    b.wait(0.3)
+    return math.dist(b.pos(), b.pos(ref))
 
 
 class Report:
@@ -137,21 +162,40 @@ def run(nv, args) -> Report:
         r.check("sneak", False, error=f"cannot read {SNEAK_EXPR}: {e}")
 
     if args.target:
-        h0 = b.health(args.target)
-        fr = b.fire(args.target, shots=3, expect_hit=True)
-        r.check("fire", fr.ok, health_before=h0, health_after=b.health(args.target), reply=str(fr))
+        try:
+            h0 = b.health(args.target)
+            fr = b.fire(args.target, shots=3, expect_hit=True)
+            r.check("fire", fr.ok, health_before=h0, health_after=b.health(args.target), reply=str(fr))
+        except ConnectionLost:
+            raise
+        except CHECK_ERRORS as e:
+            r.check("fire", False, error=f"{type(e).__name__}: {e}")
     else:
         r.skip("fire", "pass --target <ref of a hostile in line of sight> and equip a loaded weapon first")
 
     if args.door:
-        before = b.door_state(args.door)
-        b.look(ref=args.door)
-        a = b.activate_crosshair()
-        b.wait(1.5)
-        after = b.door_state(args.door)
-        r.check("activate", a.ok and before != after, before=before, after=after)
+        try:
+            dist = getattr(args, "door_dist", DOOR_DIST)
+            reached = walk_back_from(b, nv, args.door, dist) if dist > 0 else None
+            before, cell0 = b.door_state(args.door), b.cell()
+            b.look(ref=args.door)
+            a = b.activate_crosshair()
+            b.wait(1.5)
+            cell1 = b.cell()
+            try:
+                after = b.door_state(args.door)
+            except ConnectionLost:
+                raise
+            except CHECK_ERRORS:   # the player went through a load door and the old cell may be unloaded
+                after = "unloaded"
+            r.check("activate", a.ok and door_activated(before, after, cell0, cell1), before=before, after=after,
+                    cell_before=cell0, cell_after=cell1, door_dist=None if reached is None else round(reached))
+        except ConnectionLost:
+            raise
+        except CHECK_ERRORS as e:
+            r.check("activate", False, error=f"{type(e).__name__}: {e}")
     else:
-        r.skip("activate", "pass --door <ref of a door within reach>")
+        r.skip("activate", "pass --door <ref of a door>")
     nv.call("bot.stop")
     return r
 
@@ -162,6 +206,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--save")
     ap.add_argument("--target")
     ap.add_argument("--door")
+    ap.add_argument("--door-dist", type=float, default=DOOR_DIST,
+                    help="walk back to this many units from the door before the activate check (0: do not move the player)")
     ap.add_argument("--fake", action="store_true")
     ap.add_argument("--dismiss-messages", action="store_true", help="clear stray message boxes (button 0) before the checks")
     ap.add_argument("--dismiss-quiet-s", type=float, default=20.0, help="done when no box has been shown for this many seconds")
@@ -172,7 +218,11 @@ def parser() -> argparse.ArgumentParser:
 
 def check_args(args) -> list:
     """Up-front checks for a game run (not --fake). An empty list means the proof can run."""
-    return proof_args.problems(args, REQUIRED, FORMS)
+    bad = proof_args.problems(args, REQUIRED, FORMS)
+    dist = getattr(args, "door_dist", DOOR_DIST)
+    if not (dist >= 0 and math.isfinite(dist)):
+        bad.append(f"argument --door-dist: {dist!r} must be 0 or more (0: do not move the player)")
+    return bad
 
 
 def fake_bridge(mutant=None) -> FakeBridge:

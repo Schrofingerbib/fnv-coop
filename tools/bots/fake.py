@@ -88,6 +88,7 @@ class Thing:
     topics_text: List[str] = field(default_factory=list)   # terminal entry names
     base_id: int = 0                # base form id (0 = same as id); used by dev.countRefs
     topics: List[int] = field(default_factory=list)
+    load_to: int = 0                # door only: the cell a load door leads to (0 = an ordinary door that opens and closes)
 
     @property
     def dead(self) -> bool:
@@ -166,6 +167,7 @@ class FakeBridge:
         self.drop_events = drop_events          # the OnDrop native handler is registered
         self.genuine_travel = genuine_travel    # bot.fasttravel exists (engine glue on)
         self.travel_refuses = travel_refuses    # the engine's may-travel check says no
+        self.activate_reach = 400.0             # bot.activate range; the game's activation reach is about 150 (tests set it)
         self.drop_log: List[Dict[str, Any]] = []
         self.travel_due: Optional[Tuple[float, "Thing"]] = None   # (virtual time, marker): the player moves a little after the call
         self._next_ref = 0xFF000000
@@ -400,6 +402,9 @@ class FakeBridge:
         if t.kind == "door":
             if t.locked:
                 return
+            if t.load_to:   # a load door moves the player to the other cell; its open state stays closed (in game, 2026-10-21)
+                me.cell = t.load_to
+                return
             t.open_state = 1 if t.open_state == 3 else 3
         elif t.kind == "actor" and not t.dead:
             if self.mutant != "dialog_never":
@@ -473,7 +478,8 @@ class FakeBridge:
             if self.mutant != "activate_noop":
                 for t in self.world.things.values():
                     z, x = heading_deg((me.pos[0], me.pos[1], me.pos[2] + 120), (t.pos[0], t.pos[1], t.pos[2] + 60))
-                    if t.kind in ("door", "actor", "item") and math.dist(me.pos, t.pos) < 400 and angle_diff(z, me.angle["Z"]) <= 10:
+                    if (t.kind in ("door", "actor", "item") and math.dist(me.pos, t.pos) < self.activate_reach
+                            and angle_diff(z, me.angle["Z"]) <= 10):
                         self._activate(t)
                         break
             return {}
