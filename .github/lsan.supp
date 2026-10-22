@@ -1,8 +1,2 @@
 # LeakSanitizer suppressions for the sanitizers workflow. Each entry needs the reason and the issue that removes it.
-#
-# runAsync() (synccore/include/fnvcoop/worker.h): the completion closure it pushes onto the MainQueue captures a shared_ptr to that same
-# MainQueue, so a completion still queued when its session is destroyed keeps the queue alive forever (a reference cycle).
-# Seen in unit_saveload (the_same_big_rebase_with_a_worker_thread...), where the worker finishes a digest job after the session is gone.
-# Fix is Track A's: capture a raw MainQueue* in the completion (it only ever runs inside that queue's drain()). Remove these lines then.
-leak:fnvcoop::runAsync
-leak:std::make_shared<fnvcoop::MainQueue>
+# Empty: the one known leak (runAsync reference cycle, #46) is fixed; its twin runs in its own step and must be caught by LSan.

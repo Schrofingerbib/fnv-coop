@@ -1,5 +1,5 @@
-# Linux-only checks that need no game: synccore and the simfuzz soak under ASan + UBSan (g++ and clang), plus the Python quick suite.
-# Windows (MSVC x86) jobs live in their own workflow; nothing here touches game files or secrets.
+# Linux-only checks that need no game: synccore and the simfuzz soak under ASan + UBSan (g++ and clang).
+# ci.yml has the plain builds and the Python quick suite; nothing here touches game files or secrets.
 name: sanitizers
 
 on:
@@ -62,11 +62,22 @@ jobs:
           -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
           "-DCMAKE_C_FLAGS=$SAN_FLAGS" "-DCMAKE_CXX_FLAGS=$SAN_FLAGS" "-DCMAKE_EXE_LINKER_FLAGS=$SAN_FLAGS"
       - run: cmake --build build --parallel
-      # Excluded, each with its reason:
-      #  - soak_smoke_threaded: about 15% flaky, a real worker-thread race (issue #43); ASan/UBSan do not see data races (that is TSan's job).
-      #  - unit_perf / twin_perf_regression_still_fails / flight_perf: wall-clock budgets, meaningless at sanitizer speed (flight_perf failed under load).
+      # Excluded, with the reason: unit_perf / twin_perf_regression_still_fails / flight_perf have wall-clock budgets, meaningless at
+      # sanitizer speed (flight_perf failed under load). twin_unit_async_completion_leak puts the #46 reference cycle back on purpose,
+      # so LSan rightly fails it: the next step runs it on its own.
       # One known leak is suppressed in .github/lsan.supp (runAsync reference cycle, reported in the PR); everything else must be clean.
-      - run: ctest --test-dir build -j 4 --timeout 900 --output-on-failure -E '^(soak_smoke_threaded|unit_perf|twin_perf_regression_still_fails|flight_perf)$'
+      - run: ctest --test-dir build -j 4 --timeout 900 --output-on-failure -E '^(unit_perf|twin_perf_regression_still_fails|flight_perf|twin_unit_async_completion_leak)$'
+
+      - name: LSan catches the runAsync cycle of issue #46 (its twin)
+        # The twin restores the cyclic capture. With leak checking on it must fail on LSan's report; with it off its own CHECK must pass.
+        # Together: the fix holds (the main run has no leak and no suppression for it) and LSan would see the bug come back.
+        run: |
+          set -u
+          if ASAN_OPTIONS=detect_leaks=1 ./build/fnvcoop_tests --group twin --name unit_async_completion_leak > leak_twin.log 2>&1; then
+            cat leak_twin.log; echo "::error::the #46 twin exited 0 with LSan on: the reference cycle was not reported"; exit 1
+          fi
+          grep -q "LeakSanitizer: detected memory leaks" leak_twin.log || { cat leak_twin.log; echo "::error::the #46 twin failed, but not on a leak"; exit 1; }
+          ASAN_OPTIONS=detect_leaks=0 ./build/fnvcoop_tests --group twin --name unit_async_completion_leak
 
   simfuzz-soak:
     name: simfuzz soak, ASan+UBSan (${{ matrix.cxx }})
@@ -123,15 +134,3 @@ jobs:
           path: out/
           if-no-files-found: ignore
 
-  python-quick:
-    name: python quick suite (ubuntu)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      # Suites that need the game, MSVC or a prebuilt DLL print "SKIP <name>: <reason>"; any FAIL fails the job.
-      # ci.yml (#41) runs the same command on both OSes; this copy lets the sanitizer workflow stand alone and can go once #41 is merged.
-      - run: python -I tools/test_all.py --quick
