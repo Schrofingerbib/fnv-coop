@@ -105,10 +105,14 @@ foreign wheel setting ignored, 928 companion treated as anybody, 931 a client cl
 1. Two or three copies in one session, `nvcoop.ini` `[live] actors=1 avatars=1 combat=1` (+ `social=1` once dll-wiring added it), `[companions] enabled=1 dev=1 xpmode=1`.
    `nvbridge social.status` on each: `running` true, `synced` true on the guests, digests equal.
 2. `python -I plugin/companions/proof/social_proof.py snapshot --out out/social/before.json --instances 0,1,2`.
-3. Companions: recruit Boone on guest 1 (the story path), then on the host `social.status`: `companions` 1 everywhere, `teammateUnset` > 0 on the host if its engine had flagged him.
-   `social.dev {op:"cmd", kind:1, npc:"FalloutNV.esm:<Boone ref>"}` on guest 1 (wait): `stateApplied` 1 there; the same command on guest 2 must be refused (`cmdRefused`).
-4. Crime: `python -I plugin/companions/proof/social_proof.py drive --faction FalloutNV.esm:<NCR faction> --victim-net <net id of an NCR trooper> --instances 0,1,2` with an NCR
-   trooper looking at guest 1: the engine flags (`GetPCFactionAttack` ...) must agree on every instance; guards that the other machines simulate turn on guest 1.
+3. + 4. Companions and crime, scripted (no human): `python -I plugin/companions/proof/social_proof.py drive --faction FalloutNV.esm:0A46E7 --instances 0,1,2` (0A46E7 = NCRFactionNV).
+   Without `--npc` it recruits Boone (`--boone`, default FalloutNV.esm:096BCE) for guest 1: on the host `enable`, `moveto player`, then bridge `exec.ref {ref:<boone>, cmd:"SetPlayerTeammate 1", scope:true,
+   acting:{ghost:<guest 1's puppet from coop.status playerRefs.slots>, slot:1}}`, which the capture hook (`h_Teammate`) records as a `CompanionOwner` effect for slot 1. It asserts `companions` 1 on every
+   instance, `social.dev {op:"cmd", kind:1, npc:<boone>}` on guest 1 (wait): `stateApplied` +1 there; the same command on guest 2 refused (`cmdRefused` +1, `stateApplied` unchanged); `teammateUnset` on the host is
+   printed as info. Without `--victim-net` it places an NCR trooper (`--trooper-base`, default eldoradoNCRTrooper1 FalloutNV.esm:0E7E21) next to guest 1's puppet with `placeatme` run by the host, finds the
+   new reference with `dev.refsOf` (before / after) and reads its net id with `coop.owner`, then drives the crime and kill and compares the engine flags (`GetPCFactionAttack` ...) on every instance; guards that
+   the other machines simulate turn on guest 1. `--npc` / `--victim-net` keep the old manual drive. Game-free: `--selftest` runs the whole setup against a fake bridge with 7 broken-setup twins
+   (recruit never recorded, recorded for the wrong slot, guest 2 allowed to command, trooper not created, no net id, no puppet, flags differ).
 5. `snapshot --out out/social/after.json`, then `check out/social/before.json out/social/after.json --crimes 1 --kills 1 --alarms 1 --xp-grants 1`: every line must say PASS.
 6. Look for: kill XP arriving once on the killer's screen, karma moving once on every screen, no HUD spam, guards of the wanted faction reacting once. If `engine_evalFaults` is not 0,
    the `GetDetected` / `IsTrespassing` calling convention is wrong: set `[companions] crime=0` and report it.

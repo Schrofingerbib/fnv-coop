@@ -277,6 +277,45 @@ class SlotTests(unittest.TestCase):
         real._avail_gb = lambda: 0.2
         self.assertEqual(call(real, "acquire", "--owner", "D", "--slots", "1")[0], 3)
 
+    def test_need_gb_is_the_callers_need_not_the_default(self):
+        """prove.py --reserve-gb 0.2 with 1 copy to boot needs 0.9 GB: 1.0 GB free must not be refused by the 3.0 GB default."""
+        m = self.gs(3)
+        call(m, "acquire", "--owner", "A", "--slots", "1")
+        m._avail_gb = lambda: 1.0
+        self.assertEqual(call(m, "acquire", "--owner", "B", "--slots", "1")[0], 3, "no --need-gb: the configured default still applies")
+        rc, out = call(m, "acquire", "--owner", "B", "--slots", "1", "--need-gb", "0.90")
+        self.assertEqual(rc, 0, out)
+        call(m, "release", "--owner", "B")
+        rc, out = call(m, "acquire", "--owner", "B", "--slots", "1", "--need-gb", "1.60")
+        self.assertEqual(rc, 3)
+        self.assertIn("1.0 GB free < 1.6 GB required", out)
+
+    def test_twin_need_gb_ignored_is_caught(self):
+        m = self.gs(3)
+        m.required_free_gb = lambda need_gb=None: m.min_free_gb()      # broken: the caller's number is dropped
+        call(m, "acquire", "--owner", "A", "--slots", "1")
+        m._avail_gb = lambda: 1.0
+        self.assertEqual(call(m, "acquire", "--owner", "B", "--slots", "1", "--need-gb", "0.90")[0], 3, "mutant refuses what the caller said it can run on")
+        real = self.gs(3)
+        call(real, "acquire", "--owner", "C", "--slots", "1")
+        real._avail_gb = lambda: 1.0
+        self.assertEqual(call(real, "acquire", "--owner", "D", "--slots", "1", "--need-gb", "0.90")[0], 0)
+
+    def test_available_memory_is_available_mbytes_not_free(self):
+        """_avail_gb is GlobalMemoryStatusEx ullAvailPhys (= perfmon Available MBytes: standby counts), checked against an independent read."""
+        import ctypes
+        spec = importlib.util.spec_from_file_location("gs_real", self.SRC)
+        real = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(real)
+
+        class MS(ctypes.Structure):
+            _fields_ = [("l", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong), ("avail", ctypes.c_ulonglong),
+                        ("x", ctypes.c_ulonglong * 5)]
+        ms = MS()
+        ms.l = ctypes.sizeof(ms)
+        ctypes.WinDLL("kernel32").GlobalMemoryStatusEx(ctypes.byref(ms))
+        self.assertAlmostEqual(real._avail_gb(), ms.avail / 2**30, delta=0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

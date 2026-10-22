@@ -209,7 +209,8 @@ class BacklogTests(unittest.TestCase):
         b = BL.write(os.path.join(self.tmp.name, 'real'))
         self.assertGreater(b['game_wide']['synced_pct'], b['game_wide']['synced_pct_static'] - 0.001)
         self.assertGreater(len(b['questlines']), 10)
-        self.assertTrue(b['work_items'])
+        # Track A 2026-10-22: UseWeapon was the last open script function; the backlog has no work items left, and it must not list it
+        self.assertNotIn('useweapon', json.dumps(b['work_items']).lower())
 
 
 class SweepTests(unittest.TestCase):

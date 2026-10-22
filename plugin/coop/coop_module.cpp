@@ -154,7 +154,12 @@ public:
     }
 };
 PollSink g_pollSink;
-bool g_polling = false;
+// A sink that drops everything: the priming pass of a host without a world baseline (change_tracker.h).
+class NullSink : public nvhooks::StateSink {
+public:
+    void scriptVar(const fnvcoop::FormRef&, uint16_t, double) override {}
+    void global(const fnvcoop::FormRef&, float) override {}
+};
 
 std::string IniPath() {
     HMODULE self = nullptr;
@@ -311,6 +316,16 @@ void TryStart() {
     }
     ParseScenePass();
     if (g_cfg.role == Role::Host) {
+        // Quest vars / globals are host-authoritative and polled every frame, with or without a world baseline (the old gate polled only
+        // with baseline=1, so a baseline-less host never shared a var an object script wrote, e.g. VMS16.nGangerDeathCount from the gangers' OnDeath).
+        g_rt->setStatePoll([](fnvcoop::StateReplicator& to, bool first, bool prime) {
+            (void)to;
+            if (first) {
+                nvhooks::enableStatePolling(true, prime);   // clears the tracker; prime = take the present values as known
+                if (prime) { NullSink drop; nvhooks::pollHostState(drop); nvcoop::Log("coop: state poll primed (no world baseline)"); return; }
+            }
+            nvhooks::pollHostState(g_pollSink);
+        });
         // quest rules engine: rules.json (ini rules=, default nvcoop_rules.json next to the dll) + EDID / INFO->quest maps
         if (g_cfg.rulesFile.empty()) {
             std::string def = DllDir() + "nvcoop_rules.json";
@@ -368,8 +383,13 @@ void TryStart() {
         if (standIn) actor = 0x14;
         if (!logged.count((int)slot) || logged[(int)slot] != standIn) {
             logged[(int)slot] = standIn;
-            if (standIn) nvcoop::Log("coop: ACTING-STANDIN slot %d: no ghost ref (NV:MP absent or ghost not spawned); host player 14 acts", (int)slot);
-            else nvcoop::Log("coop: acting player for slot %d = ghost ref %08X", (int)slot, actor);
+            const char* why = "no NV:MP ghost";
+#ifdef NVCOOP_WITH_LIVE
+            why = nvcoop::livewire::glueSwitches().avatars ? "[live] avatars=1 but this slot's puppet does not exist yet, and no NV:MP ghost"
+                                                           : "[live] avatars=0, so there are no puppets, and no NV:MP ghost";
+#endif
+            if (standIn) nvcoop::Log("coop: ACTING-STANDIN slot %d: %s; host player 14 acts", (int)slot, why);
+            else nvcoop::Log("coop: acting player for slot %d = puppet / ghost ref %08X", (int)slot, actor);
         }
         fnvcoop::Cause c;
         c.kind = fnvcoop::CauseKind::Intent;
@@ -682,10 +702,6 @@ void OnFrame() {
 #if defined(NVCOOP_WITH_ACTORS) && !defined(NVCOOP_WITH_LIVE)
         nvcoop::actors::glueFrame(g_rt.get());   // actor ownership: after the session ticked (it polls the mux; ours is a channel on it)
 #endif
-        if (g_rt->replicator() && g_cfg.baseline) {   // polling needs a known host world (baseline) or the first poll would flood
-            if (!g_polling) { nvhooks::enableStatePolling(true); g_polling = true; }
-            nvhooks::pollHostState(g_pollSink);
-        }
         // v1 gameplay block while the world-baseline transfer runs (L5 DisablePlayerControls path; idempotent)
         if (g_rt->client() && g_rt->client()->rejected() && !g_rejectLogged) {
             g_rejectLogged = true;

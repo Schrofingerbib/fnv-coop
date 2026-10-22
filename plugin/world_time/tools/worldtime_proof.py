@@ -27,11 +27,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+# test-only: one deliberate bug, set by the selftest's twin: "press_blind" presses the confirm box without waiting for it to show
+MUTANT = os.environ.get("WORLDTIME_PROOF_MUTANT", "")
+BOX_S = 10.0         # how long the confirm box may take to come up after worldtime.rest / worldtime.travel answered
 TOL_MIN = 3.0        # game minutes two clocks may differ after a sync
 SETTLE_S = 6.0
 
@@ -84,6 +89,16 @@ class Proof:
             t += 0.5
         return pred()
 
+    def press_box(self, i: int, button: int, what: str) -> bool:
+        """Press `button` on instance i's message box once it is on screen (the box comes up a moment after worldtime.rest / worldtime.travel
+        answers; a press before that fails with "no message box is being shown"). A box that never shows is a failed check, not a crash."""
+        if MUTANT != "press_blind":
+            shown = self.wait_until(lambda: self.call(i, "bot.menu").get("kind") == "message", BOX_S)
+            if not shown:
+                return self.check(f"{what}: the confirm box came up on instance {i}", False, self.call(i, "bot.menu"))
+        self.call(i, "bot.menu.press", {"button": button})
+        return True
+
     # ---------------------------------------------------------------------------------------------------------------- steps
     def step_module(self) -> None:
         sts = [self.status(i) for i in range(len(self.nvs))]
@@ -117,8 +132,7 @@ class Proof:
         asker = 1
         r = self.call(asker, "worldtime.rest", {"kind": "wait", "minutes": minutes})
         out = {"vetoed": r.get("proceed") is False}
-        self.sleep(1.0)
-        self.call(asker, "bot.menu.press", {"button": 1})   # the asker's own "Yes"
+        self.press_box(asker, 1, "rest")   # the asker's own "Yes"
         self.sleep(1.0)
         for i in range(len(self.nvs)):
             if i == asker:
@@ -179,8 +193,7 @@ class Proof:
         before = [self.status(i).get("stats", {}).get("travelsStarted", 0) for i in range(len(self.nvs))]
         r = self.call(1, "worldtime.travel", {"marker": self.marker})
         self.check("7 travel: a party trip is vetoed until answered", r.get("proceed") is False, r)
-        self.sleep(1.0)
-        self.call(1, "bot.menu.press", {"button": 1})
+        self.press_box(1, 1, "7 travel")
         self.sleep(1.0)
         for i in range(len(self.nvs)):
             if i != 1:
@@ -210,6 +223,7 @@ class FakeWorld:
         self.asked: Optional[Dict[str, Any]] = None
         self.answers: Dict[int, str] = {}
         self.pressed = False
+        self.asked_t = 0.0
         self.cooldown_until = 0.0
 
     def advance_clock(self, c: Dict[str, Any], minutes: float) -> None:
@@ -265,15 +279,22 @@ class FakeWorld:
                     if w.t < w.cooldown_until:
                         return {"proceed": False}
                     w.asked = {"kind": "rest", "minutes": p["minutes"]}
+                    w.asked_t = w.t
                     w.answers = {}
                     w.pressed = False
                     return {"proceed": False, "awaiting": True}
                 if method == "worldtime.travel":
                     w.asked = {"kind": "travel"}
+                    w.asked_t = w.t
                     w.answers = {}
                     w.pressed = False
                     return {"proceed": False, "awaiting": True}
+                if method == "bot.menu":   # the confirm box comes up a moment after the question, like the real game
+                    shown = i == 1 and w.asked is not None and not w.pressed and w.t >= w.asked_t + 2.5
+                    return {"kind": "message" if shown else "none"}
                 if method == "bot.menu.press":
+                    if not (i == 1 and w.asked is not None and w.t >= w.asked_t + 2.5):
+                        raise RuntimeError("bot.menu.press: [-32000] no message box is being shown")
                     w.pressed = True
                     return {}
                 if method == "bot.consent":
@@ -314,6 +335,12 @@ def selftest() -> int:
     if not two.ok:
         print("selftest: two-instance run failed:", [r for r in two.results if not r["pass"]])
         bad += 1
+    if not MUTANT:   # twin: a proof that presses the confirm box before it is up must be noticed by the fake world
+        cp = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()), "--selftest"], capture_output=True, text=True,
+                            env=dict(os.environ, WORLDTIME_PROOF_MUTANT="press_blind"))
+        if cp.returncode == 0:
+            print("selftest: the press_blind twin was not caught (a press before the box shows must fail)")
+            bad += 1
     if bad:
         return 1
     print("worldtime_proof selftest: ALL OK (%d checks on the good run, 3 broken worlds caught)" % len(good.results))
@@ -332,8 +359,14 @@ def main() -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools" / "runner"))
     import nvbridge  # noqa: E402
 
+    import nvready  # noqa: E402
+
     nvs = [nvbridge.NvBridge.connect(i, wait_s=5.0) for i in a.instances]
     try:
+        why = nvready.wait_ready(nvs)
+        if why:
+            print("cannot reach the game instances: " + why)
+            return 2
         p = Proof(nvs, time.sleep, a.door, a.marker)
         ok = p.run()
         out = Path(__file__).resolve().parents[3] / "out" / "world-time"

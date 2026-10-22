@@ -663,8 +663,7 @@ std::vector<ActorRef> actorsInPlayerCell(size_t max, uint32_t formType) {
         TESObjectREFR* r = it.Get();
         if (!r || !r->refID || r->refID == kPlayerRefID) continue;
         // a placed object is a REFR whose BASE form has the object type (container, door); actors are their own ref type
-        uint32_t t = formType == kFormType_Character ? r->typeID : (r->baseForm ? r->baseForm->typeID : 0);
-        if (t != formType) continue;
+        if (!nvworld::actorTypeMatches(formType, r->typeID, r->baseForm ? r->baseForm->typeID : 0)) continue;
         ActorRef a;
         a.refID = r->refID;
         a.baseID = refIdOf(r->baseForm);

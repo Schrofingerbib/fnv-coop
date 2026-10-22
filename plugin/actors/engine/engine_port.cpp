@@ -74,6 +74,9 @@ void EnginePort::beginFrame(uint64_t nowMs) {
 }
 
 void EnginePort::flush() {
+    // 0. removed clones whose quiet period is over
+    reapDoomed(false);
+
     // 1. kill / revive retries: a console line can be refused; the target state is checked by reading the actor back
     std::vector<NetId> retry;
     for (auto& kv : e_)
@@ -419,6 +422,13 @@ void EnginePort::applyAi(Entry& e, bool on) {
         ActorRaw raw;
         raw.wantRestrained = true;
         const bool readOk = eng_.read(r, raw);
+        // A dead or dying actor has no AI to stop, and SetRestrained on it overwrites its life state with 5 ("restrained", which every reader
+        // counts as ALIVE): in game 2026-10-22 the owner's copy of a ganger read dying (1) and half a second later restrained (5), so the
+        // owner showed it alive while every other machine showed it dead (enemy_handoff "alive differs between machines").
+        if (readOk && raw.dead() && !FNV_MUT(72)) {   // twin 72: the corpse is restrained like a living NPC
+            e.aiOff = true; e.aiRef = 0;
+            return;
+        }
         const bool scriptRestrained = readOk && raw.restrainedKnown && raw.restrained;
         // a calm actor has no combat to stop: one console line less per actor (every actor is frozen for a moment at track time)
         if (cfg_.stopCombatOnRestrain && (!readOk || raw.inCombat) && !FNV_MUT(11)) eng_.stopCombat(r);
@@ -514,14 +524,41 @@ bool EnginePort::makeClone(Entry& e, CloneKind kind, uint32_t baseId, RefId anch
     return true;
 }
 
-void EnginePort::dropClone(Entry& e, bool reenableReal) {
+// A clone is written to (SetPos) every frame it moves. The engine does not always run such a line at once: in game 2026-10-22 a SetPos on
+// a stand-in's id ran after the stand-in was gone, found the id on a NavMesh (the faulting vtable was the NavMesh's) and called through
+// text (three client crashes, EIP 6C676E61 = "angl"). So a removed clone is left alone for Config::deleteQuietMs first; the ledger entry
+// stays until it is really deleted, so a crash or a save in between still cleans it up.
+void EnginePort::retireClone(RefId c, bool immediate) {
+    if (!immediate && cfg_.deleteQuietMs && !FNV_MUT(73)) {   // twin 73: deleted at once, with the last SetPos possibly still queued
+        if (!isDoomed(c)) doomed_.emplace_back(c, now_ + cfg_.deleteQuietMs);
+        return;
+    }
+    // When the engine refuses (the cell is gone already) the ledger entry stays: sweepOrphans() finishes the job when the ref is reachable.
+    if (deleteRef(c)) {
+        ledgerRemove(LedgerKind::StandIn, c);
+        ledgerRemove(LedgerKind::Restrained, c);
+    }
+}
+
+bool EnginePort::isDoomed(RefId r) const {
+    for (const auto& d : doomed_) if (d.first == r) return true;
+    return false;
+}
+
+void EnginePort::reapDoomed(bool all) {
+    if (doomed_.empty()) return;
+    std::vector<RefId> due;
+    for (auto it = doomed_.begin(); it != doomed_.end();) {
+        if (all || now_ >= it->second) { due.push_back(it->first); it = doomed_.erase(it); }
+        else ++it;
+    }
+    for (RefId r : due) retireClone(r, true);
+}
+
+void EnginePort::dropClone(Entry& e, bool reenableReal, bool immediate) {
     const RefId c = e.clone;
     if (c) {
-        // When the engine refuses (the cell is gone already) the ledger entry stays: sweepOrphans() finishes the job when the ref is reachable.
-        if (deleteRef(c)) {
-            ledgerRemove(LedgerKind::StandIn, c);
-            ledgerRemove(LedgerKind::Restrained, c);
-        }
+        retireClone(c, immediate);
         unindex(c);
         if (e.aiRef == c) e.aiRef = 0;
         if (e.protRef == c) { ledgerRemove(LedgerKind::Essential, c); e.protOn = false; e.protRef = 0; }
@@ -602,10 +639,7 @@ void EnginePort::setBase(NetId id, const FormRef& pick) {
     const CellId cell = raw.cell;
     const bool wasOff = e->aiOff;
     if (oldClone) {
-        if (deleteRef(oldClone)) {
-            ledgerRemove(LedgerKind::StandIn, oldClone);
-            ledgerRemove(LedgerKind::Restrained, oldClone);
-        }
+        retireClone(oldClone, false);
         unindex(oldClone);
         if (e->aiRef == oldClone) e->aiRef = 0;
     }
@@ -646,6 +680,23 @@ void EnginePort::kill(NetId id) {
     registry().emit(d);
 }
 
+// ---- IActorPort: inventory ---------------------------------------------------------------------------------------------------------------
+
+bool EnginePort::sampleInventory(NetId id, InvList& out) {
+    out.clear();
+    Entry* e = find(id);
+    if (!e || !activeOf(*e)) return false;
+    Registry& reg = registry();
+    return reg.invRead && reg.invRead(id, out);
+}
+
+bool EnginePort::applyInventory(NetId id, const InvList& want) {
+    Entry* e = find(id);
+    if (!e || !activeOf(*e) || e->killWanted) return false;
+    Registry& reg = registry();
+    return reg.invWrite && reg.invWrite(id, want);
+}
+
 void EnginePort::revive(NetId id) {
     Entry* e = find(id);
     const RefId r = e ? activeOf(*e) : 0;
@@ -672,6 +723,7 @@ bool EnginePort::reclaimDisabled(RefId ref) {
 // ---- world / session -------------------------------------------------------------------------------------------------------------------------
 
 void EnginePort::forgetWorld() {
+    doomed_.clear();   // refs of the old world: nothing may be run on them any more (their ledger entries are undone, or dropped as foreign, by undoStale)
     e_.clear();
     byRef_.clear();
     live_.clear();
@@ -743,7 +795,7 @@ size_t EnginePort::undoStale() {
 void EnginePort::sweepOrphans() {
     ActorRaw raw;
     for (uint32_t r : led_.all(LedgerKind::StandIn)) {
-        if (!live_.count({'s', r}) || byRef_.count(r)) continue;
+        if (!live_.count({'s', r}) || byRef_.count(r) || isDoomed(r)) continue;
         if (!eng_.read(r, raw)) continue;
         if (!deleteRef(r)) continue;
         ledgerRemove(LedgerKind::StandIn, r);
@@ -754,6 +806,7 @@ void EnginePort::sweepOrphans() {
 
 void EnginePort::releaseAll() {
     ActorRaw raw;
+    reapDoomed(true);   // the session is over: what waits for its quiet period goes now
     // every live change, then forget
     for (auto& kv : e_) {
         Entry& e = kv.second;
@@ -793,11 +846,12 @@ void EnginePort::releaseAll() {
 std::vector<NetId> EnginePort::beforeSave() {
     std::vector<NetId> reverted;
     cloneHoldUntilMs_ = now_ + cfg_.saveGraceMs;
+    reapDoomed(true);   // the save must not contain a clone, quiet period or not
     for (auto& kv : e_) {
         Entry& e = kv.second;
         if (!e.clone) continue;
         const bool swap = e.kind == CloneKind::PickSwap;
-        dropClone(e, true);
+        dropClone(e, true, true);
         ++st_.standInsPurged;
         if (swap) reverted.push_back(kv.first);
     }

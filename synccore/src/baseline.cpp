@@ -85,6 +85,7 @@ KV kvRefOp(const RefCommand& c) {
     Fnv k; k.b(33); k.u32(std::get<0>(key)); k.form(std::get<1>(key)); k.form(std::get<2>(key)); k.form(std::get<3>(key));
     Fnv v = k; v.u32(c.op); v.form(c.ref); v.form(c.a); v.form(c.b); v.u32(static_cast<uint32_t>(c.i)); v.u32(static_cast<uint32_t>(c.j));
     v.u32(static_cast<uint32_t>(c.k)); v.u32(static_cast<uint32_t>(c.l)); v.u32(fbits(c.f)); v.str(c.s); v.b(static_cast<uint8_t>(c.to.mode)); v.b(c.to.mask);
+    if (refOpIsWide(c.op) && !mutations().refCmdNarrow) { v.form(c.c); v.form(c.d); v.u32(static_cast<uint32_t>(c.m)); }
     return kv(k, v);
 }
 KV kvTravel(const FormRef& s) { Fnv k; k.b(19); k.form(s); Fnv v = k; v.b(1); return kv(k, v); }
@@ -229,7 +230,7 @@ void walkSegment(const ShadowState& w, unsigned seg, F&& put) {
         break;
     case 13: for (auto& [n, o] : w.companionOwner) put(5, kvCompanion(n, o, w.companionKind.count(n) ? w.companionKind.at(n) : uint8_t(0))); break;
     case 14: for (auto& [r, o] : w.objects) put(5, kvObj(r, o.open, o.destroyed, o.activated)); break;
-    case 15: for (auto& [k, val] : w.refVars) put(3, kvRefVar(k.first, k.second, val)); break;
+    case 15: for (auto& [k, val] : w.refVars) if (!(vol && volatileKeys().isVolatileVar(k.first, k.second))) put(3, kvRefVar(k.first, k.second, val)); break;
     case 16: for (auto& t : w.topics) put(7, kvTopic(t)); break;
     case 17: for (auto& t : w.notes) put(7, kvNote(t)); break;
     case 18: for (auto& [m, f] : w.mapMarkers) put(7, kvMarker(m, f)); break;

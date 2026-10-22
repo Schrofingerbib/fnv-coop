@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from bots import FakeBridge  # noqa: E402
 from bots import primitives as P  # noqa: E402
-from bots.bot import RpcError  # noqa: E402
+from bots.bot import BridgeError, RpcError  # noqa: E402
 
 ROLE_HOST, ROLE_CLIENT = "host", "client"
 
@@ -58,7 +58,9 @@ class LiveFake(FakeBridge):
 
     # ---- expressions the base fake does not know ----
     def eval(self, expr, ref=None):
-        m = re.match(r"\s*player\.(IsWeaponOut|GetEquippedObject)\b", expr)
+        if re.match(r"\s*player\.GetEquippedObject\b", expr):      # a bare Form: printc refuses it (in game 2026-10-22)
+            raise BridgeError(f"cannot evaluate {expr!r}: 'Error on line 1\r\n\r\nInvalid expression for parameter 2. Expected variable (got Form).'")
+        m = re.match(r"\s*(?:\(\s*)?player\.(IsWeaponOut|GetEquippedObject)\b", expr)
         if m:
             self.calls.append(("eval", expr))
             return float(self.weapon_out if m.group(1) == "IsWeaponOut" else self.weapon_equipped)

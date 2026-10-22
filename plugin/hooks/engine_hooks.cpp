@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -23,6 +24,9 @@
 #include "GameExtraData.h"
 #include "effect_json.h"
 #include "engine_addrs.h"
+#include "extract_pad.h"
+#include "fnvcoop/policy.h"
+#include "guest_objvars.h"
 #include "ref_ops.h"
 #include "story_addrs.h"
 
@@ -298,6 +302,66 @@ void noteLocalRun(uint32_t id) {
     if (g_localRunCounts.size() < 64) g_localRunCounts.emplace_back(id, 1u);
 }
 
+// ---- guest: shared quest variables that an object / NPC / effect script writes inline (guest_objvars.h) ----
+// The slot (ScriptLocal::data) of the quest variable `name`, plus its index; false when the quest has no script / event list / such a variable.
+bool questVarSlot(void* questForm, const char* name, uint32_t* idxOut, double** slotOut) {
+    __try {
+        TESQuest* q = static_cast<TESQuest*>(questForm);
+        Script* sc = q ? q->scriptable.script : nullptr;
+        ScriptEventList* el = q ? q->scriptEventList : nullptr;
+        if (!sc || !el || !el->m_vars) return false;
+        bool found = false;
+        UInt32 idx = 0;
+        for (auto v = sc->varList.Begin(); !v.End(); ++v) {
+            VariableInfo* vi = v.Get();
+            if (vi && vi->name.m_data && _stricmp(vi->name.m_data, name) == 0) { idx = vi->idx; found = true; break; }
+        }
+        if (!found) return false;
+        for (auto v = el->m_vars->Begin(); !v.End(); ++v) {
+            if (v.Get() && v.Get()->id == idx) {
+                *idxOut = idx;
+                *slotOut = &v.Get()->data;
+                return true;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return false;
+}
+struct GuardedScript {
+    const std::vector<ObjVarWrite>* writes = nullptr;   // null: this script writes no shared quest variable
+    std::vector<uint32_t> questIds;                      // parallel to *writes: engine refID of the quest (0 = plugin not loaded)
+};
+std::unordered_map<uint32_t, GuardedScript> g_guardedScripts;   // by script refID (negative answers included)
+const GuardedScript& guardedScript(uint32_t scriptRefID) {
+    auto it = g_guardedScripts.find(scriptRefID);
+    if (it != g_guardedScripts.end()) return it->second;
+    GuardedScript gs;
+    FormRef sr;
+    if (g_res && scriptRefID && g_res->toRef(scriptRefID, &sr)) {
+        gs.writes = ObjectVarWrites::builtin().of(sr);
+        if (gs.writes) for (const ObjVarWrite& w : *gs.writes) gs.questIds.push_back(g_res->fromRef(w.quest));
+    }
+    return g_guardedScripts.emplace(scriptRefID, std::move(gs)).first->second;
+}
+// Called on a guest before an object / NPC / effect script runs: remembers every shared quest variable it is known to write.
+bool guestRememberQuestVars(uint32_t scriptRefID, VarRollback& rb) {
+    const GuardedScript& gs = guardedScript(scriptRefID);
+    if (!gs.writes) return false;
+    ++g_sstats.questVarGuarded;
+    for (size_t i = 0; i < gs.writes->size(); ++i) {
+        const ObjVarWrite& w = (*gs.writes)[i];
+        void* q = gs.questIds[i] && g_res ? g_res->lookup(gs.questIds[i]) : nullptr;
+        if (!q || isLocalQuest(static_cast<TESQuest*>(q))) continue;   // GuestLocalRun quests keep their per-machine variables
+        uint32_t idx = 0;
+        double* slot = nullptr;
+        if (!questVarSlot(q, w.var.c_str(), &idx, &slot)) continue;
+        if (volatileKeys().isVolatileVar(w.quest, static_cast<uint16_t>(idx))) continue;   // per-machine by the volatile list
+        rb.remember(slot);
+    }
+    return rb.size() > 0;
+}
+
 using Fn_ScriptExec = bool(__thiscall*)(void*, void*, void*, void*, bool);
 Fn_ScriptExec o_ScriptExec;
 bool g_perfOn = false;
@@ -347,9 +411,15 @@ bool __fastcall h_ScriptExec(void* script, void*, void* thisObj, void* ev, void*
     } else {
         g_pol.enterScript();
     }
+    // Guest: the host owns quest variables. An object / NPC / effect script that writes one inline (nothing to detour) has its writes put back.
+    VarRollback rollback;
+    const bool rolled = g_pol.guest() && !local && g_applierExec == 0 && !g_pol.applying() &&
+                        (*reinterpret_cast<uint16_t*>(reinterpret_cast<char*>(script) + 0x28) != kScriptTypeQuest) &&
+                        guestRememberQuestVars(refIdOf(script), rollback);
     const uint64_t t1 = g_perfOn ? qpc() : 0;
     bool r = o_ScriptExec(script, thisObj, ev, contObj, arg3);
     const uint64_t t2 = g_perfOn ? qpc() : 0;
+    if (rolled) g_sstats.questVarRollbacks += rollback.restore();
     if (local) g_pol.leaveLocalScript(); else g_pol.leaveScript();
     if (weak) g_hub->endWeak();
     if (local && g_hub) g_hub->popMute();
@@ -480,7 +550,7 @@ bool storyCmd(const RefOpSpec* s, Fn_Cmd o, void* pi, void* sd, void* thisObj, v
     for (int k = 0; k < kMaxStoryArgs; ++k) out[k] = (static_cast<size_t>(k) < n && s->sig[k] == 's') ? static_cast<void*>(text[k]) : static_cast<void*>(&raw[k]);
     UInt32 off = *opc;  // ExtractArgs advances the offset: work on a copy so the real call sees the original
     // kMaxStoryArgs output pointers whatever the command takes: ExtractArgs fills only as many as the command has parameters
-    const bool parsed = n == 0 || extractArgs()(pi, sd, &off, thisObj, contObj, script, ev, out[0], out[1], out[2], out[3], out[4], out[5]);
+    const bool parsed = n == 0 || extractPadded(extractArgs(), pi, sd, &off, thisObj, contObj, script, ev, {out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7], out[8]});
     RefCommand rc;
     bool have = false;
     if (parsed) {
@@ -509,7 +579,7 @@ bool __cdecl h_ForceActiveQuest(void* pi, void* sd, void* thisObj, void* contObj
     TESForm* q = nullptr;
     FormRef qr;
     UInt32 off = *opc;
-    const bool have = capturing() && extractArgs()(pi, sd, &off, thisObj, contObj, script, ev, &q) && q && formRef(q, &qr);
+    const bool have = capturing() && extractPadded(extractArgs(), pi, sd, &off, thisObj, contObj, script, ev, {&q}) && q && formRef(q, &qr);
     const bool ok = CMD_FWD(o_ForceActiveQuest);
     if (ok && have) g_hub->record(ForceActiveQuest{qr, Recipient::dflt()});   // the host policy narrows it to the acting player
     return ok;
@@ -540,7 +610,7 @@ bool pkgCmd(Fn_Cmd o, bool add, CMD_ARGS) {
     bool want = g_pkgObs && capturing() && thisObj;
     if (want) {
         UInt32 off = *opc;
-        want = extractArgs()(pi, sd, &off, thisObj, contObj, script, ev, &pkg) && pkg;
+        want = extractPadded(extractArgs(), pi, sd, &off, thisObj, contObj, script, ev, {&pkg}) && pkg;
     }
     bool ok = CMD_FWD(o);
     FormRef ar, pr;
@@ -559,7 +629,7 @@ bool __cdecl h_ActivateCmd(CMD_ARGS) { return storyCmd(storySpecFor(kOpActivate)
 template <class... Out>
 bool parseArgs(CMD_ARGS, Out*... outs) {
     UInt32 off = *opc;
-    return extractArgs()(pi, sd, &off, thisObj, contObj, script, ev, outs...);
+    return extractPadded(extractArgs(), pi, sd, &off, thisObj, contObj, script, ev, {static_cast<void*>(outs)...});
 }
 inline FormRef actorRef(void* thisObj) {
     FormRef r;
@@ -778,7 +848,8 @@ bool itemCmd(Fn_Cmd o, bool add, CMD_ARGS) {
     TESForm* item = nullptr;
     int count = 0;
     UInt32 off = *opc;  // ExtractArgs advances the offset: work on a copy so the real call sees the original
-    bool parsed = extractArgs()(pi, sd, &off, thisObj, contObj, script, ev, &item, &count);
+    // AddItem / RemoveItem have a third, optional "hide message" flag (AddItem <item> <n> 1): padded, it lands in scratch.
+    bool parsed = extractPadded(extractArgs(), pi, sd, &off, thisObj, contObj, script, ev, {&item, &count});
     bool resolving = parsed && item && add && isResolvingItemType(item->typeID);
     Inventory before;
     if (resolving) before = readInventory(thisObj);
@@ -824,7 +895,7 @@ bool __cdecl h_RewardXP(CMD_ARGS) {
     bool parsed = false;
     if (capturing()) {
         UInt32 off = *opc;
-        parsed = extractArgs()(pi, sd, &off, thisObj, contObj, script, ev, &amount);
+        parsed = extractPadded(extractArgs(), pi, sd, &off, thisObj, contObj, script, ev, {&amount});
     }
     bool ok = CMD_FWD(o_RewardXP);
     if (ok && parsed && amount) g_hub->record(ModActorValue{kPseudoAV_XP, amount, Recipient::dflt()});
@@ -875,7 +946,7 @@ bool moveCmd(Fn_Cmd o, CMD_ARGS) {
     bool parsed = false;
     if (track) {
         UInt32 off = *opc;
-        parsed = extractArgs()(pi, sd, &off, thisObj, contObj, script, ev, &marker, &ox, &oy, &oz);
+        parsed = extractPadded(extractArgs(), pi, sd, &off, thisObj, contObj, script, ev, {&marker, &ox, &oy, &oz});
     }
     bool ok = CMD_FWD(o);
     if (ok && track) {
@@ -918,7 +989,7 @@ bool __cdecl h_SetAngle(CMD_ARGS) {
     UInt32 off = *opc;
     UInt32 axis = 0;
     float val = 0;
-    bool parsed = track && extractArgs()(pi, sd, &off, thisObj, contObj, script, ev, &axis, &val);
+    bool parsed = track && extractPadded(extractArgs(), pi, sd, &off, thisObj, contObj, script, ev, {&axis, &val});
     // The pre-image (angle before the command) lets the shadow restore an axis after a host load; see RefAngle in effect.h.
     constexpr float kRadToDeg = 57.29577951f;
     float pre[3] = {0, 0, 0};
@@ -949,7 +1020,7 @@ bool avCmd(Fn_Cmd o, int kind /*0 set 1 mod 2 force 3 damage*/, CMD_ARGS) {
                 UInt32 off2 = *opc;
                 UInt32 av2 = 0xFFFFFFFF;
                 float val2 = 0;
-                bool parsed2 = extractArgs()(pi, sd, &off2, thisObj, contObj, script, ev, &av2, &val2);
+                bool parsed2 = extractPadded(extractArgs(), pi, sd, &off2, thisObj, contObj, script, ev, {&av2, &val2});
                 float before2 = parsed2 ? getAV(thisObj, av2) : 0;
                 bool ok2 = CMD_FWD(o);
                 if (ok2 && parsed2) g_npAvObs(ar, av2, static_cast<uint8_t>(kind), before2, getAV(thisObj, av2));
@@ -961,7 +1032,7 @@ bool avCmd(Fn_Cmd o, int kind /*0 set 1 mod 2 force 3 damage*/, CMD_ARGS) {
     UInt32 off = *opc;
     UInt32 av = 0xFFFFFFFF;
     float val = 0;
-    bool parsed = extractArgs()(pi, sd, &off, thisObj, contObj, script, ev, &av, &val);
+    bool parsed = extractPadded(extractArgs(), pi, sd, &off, thisObj, contObj, script, ev, {&av, &val});
     float before = parsed ? getAV(thisObj, av) : 0;
     bool ok = CMD_FWD(o);
     if (ok && parsed) {
@@ -1047,6 +1118,7 @@ struct Entry {
     void* origOut;  // &o_xxx
     bool hostOnly;  // false = needed on clients too
     bool guestOnly = false;  // installed on Role::Guest only
+    bool chainForeign = false;  // hook_patch rule 4: install on top of another patcher's entry jump (xNVSE's EventManager hook)
 };
 #define HK(spec, det, orig, host) {&addr::spec, reinterpret_cast<void*>(&det), reinterpret_cast<void*>(&orig), host}
 const Entry kEntries[] = {
@@ -1079,7 +1151,10 @@ const Entry kEntries[] = {
     HK(Cmd_DamageActorValue, h_DamageAV, o_DamageAV, true),
     HK(QuestSetFailed, h_SetFailed, o_SetFailed, true),
     HK(ActorSetTeammate, h_Teammate, o_Teammate, true),
-    {&addr::MarkScriptEvent, reinterpret_cast<void*>(&h_MarkEvent), reinterpret_cast<void*>(&o_MarkEvent), true, true},
+    // xNVSE's EventManager writes `jmp MarkEventHook` here the first time anything registers a game-event handler (our own OnDrop
+    // handlers do), and its stub re-runs the prologue and jumps to 0x5AC756: it never calls a previous hook. hooks_module primes that
+    // one-shot install before Init, so this hook chains on top of xNVSE's jump instead of being silently overwritten by it.
+    {&addr::MarkScriptEvent, reinterpret_cast<void*>(&h_MarkEvent), reinterpret_cast<void*>(&o_MarkEvent), true, true, true},
     HK(PlayerSetControlsDisabled, h_Controls, o_Controls, true),
     HK(QuestCompleteAllObjectives, h_CompleteAll, o_CompleteAll, true),
     {&addr::RefActivate, reinterpret_cast<void*>(&h_Activate), reinterpret_cast<void*>(&o_Activate), true, true},
@@ -1197,7 +1272,7 @@ InitReport Init(CaptureHub& h, Role role, FormResolver* res) {
         if (e.hostOnly && role == Role::Client) continue;
         if (e.guestOnly && role != Role::Guest) continue;
         Addr tramp = 0;
-        PatchStatus st = g_reg->acquire(*e.spec, reinterpret_cast<Addr>(e.detour), &tramp, reinterpret_cast<Addr*>(e.origOut));
+        PatchStatus st = g_reg->acquire(*e.spec, reinterpret_cast<Addr>(e.detour), &tramp, reinterpret_cast<Addr*>(e.origOut), e.chainForeign);
         if (installed(st)) {
             *reinterpret_cast<void**>(e.origOut) = reinterpret_cast<void*>(tramp);
             ++rep.ok;
@@ -1232,6 +1307,28 @@ InitReport Init(CaptureHub& h, Role role, FormResolver* res) {
 }
 
 int auditTamperedHooks() { return g_reg ? g_reg->auditTampered() : 0; }
+std::string tamperedHookTargets() {
+    std::vector<Addr> t;
+    if (g_reg) g_reg->auditTampered(&t);
+    std::string s;
+    char b[16];
+    for (Addr a : t) { std::snprintf(b, sizeof b, "%s0x%08X", s.empty() ? "" : " ", static_cast<unsigned>(a)); s += b; }
+    return s;
+}
+
+std::string chainedHookTargets() {
+    std::string s;
+    if (!g_reg) return s;
+    char b[32];
+    for (const Entry& e : kEntries) {
+        if (!e.chainForeign) continue;
+        if (Addr to = g_reg->chainedOver(e.spec->target)) {
+            std::snprintf(b, sizeof b, "%s0x%08X->0x%08X", s.empty() ? "" : " ", static_cast<unsigned>(e.spec->target), static_cast<unsigned>(to));
+            s += b;
+        }
+    }
+    return s;
+}
 
 void Shutdown() {
     if (g_hub) g_hub->setEnabled(false);
@@ -1300,9 +1397,11 @@ void setEventObserver(EventObserver obs) { g_eventObs = std::move(obs); }
 void setNonPlayerAvObserver(NonPlayerAvObserver obs) { g_npAvObs = std::move(obs); }
 bool blockMutationNow() { return g_pol.blockMutation(); }
 
-void enableStatePolling(bool on) {
+void enableStatePolling(bool on, bool prime) {
     g_statePolling = on;
     g_tracker.clear();
+    g_tracker.endPrime();
+    if (on && prime) g_tracker.beginPrime();
 }
 
 size_t pollHostState(StateSink& sink) {
@@ -1328,6 +1427,7 @@ size_t pollHostState(StateSink& sink) {
             }
         }
     }
+    g_tracker.endPrime();  // a priming pass is one full pass: from now on changes are reported
     return n;
 }
 

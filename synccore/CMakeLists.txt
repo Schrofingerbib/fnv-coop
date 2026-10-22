@@ -42,7 +42,7 @@ add_library(fnvcoop_sim STATIC sim/sim.cpp)
 target_include_directories(fnvcoop_sim PUBLIC sim)
 target_link_libraries(fnvcoop_sim PUBLIC fnvcoop)
 
-add_executable(fnvcoop_tests tests/main.cpp tests/test_wire.cpp tests/test_core.cpp tests/test_session.cpp tests/test_sim.cpp tests/test_transport.cpp tests/test_baseline.cpp tests/test_saveload.cpp tests/test_rules.cpp tests/test_desync.cpp tests/test_desync_clientonly.cpp tests/test_handshake.cpp tests/test_perf.cpp tests/test_perfguard.cpp tests/test_rejoin.cpp tests/test_rejoin_dlg.cpp tests/test_failquest.cpp tests/test_round3.cpp tests/test_hostload.cpp tests/test_refcmd.cpp)
+add_executable(fnvcoop_tests tests/main.cpp tests/test_wire.cpp tests/test_core.cpp tests/test_session.cpp tests/test_sim.cpp tests/test_transport.cpp tests/test_baseline.cpp tests/test_saveload.cpp tests/test_rules.cpp tests/test_desync.cpp tests/test_desync_clientonly.cpp tests/test_handshake.cpp tests/test_perf.cpp tests/test_perfguard.cpp tests/test_rejoin.cpp tests/test_rejoin_dlg.cpp tests/test_failquest.cpp tests/test_round3.cpp tests/test_hostload.cpp tests/test_refcmd.cpp tests/test_prepared_load.cpp)
 target_compile_definitions(fnvcoop_tests PRIVATE FNVCOOP_RULES_JSON="${CMAKE_CURRENT_SOURCE_DIR}/../docs/quest-policies/rules.json")
 target_include_directories(fnvcoop_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../plugin/dialogue/include)
 # perf_guard.h uses runtime mutation twins (tools/mut/fnvcoop_mut.h, FNVCOOP_MUT=<n>); only this test exe, never the plugin
@@ -79,6 +79,11 @@ endif()
 enable_testing()
 add_test(NAME soak_smoke COMMAND fnvcoop_soak --seconds 300 --players 4 --seed 3)
 add_test(NAME soak_smoke_threaded COMMAND fnvcoop_soak --seconds 60 --players 4 --seed 4 --threaded)
+# Issue #43: a client that drops on the last event frame with the longest reconnect delay must still rejoin and converge; the twin
+# restores the old harness (reconnect after the run ended) and must fail.
+add_test(NAME soak_late_disconnect COMMAND fnvcoop_soak --seconds 60 --players 4 --seed 4 --late-disconnect)
+add_test(NAME twin_soak_late_disconnect COMMAND fnvcoop_soak --seconds 60 --players 4 --seed 4 --late-disconnect --mutate late-reconnect)
+set_tests_properties(twin_soak_late_disconnect PROPERTIES WILL_FAIL TRUE)
 add_test(NAME loopback_clean       COMMAND fnvcoop_loopback selftest)
 add_test(NAME loopback_faults      COMMAND fnvcoop_loopback selftest --loss 15)
 add_test(NAME twin_loopback_idempotency COMMAND fnvcoop_loopback selftest --loss 15 --mutate idempotency)
@@ -103,17 +108,18 @@ set_tests_properties(twin_perf_regression_still_fails PROPERTIES WILL_FAIL TRUE 
 add_test(NAME unit_handshake COMMAND fnvcoop_tests --group handshake)
 add_test(NAME unit_desync COMMAND fnvcoop_tests --group desync)
 add_test(NAME unit_desync_clientonly COMMAND fnvcoop_tests --group desync_clientonly --name client_only_keys_with_an_inverse_converge_even_above_the_repair_cap)
-# KNOWN BUG #25: client-only quest running keys have no inverse (revertEffectFor), so the digest never converges. Passing = fixed: drop WILL_FAIL.
-add_test(NAME known_bug_25_desync_client_only_quest_keys COMMAND fnvcoop_tests --group desync_clientonly --name client_only_quest_running_keys_converge)
-set_tests_properties(known_bug_25_desync_client_only_quest_keys PROPERTIES WILL_FAIL TRUE)
-add_test(NAME twin_unit_desync_clientonly_heal_disabled COMMAND fnvcoop_tests --group twin --name unit_desync_clientonly_heal_disabled)
+# Issue #25 (fixed): client-only quest running keys are settled by the host's own running state (twin unit_desync_clientonly_quest_running_reverted below).
+add_test(NAME unit_desync_client_only_quest_keys COMMAND fnvcoop_tests --group desync_clientonly --name client_only_quest_running_keys_converge)
+# Prepared-save load: a client resume cursor from another timeline is rebased (twin prepared_load_trusts_foreign_cursor below).
+add_test(NAME unit_preparedload COMMAND fnvcoop_tests --group preparedload)
 add_test(NAME unit_rules COMMAND fnvcoop_tests --group rules)
 add_test(NAME unit_saveload COMMAND fnvcoop_tests --group saveload)
 add_test(NAME unit_baseline COMMAND fnvcoop_tests --group baseline)
 add_test(NAME unit_transport COMMAND fnvcoop_tests --group transport)
 add_test(NAME sim_seeds     COMMAND fnvcoop_tests --group sim)
 foreach(twin hostload_unit_set_weather hostload_unit_set_time_scale hostload_unit_ref_script_var hostload_unit_set_map_marker hostload_unit_lock hostload_unit_object_state_open hostload_unit_object_state_sticky_open hostload_unit_ref_add_item hostload_unit_ref_remove_item hostload_unit_remove_all_items hostload_unit_clear_pre_travels hostload_sim_clear_pre_travels hostload_unit_spawn_ref hostload_unit_despawn_ref hostload_sim_set_weather hostload_sim_set_time_scale hostload_sim_ref_script_var hostload_sim_set_map_marker hostload_sim_object_state_open hostload_sim_ref_inventory hostload_sim_spawn_despawn origins_ignored round3_origins_ignored round3_ref_inv_preimage_ignored round3_spawn_rebase_ignored no_echo_guard no_idempotency stage_last_wins flags_and kills_replace apply_out_of_order
-             unit_merge unit_objective_or unit_idempotency unit_echo no_guest_suppression unit_ghost guest_runs_quest_scripts baseline_skipped unit_volatile no_epoch_bump unit_epoch unit_flood rules_barrier_release_early rules_disabled rules_extended_disabled rules_tether_ignores_anchor rules_stages_param_ignored rules_sum_as_any rules_exclusive_last_wins rules_ready_proceeds_alone rules_slideshow_no_hold rules_per_player_scene_shared rules_per_player_vars_shared rules_payment_shares_all unit_heal_disabled heal_disabled unit_chatty_baseline unit_handshake unit_slow_digest fail_not_completed round3_spawn_resurrects round3_sticky_objects_reset round3_ref_inv_no_clear round3_active_quest_shared round3_ignore_follower_caps round3_disconnect_keeps_lock round3_guest_local_replicated round3_angle_keeps_first angle_preimage_ignored round3_angle_preimage_ignored rejoin_sidecar_loses_ledger rejoin_no_reward_ids plain_rejoin_no_reward_ids rejoin_no_epoch_bump rejoin_no_idempotency rejoin_departed_hold_barrier rejoin_barrier_release_early rejoin_dlg_no_join_catchup rejoin_dlg_ignore_result_link rejoin_dlg_drop_end_on_close rejoin_dlg_leak_lock_on_close rejoin_dlg_skip_control_release rejoin_dlg_no_resync rejoin_dlg_replay_duplicate_pick refcmd_keeps_first refcmd_events_become_state refcmd_player_shared)
+             unit_merge unit_objective_or unit_idempotency unit_echo no_guest_suppression unit_ghost guest_runs_quest_scripts baseline_skipped unit_volatile unit_volatile_ref_script_vars no_epoch_bump unit_epoch unit_flood rules_barrier_release_early rules_disabled rules_extended_disabled rules_tether_ignores_anchor rules_stages_param_ignored rules_sum_as_any rules_exclusive_last_wins rules_ready_proceeds_alone rules_slideshow_no_hold rules_per_player_scene_shared rules_per_player_vars_shared rules_payment_shares_all unit_heal_disabled heal_disabled unit_chatty_baseline unit_handshake unit_slow_digest fail_not_completed round3_spawn_resurrects round3_sticky_objects_reset round3_ref_inv_no_clear round3_active_quest_shared round3_ignore_follower_caps round3_disconnect_keeps_lock round3_guest_local_replicated round3_angle_keeps_first angle_preimage_ignored round3_angle_preimage_ignored rejoin_sidecar_loses_ledger rejoin_no_reward_ids plain_rejoin_no_reward_ids rejoin_no_epoch_bump rejoin_no_idempotency rejoin_departed_hold_barrier rejoin_barrier_release_early rejoin_dlg_no_join_catchup rejoin_dlg_ignore_result_link rejoin_dlg_drop_end_on_close rejoin_dlg_leak_lock_on_close rejoin_dlg_skip_control_release rejoin_dlg_no_resync rejoin_dlg_replay_duplicate_pick refcmd_keeps_first refcmd_events_become_state refcmd_player_shared refcmd_wide_op_narrowed
+             unit_desync_clientonly_heal_disabled unit_desync_clientonly_quest_running_reverted prepared_load_trusts_foreign_cursor unit_async_completion_leak)
   add_test(NAME twin_${twin} COMMAND fnvcoop_tests --group twin --name ${twin})
 endforeach()
 
@@ -169,7 +175,7 @@ if(COMMAND fnvcoop_pch)
 endif()
 
 # ctest -j: timing-sensitive tests run alone, everything else (about 150 twin tests of a few seconds each) can overlap.
-foreach(_t unit_perf twin_perf_regression_still_fails soak_smoke soak_smoke_threaded loopback_clean loopback_faults loopback_unreliable
+foreach(_t unit_perf twin_perf_regression_still_fails soak_smoke soak_smoke_threaded soak_late_disconnect twin_soak_late_disconnect loopback_clean loopback_faults loopback_unreliable
         loopback_relay_bad_wifi loopback_relay_mobile_tether loopback_relay_transatlantic twin_loopback_relay_bypass twin_loopback_relay_partition)
   if(TEST ${_t})
     set_tests_properties(${_t} PROPERTIES RUN_SERIAL TRUE)

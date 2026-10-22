@@ -1,9 +1,12 @@
 """Game slots: the ONLY way a lane may launch FalloutNV.exe. N slots (default 2, runs/gameslot_config.json {"slots": N, "min_free_gb": 3.0}).
 
-  python -I tools/gameslot.py acquire --owner L5 --ttl 900 [--wait 1800] [--slots K]   # prints OK ...; exit 3 if busy
+  python -I tools/gameslot.py acquire --owner L5 --ttl 900 [--wait 1800] [--slots K] [--need-gb G]   # prints OK ...; exit 3 if busy
   python -I tools/gameslot.py release --owner L5
   python -I tools/gameslot.py status
 
+--need-gb G the free RAM (GB) this caller needs for the copies it is about to start (copies x 0.7 + its reserve). It replaces the
+            configured min_free_gb for the "low memory" check, so a caller that sized its own guard is not refused by a bigger default. The
+            number measured is Available MBytes (GlobalMemoryStatusEx ullAvailPhys: standby / cached pages count as available).
 --slots K   take K slots (K=1 is the normal sweep case). The OK line ends with `SLOTS 0,2`: those indices are YOURS;
             derive your instance ids / pipe names / UDP ports from them so concurrent lanes never collide.
 (no --slots) legacy behaviour: take ALL slots = exclusive use of the machine (old single-slot callers keep working
@@ -54,6 +57,8 @@ def min_free_gb():
 
 
 def _avail_gb():
+    """Available physical memory in GB = the Task Manager / perfmon "Available MBytes" (free + standby), NOT the smaller Win32_OperatingSystem
+    FreePhysicalMemory: the standby list is given back the moment a game asks for it."""
     import ctypes
 
     class MS(ctypes.Structure):
@@ -156,8 +161,13 @@ def _mine(owner, now):
     return [i for i in range(max_slots()) if (lambda c: _live(c, now) and c["owner"] == owner)(_read(_slot_path(i)))]
 
 
-def try_acquire(owner, ttl, want, ticket, now=None):
-    """-> (ok, slots, info). want=None means ALL slots (exclusive)."""
+def required_free_gb(need_gb=None):
+    """RAM a new slot needs to see: the caller's own need when it gave one, else the configured min_free_gb."""
+    return min_free_gb() if need_gb is None else float(need_gb)
+
+
+def try_acquire(owner, ttl, want, ticket, now=None, need_gb=None):
+    """-> (ok, slots, info). want=None means ALL slots (exclusive). need_gb: the caller's own RAM need (see required_free_gb)."""
     now = now or time.time()
     n = max_slots()
     need = n if want is None else min(want, n)
@@ -170,9 +180,9 @@ def try_acquire(owner, ttl, want, ticket, now=None):
     got = list(have)
     any_live = any(_live(_read(_slot_path(i)), now) for i in range(n))
     if len(have) < need and any_live:  # a 2nd+ concurrent game needs RAM headroom (first game / renewals never blocked)
-        free = _avail_gb()
-        if free < min_free_gb():
-            return False, [], "low memory: %.1f GB free < %.1f GB required for a new slot" % (free, min_free_gb())
+        free, req = _avail_gb(), required_free_gb(need_gb)
+        if free + 0.001 < req:
+            return False, [], "low memory: %.1f GB free < %.1f GB required for a new slot" % (free, req)
     for i in range(n):
         if len(got) >= need:
             break
@@ -242,6 +252,7 @@ def main(argv=None):
     ap.add_argument("--ttl", type=int, default=900)
     ap.add_argument("--wait", type=int, default=0)
     ap.add_argument("--slots", type=int, default=None)
+    ap.add_argument("--need-gb", type=float, default=None)
     a = ap.parse_args(argv)
     if a.cmd == "status":
         print(json.dumps(status()))
@@ -272,7 +283,7 @@ def main(argv=None):
         while True:
             now = time.time()
             wf.write_text(json.dumps({"owner": a.owner, "ticket": ticket, "polled": now, "slots": a.slots}))
-            ok, slots, info = try_acquire(a.owner, a.ttl, a.slots, ticket, now)
+            ok, slots, info = try_acquire(a.owner, a.ttl, a.slots, ticket, now, a.need_gb)
             if ok:
                 print("OK lease until %s; stray FalloutNV.exe pids: %s; SLOTS %s" % (
                     time.ctime(now + a.ttl), _game_pids() or "none", ",".join(map(str, slots))))

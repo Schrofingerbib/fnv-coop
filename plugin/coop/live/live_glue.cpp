@@ -37,6 +37,9 @@
 #ifdef NVCOOP_WITH_COMPANIONS
 #include "companions/companions_glue.h"
 #endif
+#ifdef NVCOOP_WITH_LOOT
+#include "loot/loot_glue.h"
+#endif
 #ifdef NVCOOP_WITH_SPAWN
 #include "GameData.h"
 #include "GameForms.h"
@@ -138,6 +141,7 @@ public:
     void setSnapshotSink(SnapshotSink s) override { nvcoop::avatar::glue::SetSnapshotSink(std::move(s)); }
     void setEquipSink(EquipSink s) override { nvcoop::avatar::glue::SetEquipSink(std::move(s)); }
     void setLocalIdentity(fnvcoop::live::NetId n, fnvcoop::live::OwnerEpoch e) override { nvcoop::avatar::glue::SetLocalIdentity(n, e); }
+    void setLocalSlot(nvcoop::avatar::Slot s) override { nvcoop::avatar::glue::SetLocalSlot(s); }
     bool addRemote(nvcoop::avatar::Slot s, const nvcoop::avatar::Appearance& a) override { return nvcoop::avatar::glue::AddRemote(s, a); }
     void removeRemote(nvcoop::avatar::Slot s) override { nvcoop::avatar::glue::RemoveRemote(s); }
     bool setRemoteAppearance(nvcoop::avatar::Slot s, const nvcoop::avatar::Appearance& a) override { return nvcoop::avatar::glue::SetRemoteAppearance(s, a); }
@@ -439,7 +443,7 @@ bool MLive(const std::string&, std::string& out) {
         out += ",\"hub\":" + g.hub.statusJson();
 #ifdef NVCOOP_WITH_AVATAR_ENGINE
         out += std::string(",\"avatarModule\":{\"enabled\":") + (nvcoop::avatar::glue::Enabled() ? "true" : "false") + ",\"running\":" +
-               (nvcoop::avatar::glue::Running() ? "true" : "false") + "}";
+               (nvcoop::avatar::glue::Running() ? "true" : "false") + ",\"why\":\"" + nvcoop::avatar::glue::NotRunningBecause() + "\"}";
         if (g_avatarNet) out += ",\"avatars\":" + g_avatarNet->statusJson();
 #endif
         out += "}";
@@ -553,8 +557,8 @@ void glueLoad() {
 #endif
 #ifdef NVCOOP_WITH_AVATAR_ENGINE
     if (g.sw.avatars) {
-        if (!nvcoop::avatar::glue::Enabled())
-            nvcoop::Log("live: avatars=1 but the avatar module is off ([avatar] enabled=1 is needed): puppets cannot appear");
+        // [live] avatars=1 also switches the avatar module on (avatar_module.cpp OnLoad), but that module loads AFTER this point: Enabled() is still
+        // false here, so the old "module is off" warning fired on every correct setup (2026-10-22). Its own load line says if it stays off.
         std::unique_ptr<AvatarsService> a(new AvatarsService());
         g_avatarNet = a.get();
         add(std::move(a), true);
@@ -581,6 +585,15 @@ void glueLoad() {
     else add(std::unique_ptr<ILiveService>(new PlaceholderService("social")), false);
 #else
     add(std::unique_ptr<ILiveService>(new PlaceholderService("social")), false);   // not in this build
+#endif
+#ifdef NVCOOP_WITH_LOOT
+    {   // plugin/loot: containers, drops, first-claim pickups (channel 0xB1). Its own switch is nvcoop.ini [loot] enabled=1 (no [live] key). The hub is built before the
+        // loot module's DeferredInit, so the service is asked for FIRST (it reads the ini itself) and only then is enabled() true: the order of the two
+        // arguments of one call is unspecified. Left out of the hub, loot_proof saw "in the session" = false on every copy (sweep 2026-10-22).
+        nvcoop::loot::LootSync& lootService = nvcoop::loot::service();
+        const bool lootOn = nvcoop::loot::enabled();
+        if (!g.hub.add(&lootService, lootOn)) nvcoop::Log("live: service loot refused by the hub (channel clash)");
+    }
 #endif
 #if defined(NVCOOP_WITH_COMPANIONS) && defined(NVCOOP_WITH_AVATAR_ENGINE)
     if (g.sw.social && g.sw.avatars)   // a puppet is a "player" to the party rules: a hit on it is a hit on its real player

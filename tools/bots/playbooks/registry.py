@@ -53,7 +53,7 @@ TWINS = [
     ("dialogue_spectator", "spectator_stuck"), ("dialogue_spectator", "dialogue_not_bridged"),
     ("pnr_vote", "pnr_early"), ("pnr_vote", "ready_veto_ignored"), ("pnr_vote", "no_stage_sync"), ("pnr_vote", "endgame_ignores_notyet"), ("pnr_vote_guest_declines", "endgame_ignores_notyet"),
     ("quest_step_sync", "no_stage_sync"), ("quest_step_sync", "no_objective_sync"),
-    ("fast_travel_tether", "tether_off"), ("fast_travel_tether", "consent_ignored"), ("fast_travel_tether", "travel_in_combat"),
+    ("fast_travel_tether", "tether_off"), ("fast_travel_tether", "consent_ignored"), ("fast_travel_tether", "travel_mode_free"), ("fast_travel_tether", "travel_in_combat"),
     ("ownership_handoff", "owner_split"), ("ownership_handoff", "flap_owner"),
     ("spawn_once", "double_spawn"),
     ("vats_hit", "vats_pauses_others"), ("vats_hit", "no_fight_sync"),

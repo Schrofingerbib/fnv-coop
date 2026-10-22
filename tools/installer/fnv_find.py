@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+import fnv_ini
 import fnv_mut
 import fnv_pe
 
@@ -131,10 +132,26 @@ def _steam_roots(reg: Registry, env: Dict[str, str]) -> List[Path]:
 
 
 def _read(p: Path) -> str:
+    """Read a Steam text file (libraryfolders.vdf, appmanifest_*.acf).
+
+    Steam writes UTF-8, but a client whose system code page is not UTF-8 (a Russian Windows,
+    cp1251) writes the ANSI code page. Decoding such a file as UTF-8 with errors="replace" turns
+    every non-ASCII character of a library path into U+FFFD: the folder does not exist any more and
+    the install is never found, with no error anywhere. So decode UTF-8 first and fall back to the
+    ANSI code page instead of mangling the path.
+    """
     try:
-        return p.read_text(encoding="utf-8", errors="replace")
+        raw = p.read_bytes()
     except OSError:
         return ""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        if fnv_mut.on("find_no_ansi_fallback"):
+            return raw.decode("utf-8", errors="replace")
+        return raw.decode(fnv_ini.ini_encoding(), errors="replace")
 
 
 def candidates(arg: Optional[str] = None, env: Optional[Dict[str, str]] = None, reg: Optional[Registry] = None,

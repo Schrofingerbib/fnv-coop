@@ -1,5 +1,6 @@
 #include "fnvcoop/wire.h"
 #include "fnvcoop/refop.h"
+#include "fnvcoop/mutations.h"
 #include <cmath>
 #include <cstring>
 #include <type_traits>
@@ -378,6 +379,7 @@ void ioE(Archive& a, RefCommand& e) {
     a.f32(e.f);
     a.str(e.s);
     io(a, e.to);
+    if (refOpIsWide(e.op) && !mutations().refCmdNarrow) { io(a, e.c); io(a, e.d); a.vari32(e.m); }   // the second shape (wide ops only)
 }
 void ioE(Archive& a, AdvanceTime& e) { a.varu32(e.minutes); }
 void ioE(Archive& a, CompleteAllObjectives& e) { io(a, e.quest); }

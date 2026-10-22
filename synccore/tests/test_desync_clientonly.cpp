@@ -4,10 +4,11 @@
 //
 // What it shows (Linux/fake world, no game):
 //  - client-only keys that have an inverse (a kill -> ResurrectActor) converge, also above the 256 cap: the budget is not the cause;
-//  - client-only quest running/stopped keys NEVER converge: revertEffectFor() (baseline.cpp) has no inverse for StartQuest/StopQuest and
-//    returns false, the client skips such a revert without a trace (session.cpp, SyncRepair), and the host keeps sending it each round.
-//    That test is registered WILL_FAIL in CMakeLists.txt (KNOWN BUG #25): when the core is fixed it starts passing, ctest then reports it
-//    as failed, and whoever fixed it removes the WILL_FAIL line.
+//  - client-only quest running/stopped keys never converged: revertEffectFor() (baseline.cpp) has no inverse for StartQuest/StopQuest,
+//    the client skipped such a revert without a trace (session.cpp, SyncRepair), and the host sent it again each round.
+//    Fixed (issue #25): the host settles these keys with its OWN running state, committed as a normal host txn (HostSession::hostQuestRunning,
+//    default: the completeness rule, a quest the host does not list is not running), and the client now counts a revert it has no inverse
+//    for (SyncStats::repairRevertsUnrevertable). Twin: questRunningReverted brings the old revert keys back.
 #include "fnvcoop/session.h"
 #include "minitest.h"
 
@@ -38,10 +39,10 @@ enum class OnlyKind { Kill, QuestRunning };
 
 struct Result {
     bool setupOk = false, healed = false;
-    uint64_t reports = 0, repairs = 0, effectsRepaired = 0;
+    uint64_t reports = 0, repairs = 0, effectsRepaired = 0, adopted = 0, clientUnrevertable = 0;
 };
 
-Result clientOnlyDrift(OnlyKind only, bool breakHeal) {
+Result clientOnlyDrift(OnlyKind only, bool breakHeal, bool revertQuestRunning = false) {
     InMemoryNetwork net{12};
     HostSession host(*net.endpoint(0));
     Engine eng;
@@ -78,11 +79,14 @@ Result clientOnlyDrift(OnlyKind only, bool breakHeal) {
     }
     Mutations m;
     m.healDisabled = breakHeal;
+    m.questRunningReverted = revertQuestRunning;
     MutationScope scope(m);
     for (int i = 0; i < 2000 && !r.healed; ++i) { run(100); r.healed = inSync(); }   // up to 200 virtual seconds
     r.reports = host.desyncs().size();
     r.repairs = host.stats().desyncRepairs;
     r.effectsRepaired = host.stats().desyncEffectsRepaired;
+    r.adopted = host.stats().questRunningAdopted;
+    r.clientUnrevertable = cs.syncStats().repairRevertsUnrevertable;
     return r;
 }
 }  // namespace
@@ -94,11 +98,23 @@ TEST(desync_clientonly, client_only_keys_with_an_inverse_converge_even_above_the
     CHECK(r.repairs >= 2);   // 305 open entries do not fit one repair message (cap 256): it took more than one round
 }
 
-// KNOWN BUG #25 (WILL_FAIL in CMakeLists.txt): what the real game showed. Remove the WILL_FAIL line when this passes.
+// Issue #25: what the real game showed (was KNOWN BUG, WILL_FAIL until fixed).
 TEST(desync_clientonly, client_only_quest_running_keys_converge) {
     Result r = clientOnlyDrift(OnlyKind::QuestRunning, false);
     REQUIRE(r.setupOk);
     CHECK_MSG(r.healed, "repairs " + std::to_string(r.repairs) + ", effects sent " + std::to_string(r.effectsRepaired));
+    CHECK_MSG(r.adopted == uint64_t(kClientOnly), "adopted " + std::to_string(r.adopted));   // each key settled once, by the host's running state
+    CHECK(r.clientUnrevertable == 0);   // nothing went out as a revert the client cannot do
+}
+
+// Twin of the #25 fix: client-only quest running keys sent as revert keys again (the old behaviour) never converge, and the client's
+// new counter shows why (the revert was silent before).
+TEST(twin, unit_desync_clientonly_quest_running_reverted) {
+    Result bad = clientOnlyDrift(OnlyKind::QuestRunning, false, true);
+    REQUIRE(bad.setupOk);
+    CHECK(!bad.healed);
+    CHECK(bad.adopted == 0);
+    CHECK(bad.clientUnrevertable >= uint64_t(kClientOnly));
 }
 
 TEST(twin, unit_desync_clientonly_heal_disabled) {

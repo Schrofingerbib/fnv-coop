@@ -391,12 +391,10 @@ void OnLoad(void* nvse) {
     nvcoop::actors::setSyncConfigurer([st](SyncConfig& sc) { sc.adjacent = [st](CellId a, CellId b) { return st->feed.adjacent(a, b); }; });
     if (nvse) {
         NVSEInterface* n = static_cast<NVSEInterface*>(nvse);
+        // QueryInterface is fine at any time; GetPluginHandle / SetSaveCallback are not (a hot reload crashed NVSE there), so the
+        // callbacks go through the forwarders NVSEPlugin_Load registered once.
         g_ser = static_cast<NVSESerializationInterface*>(n->QueryInterface(kInterface_Serialization));
-        if (g_ser) {
-            const PluginHandle h = n->GetPluginHandle();
-            g_ser->SetSaveCallback(h, CosaveSave);
-            g_ser->SetLoadCallback(h, CosaveLoad);
-        }
+        if (g_ser) nvcoop::SetCosaveCallbacks(CosaveSave, CosaveLoad);
     }
     nvcoop::RegisterMethod("actors.port", MPort, true);
     if (IniInt("dev", "actorport", 0) != 0) {

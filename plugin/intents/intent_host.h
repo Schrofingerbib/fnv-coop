@@ -25,12 +25,16 @@ namespace nvcoop::intents {
 
 constexpr RefId kHostPlayerRef = 0x14;
 
+// Who acts for a guest. Told to HostDeps::actorMode when it changes for a slot (the module logs it; a stand-in is the host's own player).
+enum class ActorMode : uint8_t { Puppet, Ghost, StandIn };
+
 struct HostDeps {
     IIntentEngine* eng = nullptr;
     std::function<bool(PlayerId slot, Bytes data)> send;                              // to one joined guest, reliable
     std::function<bool(PlayerId slot, const std::function<void()>& body)> runAsGuest; // Runtime::runAsGuest
     std::function<RefId(PlayerId slot)> puppetOf;                                     // avatar layer: the puppet of that player (0 = none)
     std::function<RefId(PlayerId slot)> ghostOf;                                      // NV:MP ghost (0 = none)
+    std::function<void(PlayerId slot, ActorMode mode, RefId actor)> actorMode;         // optional: the acting player for a slot changed (puppet / ghost / stand-in)
     std::function<bool(PlayerId slot)> joined;                                        // is that slot a joined player right now
     std::function<uint64_t()> nowMs;
     std::function<void(const FormRef& npc, PlayerId slot)> dialogueStart;             // optional: tell the 0xD1 adapter
@@ -88,7 +92,11 @@ private:
     Verdict decide(PlayerId slot, const Intent& in, bool legacy);
     Verdict dispatch(PlayerId slot, const Intent& in, const TargetInfo& t);
     bool rateOk(SlotState& s, uint64_t now);
-    bool pickActor(PlayerId slot, Kind k, TargetClass cls, Actor* out) const;
+    bool pickActor(PlayerId slot, Kind k, TargetClass cls, Actor* out);
+public:
+    // Reports the acting player of a slot to HostDeps::actorMode when the mode differs from the last one reported for it.
+    void noteActor(PlayerId slot, ActorMode mode, RefId actor);
+private:
     Result checkReach(const Actor& a, const TargetInfo& t, Kind k);
     Result runScoped(PlayerId slot, const Actor& a, Kind k, const FormRef& target, const std::function<Result(IActingScope&)>& fn);
     Verdict doActivate(PlayerId slot, const Intent& in, const TargetInfo& t);
@@ -105,6 +113,7 @@ private:
     Config cfg_;
     ContainerRedirect redirect_;
     std::map<PlayerId, SlotState> slots_;
+    std::map<PlayerId, ActorMode> lastMode_;   // last acting-player mode reported per slot
     struct Claim { PlayerId slot; uint64_t atMs; };
     std::map<FormRef, Claim> claims_;
     std::deque<FormRef> claimOrder_;

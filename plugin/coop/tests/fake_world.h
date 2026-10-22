@@ -130,6 +130,7 @@ public:
     std::map<std::string, uint32_t> spawned;       // host ref string -> local refID (differs per machine on purpose)
     std::set<std::string> despawned;
     std::map<std::string, double> refVars;         // "<ref>#<index>" -> value
+    std::map<std::string, double> questVars;       // "<quest>#<index>" -> value (SetScriptVar on a quest; not part of dump())
     std::map<std::string, int> companions;         // npc -> owner slot (absent = free)
     std::map<std::string, std::string> worldState; // key -> lane-local world effect json (NPC AV, relations, ...)
     uint64_t dupSpawns = 0, unresolvedRefOps = 0, worldApplied = 0, slideEnds = 0, forcedEvents = 0;
@@ -183,6 +184,7 @@ private:
             despawned.insert(k);
             return true;
         }
+        if (auto* x = std::get_if<SetScriptVar>(&e)) { questVars[s(x->owner) + "#" + std::to_string(x->index)] = x->value; return true; }
         if (auto* x = std::get_if<RefScriptVar>(&e)) {
             if (isCreatedRef(x->ref) && !spawned.count(s(x->ref))) { ++unresolvedRefOps; return false; }
             refVars[s(x->ref) + "#" + std::to_string(x->index)] = x->value;

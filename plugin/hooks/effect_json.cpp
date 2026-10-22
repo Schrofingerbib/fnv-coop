@@ -113,6 +113,11 @@ Value effectToJson(const Effect& e) {
         if (!x->b.plugin.empty()) o.set("b", refToStr(x->b));
         o.set("i", (int64_t)x->i).set("j", (int64_t)x->j).set("k", (int64_t)x->k).set("l", (int64_t)x->l).set("f", (double)x->f).set("to", toStr(x->to));
         if (!x->s.empty()) o.set("s", x->s);
+        if (refOpIsWide(x->op)) {   // the second shape: forms c / d and integer m
+            if (!x->c.plugin.empty()) o.set("c", refToStr(x->c));
+            if (!x->d.plugin.empty()) o.set("d", refToStr(x->d));
+            o.set("m", (int64_t)x->m);
+        }
     }
     else { T("Unsupported"); o.set("name", effectNameLocal(e)); }  // round-2 session-level effects: not carried by this codec
     return o;
@@ -188,6 +193,11 @@ bool effectFromJson(const Value& v, Effect* out, std::string* err) {
         if (v.get("b").isString()) { if (!strToRef(v.get("b").asString(""), &f)) { if (err) *err = "RefCommand: bad b"; return false; } rc.b = f; }
         rc.i = (int32_t)v.get("i").asInt(); rc.j = (int32_t)v.get("j").asInt(); rc.k = (int32_t)v.get("k").asInt(); rc.l = (int32_t)v.get("l").asInt();
         rc.f = (float)v.get("f").asNumber();
+        if (refOpIsWide(rc.op)) {
+            if (v.get("c").isString()) { if (!strToRef(v.get("c").asString(""), &f)) { if (err) *err = "RefCommand: bad c"; return false; } rc.c = f; }
+            if (v.get("d").isString()) { if (!strToRef(v.get("d").asString(""), &f)) { if (err) *err = "RefCommand: bad d"; return false; } rc.d = f; }
+            rc.m = (int32_t)v.get("m").asInt();
+        }
         rc.s = v.get("s").asString("");
         if (rc.s.size() > 255) { if (err) *err = "RefCommand: text too long"; return false; }
         if (!toRecipient(v.get("to").asString("default"), &rc.to)) { if (err) *err = "RefCommand: bad recipient"; return false; }

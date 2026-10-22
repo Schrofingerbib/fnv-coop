@@ -106,15 +106,24 @@ Result IntentHost::runLegacy(PlayerId slot, fnvcoop::IntentKind kind, const Form
     return r;
 }
 
-bool IntentHost::pickActor(PlayerId slot, Kind k, TargetClass cls, Actor* out) const {
+void IntentHost::noteActor(PlayerId slot, ActorMode mode, RefId actor) {
+    auto it = lastMode_.find(slot);
+    if (it != lastMode_.end() && it->second == mode && !FNV_MUT(330)) return;   // MUTANT 330: reported on every action, not on a change
+    lastMode_[slot] = mode;
+    if (mode == ActorMode::StandIn && FNV_MUT(331)) return;   // MUTANT 331: a stand-in is never reported (the silent host-player run)
+    if (deps_.actorMode) deps_.actorMode(slot, mode, actor);
+}
+
+bool IntentHost::pickActor(PlayerId slot, Kind k, TargetClass cls, Actor* out) {
     RefId p = deps_.puppetOf ? deps_.puppetOf(slot) : 0;
     if (FNV_MUT(311)) p = 0;   // MUTANT 311: the puppet is never used (everything runs as the host's player)
-    if (p) { out->ref = p; out->puppet = true; return true; }
+    if (p) { out->ref = p; out->puppet = true; noteActor(slot, ActorMode::Puppet, p); return true; }
     RefId g = deps_.ghostOf ? deps_.ghostOf(slot) : 0;
-    if (g && !FNV_MUT(311)) { out->ref = g; out->ghost = true; return true; }
+    if (g && !FNV_MUT(311)) { out->ref = g; out->ghost = true; noteActor(slot, ActorMode::Ghost, g); return true; }
     if (!standInAllowed(cfg_, k, cls)) return false;
     out->ref = kHostPlayerRef;
     out->standIn = true;
+    noteActor(slot, ActorMode::StandIn, kHostPlayerRef);
     return true;
 }
 
@@ -325,6 +334,7 @@ void IntentHost::playerLeft(PlayerId slot) {
         }
     }
     slots_.erase(slot);
+    lastMode_.erase(slot);
     for (auto it = lastTrigger_.begin(); it != lastTrigger_.end();) {
         if (it->first.first == slot) it = lastTrigger_.erase(it);
         else ++it;

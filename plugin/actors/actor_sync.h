@@ -46,6 +46,7 @@ public:
     void onNativeBase(NetId id, const FormRef& base);   // the engine rolled / changed the leveled base of this actor
     void onEffect(const fnvcoop::Effect& e);    // story effects applied on this machine: KillActor, ResurrectActor, CompanionOwner
     void purgeStandIns();                       // game load / session end: stand-ins are never saved
+    void onWorldReloaded();                     // game load: forget the old world's deaths (owners and epochs stay; the engine is the truth again)
 
     // ---- enemy-anim (plugin/actors/anim): reliable owner-to-all events with an opaque payload (the settled corpse pose) ----
     struct AnimEventIn { NetId id = 0; PlayerId from = kNoPlayer; OwnerEpoch epoch = 0; uint64_t eventId = 0; Bytes payload; };
@@ -110,6 +111,16 @@ private:
         live::ActorSnapshot lastPub;
         uint64_t lastResyncMs = 0;
         bool resyncedOnce = false;
+        // inventory (the owner publishes what its AI used or picked up; everyone else copies it)
+        InvList invShared;                    // the inventory everyone agrees on: the owner's last published list, or the last one received
+        bool invBase = false;                 // owner: invShared was taken from the engine (a silent baseline: worlds start equal)
+        bool invPublishedAny = false;         // a list was published or received: a joining client needs it
+        bool invPendingValid = false;
+        InvList invPending;                   // owner: a changed list waiting to stay the same for invSettleMs
+        uint64_t invPendingAt = 0, invNextMs = 0;
+        bool invWantValid = false;            // non-owner: a received list the engine copy does not hold yet (not loaded, or the write was refused)
+        InvList invWant;
+        int invTries = 0;
     };
 
     // ownership glue
@@ -149,6 +160,11 @@ private:
     void onPickReport(const Envelope& e, const MPickReport& m);
     void onResync(const Envelope& e, const MResync& m);
     void onAnimEvent(const Envelope& e, const MAnimEvent& m);
+    void onInventory(const Envelope& e, const MInventory& m);
+    void pollInventory(Rec& r);                       // owner: read, debounce, publish
+    void flushInventory(Rec& r);                      // owner: publish a changed list now (death, handoff)
+    bool publishInventory(Rec& r, const InvList& cur);
+    void applyWantedInventory(Rec& r);                // non-owner: write the last received list when the actor is here
     void applyDeath(Rec& r, bool engineKills);
     void requestResync(Rec& r);
     void hostRegister(Rec& r);
@@ -188,7 +204,9 @@ private:
     std::set<uint64_t> deathEvents_;
     std::set<uint64_t> animEvents_;                        // de-duplication of MAnimEvent (bounded, oldest ids dropped)
     AnimEventHandler animHandler_;
-    uint64_t animEventCounter_ = 0;
+    uint64_t animEventCounter_ = 0, invEventCounter_ = 0;
+    std::set<uint64_t> invEvents_;                         // de-duplication of MInventory
+    uint32_t invBudget_ = 0;                               // reads left in this tick
     uint64_t now_ = 0, nextEvalMs_ = 0, eventCounter_ = 0;
     bool hostUp_ = true;                                   // client: link to the host
     Stats stats_;

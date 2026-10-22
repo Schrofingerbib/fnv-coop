@@ -39,6 +39,7 @@ class ManagerDirectory : public IPuppetDirectory {
 public:
     ManagerDirectory(const PuppetManager& pm, Slot localSlot) : pm_(pm), local_(localSlot) {}
     Slot LocalSlot() const override { return local_; }
+    void SetLocalSlot(Slot s) { local_ = s; }
     std::vector<std::pair<Slot, RefId>> Live() const override;
 
 private:
