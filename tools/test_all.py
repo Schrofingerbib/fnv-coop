@@ -150,6 +150,14 @@ NEEDS = {
 }
 
 
+# Suites that drive Windows processes themselves (kernel32 through ctypes, taskkill, the mbcs codec, C:\ paths), not
+# through MSVC: off Windows they skip with this reason instead of failing on the missing API.
+WINDOWS_ONLY = {
+    "Proof harness: prove.py classifier, packet, ledger, owner-PC safety, --pairs scheduler, RAM guard (fake worlds, stub runners + 22 twins)":
+        "prove.py watches and stops game processes through kernel32 and taskkill",
+}
+
+
 def missing_data(name: str) -> list:
     """The files under ROOT that suite `name` needs and that do not exist."""
     files, _ = NEEDS.get(name, ((), ""))
@@ -204,6 +212,8 @@ def decide(name: str, slow: bool, tools: tuple, quick: bool, problems: dict):
         return "skip", f"{NEEDS[name][1]}. Missing: {shown}"
     if not WINDOWS and MUTANT != "no_platform_skip" and any(t in ("cmake", "msvc") for t in required_tools(slow, tools)):
         return "skip", f"needs the MSVC/CMake toolchain, which is Windows only (this is {sys.platform})"
+    if not WINDOWS and MUTANT != "no_platform_skip" and name in WINDOWS_ONLY:
+        return "skip", f"{WINDOWS_ONLY[name]}, which is Windows only (this is {sys.platform})"
     reasons = [problems[t] for t in required_tools(slow, tools) if problems.get(t)]
     if reasons:
         return "fail", ". ".join(reasons)

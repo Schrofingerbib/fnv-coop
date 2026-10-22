@@ -296,6 +296,7 @@ class CursorScan(unittest.TestCase):
         manual = json.load(open(os.path.join(HERE, "volatile_manual.json"), encoding="utf-8"))["add"]["vars"]
         self.assertIn("istonesneak", {v["name"].lower() for v in manual}, "the manual list keeps it across a regenerate")
 
+    @unittest.skipUnless(os.path.exists(vs.INVENTORY), "questlines/systems/inventory.json not generated (built from the game's quest data)")
     def test_inventory_lists_the_spawner_quests(self):
         enc = vs.load_encounters()
         self.assertEqual(enc["falloutnv.esm:15f959"], ("FalloutNV.esm:15F958", "VERNovac01"))
