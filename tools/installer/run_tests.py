@@ -135,14 +135,47 @@ def check_find_steam():
         lib2 = td / "Lib2"
         (steam / "steamapps").mkdir(parents=True)
         vdf = '"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"' + str(steam).replace("\\", "\\\\") + '"\n\t}\n\t"1"\n\t{\n\t\t"path"\t\t"' + str(lib2).replace("\\", "\\\\") + '"\n\t}\n}\n'
-        (steam / "steamapps" / "libraryfolders.vdf").write_text(vdf)
+        (steam / "steamapps" / "libraryfolders.vdf").write_text(vdf, encoding="utf-8")   # Steam writes UTF-8
         (lib2 / "steamapps").mkdir(parents=True)
-        (lib2 / "steamapps" / "appmanifest_22380.acf").write_text('"AppState"\n{\n\t"appid"\t\t"22380"\n\t"installdir"\t\t"FNV Custom Folder"\n}\n')
+        (lib2 / "steamapps" / "appmanifest_22380.acf").write_text('"AppState"\n{\n\t"appid"\t\t"22380"\n\t"installdir"\t\t"FNV Custom Folder"\n}\n', encoding="utf-8")
         fg.make_game(lib2 / "steamapps" / "common" / "FNV Custom Folder")
         reg = FakeReg({("HKCU", r"Software\Valve\Steam", "SteamPath"): str(steam)})
         found = fnv_find.candidates(None, {}, reg, lambda: [])
         assert [c.source for c in found] == ["steam"], found
         assert found[0].path.name == "FNV Custom Folder" and found[0].edition == "steam"
+
+
+def _encodable(text, enc):
+    try:
+        text.encode(enc)
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def check_find_steam_ansi_library_path():
+    """A Steam client on a system whose code page is not UTF-8 (a Russian Windows, cp1251) writes
+    libraryfolders.vdf in the ANSI code page, and the library path may hold non-ASCII characters.
+    Those must survive the read, or the install is never found - and nothing says why."""
+    with tmp() as td:
+        steam = td / "Steam"
+        # A Cyrillic folder name ("Biblioteka Steam"), written with escapes so this file stays ASCII
+        # and cannot be broken by the code page of whoever checks it out.
+        # The file is written in THIS machine's ANSI code page (what Steam does here), so pick a non-ASCII
+        # name that code page can hold: Cyrillic on cp1251, accented Latin on cp1252 and the like.
+        enc = fnv_ini.ini_encoding()
+        name = next(n for n in ("\u0411\u0438\u0431\u043b\u0438\u043e\u0442\u0435\u043a\u0430 Steam", "Biblioth\u00e8que Steam",
+                                "Bibliot\u00e9ka Steam") if _encodable(n, enc))
+        lib = td / name
+        (steam / "steamapps").mkdir(parents=True)
+        (lib / "steamapps" / "common").mkdir(parents=True)
+        fg.make_game(lib / "steamapps" / "common" / "Fallout New Vegas")
+        vdf = '"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"' + str(lib).replace("\\", "\\\\") + '"\n\t}\n}\n'
+        (steam / "steamapps" / "libraryfolders.vdf").write_bytes(vdf.encode(enc))
+        reg = FakeReg({("HKCU", r"Software\Valve\Steam", "SteamPath"): str(steam)})
+        found = fnv_find.candidates(None, {}, reg, lambda: [])
+        assert [c.path.name for c in found] == ["Fallout New Vegas"], found
+        assert found[0].path == lib / "steamapps" / "common" / "Fallout New Vegas", found
 
 
 def check_find_gog_and_retail():
@@ -774,7 +807,8 @@ def check_verify_zip_detects_tampering():
 
 # ---- the list -------------------------------------------------------------------------------------------------------------------
 
-REAL = [check_pe_version, check_find_steam, check_find_gog_and_retail, check_find_common_and_order, check_inspect, check_ini,
+REAL = [check_pe_version, check_find_steam, check_find_steam_ansi_library_path, check_find_gog_and_retail,
+        check_find_common_and_order, check_inspect, check_ini,
         check_manifest_destinations, check_manifest_detects_damage, check_install_fresh_and_status, check_install_dry_run,
         check_install_blocks_wrong_version, check_install_blocks_missing_nvse, check_install_blocks_running_game,
         check_install_blocks_damaged_payload, check_install_refuses_folder_target, check_inside,
@@ -788,6 +822,7 @@ REAL = [check_pe_version, check_find_steam, check_find_gog_and_retail, check_fin
 TWINS = [
     (check_pe_version, "pe_swap_words"),
     (check_find_steam, "find_ignore_libraries"),
+    (check_find_steam_ansi_library_path, "find_no_ansi_fallback"),
     (check_find_common_and_order, "find_no_dedup"),
     *([(check_find_steam, "find_windows_only_separators"), (check_find_common_and_order, "find_windows_only_separators")]
       if os.name != "nt" else []),   # the old Windows-only path building is only wrong off Windows

@@ -234,7 +234,7 @@ with 36 twins, `avatar_engine_tests` with 69 twins, dll-wiring's `nvcoop_live_te
 | The ghost-ref map | `plugin/avatar/avatar_api.h/.cpp` | `puppetRefOf(slot)`, `slotOfPuppet(ref)`, `actingRefOf(slot)` (the local slot answers the player's own ref 0x14, a remote slot its puppet), `slotOfActingRef(ref)`, `isPuppet`, `puppetCount`, `forEachPuppet`. Registered by the avatar module as a `ManagerDirectory` over the runtime's manager; answers live puppets only. dll-wiring's `GhostOf(slot)` and `setPlayerRefMap` can call these instead of `avatar_glue.h`. |
 | Lifecycle | tests (`full/tests/test_full.cpp`) plus two real fixes | join, leave, rejoin, interior (parked), exterior neighbour cell (SetPos only, same object), another worldspace (parked), host load (orphans purged, one puppet per player), client load, link loss. Fixed on the way: equipment that arrived before the runtime existed was dropped (now remembered and replayed); a look change used to respawn the puppet. |
 | Bridge | `win/avatar_module.cpp` | new: `avatar.api`, `avatar.look`, `avatar.puppetlook {slot}`, `avatar.hit {slot, damage, limb?, attackerRef?}`; `coop.live` -> `avatars` now carries per slot `tier`, `rx` (accepted snapshots, the proof turns the difference into a rate), `lookInfo`, and `selfLook`. |
-| In-game proof | `tools/avatar/proof_avatars.py` (WRITTEN, NOT RUN) | Two instances: wiring, look (sent equals stored, puppet gear and weapon mods read back), rates (15..24 Hz near, 3.5..7.5 Hz after a 60 m teleport, near again), lifecycle (interior park, come back, client load, no orphan), hits (router forwarded, the client's combat counters). `--selftest` runs it against a scripted fake game with 16 injected defects (all caught). |
+| In-game proof | `tools/avatar/proof_avatars.py` (WRITTEN, NOT RUN) | Two instances: wiring, look (sent equals stored, puppet gear and weapon mods read back), rates (15..24 Hz near, 3.5..7.5 Hz after a 60 m teleport, near again), lifecycle (interior park, come back, client load, no orphan), hits (router forwarded, the client's combat counters). `--selftest` runs it against a scripted fake game with 24 injected defects, 8 of them in the scripted loadout (all caught). |
 
 ### New traps, test, twin
 
@@ -283,3 +283,15 @@ with 36 twins, `avatar_engine_tests` with 69 twins, dll-wiring's `nvcoop_live_te
   unit tested on a fake game (59 tests, 540 checks, 63 twins). The game side compiles into nvcoop.dll. Every pinned address is proven against the
   reference exe (24 checks); what the engine DOES when called that way (PlaceAtMe of the template, SetPos on a restrained actor, SetAlert drawing a weapon,
   the group numbering, the cost of a line, the cell map walk, the worn-item walk) is unknown until `proof_puppet.py --loopback` has run once.
+
+### Scripted client loadout for the look phase (replaces the hand step "give the client armor and a modified weapon")
+
+`tools/avatar/proof_avatars.py` has `--loadout auto|off` (default `auto`, applied when the look phase runs) with `--armor`, `--weapon`, `--weapon-mod` and `--mod-flags`. On the CLIENT it runs
+`player.additem` and `player.EquipItem` for the armor and the weapon, then the xNVSE function `player.SetEquippedWeaponModFlags <flags>` (xNVSE `Commands_Inventory.cpp`, flags 0..7, bit n-1 = mod
+slot n) on the worn weapon, and reads each step back: `player.GetEquipped`, `player.GetEquippedWeaponModFlags`, then the avatar layer's own `avatar.look` (worn item with `mods` equal to the flags).
+The look phase additionally FAILS (it no longer passes silently) if the client holds no modified weapon or no armor. Defaults, from `out/questdata/forms.json.gz`: armor `FalloutNV.esm:1264FE`
+(ArmorLeatherReinforced, ARMO), weapon `FalloutNV.esm:0CD539` (WeapNVTrailCarbine, WEAP), mod `FalloutNV.esm:0EEA70` (ModNVTrailCarbineScope, IMOD, the one IMOD of that dump whose name pairs with a WEAP),
+flags 1. There is no console function that attaches an IMOD to an inventory item (`AttachModToInventoryItem` is in neither the vanilla command table nor the xNVSE source of this repo; only
+`EnableWeaponMod`, whose meaning is still the open hypothesis above), so the flag byte is set directly: it is exactly what the avatar layer reads (`ExtraWeaponModFlags` of the worn instance) and syncs.
+Risk to read first: `SetEquippedWeaponModFlags` returns silently when the equipped item has no extra-data list; the read-back line then fails with "read back 0 wanted 1". Twins in the self-test:
+loadout skipped, `additem` refused, weapon or armor not equipped, flags line without effect, flags set but not visible to the avatar layer, wrong flags.

@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from . import probe as P
 from .core import Ctx, Machine, Playbook, StepFailure
 from .fakecoop import FakeCoop
-from .pb_combat import gather, walk_to
+from .pb_combat import gather, goto_or_teleport, walk_to
 
 RAIDER_BASE = "FalloutNV.esm:DBB5A0"
 GECKO_BASE = "FalloutNV.esm:DBB5A1"
@@ -245,8 +245,21 @@ def dup_counts(ctx: Ctx, hostiles: List[str]) -> Optional[Dict[str, int]]:
     bases = sorted({b for b in (ctx.refs.get("hostile_base_of") or {}).values() if b})
     if not bases:
         return None
-    return ctx.optional("duplicate-NPC checks", lambda: {b: ctx.same_everywhere(f"live count of {b}", lambda m, b=b: P.ref_count(m.bot, b))
-                                                          for b in bases})
+
+    def counts_agree() -> bool:
+        return all(len({P.ref_count(m.bot, b) for m in ctx.present}) == 1 for b in bases)
+
+    def counted() -> Dict[str, int]:
+        # dev.countRefs counts the refs of the PLAYER'S cell. A player just teleported next to the enemies (the walk was stuck) is still in the
+        # old cell for a few frames: in game 2026-10-22, enemy_handoff step 01, host 1 / client 0 right after "teleported there". Wait for the
+        # machines to agree; if they never do, same_everywhere below names the ones that differ (a real missing or duplicate actor).
+        try:
+            ctx.wait_until("every machine counts the same live refs of each hostile base", counts_agree, timeout_s=ctx.opts.get("spawn_s", 15.0))
+        except StepFailure:
+            pass
+        return {b: ctx.same_everywhere(f"live count of {b}", lambda m, b=b: P.ref_count(m.bot, b)) for b in bases}
+
+    return ctx.optional("duplicate-NPC checks", counted)
 
 
 def check_no_duplicates(ctx: Ctx, c0: Optional[Dict[str, int]], hostiles: List[str]) -> None:
@@ -935,23 +948,6 @@ def fake_enemy_handoff(n: int = 2, bugs: Optional[Set[str]] = None, **kw) -> Tup
 SITE_REFS = ["FalloutNV.esm:D00001", "FalloutNV.esm:D00002", "FalloutNV.esm:D00003"]
 SITE_BASES = ["FalloutNV.esm:DBB5B0", "FalloutNV.esm:DBB5B1"]
 SITE_MARKER = "FalloutNV.esm:D0FFFF"
-
-
-def goto_or_teleport(ctx: Ctx, m: Machine, ref: str, dist: float) -> Any:
-    """Walk to `ref`. When the walk is stuck on terrain, teleport there and add a note. Use it only to place a player before the
-    checks: the sync checks come after. In game 2026-10-21 the host stuck on the slope between GSPG01 and
-    GoodspringsPowderGangMarker (1042 units, 290 up) and enemy_spawn failed at step 01 before it checked anything."""
-    r = m.bot.goto_ref(ref, dist)
-    reason = str(getattr(r, "reason", ""))
-    # a walk that times out far away is a placement problem too (in game 2026-10-22: the guest still 4774 units from the marker)
-    if getattr(r, "ok", False) or not any(w in reason for w in ("stuck", "timeout")):
-        return r
-    note = f"{m.name}: the walk to {ref} did not arrive ({reason}), teleported there"
-    ctx.notes.append(note)
-    ctx.log(note)
-    r = m.bot.goto_ref(ref, dist, mode="teleport")
-    ctx.settle()          # a teleport lands at once: let the engine and the session catch up (cell load, replication)
-    return r
 
 
 def fake_enemy_spawn(n: int = 2, bugs: Optional[Set[str]] = None, **kw) -> Tuple[FakeCoop, dict]:

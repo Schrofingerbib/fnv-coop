@@ -10,6 +10,10 @@
 //      (55 8B EC): we only hook function ENTRIES, so the stolen bytes never contain a rel32 branch that would need
 //      relocating into the trampoline.
 //   3. Trampoline = stolen bytes + `jmp target+stolen`. The detour calls the original through it.
+//   4. Chaining (opt-in per acquire, `chainForeignJmp`): when the entry already holds another patcher's `jmp rel32` (xNVSE's
+//      EventManager does this at MarkBaseExtraListScriptEvent 0x5AC750) and the rest of the signature is intact, we hook ON TOP of
+//      it: only those 5 bytes are replaced, and the trampoline is that jump relocated, so the call order is game -> ours -> theirs
+//      -> original. Release puts their jump back byte for byte. Their code never points into ours, so a core unload stays safe.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -70,7 +74,10 @@ public:
     // On success *trampolineOut is the address to call for the original function.
     // `origSlot` (optional, 32-bit): written with the trampoline address BEFORE the entry is patched, so a thread that enters the detour
     // the instant the patch lands already finds a valid "original" pointer (the detours call through it).
-    PatchStatus acquire(const HookSpec& spec, Addr detour, Addr* trampolineOut, Addr* origSlot = nullptr);
+    // `chainForeignJmp`: see rule 4 at the top. Off = a foreign jump at the entry is refused (AlreadyHooked), as before.
+    PatchStatus acquire(const HookSpec& spec, Addr detour, Addr* trampolineOut, Addr* origSlot = nullptr, bool chainForeignJmp = false);
+    // The foreign jump target an installed hook was chained over (rule 4), 0 = not chained / not installed.
+    Addr chainedOver(Addr target) const;
     PatchStatus release(const HookSpec& spec);
     int refCount(const HookSpec& spec) const;
     size_t installedCount() const { return hooks_.size(); }
@@ -80,7 +87,7 @@ public:
     int restoreAllAndVerify();
     // Read-only preflight for a reload: how many installed hooks no longer have our patch bytes at the entry
     // (another patcher chained over it). Such a hook cannot be restored safely, so the reload must be refused.
-    int auditTampered() const;
+    int auditTampered(std::vector<Addr>* which = nullptr) const;   // which: the targets whose bytes are no longer ours
     // Reload drain, step 1: put the original bytes back at every entry but keep the trampolines and the bookkeeping, so no thread
     // can ENTER a detour any more while threads already inside it finish. Returns how many hooks could not be suspended (0 = all).
     // resumeAll() re-patches every suspended hook (used when the drain times out and the reload is refused).
@@ -102,6 +109,7 @@ private:
         uint8_t patch[16] = {};
         int refs = 0;
         bool suspended = false;
+        Addr chainedTo = 0;   // rule 4: the foreign jump target we installed on top of (0 = a normal entry hook)
     };
     MemoryOps& mem_;
     std::map<Addr, Installed> hooks_;

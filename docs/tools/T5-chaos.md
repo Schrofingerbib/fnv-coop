@@ -29,6 +29,13 @@ Live control, newline-delimited JSON-RPC 2.0 over TCP on R (or `chaos.py call --
 `set_params {params:{...}, dir?}`, `partition {dir: c2s|s2c|both, on}`, `disconnect {duration_ms}`, `reconnect`,
 `shutdown`. Python: `from relay import ChaosClient`.
 
+## Joining a live pair through the relay (`chaos_pair.py`)
+`python -I tools/chaos/chaos_pair.py --instances 0,1 --info-file runs/chaos.json -- tools/bots/run_fight.py --instances 0,1 --which fight --chaos bad_wifi --chaos-seed 7 --chaos-rpc runs/chaos.json`
+reads the host copy's `[coop] port`, starts the relay (clean `lan` profile) in front of it, writes the info file, makes the client copy `coop.leave` then
+`coop.join {host:127.0.0.1, port:<relay>}` over its bridge and waits for `client.joined`, runs the command after `--`, and always puts the client back on the host's real port
+and stops the relay. Exit codes: the command's own; 2 "cannot reach the game instances" when a copy's bridge is down; 1 when the client did not join through the relay.
+`prove.py` uses it for `enemy_chaos_bad_wifi`. Tests: `test_chaos_pair.py` (fake client bridge, real relay and UDP echo on loopback; 2 twins in `run_tests.py`).
+
 ## Packet log (agreed format proposal sent to T1b-analyzer; no reply yet)
 JSON Lines. Header: `{"format":"nvchaos-packetlog","version":1,"profile","seed","start_wall"}`. Per datagram:
 `t` (ms, relay monotonic clock), `dir`, `peer`, `n` (per-direction counter), `len`, `head` (first 16 bytes, hex),

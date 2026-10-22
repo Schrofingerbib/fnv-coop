@@ -16,6 +16,15 @@
 
 namespace nvworld {
 
+// world.actors {type}: does a reference of the player's cell belong in the list? 0x3A (REFR), 0x3B (Character) and 0x3C (Creature) are REFERENCE
+// types, read from the reference itself; any other value is the BASE form type (0x1B container, 0x1C door). Only 0x3B used to be a reference type,
+// so `type: 60` compared a creature reference's BASE type (TESCreature 0x2B) with 0x3C and listed nothing: spawn_proof counted [0, 0, 0] radroaches
+// on every machine in the sweep of 2026-10-22 although the roll had made one.
+inline bool actorTypeMatches(uint32_t want, uint32_t refType, uint32_t baseType) {
+    const bool wantRef = FNV_MUT(52) ? want == 0x3B : (want >= 0x3A && want <= 0x3C);   // twin 52: only characters are a reference type
+    return (wantRef ? refType : baseType) == want;
+}
+
 struct Evaluator {
     const char* name;
     uint32_t addr;     // evaluator = 4th field of the engine command table entry (table 0x118E8E0, stride 0x28)

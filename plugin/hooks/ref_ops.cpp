@@ -108,6 +108,8 @@ const RefOpSpec kStorySpecs[] = {
     {fnvcoop::kOpPlayIdle, "playidle", S_(Cmd_PlayIdle), "s", "s", 1, REF | AI},
     {fnvcoop::kOpSetCriticalStage, "setcriticalstage", S_(Cmd_SetCriticalStage), "c", "i", 1, REF},
     {fnvcoop::kOpSetActorFullName, "setactorfullname", S_(Cmd_SetActorFullName), "o", "a", 1, REF},   // the name is a Message FORM (param type 0x31), not a text
+    // ---- the second shape: nine parameters. weapon, two object refs, an int, four optional ints, an optional object ref (engine param types 21 4 4 1 1 1 1 1 4)
+    {fnvcoop::kOpUseWeapon, "useweapon", S_(Cmd_UseWeapon), "oooiiiiio", "abcijklmd", 4, REF | AI},
 };
 const size_t kStorySpecCount = sizeof(kStorySpecs) / sizeof(kStorySpecs[0]);
 
@@ -134,12 +136,13 @@ bool plainWord(const std::string& s) {
         if (!(std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.' || ch == ':')) return false;
     return true;
 }
-int slotIndex(char c) {   // i j k l -> 0..3
+int slotIndex(char c) {   // i j k l m -> 0..4
     switch (c) {
         case 'i': return 0;
         case 'j': return 1;
         case 'k': return 2;
         case 'l': return 3;
+        case 'm': return 4;
         default: return -1;
     }
 }
@@ -148,6 +151,7 @@ int32_t& intSlot(fnvcoop::RefCommand& c, char s) {
         case 'j': return c.j;
         case 'k': return c.k;
         case 'l': return c.l;
+        case 'm': return c.m;
         default: return c.i;
     }
 }
@@ -156,10 +160,26 @@ int32_t intOf(const fnvcoop::RefCommand& c, char s) {
         case 'j': return c.j;
         case 'k': return c.k;
         case 'l': return c.l;
+        case 'm': return c.m;
         default: return c.i;
     }
 }
-const fnvcoop::FormRef& formOf(const fnvcoop::RefCommand& c, char s) { return s == 'b' ? c.b : c.a; }
+fnvcoop::FormRef& formSlot(fnvcoop::RefCommand& c, char s) {
+    switch (s) {
+        case 'b': return c.b;
+        case 'c': return c.c;
+        case 'd': return c.d;
+        default: return c.a;
+    }
+}
+const fnvcoop::FormRef& formOf(const fnvcoop::RefCommand& c, char s) {
+    switch (s) {
+        case 'b': return c.b;
+        case 'c': return c.c;
+        case 'd': return c.d;
+        default: return c.a;
+    }
+}
 }  // namespace
 
 bool buildRefCommand(const RefOpSpec& s, uint32_t callingRef, const ArgValue* args, const RefToForm& toForm, fnvcoop::RefCommand* out,
@@ -177,7 +197,7 @@ bool buildRefCommand(const RefOpSpec& s, uint32_t callingRef, const ArgValue* ar
         const char t = s.sig[k], d = s.slots[k];
         const ArgValue& a = args[k];
         if (t == 'o') {
-            fnvcoop::FormRef& dst = d == 'b' ? c.b : c.a;
+            fnvcoop::FormRef& dst = formSlot(c, d);
             if (a.form && !toForm(a.form, &dst)) return fail("form argument has no stable name");
             if (!a.form && k < s.minArgs) return fail("required form argument is missing");
         } else if (t == 's') {
@@ -200,6 +220,7 @@ bool buildRefCommand(const RefOpSpec& s, uint32_t callingRef, const ArgValue* ar
             c.f = a.f;
         }
     }
+    if (FNV_MUT(12)) { c.c = fnvcoop::FormRef(); c.d = fnvcoop::FormRef(); c.m = 0; }   // twin 12: the second shape is dropped (UseWeapon would shoot at the wrong target)
     if (FNV_MUT(1)) c.ref = fnvcoop::FormRef();   // twin 1: the calling reference is dropped (every command would hit "nothing")
     const fnvcoop::RefOpInfo* info = fnvcoop::refOpInfo(s.op);
     if (!info) return fail("unknown op");

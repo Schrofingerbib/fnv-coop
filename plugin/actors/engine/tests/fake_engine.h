@@ -53,6 +53,7 @@ public:
     bool refuseWrites = false;                     // every write fails
     std::set<std::string> refuseOps;               // op names that fail ("setrestrained", "kill", ...)
     bool noAnchor = false;                         // anchorInCell finds nothing
+    bool restrainOverwritesLife = true;            // the real engine (game 2026-10-22): SetRestrained 1 on a dying / dead actor makes its life state 5
 
     FakeEngine() {
         cells[1] = Cell{};
@@ -225,6 +226,7 @@ public:
     bool setRestrained(RefId ref, bool on) override {
         if (!w(on ? "restrain" : "unrestrain", ref)) return false;
         a[ref].restrained = on;
+        if (on && restrainOverwritesLife && (a[ref].life == 1 || a[ref].life == 2)) a[ref].life = 5;
         return true;
     }
     bool stopCombat(RefId ref) override { if (!w("stopcombat", ref)) return false; a[ref].target = 0; return true; }

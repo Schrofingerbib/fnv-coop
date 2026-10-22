@@ -12,6 +12,7 @@ public:
     void setSnapshotSink(SnapshotSink s) override { rt_.SetSnapshotSink(std::move(s)); }
     void setEquipSink(EquipSink s) override { rt_.SetEquipSink(std::move(s)); }
     void setLocalIdentity(fnvcoop::live::NetId n, fnvcoop::live::OwnerEpoch e) override { rt_.SetLocalIdentity(n, e); }
+    void setLocalSlot(nvcoop::avatar::Slot s) override { rt_.SetLocalSlot(s); }
     bool addRemote(nvcoop::avatar::Slot s, const nvcoop::avatar::Appearance& a) override { return rt_.AddRemote(s, a); }
     void removeRemote(nvcoop::avatar::Slot s) override { rt_.RemoveRemote(s); }
     bool setRemoteAppearance(nvcoop::avatar::Slot s, const nvcoop::avatar::Appearance& a) override { return rt_.SetRemoteAppearance(s, a); }

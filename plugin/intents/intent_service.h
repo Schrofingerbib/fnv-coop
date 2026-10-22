@@ -22,6 +22,7 @@ struct ServiceDeps {
     IIntentEngine* eng = nullptr;
     std::function<RefId(PlayerId)> puppetOf;           // plugin/avatar: the puppet that stands for a remote player
     std::function<RefId(PlayerId)> ghostOf;            // NV:MP ghost, optional
+    std::function<void(PlayerId slot, ActorMode mode, RefId actor)> actorMode;   // host: the acting player of a slot changed (the module logs it)
     std::function<uint64_t()> nowMs;
     std::function<bool()> containerMenuOpen;           // guest: is the loot menu on screen
     std::function<void(const FormRef& npc)> startDialogue;                 // guest: 0xD1 request

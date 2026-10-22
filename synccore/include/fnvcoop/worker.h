@@ -13,6 +13,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include "fnvcoop/mutations.h"
 
 namespace fnvcoop {
 
@@ -63,9 +64,15 @@ void runAsync(IWorker* w, const std::shared_ptr<MainQueue>& q, Work work, Done d
     q->began();
     auto doneP = std::make_shared<Done>(std::move(done));
     auto workP = std::make_shared<Work>(std::move(work));
-    w->post([q, doneP, workP]() {
+    // The completion is queued ON q and only ever runs inside q's drain(), so it must not own q: a strong capture is a reference cycle
+    // (q -> its queue -> the closure -> q) and a session destroyed while a result is still queued leaked the queue and the result.
+    // Only the job posted to the worker holds q strongly (it keeps q alive until the completion is queued); the completion gets a raw pointer.
+    const bool holdQueue = mutations().asyncDoneHoldsQueue;   // test twin: the old, cyclic capture
+    w->post([q, doneP, workP, holdQueue]() {
         auto r = std::make_shared<R>((*workP)());
-        q->push([q, doneP, r]() { (*doneP)(std::move(*r)); q->finished(); });
+        MainQueue* raw = q.get();
+        std::shared_ptr<MainQueue> cycle = holdQueue ? q : nullptr;
+        q->push([raw, cycle, doneP, r]() { (*doneP)(std::move(*r)); raw->finished(); });
     });
 }
 

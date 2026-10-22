@@ -364,8 +364,14 @@ struct RefCommand {
     float f = 0;
     std::string s;   // a text argument (PlayIdle's idle name): at most 255 characters on the wire
     Recipient to;
+    // Second shape (refOpIsWide, refop.h): a command with more parameters than the slots above. UseWeapon has four forms and five integers, so a
+    // wide op also carries the forms `c` / `d` and the integer `m` (forms a b c d, integers i j k l m). They travel only for wide ops: every other
+    // op's bytes are unchanged, and the decoder rejects nothing for them.
+    FormRef c, d;
+    int32_t m = 0;
     bool operator==(const RefCommand& o) const {
-        return op == o.op && ref == o.ref && a == o.a && b == o.b && i == o.i && j == o.j && k == o.k && l == o.l && f == o.f && s == o.s && to == o.to;
+        return op == o.op && ref == o.ref && a == o.a && b == o.b && i == o.i && j == o.j && k == o.k && l == o.l && f == o.f && s == o.s && to == o.to &&
+               c == o.c && d == o.d && m == o.m;
     }
 };
 

@@ -199,8 +199,9 @@ Parallel pairs
 - Two `run_parallel` runs on the same pairs at once are not prevented.
 
 Diagnosis
-- The expression `player.GetEquippedObject 5` (the "nothing equipped" diagnosis) is unverified. If the game rejects it, that text is
-  left out of the failure.
+- The expression `(player.GetEquippedObject 5) && 1` (the "nothing equipped" diagnosis) is unverified. The bare `player.GetEquippedObject 5`
+  was refused by the game (2026-10-22: "Expected variable (got Form)": printc takes a number). If the game rejects this one too, that text
+  is left out of the failure (the VATS playbook then assumes a weapon is held).
 - The inspector's `ui.status` and `coop.status` reads follow the plugin source, not a live run.
 - Ammo count is the reserve; in FNV the loaded clip is not in it, so it can stay unchanged until a reload.
 - Playbooks run with `auto_dismiss` on, so `activate`, `talk` and `activate_crosshair` now read the menu first and may press a box

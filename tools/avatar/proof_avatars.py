@@ -4,17 +4,24 @@ instances. `--selftest` runs the analysis against a scripted fake game plus inje
 
     python -I tools/avatar/proof_avatars.py --host 0 --client 1 --enemy-ref 000XXXXX         # all phases
     python -I tools/avatar/proof_avatars.py --host 0 --client 1 --phases wiring,look,rates   # some phases
+    python -I tools/avatar/proof_avatars.py --host 0 --client 1 --phases look --loadout off  # the client already holds the gear
     python -I tools/avatar/proof_avatars.py --selftest
 
 Provision two instances first (the lead starts them; this tool never launches a game and never takes the game slot):
     python -I tools/runner/run.py provision --n 2 --ini coop.enable=1 --ini live.actors=1 --ini live.avatars=1 --ini live.combat=1 --ini avatar.enabled=1 \
         --ini dev.bots=1
   Host and client in one co-op session, both in an EXTERIOR with about 120 m of free ground along +X in front of the client (the rates phase walks the
-  client away by teleport), the client holding a weapon WITH at least one modification and wearing armor; ideally a non-default height / hair.
+  client away by teleport); ideally a non-default height / hair.
+  The client's loadout (a weapon WITH a modification, and armor) is NOT a hand step any more: `--loadout auto` (the default, used when the look phase runs)
+  gives it through bridge console lines: player.additem + player.EquipItem for the armor and the weapon, then the xNVSE function
+  player.SetEquippedWeaponModFlags (NVSE Commands_Inventory.cpp, flags 0..7, one bit per mod slot) on the worn weapon, and reads every step back
+  (player.GetEquipped, player.GetEquippedWeaponModFlags, then avatar.look). `--loadout off` skips it (the client must then hold the gear already).
+  Defaults (DEFAULT_LOADOUT below) are pinned vanilla ids; override with --armor / --weapon / --weapon-mod / --mod-flags.
 
 Phases (default: all), each one judged by pure functions below:
   wiring     both machines run the avatar module, list the other player in the roster, have a puppet ref for it, accepted snapshots, nothing forged.
-  look       the Look the client sent (selfLook, avatar.look) equals what the host stored (roster[].lookInfo): race, sex, hair, eyes, hair colour, height,
+  look       (first: the loadout above is given and read back, and the client is checked to hold a modified weapon and armor.)
+             the Look the client sent (selfLook, avatar.look) equals what the host stored (roster[].lookInfo): race, sex, hair, eyes, hair colour, height,
              weight, face coefficients, worn items and weapon modification flags. Then the PUPPET on the host: wears the same items, and the weapon
              modification flags READ BACK from the engine equal the wanted ones (this is the check of the EnableWeaponMod hypothesis, reported on its own
              line); SetScale was sent when the height differs; no console exception, no foreign reference refused.
@@ -35,6 +42,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -53,6 +61,18 @@ SETTLE_S = 4.0
 HIT_DAMAGE = 5
 FAR_OFFSET = 4200.0      # game units (60 m) along +X
 PARK_WAIT_S = 4.0
+LOADOUT_WAIT_S = 12.0
+
+# The scripted loadout of the CLIENT (the look phase needs a weapon with a modification and worn armor). Every id was taken from the game data of this
+# repo, out/questdata/forms.json.gz (keys "Plugin.esm:HEX", fields sig / edid), not guessed:
+#   WEAP FalloutNV.esm:0CD539 edid WeapNVTrailCarbine        the Trail Carbine (a vanilla weapon that has a scope mod)
+#   IMOD FalloutNV.esm:0EEA70 edid ModNVTrailCarbineScope    its scope; the dump holds only 9 IMOD forms, this is the one whose name pairs with a WEAP there
+#   ARMO FalloutNV.esm:1264FE edid ArmorLeatherReinforced    reinforced leather armor
+# Why flags and not "attach the IMOD": the game has no console function that attaches an IMOD to an inventory item (the vanilla command table,
+# plugin/hooks/tools/re/command_table.json, ends at 0x1CD and has only EnableWeaponMod; the xNVSE source in third_party/NVSE has no AttachModToInventoryItem).
+# What the avatar layer syncs is the ExtraWeaponModFlags byte of the WORN weapon, and xNVSE writes exactly that byte with SetEquippedWeaponModFlags
+# (bit n-1 = mod slot n), so slot 1 (= the scope on the Trail Carbine) is flag 1. "mod" is kept for the report and for a later real IMOD attach.
+DEFAULT_LOADOUT: Dict[str, Any] = {"armor": "FalloutNV.esm:1264FE", "weapon": "FalloutNV.esm:0CD539", "mod": "FalloutNV.esm:0EEA70", "mod_flags": 1}
 
 
 # ------------------------------------------------------------------------------------------------------------------------------------------
@@ -127,6 +147,37 @@ def check_gear(source: Dict[str, Any], puppet: Dict[str, Any], engine: Dict[str,
     return out
 
 
+def form_ints(worn: Sequence[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    out: Dict[int, Dict[str, Any]] = {}
+    for w in worn:
+        try:
+            out[int(str(w.get("form", "0")), 16)] = w
+        except ValueError:
+            pass
+    return out
+
+
+def check_loadout_worn(src: Dict[str, Any], armor: int, weapon: int, flags: int) -> List[Check]:
+    """`src` = avatar.look on the client: it must hold the modified weapon and the armor the look phase is about (so the weapon-mod check of
+    check_gear cannot pass by having nothing to compare). armor / weapon are runtime form ids, flags the wanted ExtraWeaponModFlags."""
+    worn = form_ints(src.get("worn", []))
+    w = worn.get(weapon)
+    out: List[Check] = [("look: the client wears the loadout armor", armor in worn and not worn[armor].get("weapon"), f"worn {[hex(f) for f in worn]}")]
+    out.append(("look: the client holds the loadout weapon", bool(w and w.get("weapon")), f"worn {[hex(f) for f in worn]}"))
+    got = int(w.get("mods", 0)) if w else 0
+    out.append(("look: the client's weapon has the modification (avatar.look mods)", bool(w) and got == flags and got != 0, f"mods {got} wanted {flags}"))
+    return out
+
+
+def check_loadout_any(src: Dict[str, Any]) -> List[Check]:
+    """For --loadout off: the client must already hold SOME modified weapon and SOME armor."""
+    worn = list(src.get("worn", []))
+    gun = [x for x in worn if x.get("weapon") and int(x.get("mods", 0))]
+    arm = [x for x in worn if not x.get("weapon")]
+    return [("look: the client holds a weapon with a modification", bool(gun), f"worn {worn}"),
+            ("look: the client wears armor", bool(arm), f"worn {worn}")]
+
+
 def rate_hz(a: Dict[str, Any], b: Dict[str, Any], slot: int, dt: float) -> Optional[float]:
     ea, eb = roster_entry(a, slot), roster_entry(b, slot)
     if not ea or not eb or dt <= 0:
@@ -178,11 +229,22 @@ def check_hit(result: Dict[str, Any], before: Dict[str, Any], after: Dict[str, A
 # ------------------------------------------------------------------------------------------------------------------------------------------
 # driver
 # ------------------------------------------------------------------------------------------------------------------------------------------
+def eval_expr(call: Call, expr: str) -> float:
+    """An NVSE expression evaluated on a machine through the bridge `exec` (the same printc line nvbridge.eval sends)."""
+    out = str(call("exec", {"cmd": 'printc "NVCOOP_EVAL=%g" (' + expr + ')'}).get("output", ""))
+    i = out.rfind("NVCOOP_EVAL=")
+    if i < 0:
+        raise RuntimeError(f"cannot evaluate {expr!r}: {out!r}")
+    return float(out[i + 12:].split()[0])
+
+
 class Proof:
     def __init__(self, host: Call, client: Call, sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic,
                  wait_s: float = 40.0, interior: str = "", exterior: str = "", enemy_ref: str = "", save: str = "",
-                 load: Optional[Callable[[], None]] = None, host_load: Optional[Callable[[], None]] = None):
+                 load: Optional[Callable[[], None]] = None, host_load: Optional[Callable[[], None]] = None,
+                 loadout: Optional[Dict[str, Any]] = None):
         self.h, self.c, self.sleep, self.now, self.wait_s = host, client, sleep, now, wait_s
+        self.loadout = loadout            # None = --loadout off
         self.interior, self.exterior, self.enemy_ref, self.save = interior, exterior, enemy_ref, save
         self.load, self.host_load = load, host_load
         self.results: List[Check] = []
@@ -206,6 +268,69 @@ class Proof:
     def client_slot(self) -> int:
         return int(self.c("coop.live", None).get("avatars", {}).get("self", -1))
 
+    def runtime_id(self, spec: str) -> int:
+        """'Plugin.esm:HEX' -> the 32-bit runtime id on the CLIENT (load-order index in the top byte). A bare hex string is taken as it is."""
+        if ":" not in spec:
+            return int(spec, 16)
+        name, local = spec.rsplit(":", 1)
+        plugins = sorted(self.c("plugins", None).get("plugins", []), key=lambda p: p["index"])
+        for p in plugins:
+            if p["name"].lower() == name.lower():
+                return (int(p["index"]) << 24) | int(local, 16)
+        raise RuntimeError(f"plugin {name} is not loaded on the client")
+
+    def give_loadout(self) -> None:
+        """Scripted, no human: armor + a modified weapon on the CLIENT, each step read back from the engine, then from the avatar layer.
+        A failed step is a FAIL line that says which step; the look phase then fails on its own checks as well."""
+        lo = self.loadout or {}
+        flags = int(lo["mod_flags"])
+        try:
+            armor, weapon = self.runtime_id(lo["armor"]), self.runtime_id(lo["weapon"])
+        except Exception as e:  # noqa: BLE001
+            self.add([("loadout: ids resolve on the client", False, str(e))])
+            return
+
+        def step(what: str, cmd: str) -> bool:
+            r = self.c("exec", {"cmd": cmd})
+            ok = bool(r.get("ok", True))
+            if not ok:
+                self.add([(f"loadout: {what}", False, f"{cmd!r} refused: {r.get('output', '')}")])
+            return ok
+
+        def polled(expr: str, want: Callable[[float], bool]) -> Tuple[bool, float]:
+            val = [float("nan")]
+
+            def pred() -> bool:
+                try:
+                    val[0] = eval_expr(self.c, expr)
+                except Exception:  # noqa: BLE001
+                    return False
+                return want(val[0])
+            return self.wait_for(pred, LOADOUT_WAIT_S, 0.3), val[0]
+
+        for what, form in (("armor", armor), ("weapon", weapon)):
+            if eval_expr(self.c, f"player.GetItemCount {form:08X}") < 1:
+                if not step(f"{what} added to the inventory", f"player.additem {form:08X} 1"):
+                    return
+        for what, form in (("armor", armor), ("weapon", weapon)):
+            if not step(f"{what} equip line accepted", f"player.EquipItem {form:08X}"):
+                return
+            ok, v = polled(f"player.GetEquipped {form:08X}", lambda x: x != 0)
+            self.add([(f"loadout: the {what} is equipped (GetEquipped)", ok, f"GetEquipped {form:08X} = {v}")])
+        if not step("weapon mod flags line accepted", f"player.SetEquippedWeaponModFlags {flags}"):
+            return
+        ok, v = polled("player.GetEquippedWeaponModFlags", lambda x: int(x) == flags)
+        self.add([("loadout: the equipped weapon carries the modification (GetEquippedWeaponModFlags)", ok, f"read back {v} wanted {flags}")])
+        seen: Dict[str, Any] = {}
+
+        def layer() -> bool:
+            seen.clear()
+            seen.update(self.c("avatar.look", None))
+            return all(c[1] for c in check_loadout_worn(seen, armor, weapon, flags))
+        ok = self.wait_for(layer, LOADOUT_WAIT_S, 0.5)
+        self.add([("loadout: the avatar layer sees the modified weapon and the armor (avatar.look)", ok,
+                   f"worn {seen.get('worn')} wanted armor {armor:08X} weapon {weapon:08X} mods {flags}")])
+
     # ---- phases ----------------------------------------------------------------------------------------------------------------------
     def wiring(self) -> None:
         def ready() -> bool:
@@ -223,6 +348,10 @@ class Proof:
         hl, cl = self.live()
         self.add(check_look(cl.get("avatars", {}).get("selfLook"), (roster_entry(hl, slot) or {}).get("lookInfo"), "client -> host"))
         src = self.c("avatar.look", None)
+        if self.loadout:
+            self.add(check_loadout_worn(src, self.runtime_id(self.loadout["armor"]), self.runtime_id(self.loadout["weapon"]), int(self.loadout["mod_flags"])))
+        else:
+            self.add(check_loadout_any(src))
         pup = self.h("avatar.puppetlook", {"slot": slot})
         st = self.h("avatar.status", None)
         want_scale = bool(src.get("ok")) and src.get("height", 0) not in (0, 1000)
@@ -305,6 +434,8 @@ class Proof:
         self.add(check_hit(res, cb, ca, self.h("avatar.api", None), HIT_DAMAGE))
 
     def run(self, phases: Sequence[str]) -> List[Check]:
+        if self.loadout and "look" in phases:
+            self.give_loadout()
         for ph in phases:
             getattr(self, ph)()
         return self.results
@@ -330,7 +461,10 @@ class FakeGame:
     """Two machines that behave as the avatar layer should. Every defect in DEFECTS breaks exactly one promise."""
 
     DEFECTS = ("look_mismatch", "mods_not_applied", "gear_missing", "rate_ignored", "tier_wrong", "no_park", "orphan_after_load", "api_roundtrip",
-               "foreign_refused", "hit_not_forwarded", "hit_proceeds", "hit_not_received", "forged", "scale_not_applied", "no_modlines", "puppet_lost_on_client_load")
+               "foreign_refused", "hit_not_forwarded", "hit_proceeds", "hit_not_received", "forged", "scale_not_applied", "no_modlines", "puppet_lost_on_client_load",
+               # the scripted loadout (each one breaks one step of it; the look phase must report it)
+               "loadout_skipped", "additem_refused", "weapon_not_equipped", "armor_not_equipped", "modflags_refused", "modflags_not_in_layer",
+               "wrong_flags", "armor_not_in_layer")
 
     def __init__(self, defect: str = ""):
         self.d = defect
@@ -342,9 +476,12 @@ class FakeGame:
         self.hits_recv = self.hits_applied = self.dmg = 0
         self.loads = 0
         self.height = 1100
-        self.gun = 0x3A00
-        self.armor = 0x2A00
-        self.mods = 0x05
+        # the client's gear starts EMPTY: only the scripted loadout (or the defect-free default of Proof) gives it. Runtime ids = plugin index 0 + local id.
+        self.gun = 0x000CD539
+        self.armor = 0x001264FE
+        self.inv: Dict[int, int] = {}
+        self.equipped: set = set()
+        self.mods = 0
 
     # time
     def sleep(self, s: float) -> None:
@@ -373,7 +510,15 @@ class FakeGame:
     def look_info(self, stored: bool) -> Dict[str, Any]:
         h = self.height + (13 if stored and self.d == "look_mismatch" else 0)
         return {"race": 1, "female": False, "hair": 4660, "eyes": 85, "hairColor": 10531008, "height": h, "weight": 950, "faceCoeffs": 130,
-                "equip": [{"form": self.armor, "weapon": False, "mods": 0}, {"form": self.gun, "weapon": True, "mods": self.mods}]}
+                "equip": self.worn_equip()}
+
+    def worn_equip(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if self.armor in self.equipped and self.d != "armor_not_in_layer":
+            out.append({"form": self.armor, "weapon": False, "mods": 0})
+        if self.gun in self.equipped:
+            out.append({"form": self.gun, "weapon": True, "mods": 0 if self.d == "modflags_not_in_layer" else self.mods})
+        return out
 
     def avatars(self, host: bool) -> Dict[str, Any]:
         if host:
@@ -406,6 +551,40 @@ class FakeGame:
             w.append({"form": "0x%08X" % self.armor, "weapon": False, "mods": 0, "modsKnown": True})
         return w
 
+    def eval_line(self, cmd: str) -> Optional[Dict[str, Any]]:
+        m = re.match(r'printc "NVCOOP_EVAL=%g" \((.*)\)$', cmd)
+        if not m:
+            return None
+        e = m.group(1).split()
+        if e[0] == "player.GetItemCount":
+            v = self.inv.get(int(e[1], 16), 0)
+        elif e[0] == "player.GetEquipped":
+            v = 1 if int(e[1], 16) in self.equipped else 0
+        elif e[0] == "player.GetEquippedWeaponModFlags":
+            v = self.mods if self.gun in self.equipped else 0
+        else:
+            raise KeyError(cmd)
+        return {"ok": True, "output": "NVCOOP_EVAL=%g" % v}
+
+    def loadout_line(self, cmd: str) -> Optional[Dict[str, Any]]:
+        t = cmd.split()
+        if t[0] == "player.additem":
+            if self.d == "additem_refused":
+                return {"ok": False, "output": "Script command \"additem\" not found"}
+            self.inv[int(t[1], 16)] = self.inv.get(int(t[1], 16), 0) + int(t[2])
+            return {"ok": True, "output": ""}
+        if t[0] == "player.EquipItem":
+            f = int(t[1], 16)
+            refused = (f == self.gun and self.d == "weapon_not_equipped") or (f == self.armor and self.d == "armor_not_equipped")
+            if self.inv.get(f, 0) >= 1 and not refused:
+                self.equipped.add(f)
+            return {"ok": True, "output": ""}
+        if t[0] == "player.SetEquippedWeaponModFlags":
+            if self.gun in self.equipped and self.d != "modflags_refused":
+                self.mods = int(t[1]) + (2 if self.d == "wrong_flags" else 0)
+            return {"ok": True, "output": ""}
+        return None
+
     def host_call(self, method: str, params: Optional[dict] = None) -> Any:
         p = params or {}
         if method == "coop.live":
@@ -431,9 +610,10 @@ class FakeGame:
         p = params or {}
         if method == "coop.live":
             return self.live(False)
+        if method == "plugins":
+            return {"plugins": [{"name": "FalloutNV.esm", "index": 0}, {"name": "nvcoop.esp", "index": 1}]}
         if method == "avatar.look":
-            return {"ok": True, "height": self.height, "worn": [{"form": "0x%08X" % self.gun, "weapon": True, "mods": self.mods},
-                                                              {"form": "0x%08X" % self.armor, "weapon": False, "mods": 0}]}
+            return {"ok": True, "height": self.height, "worn": [{"form": "0x%08X" % w["form"], "weapon": w["weapon"], "mods": w["mods"]} for w in self.worn_equip()]}
         if method == "avatar.puppetlook":
             return {"slot": 0, "ref": "0x%08X" % self.client_puppet_of_host, "worn": []}
         if method == "avatar.status":
@@ -444,6 +624,9 @@ class FakeGame:
             return {"stats": {"hitsReceived": self.hits_recv, "hitsApplied": self.hits_applied, "damageApplied": self.dmg}}
         if method == "exec":
             cmd = p.get("cmd", "")
+            ev = self.eval_line(cmd) or self.loadout_line(cmd)
+            if ev is not None:
+                return ev
             if cmd.startswith("coc ") and "Interior" in cmd:
                 self.cell = "int"
             elif cmd.startswith("coc "):
@@ -462,7 +645,7 @@ class FakeGame:
 def run_fake(defect: str) -> List[Check]:
     g = FakeGame(defect)
     pr = Proof(g.host_call, g.client_call, sleep=g.sleep, now=g.now, wait_s=20.0, interior="GSInterior", exterior="GSExterior", enemy_ref="00112233",
-               save="s", load=g.do_load)
+               save="s", load=g.do_load, loadout=None if defect == "loadout_skipped" else dict(DEFAULT_LOADOUT))
     # the proof's own 'load' bumps the fake's counter; with a defect the host puppet changes
     results = pr.run(PHASES)
     results += [("skipped", False, s) for s in pr.skipped]
@@ -484,6 +667,19 @@ def selftest() -> int:
         print(f"defect {d:28s} {'caught by ' + str(len(caught)) + ' check(s)' if caught else 'SURVIVED'}")
         if not caught:
             bad += 1
+    # --loadout off: a client that already holds the gear passes, an empty one fails with the two precondition lines
+    for pre, want_fail in ((True, False), (False, True)):
+        g = FakeGame("")
+        if pre:
+            g.inv = {g.gun: 1, g.armor: 1}
+            g.equipped = {g.gun, g.armor}
+            g.mods = 1
+        pr = Proof(g.host_call, g.client_call, sleep=g.sleep, now=g.now, wait_s=20.0, loadout=None)
+        pr.run(("wiring", "look"))
+        failed = [c[0] for c in pr.results if not c[1]]
+        print(f"loadout off, gear {'present' if pre else 'absent '}: {'failed ' + str(len(failed)) if failed else 'passed'}")
+        if bool(failed) != want_fail:
+            bad += 1
     # pure helpers
     assert norm_equip([{"form": 2, "weapon": True, "mods": 1}, {"form": 1}]) == [(1, False, 0), (2, True, 1)]
     assert rate_hz({"avatars": {"roster": [{"slot": 1, "rx": 10}]}}, {"avatars": {"roster": [{"slot": 1, "rx": 110}]}}, 1, 5.0) == 20.0
@@ -502,10 +698,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--save", default="", help="save name (no extension) the CLIENT loads in the lifecycle phase")
     ap.add_argument("--enemy-ref", default="", help="a hostile actor the HOST owns, in hex (hits phase)")
     ap.add_argument("--wait", type=float, default=40.0)
+    ap.add_argument("--loadout", choices=("auto", "off"), default="auto",
+                    help="auto (default): give the CLIENT armor + a weapon with a modification through the bridge before the look phase; off: it must hold them already")
+    ap.add_argument("--armor", default=DEFAULT_LOADOUT["armor"], help="loadout armor, Plugin.esm:HEX (default %(default)s, ArmorLeatherReinforced)")
+    ap.add_argument("--weapon", default=DEFAULT_LOADOUT["weapon"], help="loadout weapon, Plugin.esm:HEX (default %(default)s, WeapNVTrailCarbine)")
+    ap.add_argument("--weapon-mod", default=DEFAULT_LOADOUT["mod"], help="the IMOD the flag stands for, Plugin.esm:HEX (report only; default %(default)s, ModNVTrailCarbineScope)")
+    ap.add_argument("--mod-flags", type=int, default=DEFAULT_LOADOUT["mod_flags"], help="ExtraWeaponModFlags to set on the worn weapon, 1..7 (default %(default)s = mod slot 1)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
+    if not 1 <= a.mod_flags <= 7:
+        print("--mod-flags must be 1..7 (xNVSE SetEquippedWeaponModFlags takes 0..7; 0 would remove the modification)", file=sys.stderr)
+        return 2
     phases = [p.strip() for p in a.phases.split(",") if p.strip()]
     bad = [p for p in phases if p not in PHASES]
     if bad:
@@ -513,6 +718,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     sys.path.insert(0, os.path.join(REPO, "tools", "runner"))
     from nvbridge import NvBridge  # noqa: E402
+    import nvready  # noqa: E402
     try:
         hb = NvBridge.connect(instance=a.host, wait_s=a.wait)
         cb = NvBridge.connect(instance=a.client, wait_s=a.wait)
@@ -520,10 +726,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"cannot reach the game instances: {e}", file=sys.stderr)
         return 2
     try:
+        why = nvready.wait_ready([hb, cb])   # coop.live fails with "main thread did not service the request" while a copy still boots or loads
+        if why:
+            print(f"cannot reach the game instances: {why}", file=sys.stderr)
+            return 2
         host = lambda m, p=None: hb.call(m, p or {})  # noqa: E731
         client = lambda m, p=None: cb.call(m, p or {})  # noqa: E731
+        loadout = {"armor": a.armor, "weapon": a.weapon, "mod": a.weapon_mod, "mod_flags": a.mod_flags} if a.loadout == "auto" else None
         pr = Proof(host, client, wait_s=a.wait, interior=a.interior, exterior=a.exterior, enemy_ref=a.enemy_ref, save=a.save,
-                   load=(lambda: cb.load_save(a.save)) if a.save else None)
+                   load=(lambda: cb.load_save(a.save)) if a.save else None, loadout=loadout)
         results = pr.run(phases)
         return report(results, pr.skipped)
     finally:

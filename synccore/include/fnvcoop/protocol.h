@@ -30,6 +30,9 @@ struct Hello {
     uint64_t contentHash = 0;     // plugin load-order hash (must equal the host's when wantBaseline)
     uint32_t lastEpoch = 0;       // world epoch my state belongs to (0 = none)
     HandshakeInfo hs;             // build / rules / volatile / mod list identity
+    // Appended after hs (absent from older builds = 0): hash of the client's shared shadow at lastSeq. The host resumes the cursor only if
+    // its own state at lastSeq hashes the same; epoch numbers alone do not identify a timeline across host runs (a prepared-save load).
+    uint64_t cursorCheck = 0;
 };
 constexpr uint8_t kHelloWantBaseline = 1;
 // Host -> client. If hasSnapshot, the client replaces its state with `snapshot` (applying the diff to its world).

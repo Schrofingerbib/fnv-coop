@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Run the four two-player VATS playbooks (tools/bots/playbooks/pb_vats.py, docs/tools/vats.md): gun, melee, explosive, energy.
+"""Run the two-player VATS playbooks (tools/bots/playbooks/pb_vats.py, docs/tools/vats.md): gun, melee, explosive, energy, and vats_world_moves.
 
 Game-free (the fake VATS world, what the unit tests use):
     python -I tools/bots/run_vats.py --fake
     python -I tools/bots/run_vats.py --fake --playbook vats_melee --bug vats_no_lunge          # must FAIL (exit 1)
+    python -I tools/bots/run_vats.py --fake --playbook vats_world_moves                         # the measured hand steps (clock, NPC, walking, limb)
+    python -I tools/bots/run_vats.py --fake --playbook vats_world_moves --bug vats_world_paused # must FAIL (exit 1)
     python -I tools/bots/run_vats.py --list
 
 In a game (the helper runs this; this tool never launches a game or takes the game slot). Start two co-op instances joined as one session
@@ -12,6 +14,9 @@ In a game (the helper runs this; this tool never launches a game or takes the ga
     python -I tools/bots/run_vats.py --instances 0,1 --playbook vats_gun --weapon gun=<item> --slowmo
 `<item>` is an editor id or `Plugin.esm:HEX` of a weapon of that class that the player may use. This tool deliberately has NO default: the editor ids
 were not verified, and a class test with the wrong weapon proves nothing. Every playbook starts from the scenario vats_hit (a Powder Ganger).
+The fifth playbook needs NO weapon argument and is not part of the default set (name it): it equips `--weapon any=<item>` when one is given, else it uses the weapon
+the player already holds (it fails with a clear message when there is none):
+    python -I tools/bots/run_vats.py --instances 0,1 --playbook vats_world_moves
 Afterwards: python -I plugin/vats/proof/vats_proof.py snapshot / check (docs/tools/vats.md "In-game proof").
 Exit code: 0 all pass, 1 a playbook failed, 2 usage or setup error. Nothing here has run in a game.
 """
@@ -21,6 +26,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import sys
 import time
 from typing import Any, Dict, List
@@ -52,10 +58,35 @@ def run_fake(names: List[str], players: int, bugs: set, outroot: str, opts: dict
     return results
 
 
+_HEX_REF = re.compile(r"(?:[A-Za-z0-9_ .\-]+\.(?:esm|esp):)?(?:0[xX])?[0-9A-Fa-f]{1,8}")
+
+
+def weapon_ref(item: str, edids=None) -> str:
+    """The weapon argument as a FormID the bridge console resolves: `Plugin.esm:HEX` or a bare hex id. The console does not resolve editor ids
+    (internal lane notes): "WeapNV9mmPistol" would reach `player.additem WEAPNV9MMPISTOL` (hexid() of an editor id) and make nothing, so an editor id is
+    looked up in `edids` (editor id -> `Plugin.esm:HEX`, out/questdata/forms.json.gz when it exists) or refused with the reason. Raises ValueError."""
+    item = item.strip()
+    if _HEX_REF.fullmatch(item):
+        return item
+    if edids and item in edids:
+        return edids[item]
+    raise ValueError(f"weapon {item!r} is not a FormID: pass Plugin.esm:HEX (FalloutNV.esm:0E3778 is the 9mm pistol); the bridge console cannot resolve editor ids")
+
+
+def _questdata_edids(repo: str):
+    """editor id -> `Plugin.esm:HEX` of every weapon in out/questdata/forms.json.gz (empty when the file is not there)."""
+    import gzip
+    p = os.path.join(repo, "out", "questdata", "forms.json.gz")
+    if not os.path.isfile(p):
+        return {}
+    with gzip.open(p, "rt", encoding="utf-8") as fh:
+        return {v["edid"]: k for k, v in json.load(fh).items() if v.get("sig") == "WEAP" and v.get("edid")}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list", action="store_true")
-    ap.add_argument("--playbook", default="all", help="vats_gun | vats_melee | vats_explosive | vats_energy | comma list | all")
+    ap.add_argument("--playbook", default="all", help="vats_gun | vats_melee | vats_explosive | vats_energy | vats_world_moves | comma list | all (= the four weapon classes)")
     ap.add_argument("--fake", action="store_true")
     ap.add_argument("--bug", action="append", default=[], help="(fake) a deliberate bug; the run must then fail")
     ap.add_argument("--players", type=int, default=0)
@@ -73,7 +104,7 @@ def main(argv=None) -> int:
             pb = cls()
             print(f"{n:16} {pb.weapon_class:10} scenario={pb.scenario:10} {pb.summary}")
         return 0
-    names = list(pb_vats.VATS_REGISTRY) if a.playbook == "all" else [x for x in a.playbook.split(",") if x]
+    names = list(pb_vats.VATS_CLASS_PLAYBOOKS) if a.playbook == "all" else [x for x in a.playbook.split(",") if x]
     unknown = [n for n in names if n not in pb_vats.VATS_REGISTRY]
     if unknown:
         print(f"unknown playbook(s) {unknown}; use --list", file=sys.stderr)
@@ -92,8 +123,13 @@ def main(argv=None) -> int:
                 print(f"--weapon wants CLASS=ITEM, got {w!r}", file=sys.stderr)
                 return 2
             k, v = w.split("=", 1)
-            weapons[k.strip().lower()] = v.strip()
-        missing = [pb_vats.make_vats(n).weapon_class for n in names if pb_vats.make_vats(n).weapon_class not in weapons]
+            try:
+                weapons[k.strip().lower()] = weapon_ref(v, _questdata_edids(REPO) if not _HEX_REF.fullmatch(v.strip()) else None)
+            except ValueError as e:
+                print(str(e), file=sys.stderr)
+                return 2
+        missing = [pb_vats.make_vats(n).weapon_class for n in names
+                   if pb_vats.make_vats(n).weapon_class not in weapons and pb_vats.make_vats(n).weapon_class != "any"]
         if missing:
             print(f"no weapon given for class(es) {missing}: pass --weapon <class>=<editor id or Plugin.esm:HEX> (there is no default on purpose)", file=sys.stderr)
             return 2
@@ -121,7 +157,8 @@ def main(argv=None) -> int:
                     if not a.keep_going:
                         break
                     continue
-                refs["weapon"] = weapons[pb.weapon_class]
+                if pb.weapon_class in weapons:
+                    refs["weapon"] = weapons[pb.weapon_class]
                 if a.neighbor:
                     refs["neighbor"] = a.neighbor
                 machines = [core.Machine(i, "host" if i == 0 else f"client{i}", PlaybookBot(Bot(nv, "host" if i == 0 else f"client{i}")), inst[i]) for i, nv in enumerate(nvs)]

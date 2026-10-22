@@ -19,13 +19,15 @@
 //   bot.menu.press {button}                     -> {menu,button,path}  answer the message box our ops layer is showing (consent, PNR confirm),
 //                                                  path "ui"; when it shows none and the engine's own MessageMenu (1001) is the top menu, press that
 //                                                  box's button natively: path "native", plus {value,buttons} (see pressNativeMessageButton)
+//   bot.menu.close {kind?="container"}          -> {closed,menu,kind}  close the open menu the engine's own way (CloseAllMenusCore), only when the top menu is that
+//                                                  kind ("any" = every kind a player could cancel out of, never a message box); gone from bot.menu a frame later
 //   bot.consent {answer:"ready"|"notyet"}       -> {menu,button}  answer the party-consent prompt (buttons: Ready=0, Not yet=1)
 //   bot.inventory {ref?,items?:[form]}          -> {items:[{item,count}],partial}  totals via the engine's own counting
 //   bot.say {info}                              -> {said,index,nextState}  choose that INFO in the open DialogMenu (state must be ready)
 //   bot.dialog                                  -> {choices:[{idx,info}]}  what the open dialogue offers (moves the selection like a click)
 //   bot.vats {ref,limb?} / test.vats.hit        -> {started}      tick-driven VATS job (VatsJob in bot_engine.h); progress in bot.status.vats
 //                                                  {phase,reason}, phase idle|enter|tutorial|zoom|target|queue|execute|playback|done|failed
-//   test.fasttravel {marker}                    -> {genuine:false} MoveTo the marker (a teleport that crosses cells; the real fast-travel engine call is unknown)
+//   test.fasttravel {marker}                    -> {genuine:false} MoveTo the marker (a teleport that crosses cells; bot.fasttravel is the genuine one). Needs env NVCOOP_TEST_HELPERS=1.
 //   bot.fasttravel {marker}                     -> {genuine:true,queued}  the map menu's own travel path (see fastTravel in bot_engine.h); the move happens a few frames later
 //   bot.drops {since?,base?,windowMs?}          -> {seq,drops:[{seq,ref,base,dropper}]}  what the engine's OnDrop event reported (native handler); seq is the log position
 //   dev.refsOf {base,cell?}                     -> {refs:[..],count}  the loaded, enabled refs of that base form (fallback to find a dropped ref)
@@ -60,11 +62,15 @@ struct IBotEngine {
     virtual bool moveTo(const std::string& ref, std::string* err) { (void)ref; *err = "unsupported: moveTo not wired"; return false; }
     // The engine's always-run state (alwaysRunState in bot_engine.h): 1 on, 0 off or ignored, -1 unknown.
     virtual int alwaysRun() { return -1; }
+    // test.* methods that change the world outside the game's rules (test.fasttravel teleports) run only when the game was started with the
+    // env NVCOOP_TEST_HELPERS=1, like the other test helpers of the repo. The default (tests, mocks) is on.
+    virtual bool testHelpers() { return true; }
 };
 
 // Runtime twins (FNVCOOP_MUT=<n>) for this file, every one must make tests/test_bots.cpp fail:
 //  native message box press (33, 36, 40; the others of 33..41 are in bot_engine.h):
 //  33 native path never used    36 native path tried before the UI layer    40 native reply says path "ui"
+//  test.fasttravel gate (64): the env gate is skipped (a teleport helper is open on a normal game)
 //  always-run (42, 43, 46; 44 and 45 are in bot_engine.h):
 //  42 bot.move holds Run for run:true whatever the always-run toggle is (the behaviour the first in-game run measured)
 //  43 a toggle change during a move is not followed     46 an unknown always-run state is treated as on
@@ -206,6 +212,9 @@ public:
         } else if (method == "bot.menu") {
             IEngine* g = e_.engine();
             ok = g ? menuInfo(*g, &o, &out) : (out = "unsupported: engine glue not wired", false);
+        } else if (method == "bot.menu.close") {
+            IEngine* g = e_.engine();
+            ok = g ? closeOpenMenu(*g, p.get("kind").asString(""), &o, &out) : (out = "unsupported: engine glue not wired", false);
         } else if (method == "bot.menu.press" || method == "bot.consent") {
             int button = (int)p.get("button").asInt(-1);
             if (method == "bot.consent") {
@@ -279,6 +288,7 @@ public:
             IEngine* g = e_.engine();
             ok = g ? refsOf(*g, p.get("base").asString(""), p.get("cell").asString(""), &o, &out) : (out = "unsupported: engine glue not wired", false);
         } else if (method == "test.fasttravel") {
+            if (!e_.testHelpers() && !FNV_MUT(64)) { out = "test helpers disabled (start the game with NVCOOP_TEST_HELPERS=1)"; return false; }
             ok = e_.moveTo(p.get("marker").asString(""), &out);
             if (ok) o.set("genuine", false);
         } else if (method == "dev.countRefs") {

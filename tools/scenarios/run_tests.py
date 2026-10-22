@@ -418,6 +418,28 @@ class RunnerOnFake(unittest.TestCase):
         for r in results:
             self.assertEqual(r["status"], "pass", (r["scenario"], [s for s in r["steps"] if s["status"] != "pass"]))
 
+    def test_two_player_scenario_on_one_copy_moves_only_that_copy(self):
+        """proof tests on ONE copy load goodsprings_enemies (players: 2): steps on 'all'/'guest' must not index a copy that is not there."""
+        w, clock, nvs = fakegame.make(1)
+        prime(w)
+        r = runner.Runner(nvs, runner.StateStore(), sleep=clock.sleep, now=clock.now, log=lambda *a: None, order=ORDER)
+        sc = load("goodsprings_enemies")
+        self.assertEqual(sc["players"], 2)
+        j = r.jump(sc)
+        bad = [s for s in j["setup"] if s["status"] in ("error", "blocked")]
+        self.assertEqual(bad, [], bad)
+        self.assertTrue(any(s["id"] == "players_to_gang" and s["status"] == "pass" for s in j["setup"]))
+
+    def test_check_that_needs_a_missing_player_errors_not_passes(self):
+        w, clock, nvs = fakegame.make(1)
+        prime(w)
+        r = runner.Runner(nvs, runner.StateStore(), sleep=clock.sleep, now=clock.now, log=lambda *a: None, order=ORDER)
+        sc = copy.deepcopy(load("quest_stage_sync"))
+        st = [s for s in sc["steps"] if s["op"] == "check"][0]
+        st["on"] = "guest"
+        rec = r._step(sc, st, scenlib.Resolver(sc, ORDER))
+        self.assertEqual(rec["status"], "error", rec)
+
     def test_proposed_capabilities_are_blocked_not_passed(self):
         _, results, _ = run_pair(["ownership_handoff", "save_load_rejoin"])
         for r in results:
@@ -1034,6 +1056,41 @@ class EventDrivenWaits(unittest.TestCase):
         self.assertTrue(cs["digestOk"], cs)
         self.assertEqual(cs["settleRepairs"], 1)
 
+    def test_a_heal_after_the_sync_wait_is_settled_inside_the_jump(self):
+        # A1c: the guest's late load-time scripts differ from the host only after the first sync wait (the 14 message boxes take ~50 s);
+        # the digest that finds it repaired 256 effects in the playbook's first step and its strict counters failed.
+        sim = fakegame.CoopSim(digests="mismatch_late", late_at=75.0)
+        w, clock, nvs = boxed(sim=sim)
+        j = runner_on(nvs, clock, prepared=False).jump(load("quest_stage_sync"))
+        d = nvs[0].call("coop.status")["desyncs"]["digests"]
+        self.assertEqual((d["repairs"], d["effectsRepaired"]), (1, 256), d)          # the repair happened inside the jump ...
+        self.assertTrue(j["coopSync"]["settledAfterSetup"]["digestOk"], j["coopSync"])
+        self.assertEqual(j["coopSync"]["settledAfterSetup"]["settleRepairs"], 1)
+        clock.sleep(120.0)                                                              # ... and nothing is left for the test that runs next
+        self.assertEqual(nvs[0].call("coop.status")["desyncs"]["digests"]["repairs"], 1)
+
+    def test_the_wait_ends_at_an_ok_after_the_mismatch_not_at_one_from_before_it(self):
+        # digests arrive faster than the 0.5 s poll: one poll sees ok rounds AND the mismatch. Ending there leaves the repair (256 effects,
+        # possibly deferred by the budget) unfinished for the next test; the wait must see an ok digest from after the mismatch.
+        sim = fakegame.CoopSim(digests="mismatch_late", late_at=75.0, every=0.2)
+        w, clock, nvs = boxed(sim=sim)
+        rn = runner_on(nvs, clock, prepared=False)
+        sim.on_load(clock.now() - 74.6)                    # 74.6 s since the load: ok rounds so far, the mismatch round is at 75.0
+        res = rn._wait_digest_ok(60.0, 0.5, 20.0)
+        d = nvs[0].call("coop.status")["desyncs"]["digests"]
+        ok_before = int(round((75.0 - 6.0) / 0.2))          # the rounds before the mismatch round
+        self.assertTrue(res["digestOk"], res)
+        self.assertGreater(d["ok"], ok_before, d)           # at least one ok round after the mismatch
+        self.assertEqual(res["settleRepairs"], 1)
+
+    def test_an_in_place_jump_with_nothing_to_reset_does_not_wait_again(self):
+        w, clock, nvs = boxed(sim=fakegame.CoopSim())
+        rn = runner_on(nvs, clock, prepared=False)
+        rn.jump(load("quest_stage_sync"))
+        j = rn.jump(load("quest_stage_sync"))
+        if not j["reload"] and not j["reset"] and not j["setup"]:
+            self.assertNotIn("settledAfterSetup", j["coopSync"] or {})
+
     def test_mismatches_on_changing_keys_are_not_called_the_same(self):
         _, cs = self.jump(fakegame.CoopSim(digests="mismatch_moving"))
         self.assertFalse(cs["digestOk"])
@@ -1081,6 +1138,7 @@ MUTANTS = {
     "nodirty": "scenarios never record what they changed",
     "passall": "every check passes",
     "firsthost": "every step runs only on the host",
+    "allplayers": "a step asks for every player the scenario lists, also those with no copy (IndexError on one copy)",
     "oldkey": "state key is instance@generation again (repeats after a pool restart)",
     "wholedict": "put writes the whole in-memory dict (loses keys of other processes)",
     "noreread": "the plan uses the state read at start, not the file now",
@@ -1100,6 +1158,8 @@ MUTANTS = {
     "nobridgeid": "instance ids come from the key only (pair 1 would use the prepared saves of instances 0 and 1)",
     "directpos": "prepare_save --direct records instances by position, not by the ids given (pair 1 would write into instances 0 and 1)",
     "nostall": "the sync wait never gives up on a client that stopped (180 s)",
+    "nofinalsettle": "the jump does not wait for the first digest round after its message boxes, reset and setup steps",
+    "anyok": "the digest wait ends at any ok digest, also one from before a mismatch it saw",
 }
 
 
