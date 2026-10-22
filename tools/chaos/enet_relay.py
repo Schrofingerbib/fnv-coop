@@ -7,9 +7,10 @@ points the client processes at the relay. The loopback programs run with their o
 reordered or duplicated datagram comes from the relay. Passes (exit 0) when the host and every client finish, all digests are equal,
 and the relay saw traffic in both directions (and dropped some, for a profile with loss). Prints one line per check.
 
---twin NAME is a mutation twin: it breaks the setup on purpose and the run must then FAIL (exit 1).
-  bypass     the clients connect to the host directly: nothing crosses the relay, so the "relay saw traffic" check must fail
-  partition  the relay drops everything in both directions: the clients never join, so the run must time out
+--twin NAME is a mutation twin: it breaks the setup on purpose, and exits 0 only when the run fails BECAUSE of that breakage
+(any other failure, such as a host that never started, makes the twin exit 1):
+  bypass     the clients connect to the host directly: the session must still work and the relay must forward nothing
+  partition  the relay drops everything in both directions: it must drop datagrams as a partition and no client may finish
 """
 import argparse
 import os
@@ -76,6 +77,7 @@ def run(a):
         relay.close()
 
     problems = []
+    facts = {}
     host = read_result(tmp / "host.txt")
     clients = [read_result(tmp / ("c%d.txt" % i)) for i in range(a.clients)]
     print("profile %s: host    %s" % (a.profile, host or "(no result)"))
@@ -99,10 +101,34 @@ def run(a):
         problems.append("the relay forwarded nothing in at least one direction: the traffic did not go through it")
     if a.profile not in ("lan",) and dropped == 0:
         problems.append("profile %s dropped nothing: the impairment was not applied" % a.profile)
+    # What a twin needs to tell its own planted failure from any other one (a host that never started fails every check too).
+    facts["session_ok"] = host.startswith("OK") and all(c.startswith("OK") and field(c, "DIGEST") == digest for c in clients) and digest is not None
+    facts["no_client_ok"] = not any(c.startswith("OK") for c in clients)
+    facts["forwarded_nothing"] = all(n == 0 for n in seen.values())
+    facts["partition_drops"] = sum(s["reasons"].get("partition", 0) for s in stats.values())
     for f in tmp.glob("*"):
         f.unlink()
     tmp.rmdir()
-    return problems
+    return problems, facts
+
+
+def twin_caught(name, problems, facts):
+    """(caught, why). A twin counts as caught only by the failure it plants, not by any failure."""
+    if not problems:
+        return False, "no check failed"
+    if name == "bypass":
+        if not facts["session_ok"]:
+            return False, "the direct session itself failed, so the relay checks were never what caught it"
+        if not facts["forwarded_nothing"]:
+            return False, "the relay forwarded traffic although the clients bypassed it"
+        return True, "the session worked directly and the relay forwarded nothing"
+    if name == "partition":
+        if facts["partition_drops"] == 0:
+            return False, "the relay dropped nothing as a partition"
+        if not facts["no_client_ok"]:
+            return False, "a client finished OK through a partitioned relay"
+        return True, "the relay dropped %d datagrams as a partition and no client finished" % facts["partition_drops"]
+    raise ValueError(name)
 
 
 def main(argv=None):
@@ -119,12 +145,13 @@ def main(argv=None):
     if not os.path.exists(a.loopback):
         print("no such executable: %s" % a.loopback)
         return 2
-    problems = run(a)
+    problems, facts = run(a)
     for p in problems:
         print("FAIL: " + p)
     if a.twin:
-        print(("TWIN OK: '%s' was caught" if problems else "TWIN FAIL: '%s' went unnoticed") % a.twin)
-        return 0 if problems else 1
+        caught, why = twin_caught(a.twin, problems, facts)
+        print("TWIN %s: '%s' %s (%s)" % ("OK" if caught else "FAIL", a.twin, "was caught" if caught else "was not caught by its own failure", why))
+        return 0 if caught else 1
     print("FAIL" if problems else "PASS (%s through the relay)" % a.profile)
     return 1 if problems else 0
 

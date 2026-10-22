@@ -137,6 +137,11 @@ if(FNVCOOP_PYTHON)
   endforeach()
   add_test(NAME twin_loopback_relay_bypass    COMMAND ${FNVCOOP_PYTHON} -I ${_relay_py} --loopback $<TARGET_FILE:fnvcoop_loopback> --profile bad_wifi --twin bypass)
   add_test(NAME twin_loopback_relay_partition COMMAND ${FNVCOOP_PYTHON} -I ${_relay_py} --loopback $<TARGET_FILE:fnvcoop_loopback> --profile bad_wifi --twin partition --timeout 20)
+  # The twins must not count an unrelated failure as caught: with python itself as the "loopback" no host ever starts, so both must exit 1.
+  foreach(_t bypass partition)
+    add_test(NAME twin_loopback_relay_${_t}_needs_its_own_failure COMMAND ${FNVCOOP_PYTHON} -I ${_relay_py} --loopback ${FNVCOOP_PYTHON} --profile bad_wifi --twin ${_t} --timeout 5)
+    set_tests_properties(twin_loopback_relay_${_t}_needs_its_own_failure PROPERTIES WILL_FAIL TRUE)
+  endforeach()
 endif()
 
 # T5 chaos mirror (synccore/chaos/CMakeLists.txt)

@@ -78,7 +78,10 @@ It passes when the host and both clients finish, all digests are equal, and the 
 for a profile with loss). Options: `--profile`, `--clients`, `--txns`, `--timeout`, `--set NAME=VALUE` (override one parameter in both directions).
 ctest (synccore, needs Python): `loopback_relay_bad_wifi`, `loopback_relay_mobile_tether`, `loopback_relay_transatlantic` (about 4 s each) and two
 twins that must be caught: `twin_loopback_relay_bypass` (clients connect straight to the host: nothing crosses the relay) and
-`twin_loopback_relay_partition` (the relay drops everything: the clients never join). A twin exits 0 when it is caught, like `twin_loopback_*`.
+`twin_loopback_relay_partition` (the relay drops everything: the clients never join). A twin exits 0 when it is caught, like `twin_loopback_*`,
+and only by its own breakage: bypass needs a working direct session with nothing forwarded, partition needs partition drops and no client
+finishing. `twin_loopback_relay_{bypass,partition}_needs_its_own_failure` (WILL_FAIL) run each twin with no host at all, which must not
+count as caught.
 
 Measured on Linux (2 clients, 150 transactions, 400 to 2300 datagrams per direction): `lan`, `good_wifi`, `bad_wifi`, `mobile_tether` and
 `transatlantic` converge in 3 to 5 s with the host's digest. **`hell` does not**: both clients apply all 150 transactions and hold the host's
