@@ -191,6 +191,9 @@ class RelayIntegration(unittest.TestCase):
         try:
             cc.set_profile(str(info), profile, seed)
             c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Every echo waits in this socket until the sends are done. Linux's default receive buffer (212992 bytes, about
+            # 850 bytes per small datagram) holds only about 250 of them and drops the rest, which would read as relay loss.
+            c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
             c.settimeout(0.05)
             for i in range(n):
                 c.sendto(i.to_bytes(4, "big") + b"x" * 40, ("127.0.0.1", relay.port))

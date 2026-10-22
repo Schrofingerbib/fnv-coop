@@ -1249,6 +1249,24 @@ class ManifestSetup(unittest.TestCase):
         self.assertEqual(sc["forms"]["gang1"]["ref"], self.m["params"]["npc_ref"])
 
 
+class CrossDrive(unittest.TestCase):
+    """An instance folder on another drive than the checkout (CI: checkout on D:, temp on C:) is passed on absolute."""
+    def other_drive(self, p, start=None):
+        raise ValueError("path is on mount 'C:', start on mount 'D:'")
+
+    def test_an_instance_dir_on_another_drive_is_passed_absolute(self):
+        real = os.path.relpath
+        prove.os.path.relpath = self.other_drive
+        try:
+            got = prove.rel_or_abs(Path("/elsewhere") / "fnv-instances" / "0")
+        finally:
+            prove.os.path.relpath = real
+        self.assertEqual(got, (Path("/elsewhere") / "fnv-instances" / "0").as_posix())
+
+    def test_an_instance_dir_inside_the_checkout_stays_relative(self):
+        self.assertEqual(prove.rel_or_abs(ROOT / "out" / "inst" / "0"), "out/inst/0")
+
+
 class RealFakeWorld(unittest.TestCase):
     """prove.py --fake on the existing fake co-op world: a clean fight passes, the double_damage bug is classified SYNC."""
 
