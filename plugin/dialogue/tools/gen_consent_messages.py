@@ -15,8 +15,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, '..', '..', '..'))
 sys.path.insert(0, os.path.join(ROOT, 'tools', 'questdata'))
 import esm  # noqa: E402
+import extract  # noqa: E402
 
-DEFAULT_DATA = r'C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas\Data'
+DEFAULT_DATA = extract.DEFAULT_DATA      # found by install discovery, so regional/PCR installs work too
 PLUGINS = ['FalloutNV.esm', 'DeadMoney.esm', 'HonestHearts.esm', 'OldWorldBlues.esm', 'LonesomeRoad.esm']
 PREFIX = 'VEndGameWarningMsg'
 YES = re.compile(r"(?i)^(yes|continue|proceed|begin|go|ok|okay|i am sure|sure|start|let'?s do this)")

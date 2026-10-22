@@ -103,18 +103,6 @@ SUITES = [
 
 import re
 
-# Public export: suites that need your own game install or generated game data skip with a reason instead of failing.
-def _data(*parts):
-    return (ROOT.joinpath(*parts)).exists()
-
-
-NEEDS = {
-    "L6 nvmp sigs (pinned 9.4)": (lambda: _data("third_party", "nvmp", "nvmp", "client.dll"),
-                                  "needs your own NV:MP 9.4 client.dll under third_party/nvmp/nvmp/"),
-    "L8 dialogue": (lambda: _data("out", "questdata", "risk.json"),
-                    "needs out/questdata (python -I tools/questdata/run_all.py) and an MSVC x86 toolchain"),
-}
-
 MUTANT = os.environ.get("TEST_ALL_MUTANT", "")
 WINDOWS = sys.platform == "win32"   # MSVC and the build scripts (vcvars, build_l1.cmd) exist on Windows only
 
@@ -357,9 +345,12 @@ def main() -> int:
             failed.append(name)
             continue
         need = NEEDS.get(name)
-        if need and not need[0]():
-            print(f"SKIP {name}: {need[1]}")
-            continue
+        if need:
+            # Same check decide() already did, but re-read the files: a suite may have been
+            # un-skipped above, and missing_data() is the one that knows the file-list form.
+            if missing_data(name):
+                print(f"SKIP {name}: {need[1]}")
+                continue
         t0 = time.time()
         p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, errors="replace")
         out = p.stdout + p.stderr
