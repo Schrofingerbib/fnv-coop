@@ -123,6 +123,14 @@ if(FNVCOOP_PYTHON)
   add_test(NAME drift_effect_table COMMAND ${FNVCOOP_PYTHON} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_effect_table.py --check)
   add_test(NAME twin_drift_effect_table COMMAND ${FNVCOOP_PYTHON} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_effect_table.py --check --mutate)
   set_tests_properties(twin_drift_effect_table PROPERTIES WILL_FAIL TRUE)
+  # The real ENet transport and the session protocol through the UDP chaos relay (tools/chaos), seeded profiles, two clients, 150 txns.
+  # 'hell' is not gated: see docs/tools/T5-chaos.md ("Through the relay"). A twin passes (exit 0) when its deliberate breakage is caught.
+  set(_relay_py ${CMAKE_CURRENT_SOURCE_DIR}/../tools/chaos/enet_relay.py)
+  foreach(_p bad_wifi mobile_tether transatlantic)
+    add_test(NAME loopback_relay_${_p} COMMAND ${FNVCOOP_PYTHON} -I ${_relay_py} --loopback $<TARGET_FILE:fnvcoop_loopback> --profile ${_p})
+  endforeach()
+  add_test(NAME twin_loopback_relay_bypass    COMMAND ${FNVCOOP_PYTHON} -I ${_relay_py} --loopback $<TARGET_FILE:fnvcoop_loopback> --profile bad_wifi --twin bypass)
+  add_test(NAME twin_loopback_relay_partition COMMAND ${FNVCOOP_PYTHON} -I ${_relay_py} --loopback $<TARGET_FILE:fnvcoop_loopback> --profile bad_wifi --twin partition --timeout 20)
 endif()
 
 # T5 chaos mirror (synccore/chaos/CMakeLists.txt)
@@ -161,7 +169,8 @@ if(COMMAND fnvcoop_pch)
 endif()
 
 # ctest -j: timing-sensitive tests run alone, everything else (about 150 twin tests of a few seconds each) can overlap.
-foreach(_t unit_perf twin_perf_regression_still_fails soak_smoke soak_smoke_threaded loopback_clean loopback_faults loopback_unreliable)
+foreach(_t unit_perf twin_perf_regression_still_fails soak_smoke soak_smoke_threaded loopback_clean loopback_faults loopback_unreliable
+        loopback_relay_bad_wifi loopback_relay_mobile_tether loopback_relay_transatlantic twin_loopback_relay_bypass twin_loopback_relay_partition)
   if(TEST ${_t})
     set_tests_properties(${_t} PROPERTIES RUN_SERIAL TRUE)
   endif()
