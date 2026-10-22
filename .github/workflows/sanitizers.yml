@@ -95,12 +95,22 @@ jobs:
       - name: Seed base
         # PRs and pushes use the same seeds every time (a red run can be reproduced exactly). The weekly run moves to a new block
         # each week; the seed it used is printed, and `fnvcoop_simfuzz --target em --seed N --count 1` replays one session.
+        # The manual inputs arrive as environment variables (never pasted into the script) and must be positive integers: a count
+        # of 0 or text would run no session and still pass.
+        env:
+          IN_SEED_BASE: ${{ github.event.inputs.seed_base }}
+          IN_COUNT: ${{ github.event.inputs.count }}
+          EVENT: ${{ github.event_name }}
         run: |
-          if [ -n "${{ github.event.inputs.seed_base }}" ]; then base="${{ github.event.inputs.seed_base }}"
-          elif [ "${{ github.event_name }}" = schedule ]; then base=$(( $(date +%s) / 604800 * 100000 + 1 ))
+          set -u
+          positive() { [[ "$2" =~ ^[1-9][0-9]{0,9}$ ]] || { echo "::error::$1 must be a positive integer, got '$2'"; exit 1; }; }
+          if [ -n "$IN_SEED_BASE" ]; then positive seed_base "$IN_SEED_BASE"; base="$IN_SEED_BASE"
+          elif [ "$EVENT" = schedule ]; then base=$(( $(date +%s) / 604800 * 100000 + 1 ))
           else base=1; fi
+          count="${IN_COUNT:-300}"; positive count "$count"
+          echo "SEED_BASE=$base (count $count)"
           echo "SEED_BASE=$base" >> "$GITHUB_ENV"
-          echo "COUNT=${{ github.event.inputs.count || 300 }}" >> "$GITHUB_ENV"
+          echo "COUNT=$count" >> "$GITHUB_ENV"
       - name: Configure (fuzzer, em and mini targets)
         run: >
           cmake -S synccore/fuzz -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
