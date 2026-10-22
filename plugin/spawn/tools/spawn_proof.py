@@ -5,7 +5,7 @@ NOT RUN by the lane that wrote it (code only). The helper runs it on a PC where 
 session (host = instance 0), standing within about 500 units of each other in the same exterior cell, with nvcoop built with
 NVCOOP_WITH_SPAWN and the wiring in plugin/spawn/spawn_glue.h done (docs/tools/spawn-arb.md, "In-game proof").
 
-    python -I plugin/spawn/tools/spawn_proof.py --instances 0 1 [2] [--base RadRoach] [--type 60] [--respawn]
+    python -I plugin/spawn/tools/spawn_proof.py --instances 0 1 [2] [--base 0001CF7C] [--type 60] [--respawn]
     python -I plugin/spawn/tools/spawn_proof.py --selftest          # game-free: the script's own pass / fail logic against a fake world
 
 How the encounter is made: the console command  player.PlaceAtMe <base> 1  on a CLIENT makes a dynamic actor nobody announced, which is
@@ -26,10 +26,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+# The base is a hex FormID, never an editor id: the bridge's console does not resolve editor ids (internal lane notes), and FalloutNV.esm has no
+# creature with the EditorID "RadRoach" anyway (the radroach is CrRadroach, 0001CF7C). The sweep of 2026-10-22 rolled "RadRoach": the line made
+# nothing on any copy and step 2 read "exactly one more actor (saw [0, 0, 0])".
+DEFAULT_BASE = "0001CF7C"
+_HEX = re.compile(r"^[0-9A-Fa-f]{1,8}$")
+
+
+def base_problem(base: str) -> Optional[str]:
+    if _HEX.match(str(base)):
+        return None
+    return (f"--base {base!r} is not a hex FormID: the bridge console does not resolve editor ids, so the roll would make nothing "
+            f"(radroach = {DEFAULT_BASE}, CrRadroach in FalloutNV.esm)")
+
 
 SETTLE_S = 8.0          # a roll needs: scan (<=0.5 s) + settle 0.5 s + round trip + SpawnRef creation
 DEATH_SETTLE_S = 4.0
@@ -44,6 +59,7 @@ class Proof:
         self.log = log
         self.failures: List[str] = []
         self.passes = 0
+        self.roll_errors: List[str] = []
 
     # ---- helpers ----
     def check(self, ok: bool, what: str, seen: Any = None) -> bool:
@@ -69,7 +85,9 @@ class Proof:
         return [len(self.actors(nv)) for nv in self.nvs]
 
     def roll(self, idx: int) -> None:
-        self.nvs[idx].exec(f"player.PlaceAtMe {self.base} 1")
+        r = self.nvs[idx].exec(f"player.PlaceAtMe {self.base} 1")
+        if isinstance(r, dict) and not r.get("ok", True):       # a refused line used to be dropped here, and the step only said "saw [0, 0, 0]"
+            self.roll_errors.append(f"instance {idx}: {r.get('output') or 'refused'}")
 
     def states(self) -> List[Dict[int, Dict[str, Any]]]:
         return [self.sites(nv) for nv in self.nvs]
@@ -95,6 +113,7 @@ class Proof:
         before_sites = self.states()
         self.roll(1)
         self.sleep(SETTLE_S)
+        self.check(not self.roll_errors, "the game accepted the roll command (player.PlaceAtMe)", self.roll_errors)
         after = self.counts()
         deltas = [a - b for a, b in zip(after, before_counts)]
         self.check(all(d == 1 for d in deltas), "every instance has exactly one more actor", deltas)
@@ -206,6 +225,9 @@ class FakeNv:
 
     def exec(self, cmd: str, ref: Optional[str] = None) -> Dict[str, Any]:
         if cmd.lower().startswith("player.placeatme"):
+            base = cmd.split()[1] if len(cmd.split()) > 1 else ""
+            if base_problem(base):          # like the real console through the bridge: an editor id does not resolve and nothing is placed
+                return {"ok": False, "output": f"Script command 'PlaceAtMe' cannot resolve form '{base}'"}
             self.w.rolls.append((self.i, self.w.t))
         elif cmd == "Kill" and ref:
             self.w.kill(ref)
@@ -292,7 +314,7 @@ def selftest() -> int:
         w = FakeWorld(3, arbitrate)
         nvs = [FakeNv(w, i) for i in range(3)]
         lines: List[str] = []
-        p = Proof(nvs, w.sleep, 0x3B, "RadRoach", log=lines.append)
+        p = Proof(nvs, w.sleep, 0x3B, DEFAULT_BASE, log=lines.append)
         rc = p.run(respawn=True)
         passed = rc == 0
         # fake created ids carry the 0xFF prefix, as the real ones do
@@ -303,13 +325,26 @@ def selftest() -> int:
     # the failing world must fail for the right reason: the step that counts actors per instance
     w = FakeWorld(3, False)
     nvs = [FakeNv(w, i) for i in range(3)]
-    p = Proof(nvs, w.sleep, 0x3B, "RadRoach", log=lambda s: None)
+    p = Proof(nvs, w.sleep, 0x3B, DEFAULT_BASE, log=lambda s: None)
     p.run(respawn=False)
     if "every instance has exactly one more actor" not in p.failures:
         print("selftest: the duplicating world was not caught by the 'exactly one more actor' check")
         ok = False
     else:
         print("selftest: the duplicating world is caught by the per-instance actor count")
+    # an editor id as the base (the sweep of 2026-10-22: "RadRoach"): the game refuses the roll, and the script must say THAT, not only "saw [0, 0, 0]"
+    w = FakeWorld(3, True)
+    nvs = [FakeNv(w, i) for i in range(3)]
+    p = Proof(nvs, w.sleep, 0x3B, "RadRoach", log=lambda s: None)
+    p.run(respawn=False)
+    if "the game accepted the roll command (player.PlaceAtMe)" not in p.failures:
+        print("selftest: a roll with an editor id was not reported as a refused command")
+        ok = False
+    else:
+        print("selftest: a roll with an editor id is reported as a refused command")
+    if not base_problem("RadRoach") or base_problem(DEFAULT_BASE) or base_problem("0001cf7c"):
+        print("selftest: base_problem does not tell an editor id from a hex FormID")
+        ok = False
     print("ALL OK" if ok else "SELFTEST FAILED")
     return 0 if ok else 1
 
@@ -317,13 +352,16 @@ def selftest() -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--instances", type=int, nargs="+", default=[0, 1], help="bridge instance numbers; the first is the host")
-    ap.add_argument("--base", default="RadRoach", help="console form (EditorID) of the actor the encounter makes; verify it in the console first")
+    ap.add_argument("--base", default=DEFAULT_BASE, help="hex FormID of the actor the encounter makes (default: CrRadroach); an EditorID does not resolve in the bridge console")
     ap.add_argument("--type", type=int, default=0x3C, help="form type world.actors lists (0x3B characters, 0x3C creatures)")
     ap.add_argument("--respawn", action="store_true", help="also prove the respawn step (moves the host's game time on by 4 days)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args(argv)
     if a.selftest:
         return selftest()
+    if base_problem(a.base):
+        print(base_problem(a.base), file=sys.stderr)
+        return 2
     sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools" / "runner"))
     from nvbridge import NvBridge  # noqa: E402
     nvs = [NvBridge.connect(instance=i, wait_s=10) for i in a.instances]

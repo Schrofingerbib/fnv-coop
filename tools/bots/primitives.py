@@ -43,6 +43,7 @@ M_BOT_SAY = "bot.say"          # {info: "plugin:HEX"} -> {said}
 M_BOT_MENU = "bot.menu"        # {} -> {kind: "none|dialogue|container|terminal|pipboy|...", ref?}
 M_BOT_INVENTORY = "bot.inventory"  # {ref?} -> {items:[{item, count}]}
 # in-process input driver (plugin/bots/bot_rpc.h)
+M_BOT_MENU_CLOSE = "bot.menu.close"   # {kind?="container"|"any"} -> {closed, menu, kind}: CloseAllMenusCore, only when the top menu is that kind
 M_BOT_MENU_PRESS = "bot.menu.press"   # {button} -> {menu, button, path: ui|native, value?, buttons?}
 M_BOT_PRESS = M_BOT_MENU_PRESS
 M_BOT_CONSENT = "bot.consent"          # {answer: ready|notyet}
@@ -118,7 +119,9 @@ def is_weapon_out() -> str:                   # expression: 1 while the player's
 
 
 def equipped_weapon() -> str:                 # UNVERIFIED (expression): NVSE GetEquippedObject, slot 5 = weapon; 0 = nothing equipped.
-    return "player.GetEquippedObject 5"       # Only used to explain a failure (the form id loses digits in %g, so only 0 / not 0 is read).
+    # Only used to explain a failure, only 0 / not 0 is read. The bare "player.GetEquippedObject 5" returns a Form and printc refuses it
+    # ("Invalid expression for parameter 2. Expected variable (got Form)", in game 2026-10-22): `&& 1` turns the form into a number.
+    return "(player.GetEquippedObject 5) && 1"
 
 
 def item_count(holder: str, item: str) -> Line:  # UNVERIFIED (expression); holder is "player" or the holder's ref

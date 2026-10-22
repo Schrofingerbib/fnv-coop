@@ -28,6 +28,13 @@ inline Config rigConfig() {
     c.deathGraceMs = 1500;
     c.scanMs = 500;
     c.saveGraceMs = 3000;
+    c.deleteQuietMs = 0;   // the older tests read the engine right after a removal; the quiet period has its own tests (quietRigConfig)
+    return c;
+}
+
+inline Config quietRigConfig() {
+    Config c = rigConfig();
+    c.deleteQuietMs = 750;   // the shipped default
     return c;
 }
 

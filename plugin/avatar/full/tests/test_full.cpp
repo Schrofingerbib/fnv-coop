@@ -7,7 +7,7 @@
 //   * a hit on a puppet reaches the real player's machine through the combat API (HitValidator / applyHit), exactly once
 //   * the Look v2 wire format
 // Built once with FNVCOOP_RUNTIME_MUT; run once for real and once per mutation twin (FNVCOOP_MUT=<n>, tools/mut/run_twins.py):
-//   101..104 avatar_wire.cpp   105..109 avatar_net.cpp
+//   101..104 avatar_wire.cpp   105..110 avatar_net.cpp
 // Everything here is a model of the game and the network. It proves the logic, not that the engine accepts the calls.
 #include <algorithm>
 #include <cmath>
@@ -76,6 +76,7 @@ struct CountingSide : IAvatarSide {
     void setSnapshotSink(SnapshotSink s) override { in.setSnapshotSink(std::move(s)); }
     void setEquipSink(EquipSink s) override { in.setEquipSink(std::move(s)); }
     void setLocalIdentity(live::NetId n, live::OwnerEpoch e) override { in.setLocalIdentity(n, e); }
+    void setLocalSlot(av::Slot sl) override { in.setLocalSlot(sl); }
     bool addRemote(av::Slot s, const av::Appearance& a) override { ++addRemoteCalls; return in.addRemote(s, a); }
     void removeRemote(av::Slot s) override { ++removeCalls; in.removeRemote(s); }
     bool setRemoteAppearance(av::Slot s, const av::Appearance& a) override { ++appearanceCalls; return in.setRemoteAppearance(s, a); }
@@ -158,7 +159,7 @@ struct Node {
         RuntimeConfig rc;
         rc.puppet.templates = {{1, false, kTplM}, {1, true, kTplF}};
         rc.puppet.defaultTemplate = kTplM;
-        rc.puppet.localSlot = slot;
+        // localSlot stays at the ini default 0, exactly as the shipped module has it: the session start (AvatarNet::sessionBegin) must tell the runtime its slot
         rt.reset(new AvatarRuntime(be, rc));
         inner.reset(new RuntimeSide(*rt));
         side.reset(new CountingSide(*inner));
@@ -498,6 +499,23 @@ void a_late_joiner_learns_every_look() {
 // ============================================================================================================================
 // lifecycle: join, leave, cell change, fast travel, load
 // ============================================================================================================================
+// Live game 2026-10-22 (live_wiring_all): the client's avatar runtime was created with the ini default localSlot 0 and never told its real slot, so
+// it refused the HOST's puppet as "the local slot" ("client has a puppet ref for the host" failed with ref 0 while 169 snapshots had arrived).
+void a_client_gets_the_hosts_puppet_whatever_the_ini_local_slot_says() {
+    g_test = "a_client_gets_the_hosts_puppet_whatever_the_ini_local_slot_says";
+    Rig r;
+    Node& h = r.host();
+    Node& a = r.addClient(1);
+    Node& b = r.addClient(2);
+    CHECK(a.rt->manager().LocalSlot() == 0 && b.rt->manager().LocalSlot() == 0);   // the ini default: wrong for a client until the session says so
+    r.run(3500);
+    CHECK(a.rt->manager().LocalSlot() == 1 && b.rt->manager().LocalSlot() == 2 && h.rt->manager().LocalSlot() == 0);
+    CHECK(a.puppet(0) != nullptr && b.puppet(0) != nullptr);            // the host's puppet, on every client
+    CHECK(h.puppet(1) != nullptr && h.puppet(2) != nullptr && a.puppet(2) != nullptr && b.puppet(1) != nullptr);
+    CHECK(a.puppet(1) == nullptr && b.puppet(2) == nullptr);            // nobody gets a puppet of himself
+    CHECK(h.actors() == 2 && a.actors() == 2 && b.actors() == 2);
+}
+
 void lifecycle_end_to_end() {
     g_test = "lifecycle_end_to_end";
     Rig r(true);
@@ -962,7 +980,7 @@ const TestCase kTests[] = {
     T(wire_look_v2_roundtrip_and_rejections), T(planner_tiers_hysteresis_and_pending),
     T(rates_near_far_and_out), T(uplink_follows_the_highest_tier), T(elsewhere_trickles_and_comes_back), T(last_position_is_never_lost_behind_the_rate),
     T(look_travels_and_applies_in_place), T(a_late_joiner_learns_every_look),
-    T(lifecycle_end_to_end), T(client_load_and_link_loss), T(hits_on_a_puppet_reach_the_real_player), T(status_json_contract),
+    T(a_client_gets_the_hosts_puppet_whatever_the_ini_local_slot_says), T(lifecycle_end_to_end), T(client_load_and_link_loss), T(hits_on_a_puppet_reach_the_real_player), T(status_json_contract),
 };
 
 }  // namespace

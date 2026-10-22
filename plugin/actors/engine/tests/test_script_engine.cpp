@@ -116,10 +116,18 @@ TEST(script_engine, actor_values_use_the_console_names_and_unknown_ones_run_noth
     CHECK(e.forceAv(0x10, kAvRightLeg, 12));
     CHECK(!e.forceAv(0x10, 99, 1));
     CHECK(h.lines.size() == 3);
-    CHECK(h.lines[0] == "ForceActorValue Health 85.40@00000010");
-    CHECK(h.lines[1] == "ForceActorValue PerceptionCondition 0.00@00000010");
-    CHECK(h.lines[2] == "ForceActorValue RightMobilityCondition 12.00@00000010");
+    CHECK(h.lines[0] == "ForceActorValue Health 85@00000010");
+    CHECK(h.lines[1] == "ForceActorValue PerceptionCondition 0@00000010");
+    CHECK(h.lines[2] == "ForceActorValue RightMobilityCondition 12@00000010");
     for (uint8_t av : watchedAvs()) CHECK_MSG(avConsoleName(av) != nullptr, std::to_string(av));
+}
+
+TEST(script_engine, an_amount_is_a_whole_number_the_console_can_compile) {
+    // game 2026-10-22: "ForceActorValue Health 30.00" prints "Unknown variable '30.00' for parameter Amount" and changes nothing.
+    CHECK(lines::forceAv("Health", 30.0f) == "ForceActorValue Health 30");
+    CHECK(lines::forceAv("Health", 29.6f) == "ForceActorValue Health 30");
+    CHECK(lines::forceAv("Health", 0.0f) == "ForceActorValue Health 0");
+    CHECK(lines::forceAv("Fatigue", 210.2f).find('.') == std::string::npos);
 }
 
 TEST(script_engine, refused_lines_are_counted) {

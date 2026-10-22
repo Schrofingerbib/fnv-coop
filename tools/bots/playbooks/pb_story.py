@@ -7,6 +7,7 @@ from . import goodsprings_plan as GP
 from . import probe as P
 from .core import Ctx, Machine, Playbook, StepFailure
 from .fakecoop import FakeCoop
+from .pb_combat import goto_or_teleport
 
 PNR_Q, PNR_STAGE = "FalloutNV.esm:E00001", 30
 SYNC_Q = "FalloutNV.esm:E00002"
@@ -76,7 +77,8 @@ class PnrVotePlaybook(Playbook):
             ctx.wait_until("every other player has a Ready / Not yet prompt", seen, timeout_s=timeout)
 
         with ctx.step("ready check: everybody stands at the NPC, quest is at the start stage"):
-            for n_, r in ctx.on_all(lambda m: m.bot.goto_ref(moore, 150)).items():
+            # placement only: the checks come after. In game 2026-10-22 client1 stood still 220 (then 608) units from the patrolling NPC
+            for n_, r in ctx.on_all(lambda m: goto_or_teleport(ctx, m, moore, 150)).items():
                 ctx.must(r, f"{n_} walks to the NPC")
             ctx.same_everywhere("quest stage", lambda m: P.quest_stage(m.bot, q))
             ctx.expect(P.quest_stage(host.bot, q) == s_from, f"quest should be at stage {s_from}")

@@ -146,6 +146,17 @@ struct FakeGame : nvbots::IEngine {
         return clickOk;
     }
 
+    // ---- bot.menu.close: CloseAllMenusCore empties the menu stack (the top menu id reads 0 afterwards)
+    bool closeOk = true;
+    int closeAllCalls = 0;
+    bool closeAllMenus() override {
+        ++closeAllCalls;
+        calls.push_back("closeallmenus");
+        if (!closeOk) return false;
+        topId = 0;
+        return true;
+    }
+
     // ---- bot.vats: the engine side. vatsFrame() plays one game frame: the camera (enter, zoom 1 -> 3 -> 2, playback 4 -> 0) and
     // VATSMenu::Update (returns at once while TutorialMenu is open; asks the attack-button test, which the live detour answers from the gate).
     static constexpr Addr32 kVatsPart = 0x35100000, kTutorialTile = 0x35200000;

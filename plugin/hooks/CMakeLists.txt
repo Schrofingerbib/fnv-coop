@@ -39,7 +39,7 @@ endif()
 
 # ---- game-free core: prologue-checked patcher + capture hub (+ mutant twin) ----
 foreach(v "" _mutant)
-  add_library(nvcoop_hooks_core${v} STATIC ${NVH_DIR}/hook_patch.cpp ${NVH_DIR}/capture_hub.cpp ${NVH_DIR}/effect_json.cpp ${NVH_DIR}/suppress_policy.cpp ${NVH_DIR}/change_tracker.cpp ${NVH_DIR}/apply_lines.cpp ${NVH_DIR}/inventory_diff.cpp ${NVH_DIR}/guest_local_run.cpp ${NVH_DIR}/party_cond.cpp)
+  add_library(nvcoop_hooks_core${v} STATIC ${NVH_DIR}/hook_patch.cpp ${NVH_DIR}/capture_hub.cpp ${NVH_DIR}/effect_json.cpp ${NVH_DIR}/suppress_policy.cpp ${NVH_DIR}/change_tracker.cpp ${NVH_DIR}/apply_lines.cpp ${NVH_DIR}/inventory_diff.cpp ${NVH_DIR}/guest_local_run.cpp ${NVH_DIR}/guest_objvars.cpp ${NVH_DIR}/party_cond.cpp)
   target_include_directories(nvcoop_hooks_core${v} PUBLIC ${NVH_DIR} ${NVH_DIR}/.. ${NVH_SYNCCORE_INC})
   nvh_flags(nvcoop_hooks_core${v})
   if(COMMAND fnvcoop_pch)
@@ -63,6 +63,28 @@ enable_testing()
 add_test(NAME hooks_unit COMMAND nvcoop_hooks_tests)
 add_test(NAME hooks_unit_mutation_twin COMMAND nvcoop_hooks_tests_mutant)
 set_tests_properties(hooks_unit_mutation_twin PROPERTIES WILL_FAIL TRUE)
+
+# ---- hook chaining twins (hook_patch.cpp rule 4), one at a time: NVHOOKS_CHAIN_MUT=<n> picks the broken variant at run time.
+# Only this test copy compiles them in (NVHOOKS_CHAIN_TWINS); the plugin and every other build get chainMut() == 0. ----
+if(NOT TARGET nvcoop_hooks_core_twins AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_LIST_DIR)
+  add_library(nvcoop_hooks_core_twins STATIC ${NVH_DIR}/hook_patch.cpp ${NVH_DIR}/capture_hub.cpp ${NVH_DIR}/effect_json.cpp ${NVH_DIR}/suppress_policy.cpp ${NVH_DIR}/change_tracker.cpp ${NVH_DIR}/apply_lines.cpp ${NVH_DIR}/inventory_diff.cpp ${NVH_DIR}/guest_local_run.cpp ${NVH_DIR}/guest_objvars.cpp ${NVH_DIR}/party_cond.cpp)
+  target_include_directories(nvcoop_hooks_core_twins PUBLIC ${NVH_DIR} ${NVH_DIR}/.. ${NVH_SYNCCORE_INC})
+  target_compile_definitions(nvcoop_hooks_core_twins PUBLIC NVHOOKS_CHAIN_TWINS=1)   # PUBLIC: extract_pad.h twin 4 lives in the test TU
+  nvh_flags(nvcoop_hooks_core_twins)
+  add_executable(nvcoop_hooks_tests_chaintwins ${NVH_DIR}/tests/test_hooks.cpp)
+  target_link_libraries(nvcoop_hooks_tests_chaintwins PRIVATE nvcoop_hooks_core_twins nvh_synccore)
+  target_compile_definitions(nvcoop_hooks_tests_chaintwins PRIVATE NVH_DATA_DIR="${NVH_DIR}/data" NVH_RULES_JSON="${NVH_DIR}/../../docs/quest-policies/rules.json")
+  nvh_flags(nvcoop_hooks_tests_chaintwins)
+  set_target_properties(nvcoop_hooks_tests_chaintwins PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/hooks_tests")
+  foreach(cfg _DEBUG _RELEASE _RELWITHDEBINFO _MINSIZEREL)
+    set_target_properties(nvcoop_hooks_tests_chaintwins PROPERTIES RUNTIME_OUTPUT_DIRECTORY${cfg} "${CMAKE_BINARY_DIR}/hooks_tests")
+  endforeach()
+  add_test(NAME hooks_chain_real COMMAND nvcoop_hooks_tests_chaintwins)
+  foreach(n 1 2 3 4)   # 4 = extract_pad.h without padding
+    add_test(NAME hooks_chain_twin${n} COMMAND nvcoop_hooks_tests_chaintwins)
+    set_tests_properties(hooks_chain_twin${n} PROPERTIES WILL_FAIL TRUE ENVIRONMENT "NVHOOKS_CHAIN_MUT=${n}")
+  endforeach()
+endif()
 
 # ---- story-capture (docs/tools/story-capture.md): the RefCommand op table, its console-line builder and the capture decoder. Game-free. Twins are
 # RUNTIME-switchable (tools/mut/fnvcoop_mut.h, FNVCOOP_MUT=<n>): the test binary links the _rt copy; the game glue (nvcoop_hooks_game) compiles

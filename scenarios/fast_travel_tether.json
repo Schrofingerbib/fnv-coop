@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "fast_travel_tether",
   "title": "Fast-travel tether",
-  "description": "The host fast travels from Goodsprings to Novac while the guest stays behind. With party consent the guest must be pulled to the same place; out of combat only. The fast travel step needs the proposed bridge method test.fasttravel and is blocked until it exists. How consent is given in the test is unknown and not modeled here.",
+  "description": "The host fast travels from Goodsprings to Novac while the guest stays behind. With party consent the guest must be pulled to the same place; out of combat only. The fast travel step uses the bridge method test.fasttravel (a MoveTo teleport, needs the game started with NVCOOP_TEST_HELPERS=1); the playbook of the same name uses the genuine bot.fasttravel. Consent is given by the playbook (bot.consent), not by this scenario.",
   "players": 2,
   "tags": [
     "travel",

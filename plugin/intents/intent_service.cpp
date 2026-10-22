@@ -48,6 +48,7 @@ void IntentService::begin(nvcoop::coop::Runtime* rt, fnvcoop::MuxTransport* mux,
         hd.nowMs = deps_.nowMs;
         hd.puppetOf = deps_.puppetOf;
         hd.ghostOf = deps_.ghostOf;
+        hd.actorMode = deps_.actorMode;
         hd.dialogueStart = deps_.hostDialogue;
         hd.allowActivation = deps_.allowActivation;
         hd.interacted = deps_.interacted;
@@ -131,9 +132,12 @@ uint64_t IntentService::runDialogueResult(const fnvcoop_dlg::ResultRequest& rq) 
     RefId actor = kHostPlayerRef;
     if (slot != kHostPlayer) {
         RefId p = deps_.puppetOf ? deps_.puppetOf(slot) : 0;
-        if (!p && deps_.ghostOf) p = deps_.ghostOf(slot);
+        ActorMode mode = ActorMode::Puppet;
+        if (!p && deps_.ghostOf) { p = deps_.ghostOf(slot); mode = ActorMode::Ghost; }
         if (p) actor = p;
         else if (!cfg_.standIn || cfg_.requirePuppet) { ++dlgStats_.refused; return 0; }   // no stand-in allowed: the script does not run for a stranger
+        else mode = ActorMode::StandIn;
+        if (host_) host_->noteActor(slot, mode, actor);
     } else {
         ++dlgStats_.asHost;
     }

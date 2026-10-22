@@ -716,6 +716,8 @@ std::vector<Body> sampleBodies() {
     v.push_back(sf2);
     MAnimEvent ae; ae.id = 7; ae.epoch = 3; ae.eventId = 0x0100000000000011ull; ae.payload = Bytes{1, 2, 3, 4, 5};
     v.push_back(ae);
+    MInventory iv; iv.id = 7; iv.epoch = 3; iv.eventId = 0x0100000000000012ull; iv.items = {{refOf(0x15169), 2}, {refOf(0x8ED03), 300}};
+    v.push_back(iv);
     return v;
 }
 
@@ -764,7 +766,88 @@ std::string scnAnimEvents() {
     if (got[0].size() != 1 || got[2].size() != 1) return fail("an event of an old epoch was delivered", r);
     return r.errors.empty() ? "" : r.errors[0];
 }
+
+// ---- inventory: the owner's AI uses an item, every other copy loses it too ---------------------------------------------------------------
+// corpse_loot_race, game 2026-10-22: the ganger drank a Stimpak on the owner's machine; host 2 Stimpaks, client 3, before anyone looted.
+std::string scnInventory() {
+    Rig r(3);
+    const FormRef stim = refOf(0x15169), ammo = refOf(0x8ED03);
+    r.addActor(101, 3, V(1000), false, ~0u, 30, 0);
+    r.setPose(0, 8, V(0)); r.setPose(1, 3, V(1200)); r.setPose(2, 3, V(2500));
+    for (auto& mc : r.m) { mc->eng.a[101].inv[stim] = 3; mc->eng.a[101].inv[ammo] = 40; }
+    r.run(1500);
+    if (r.host().sync->ownerOf(101).owner != 1) return fail("setup: client 1 should own", r);
+    for (auto& mc : r.m) if (mc->sync->stats().invPublished != 0 || mc->eng.a[101].invWrites != 0) return fail("equal worlds sent or wrote an inventory on machine " + std::to_string(mc->slot), r);
+    // 1. the owner's AI drinks a Stimpak: not at once (it must stay the same for a moment), then on every other machine
+    r.at(1).eng.a[101].inv[stim] = 2;
+    r.run(400);
+    for (int i : {0, 2}) if (r.at(i).eng.a[101].inv[stim] != 3) return fail("the list was published before it settled (machine " + std::to_string(i) + ")", r);
+    r.run(2000);
+    for (int i : {0, 2}) {
+        if (r.at(i).eng.a[101].inv[stim] != 2) return fail("machine " + std::to_string(i) + " still has " + std::to_string(r.at(i).eng.a[101].inv[stim]) + " Stimpaks after the owner used one", r);
+        if (r.at(i).eng.a[101].inv[ammo] != 40) return fail("an item the owner did not touch changed on machine " + std::to_string(i), r);
+        if (r.at(i).eng.a[101].invWrites != 1) return fail("machine " + std::to_string(i) + " wrote the inventory " + std::to_string(r.at(i).eng.a[101].invWrites) + " times (once)", r);
+    }
+    if (r.at(1).eng.a[101].invWrites != 0 || r.at(1).eng.a[101].inv[stim] != 2) return fail("the owner's own inventory was written", r);
+    if (r.at(1).sync->stats().invPublished != 1) return fail("the owner published " + std::to_string(r.at(1).sync->stats().invPublished) + " lists (one)", r);
+    // 2. a replicated AddItem effect lands on the owner now and on the others 600 ms later: the list that follows must not add it a second time
+    r.at(1).eng.a[101].inv[stim] += 2;
+    r.run(600);
+    for (int i : {0, 2}) r.at(i).eng.a[101].inv[stim] += 2;
+    r.run(3000);
+    for (auto& mc : r.m) if (mc->eng.a[101].inv[stim] != 4) return fail("machine " + std::to_string(mc->slot) + " has " + std::to_string(mc->eng.a[101].inv[stim]) + " Stimpaks after a replicated AddItem 2 (4)", r);
+    // 3. a list from a bystander (it does not own the actor) is dropped by the host and reaches nobody
+    MInventory forged; forged.id = 101; forged.epoch = r.host().sync->ownerOf(101).epoch; forged.eventId = (2ull << 48) | 77; forged.items = {{stim, 99}};
+    Envelope fe; fe.src = 2; fe.dest = kNoPlayer; fe.body = forged;
+    r.net.send(2, 0, true, encodeEnvelope(fe));
+    r.run(300);
+    for (auto& mc : r.m) if (mc->eng.a[101].inv[stim] == 99) return fail("a forged inventory from a non-owner was applied on machine " + std::to_string(mc->slot), r);
+    if (r.host().sync->stats().invRejected == 0) return fail("the forged inventory was not counted as rejected", r);
+    // 4. a duplicate delivery is applied once
+    const int writes = r.at(0).eng.a[101].invWrites;
+    for (size_t k = 0, n = r.net.captured.size(); k < n; ++k) {
+        const NetMsg& m = r.net.captured[k];
+        Envelope env;
+        if (m.to == 0 && m.data.size() > 2 && m.data[1] == SubEnvelope && decodeEnvelope(m.data.data() + 2, m.data.size() - 2, env) && std::holds_alternative<MInventory>(env.body))
+            r.at(0).sync->receive(static_cast<PlayerId>(m.from), m.data.data(), m.data.size());
+    }
+    r.run(100);
+    if (r.at(0).eng.a[101].invWrites != writes) return fail("a replayed inventory was written again", r);
+    // 5. a client that joins later hears what was used before it came
+    r.at(2).eng.a[101].inv[stim] = 9;
+    r.host().sync->playerJoined(2);
+    r.run(500);
+    if (r.at(2).eng.a[101].inv[stim] != 4) return fail("a joining client did not get the shared inventory", r);
+    // 6. the last thing it used before it died counts, even inside the settle time
+    r.at(1).eng.a[101].inv[stim] = 3;
+    if (!r.at(1).sync->onLocalDeath(101)) return fail("the owner may not let an ordinary NPC die", r);
+    r.run(300);
+    for (int i : {0, 2}) if (r.at(i).eng.a[101].inv[stim] != 3) return fail("machine " + std::to_string(i) + " did not get the item used just before the death", r);
+    return r.errors.empty() ? "" : r.errors[0];
+}
+
+// A list that arrives while the actor is not loaded here (or while the engine refuses the write) is kept and written when it can be.
+std::string scnInventoryLate() {
+    Rig r(2);
+    const FormRef stim = refOf(0x15169);
+    r.addActor(101, 3, V(1000), false, ~0u, 30, 0);
+    r.setPose(0, 8, V(0)); r.setPose(1, 3, V(1200));
+    for (auto& mc : r.m) mc->eng.a[101].inv[stim] = 3;
+    r.run(1500);
+    if (r.host().sync->ownerOf(101).owner != 1) return fail("setup: client 1 should own", r);
+    r.host().eng.refuseInventory = true;
+    r.at(1).eng.a[101].inv[stim] = 1;
+    r.run(2500);
+    if (r.host().eng.a[101].inv[stim] != 3) return fail("the host wrote while the engine refused", r);
+    r.host().eng.refuseInventory = false;
+    r.run(1500);
+    if (r.host().eng.a[101].inv[stim] != 1) return fail("a refused write was not retried", r);
+    return r.errors.empty() ? "" : r.errors[0];
+}
 }  // namespace
+
+TEST(inventory, an_owners_item_use_reaches_every_copy_once) { checkEmpty(scnInventory()); }
+TEST(inventory, a_refused_write_is_retried) { checkEmpty(scnInventoryLate()); }
 
 TEST(anim, owner_events_reach_everyone_once_and_forgeries_do_not) { checkEmpty(scnAnimEvents()); }
 

@@ -98,7 +98,8 @@ _BASES: Dict[str, Dict[str, str]] = {}
 
 
 def _hostiles(f, repo):
-    hs = [f["gang1"], f["gang2"], f["gecko1"], f["gecko2"]]
+    # the powder gangers only: the VCG02 geckos are hostile to the gang, and moved next to it they died before step 01 (in game 2026-10-21)
+    hs = [f["gang1"], f["gang2"]]
     return {"hostiles": hs, "hostile_base_of": {h: _base_of(repo, h) for h in hs}, "weapon": f["pistol"]}
 
 
@@ -115,7 +116,7 @@ def _m_enemy_spawn(f, repo):
 
 
 def _m_corpse(f, repo):
-    return {"victim": f["gang1"], "item": f["stimpak"], "item_count": 3, "hostile_base_of": {f["gang1"]: _base_of(repo, f["gang1"])}}
+    return {"victim": f["gang1"], "item": f["lootItem"], "item_count": 3, "hostile_base_of": {f["gang1"]: _base_of(repo, f["gang1"])}}
 
 
 def _m_vats(f, repo):

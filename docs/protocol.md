@@ -117,7 +117,7 @@ by the client in Hello and echoed in every later message so stale datagrams from
 
 | Id | Name | Dir | Body (in order) |
 |---|---|---|---|
-| 1 | Hello | C | `varu32 session`, `u64 token` (stable per-install identity -> slot), `varu lastSeq`, `u8 flags` (bit0 wantBaseline), `u64 contentHash`, `varu32 lastEpoch`, HandshakeInfo |
+| 1 | Hello | C | `varu32 session`, `u64 token` (stable per-install identity -> slot), `varu lastSeq`, `u8 flags` (bit0 wantBaseline), `u64 contentHash`, `varu32 lastEpoch`, HandshakeInfo, `u64 cursorCheck` (appended; absent from older builds = 0: hash of the client's shared shadow at `lastSeq`, sent when resuming, see section 11) |
 | 2 | Welcome | H | `varu32 session`, `u8 slot` (< 8), `varu headSeq`, SharePolicy, `boolean hasSnapshot` [ShadowState], `varu32 intentEpoch`, `varu32 lastIntent`, `varu32 baselineId` (!= 0: baseline transfer follows), `u8 baselineAbs` (bit0 karma, bit1 reputation synced by baseline), `varu32 worldEpoch`, `count rewards` then per reward `varu id`, Effect (v5: every item / actor-value reward this slot received this epoch, see section 13) |
 | 3 | Reject | H | `varu32 session`, `u8 reason`, `str text` (player-facing, <= 255) |
 | 4 | TxnBatch | H | `varu32 session`, `varu32 worldEpoch` (0 = unspecified), `count txns (<= 256)`, EffectTxn each |
@@ -207,7 +207,7 @@ Tag = variant index. Field list after the tag (types per 3.3, FormRef per sectio
 | 47 | SetTimeScale | f32 scale, boolean hasBefore, f32 before (SetGlobalTimeMultiplier, 0 = never set) |
 | 48 | AdvanceTime | varu32 minutes (sleep / wait; EVENT) |
 | 49 | RefAngle | ref, u8 axis, f32 degrees, boolean hasBefore, f32 before |
-| 50 | RefCommand | varu32 op, ref, a, b, vari32 i, vari32 j, vari32 k, vari32 l, f32 f, str s, to |
+| 50 | RefCommand | varu32 op, ref, a, b, vari32 i, vari32 j, vari32 k, vari32 l, f32 f, str s, to, c, d, vari32 m |
 <!-- END EFFECT TABLE -->
 
 Integer deltas on purpose (XP, caps, karma, rep): replicas stay bit-identical. Floats appear only for globals, positions and
@@ -260,7 +260,14 @@ The client periodically (and on `DigestRequest`, after barriers/scenes) sends `S
 key buckets) over its REAL engine world at an applied `seq`. The host compares against the same seq; for mismatching shards it
 sends `ShardRequest` (128-bit mask), the client answers `ShardEntries` (<= 1000 per message, `truncated` set if it hit the cap),
 and the host sends `SyncRepair`: force-set effects and revert keys, skipping keys touched since the digest. Repairs are only
-applied if the `epoch` matches.
+applied if the `epoch` matches. A revert key the client has no inverse for is left as it is and counted
+(`ClientSession::SyncStats::repairRevertsUnrevertable`, `coop.status` client `repairUnrevertable`).
+
+Client-only quest running keys (`StartQuest` / `StopQuest` entries the host's state has no entry for, issue #25) are not sent as
+revert keys: a quest's running flag has no inverse. The host settles them itself by committing its OWN running state for those quests as
+a normal host txn (`HostSession::hostQuestRunning` reads the host engine; without it the completeness default, not running, is used).
+Every client receives it, the host's key space is complete afterwards, and the digest converges. Counted in `HostStats::questRunningAdopted`
+(`desyncs.digests.questRunningAdopted`) and in the repair counters.
 
 ### 7.6 AppData
 
@@ -365,6 +372,13 @@ Pinned by the integrated tests `synccore/tests/test_rejoin*.cpp`:
 * A plain reconnect (same process, `ClientSession::connect` with a larger `session`) resumes from `lastSeq`; txns it missed are replayed
   once, never twice. If the host world epoch changed meanwhile (the host loaded a save) the host sends `Rebase` and the client re-baselines
   via its baseline provider; txns of the old epoch are fenced off by `worldEpoch` and never replayed into the new epoch.
+* A resume from the client's own save sidecar (`onLocalSaveLoaded`) is only valid against the timeline the sidecar was saved in, and
+  epoch numbers do not identify one across host runs (a fresh host loading a prepared save reaches the epoch number the client's newer
+  sidecar was saved in, with another history). The resuming Hello carries `cursorCheck`, a hash of the client's shadow at `lastSeq`; the
+  host resumes only if its own state at `lastSeq` hashes the same and `lastSeq` is not past its head (a cursor the log no longer holds:
+  only a token this host welcomed in this epoch). Otherwise it answers `Rebase` with its current epoch (the client accepts a Rebase to its
+  own epoch while not joined), the client re-baselines and adopts the host's sequence; per-player state stays what its save holds.
+  Counted in `HostStats::resumesRefused`.
 * A baseline join (restart with the client's own save, `Hello.flags` bit0) receives the shared world as a diff plus the per-slot ledger
   (items/XP earned so far) as live effects. A restarted client whose save already contains those rewards receives them again: per-player
   rewards are not part of the world diff. Known limitation; clients that can tell should treat ledger effects delivered with `fromSnapshot`
@@ -762,6 +776,8 @@ never run in a game. The hooks that produce it are OFF unless `nvcoop.ini [hooks
 One new effect, tag 49 (the table in section 6 is generated): `varu32 op, ref, a, b, vari32 i, j, k, l, f32 f, str s (at most 255 bytes), recipient`.
 `ref` is the calling reference (empty plugin = none), `a` / `b` are form arguments, `s` is a text argument. What the slots mean is per op (`kStorySpecs`).
 
+- **Second shape (wide ops).** `refOpIsWide(op)` (today only UseWeapon, op 78: four forms and five integers) adds `ref c, ref d, vari32 m` after the recipient. Only wide ops carry
+  them, so every other op's bytes are unchanged. The decoder reads them by the op id alone.
 - **Op ids are append-only** and part of the format. A decoder rejects op 0 and every id it does not know (`Malformed`); a txn that carries one is dropped whole.
 - **Event or state.** `refop.h` marks every op. An EVENT (StartCombat, EvaluatePackage, Dispel, the chargen calls ...) is delivered once to its
   recipients and remembered nowhere. A STATE op (SetGhost, SetScale, AddSpell / RemoveSpell, AddFormToFormList ...) replaces the previous command with the same key
@@ -782,7 +798,8 @@ One new effect, tag 49 (the table in section 6 is generated): `varu32 op, ref, a
 
 Code: `synccore/loot/loot.{h,cpp}` (rules), `synccore/loot/loot_wire.{h,cpp}` (messages), `plugin/loot/loot_sync.{h,cpp}` (the live-hub service), docs/tools/loot.md. Rides the coop
 `MuxTransport` through the live hub (`livewire::ILiveService`); everything is reliable-ordered except `MClutter` (unreliable sequenced). Status: unit-tested game-free
-(`plugin\lootun_tests.cmd`); never run in a game. The channel is self-versioned and does NOT change the story envelope, so `kProtocolVersion` / `kWireVersion` are not bumped
+(`plugin\loot
+un_tests.cmd`); never run in a game. The channel is self-versioned and does NOT change the story envelope, so `kProtocolVersion` / `kWireVersion` are not bumped
 (like 0xAC, 0xCB, 0xA5, 0xAD, 0x7E, 0xDA, 0xB7): a build without the module drops the datagrams as unroutable and a guest's requests time out and roll back.
 
 ```

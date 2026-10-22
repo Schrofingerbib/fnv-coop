@@ -310,6 +310,53 @@ TEST(baseline, volatile_faction_ranks_are_per_machine) {
     volatileKeys().clear();
 }
 
+namespace {
+// Object / NPC script vars (RefScriptVar) obey the same list as quest vars. Before 2026-10-22 only quest vars (SetScriptVar) were
+// consulted, so a per-machine timer on a ref (171CDC var 1, in game 2026-10-21) was baselined, diffed and replicated.
+// Shared by the real test and its twin.
+bool refScriptVarsObeyTheVolatileList() {
+    volatileKeys().clear();
+    std::string err;
+    bool ok = volatileKeys().loadFromText("var FalloutNV.esm:171CDC 1\nowner FalloutNV.esm:171CDD\n", &err);
+    const FormRef a("falloutnv.esm", 0x171CDC), b("falloutnv.esm", 0x171CDD), c("falloutnv.esm", 0x171CDE);
+    ok &= volatileKeys().isVolatile(RefScriptVar{a, 1, 8.0});
+    ok &= !volatileKeys().isVolatile(RefScriptVar{a, 2, 8.0});     // other var of the same ref stays shared
+    ok &= volatileKeys().isVolatile(RefScriptVar{b, 9, 1.0});      // owner entry: every var of that ref
+    ok &= !volatileKeys().isVolatile(RefScriptVar{c, 1, 8.0});     // other refs stay shared
+    ShadowState host = bigWorld(20), client = host;
+    host.refVars[{a, 1}] = 8.01762;
+    host.refVars[{a, 2}] = 3.0;
+    host.refVars[{b, 4}] = 2.0;
+    host.refVars[{c, 1}] = 5.0;
+    BaselineDiff d = diffBaseline(host, summarizeWorld(client, 1), SharePolicy(), 1, false, 0, false, {});
+    int refVars = 0;
+    for (auto& e : d.effects)
+        if (auto* v = std::get_if<RefScriptVar>(&e)) { ++refVars; ok &= (v->ref == a && v->index == 2) || v->ref == c; }
+    ok &= refVars == 2;
+    size_t withVol = baselineEntries(host).size();
+    volatileKeys().clear();
+    ok &= baselineEntries(host).size() == withVol + 2;   // the two volatile ref vars come back once the list is empty
+    EffectTxn t;
+    volatileKeys().loadFromText("var FalloutNV.esm:171CDC 1\nowner FalloutNV.esm:171CDD\n", &err);
+    t.effects = {RefScriptVar{a, 1, 8.5}, RefScriptVar{a, 2, 1.0}, RefScriptVar{b, 4, 7.0}, RefScriptVar{c, 1, 1.0}};
+    ok &= normalizeTxn(t, SharePolicy()) == 2;
+    ok &= t.effects.size() == 2;
+    volatileKeys().clear();
+    return ok;
+}
+}  // namespace
+
+TEST(baseline, volatile_ref_script_vars_are_per_machine) {
+    CHECK(refScriptVarsObeyTheVolatileList());
+}
+
+TEST(twin, unit_volatile_ref_script_vars) {
+    Mutations m; m.ignoreVolatile = true;
+    MutationScope s(m);
+    CHECK(!refScriptVarsObeyTheVolatileList());
+    volatileKeys().clear();
+}
+
 TEST(twin, unit_volatile) {
     Mutations m; m.ignoreVolatile = true;
     MutationScope s(m);

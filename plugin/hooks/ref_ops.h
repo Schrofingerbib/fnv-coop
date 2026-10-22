@@ -7,8 +7,8 @@
 //
 // Argument letters (one per ENGINE parameter, in engine order; the engine's own ParamInfo type ids are pinned in data/story_cmd_params.json,
 // generated from a reference exe by tools/gen_story_params.py and checked by the unit tests):
-//   o  a form (ObjectRef / Actor / Spell / Quest / Cell / ...), returned as TESForm*      -> RefCommand.a or .b
-//   i  an integer                                                                          -> RefCommand.i .j .k .l
+//   o  a form (ObjectRef / Actor / Spell / Quest / Cell / ...), returned as TESForm*      -> RefCommand.a .b (.c .d on a wide op)
+//   i  an integer                                                                          -> RefCommand.i .j .k .l (.m on a wide op)
 //   f  a float                                                                              -> RefCommand.f
 //   s  a text (a char buffer of kStoryTextMax bytes is handed to ExtractArgs)                                         -> RefCommand.s
 //   c  a critical stage (index into g_criticalStageNames, printed as its name)                                            -> an int slot
@@ -27,7 +27,7 @@
 namespace nvhooks {
 
 constexpr int kStoryTextMax = 256;   // ExtractArgs copies a text parameter into a buffer this big (xNVSE passes char[256] the same way)
-constexpr int kMaxStoryArgs = 6;   // ExtractArgs is handed this many output pointers; no hooked command has more parameters
+constexpr int kMaxStoryArgs = 9;   // ExtractArgs is handed this many output pointers; no hooked command has more parameters (UseWeapon has nine)
 
 enum RefOpFlags : uint8_t {
     kRoAiOrder = 1,       // an order to the actor's AI: only the machine that runs that actor's AI performs it (the others show its snapshots)
@@ -42,7 +42,7 @@ struct RefOpSpec {
     const char* fn;              // the census / coverage function key (lower case script name)
     const HookSpec* hook;        // the engine handler (story_addrs.h, or engine_addrs.h for kRoSharedHook)
     const char* sig;             // engine parameters, in order (see above)
-    const char* slots;           // destination slot per parameter: a b (forms)  i j k l (ints)  f (float)
+    const char* slots;           // destination slot per parameter: a b (forms)  i j k l (ints)  f (float); wide ops (refOpIsWide) also c d (forms) and m (int)
     uint8_t minArgs;             // required parameters (the rest are optional in the engine)
     uint8_t flags;               // RefOpFlags
 };

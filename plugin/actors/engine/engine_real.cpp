@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "actors/engine/av_read.h"
 #include "actors/engine/engine_real.h"
 #include "common/nvcoop_api.h"
 
@@ -256,15 +257,41 @@ TESObjectREFR* PlaceSEH(TESObjectREFR* anchor, TESForm* base) {
 
 RealEngineHost::RealEngineHost() = default;
 
+// One reading of one pin. A function another plugin (or our own hook lane) detoured starts with a jump and still forwards to the original: callable.
+// A refused pin logs the bytes it found, once per distinct reading (pin_check.h has the reasons the same exe can answer differently).
+static bool CheckPin(const char* name, uintptr_t addr, const unsigned char* expected, std::string& lastSeen) {
+    unsigned char b[16] = {};
+    const bool readable = SafeRead(addr, b, 16);
+    const PinState st = classifyPin(readable, b, expected);
+    if (!pinOk(st)) {
+        const std::string line = pinRefusal(name, addr, st, b, expected);
+        if (line != lastSeen) {
+            lastSeen = line;
+            nvcoop::Log("actors: %s", line.c_str());
+        }
+    } else if (st == PinState::Detoured && lastSeen != "detoured") {
+        lastSeen = "detoured";
+        nvcoop::Log("actors: pin %s at %08X is detoured by another patch (starts with E9); calling through it", name, static_cast<unsigned>(addr));
+    }
+    return pinOk(st);
+}
+
 void RealEngineHost::checkPins() {
-    pinsChecked_ = true;
-    unsigned char b[16];
-    pins_.placeAtMe = SafeRead(world_addrs::Call_PlaceAtMe.addr, b, 16) && std::memcmp(b, world_addrs::Call_PlaceAtMe.bytes, 16) == 0;
-    // a function we detoured ourselves (or another mod did) starts with a jump and still forwards to the original: callable
-    auto okSpec = [&](const nvhooks::HookSpec& s) { return SafeRead(s.target, b, 16) && (std::memcmp(b, s.expected, 16) == 0 || b[0] == 0xE9); };
-    pins_.getActorValue = okSpec(nvhooks::addr::ActorGetActorValue);
-    pins_.isDisabled = okSpec(nvhooks::addr::RefIsDisabled);
-    nvcoop::Log("actors: engine pins placeAtMe=%d getActorValue=%d isDisabled=%d", pins_.placeAtMe, pins_.getActorValue, pins_.isDisabled);
+    static std::string seenPlace, seenAv, seenDis;
+    const Pins before = pins_;
+    pins_.placeAtMe = CheckPin("Call_PlaceAtMe", world_addrs::Call_PlaceAtMe.addr, world_addrs::Call_PlaceAtMe.bytes, seenPlace);
+    pins_.getActorValue = CheckPin("Actor::GetActorValue", nvhooks::addr::ActorGetActorValue.target, nvhooks::addr::ActorGetActorValue.expected, seenAv);
+    pins_.isDisabled = CheckPin("TESObjectREFR::IsDisabled", nvhooks::addr::RefIsDisabled.target, nvhooks::addr::RefIsDisabled.expected, seenDis);
+    const bool all = pins_.placeAtMe && pins_.getActorValue && pins_.isDisabled;
+    pinPolicy_.record(all, GetTickCount64());
+    if (pinPolicy_.checks() == 1 || all || pinPolicy_.final() || before.placeAtMe != pins_.placeAtMe || before.getActorValue != pins_.getActorValue ||
+        before.isDisabled != pins_.isDisabled)
+        nvcoop::Log("actors: engine pins placeAtMe=%d getActorValue=%d isDisabled=%d (check %d%s)", pins_.placeAtMe, pins_.getActorValue, pins_.isDisabled,
+                    pinPolicy_.checks(), pinPolicy_.final() ? ", final" : ", will look again");
+}
+
+void RealEngineHost::ensurePins() {
+    if (pinPolicy_.due(GetTickCount64())) checkPins();
 }
 
 bool RealEngineHost::worldReady() {
@@ -277,7 +304,7 @@ bool RealEngineHost::worldReady() {
 bool RealEngineHost::read(RefId ref, ActorRaw& out) {
     const bool wantRestrained = out.wantRestrained;
     out = ActorRaw{};
-    if (!pinsChecked_) checkPins();
+    ensurePins();
     Actor* a = ActorSEH(ref);
     if (!a) return false;
     if (!FillRawSEH(a, out)) {
@@ -305,13 +332,20 @@ bool RealEngineHost::readPose(RefId ref, CellId& cell, live::Vec3& pos, float& r
 }
 
 bool RealEngineHost::actorValue(RefId ref, uint8_t av, float& out) {
-    if (!pinsChecked_) checkPins();
-    if (!pins_.getActorValue) return false;
+    ensurePins();
     Actor* a = ActorSEH(ref);
     if (!a) return false;
-    if (GetAvSEH(a, av, out)) return true;
-    ++sehFaults_;
-    return false;
+    AvReads r;
+    double v = 0;
+    if (nvworld::queryCondition("GetActorValue", ref, av, &v)) {   // the console's own path: includes the damage of an actor that is not loaded
+        r.evalOk = true;
+        r.eval = static_cast<float>(v);
+    }
+    if (pins_.getActorValue) {
+        if (GetAvSEH(a, av, r.direct)) r.directOk = true;
+        else ++sehFaults_;
+    }
+    return pickActorValue(r, out);
 }
 
 void RealEngineHost::loadedActors(std::vector<RefId>& out, size_t max) {
@@ -374,7 +408,7 @@ RefId RealEngineHost::anchorInCell(CellId cell, live::Vec3& p) {
 }
 
 RefId RealEngineHost::placeAtMe(RefId anchor, uint32_t baseId) {
-    if (!pinsChecked_) checkPins();
+    ensurePins();
     if (!pins_.placeAtMe) return 0;
     TESForm* af = LookupSEH(anchor);
     TESForm* base = LookupSEH(baseId);

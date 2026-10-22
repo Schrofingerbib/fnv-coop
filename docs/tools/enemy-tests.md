@@ -30,7 +30,7 @@ Exit codes: 0 all pass, 1 a test failed, 2 usage or setup error, 3 BLOCKED (a re
 ## The four tests
 
 All four start from the scenario `scenarios/goodsprings_enemies.json` (two powder gangers GSPG01/GSPG02 and the two VCG02 geckos,
-both players next to them with health raised, three stimpaks on the first ganger). After EVERY step the engine settles, runs snapdiff
+both players next to them with health raised, three duct tape on the first ganger). After EVERY step the engine settles, runs snapdiff
 host vs client, and fails if a desync counter rose. At the end each test runs the T7 animation / pose check with the FIGHT thresholds.
 
 | Test | Steps | What must hold |

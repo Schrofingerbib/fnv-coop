@@ -124,6 +124,15 @@ RefId PuppetOf(PlayerId slot) {
     return 0;
 #endif
 }
+// Why a guest has no puppet, for the stand-in log line.
+const char* AvatarsNote() {
+#ifdef NVCOOP_WITH_LIVE
+    return nvcoop::livewire::glueSwitches().avatars ? "[live] avatars=1 but this slot's puppet does not exist yet (not spawned, other cell or session not synced)"
+                                                     : "[live] avatars=0, so there are no puppets";
+#else
+    return "this build has no avatar layer";
+#endif
+}
 RefId GhostOf(PlayerId slot) {
 #ifdef NVCOOP_WITH_NVMP
     return slot == fnvcoop::kHostPlayer ? 0u : nvmp::GhostRefOfPlayer(static_cast<uint8_t>(slot));
@@ -288,6 +297,15 @@ void Init() {
     d.eng = &nvcoop::intents::game::engine();
     d.puppetOf = PuppetOf;
     d.ghostOf = GhostOf;
+    d.actorMode = [](fnvcoop::PlayerId slot, nvcoop::intents::ActorMode mode, nvcoop::intents::RefId actor) {
+        // Logged once per slot and mode change. A stand-in is the HOST'S OWN player acting for the guest (rewards and karma still go to the guest by
+        // origin, but `player` inside the scripts is the host): it is only expected with [live] avatars=0 and no NV:MP ghost.
+        switch (mode) {
+            case nvcoop::intents::ActorMode::Puppet: nvcoop::Log("intents: acting player for slot %d = avatar puppet %08X", (int)slot, (unsigned)actor); break;
+            case nvcoop::intents::ActorMode::Ghost: nvcoop::Log("intents: acting player for slot %d = NV:MP ghost %08X", (int)slot, (unsigned)actor); break;
+            case nvcoop::intents::ActorMode::StandIn: nvcoop::Log("intents: ACTING-STANDIN slot %d: %s; host player 14 acts", (int)slot, AvatarsNote()); break;
+        }
+    };
     d.nowMs = NowMs;
     d.containerMenuOpen = [] { return nvcoop::intents::game::containerMenuOpen(); };
     d.startDialogue = [](const fnvcoop::FormRef& npc) {

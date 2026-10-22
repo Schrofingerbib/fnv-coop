@@ -63,7 +63,17 @@ void Machine::onOwnApplied(const OwnMsg& m, ApplyResult r) {
     }
     const bool sawFinal = acked_.count(m.netId) != 0;   // the old owner's last state reached us before the commit
     acked_.erase(m.netId);
-    awaitOld_.erase(m.netId);                           // any ownership change ends an earlier wait
+    // Any ownership change ends an earlier wait for a previous owner's final state, with one exception: a Grant that gives the actor back to
+    // us (it cancels our own outgoing handoff, or restates our ownership) changes nothing about who may still be driving it. The old owner has
+    // not necessarily heard of the first handoff yet (slow link), so we keep waiting for its final state until the safety timeout.
+    std::pair<PlayerId, uint64_t> keptWait{kNoPlayer, 0};
+    bool hadWait = false;
+    if (m.kind == OwnMsg::Grant && m.owner == cfg_.self && !engineFaults().grantEndsOwnerWait) {
+        auto w = awaitOld_.find(m.netId);
+        if (w != awaitOld_.end()) { keptWait = w->second; hadWait = true; }
+    }
+    awaitOld_.erase(m.netId);
+    if (hadWait) awaitOld_[m.netId] = keptWait;
     if (m.kind == OwnMsg::Ack) return;
     // Sequence numbers must order across owners: a new owner that never saw the old owner's last snapshot (forced commit, lost
     // final) would otherwise reuse a sequence number and have its state ignored by the old owner.

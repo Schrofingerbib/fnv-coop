@@ -1,6 +1,7 @@
 // Core-side implementation of nvcoop_api.h for the split build (cmake -DNVCOOP_SPLIT_LOADER=ON).
 // In the monolith these functions live in common/nvcoop_api.cpp; in the core DLL they forward to the
 // permanent loader through the C ABI, so module code compiles and behaves unchanged.
+#include <cstddef>
 #include <cstdarg>
 #include <cstdio>
 #include <memory>
@@ -106,6 +107,14 @@ void RegisterMethodClosure(const char* name, MethodClosure fn, bool mainThread, 
 void UnregisterMethodsByOwner(int) {}
 
 void RegisterModule(const Module& m) { S().modules.push_back(m); }
+
+// The loader owns the NVSE serialization callbacks and forwards to these until it unloads this core (see loader_abi.h set_cosave).
+void SetCosaveCallbacks(void (*save)(void* intfc), void (*load)(void* intfc)) {
+    if (g_api && g_api->size >= offsetof(NvLoaderApi, set_cosave) + sizeof(void*) && g_api->set_cosave) g_api->set_cosave(save, load);
+    else Log("cosave: this loader cannot forward cosave callbacks (built before set_cosave): the cosave is not written");
+}
+void RunCosave(bool, void*) {}   // only the loader's forwarders run cosaves
+bool HasCosaveCallbacks() { return false; }
 
 void Log(const char* fmt, ...) {
     char buf[1024];

@@ -64,6 +64,8 @@ enum RefOp : uint16_t {
     kOpAddItemHealthPercent = 72,
     // animation and faction deltas
     kOpPlayGroup = 73, kOpModFactionRank = 74, kOpPlayIdle = 75, kOpSetCriticalStage = 76, kOpSetActorFullName = 77,
+    // the second shape: more parameters than a RefCommand's a / b / i..l slots (refOpIsWide)
+    kOpUseWeapon = 78,
     kOpCount_
 };
 
@@ -148,6 +150,7 @@ inline constexpr RefOpInfo kRefOps[] = {
     FNV_RO_E(kOpPlayIdle, "PlayIdle", kRcpDefault),
     FNV_RO_E(kOpSetCriticalStage, "SetCriticalStage", kRcpDefault),
     FNV_RO_S(kOpSetActorFullName, "SetActorFullName", kKeyRef, kRcpDefault),
+    FNV_RO_E(kOpUseWeapon, "UseWeapon", kRcpDefault),
 };
 #undef FNV_RO_E
 #undef FNV_RO_S
@@ -156,6 +159,8 @@ static_assert(sizeof(kRefOps) / sizeof(kRefOps[0]) == kOpCount_, "kRefOps must l
 // nullptr for an unknown id (a decoder rejects it).
 inline const RefOpInfo* refOpInfo(uint16_t id) { return id < kOpCount_ && kRefOps[id].id == id ? &kRefOps[id] : nullptr; }
 inline bool refOpKnown(uint16_t id) { return id != kOpNone && refOpInfo(id) != nullptr; }
+// Wide ops carry the forms c / d and the integer m of RefCommand as well (UseWeapon: weapon, shooter, target, + optional fourth form; five integers).
+inline bool refOpIsWide(uint16_t id) { return id == kOpUseWeapon; }
 inline bool refOpIsState(uint16_t id) { const RefOpInfo* i = refOpInfo(id); return i && i->kind == kRefOpState; }
 
 }  // namespace fnvcoop

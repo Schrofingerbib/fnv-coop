@@ -37,6 +37,10 @@ public:
     // the old puppet (reconnect): the old ref is deleted, never left behind.
     bool AddPlayer(Slot slot, const Appearance& a);
     void RemovePlayer(Slot slot);
+    // This machine's own slot, known once the session has assigned it (a client joins as slot 1, 2, ...; the ini default is 0). The local
+    // slot never gets a puppet: a puppet that already exists for it is removed.
+    void SetLocalSlot(Slot slot);
+    Slot LocalSlot() const { return cfg_.localSlot; }
     void SetEquipment(Slot slot, const std::vector<EquipEntry>& wanted);
     // A changed look of a known player: same template (race / sex) = applied to the live puppet without a respawn; another template = a new
     // puppet (AddPlayer, equipment kept). False when the slot has no puppet.

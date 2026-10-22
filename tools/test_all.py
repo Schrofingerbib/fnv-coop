@@ -30,9 +30,11 @@ SUITES = [
     ("lint split string literals", [sys.executable, "-I", "tools/lint/fix_newline_literals.py", "--check"], False, NO),
     ("lint tool tests (+ twin)", [sys.executable, "-I", "tools/lint/test_fix_newline_literals.py", "--twin"], False, NO),
     ("lint every Python file parses", [sys.executable, "-I", "tools/lint/check_py_compiles.py"], False, NO),
+    ("lint loot service is in the live hub (+ twins)", [sys.executable, "-I", "tools/lint/check_loot_wiring.py", "--self-test"], False, NO),
+    ("lint loot service wiring", [sys.executable, "-I", "tools/lint/check_loot_wiring.py"], False, NO),
     ("test_all preflight", [sys.executable, "-I", "tools/test_all_selftest.py"], False, NO),
     ("canonical nvcoop.dll build", ["cmd", "/c", r"tools\runner\build_l1.cmd"], True, CM),
-    ("T5 chaos box", [sys.executable, "-I", "tools/chaos/run_tests.py"], False, NO),
+    ("T5 chaos box (+ chaos_pair: a pair joined through the relay)", [sys.executable, "-I", "tools/chaos/run_tests.py"], False, NO),
     ("L3 questdata", [sys.executable, "-I", "tools/questdata/run_tests.py"], False, NO),
     ("L7 snapshot", [sys.executable, "-I", "plugin/snapshot/tools/run_tests.py", "--no-engine"], False, MS_OPT),
     ("L9 coverage", [sys.executable, "-I", "tools/coverage/run_tests.py"], False, NO),
@@ -46,6 +48,8 @@ SUITES = [
     ("Live wiring in-game proof (selftest + injected defects)", [sys.executable, "-I", "tools/runner/live_wiring_proof.py", "--selftest"], False, NO),
     ("Release: installer, uninstaller, packager (fake game folder + twins)", [sys.executable, "-I", "tools/installer/run_tests.py"], False, NO),
     ("Release: launcher (settings, nvcoop.ini, port checks, start; + twins)", [sys.executable, "-I", "tools/launcher/run_tests.py"], False, NO),
+    ("Proof harness: prove.py classifier, packet, ledger, owner-PC safety, --pairs scheduler, RAM guard (fake worlds, stub runners + 22 twins)", [sys.executable, "-I", "tools/proof/tests/run_tests.py"], False, NO),
+    ("Proof drivers: release .cmd scripts, launcher loopback, public tree build, split-screen smoke (fake runners, damaged-release and launcher-fault twins + 5 twins)", [sys.executable, "-I", "tools/proof/drivers/tests/run_tests.py"], False, NO),
     ("T4b scenarios", [sys.executable, "-I", "-X", "utf8", "tools/scenarios/run_tests.py"], False, NO),
     ("T1b flight analyzer (fast)", [sys.executable, "-I", "tools/flight/run_tests.py"], False, NO),
     ("T1b flight analyzer (full + mutation twin)", [sys.executable, "-I", "tools/flight/run_tests.py", "--full"], True, NO),
@@ -88,6 +92,9 @@ SUITES = [
     ("social-core (companions, crime, kill rewards: rules + 66 runtime twins)", ["cmd", "/c", r"synccore\social\run_tests.cmd"], True, CM),
     ("companions-crime (SocialSync on 3 machines: companions, crime, kill rewards + 28 twins)", ["cmd", "/c", r"plugin\companions\run_tests.cmd"], True, CM),
     ("companions-crime in-game proof checker (selftest)", [sys.executable, "-I", "plugin/companions/proof/social_proof.py", "--selftest"], False, NO),
+    ("Readiness wait shared by prove.py and the proof scripts (+ twins, wiring of every script)", [sys.executable, "-I", "tools/runner/tests/test_nvready.py"], False, NO),
+    ("loot in-game proof checker (selftest + late-session twin)", [sys.executable, "-I", "plugin/loot/tools/loot_proof.py", "--selftest"], False, NO),
+    ("world-time in-game proof checker (selftest + press-blind twin)", [sys.executable, "-I", "plugin/world_time/tools/worldtime_proof.py", "--selftest"], False, NO),
     ("T1a flight recorder", ["cmd", "/c", r"plugin\flight\run_tests.cmd"], True, CM),
     ("T3b reload state", ["cmd", "/c", r"plugin\reload\run_tests.cmd"], True, CM),
     ("T3a loader", ["cmd", "/c", r"plugin\loader\run_tests.cmd"], True, CM),
@@ -102,6 +109,18 @@ SUITES = [
 
 
 import re
+
+# Public export: suites that need your own game install or generated game data skip with a reason instead of failing.
+def _data(*parts):
+    return (ROOT.joinpath(*parts)).exists()
+
+
+NEEDS = {
+    "L6 nvmp sigs (pinned 9.4)": (lambda: _data("third_party", "nvmp", "nvmp", "client.dll"),
+                                  "needs your own NV:MP 9.4 client.dll under third_party/nvmp/nvmp/"),
+    "L8 dialogue": (lambda: _data("out", "questdata", "risk.json"),
+                    "needs out/questdata (python -I tools/questdata/run_all.py) and an MSVC x86 toolchain"),
+}
 
 MUTANT = os.environ.get("TEST_ALL_MUTANT", "")
 WINDOWS = sys.platform == "win32"   # MSVC and the build scripts (vcvars, build_l1.cmd) exist on Windows only
@@ -345,12 +364,9 @@ def main() -> int:
             failed.append(name)
             continue
         need = NEEDS.get(name)
-        if need:
-            # Same check decide() already did, but re-read the files: a suite may have been
-            # un-skipped above, and missing_data() is the one that knows the file-list form.
-            if missing_data(name):
-                print(f"SKIP {name}: {need[1]}")
-                continue
+        if need and not need[0]():
+            print(f"SKIP {name}: {need[1]}")
+            continue
         t0 = time.time()
         p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, errors="replace")
         out = p.stdout + p.stderr

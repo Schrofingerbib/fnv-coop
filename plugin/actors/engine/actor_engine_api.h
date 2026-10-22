@@ -148,6 +148,13 @@ void setRefExclusion(RefFilter f);
 using CreatedIdResolver = std::function<bool(RefId ref, NetId& netId, fnvcoop::FormRef& wireRef)>;
 void setCreatedIdResolver(CreatedIdResolver f);
 
+// Inventory totals of a tracked actor (plugin/loot owns the engine calls: base container + changes). The reader says false when it cannot
+// read the actor exactly (an unresolved leveled list in it); the writer makes the engine copy hold exactly the list. Without them an owner's
+// item use is not copied to the other machines.
+using InventoryReader = std::function<bool(NetId, InvList&)>;
+using InventoryWriter = std::function<bool(NetId, const InvList&)>;
+void setInventoryAccess(InventoryReader read, InventoryWriter write);
+
 // Story effects applied on this machine (the host's captured ones too): KillActor, ResurrectActor and CompanionOwner reach ActorSync::onEffect().
 // Any other effect is ignored here. Called by the effect applier / capture sink wiring.
 void onEffect(const fnvcoop::Effect& e);
@@ -180,6 +187,7 @@ struct Config {
     uint32_t maxStandIns = 64;
     bool swapLeveled = true;                  // leveled pick differs from the local roll: replace the body with a clone of the pick (unverified in game)
     uint32_t saveGraceMs = 3000;              // after beforeSave(): no new clones for this long, so the save does not contain them
+    uint32_t deleteQuietMs = 750;             // a removed clone is deleted this long after its last write (0 = at once): the engine may still hold a queued SetPos for its id
 };
 void configure(const Config& c);
 const Config& config();

@@ -43,7 +43,8 @@ sys.path.insert(0, str(ROOT / "tools" / "runner"))
 
 TOL_POS = 0.75          # game units, console prints %g
 TOL_ANGLE = 1.5         # degrees
-TOL_HEALTH = 1.0
+TOL_HEALTH = 0.5
+HEALTH_STEP = 10
 DRIVE_STEPS = 20
 DRIVE_STEP_UNITS = 5.0
 DRIVE_PERIOD_S = 0.06
@@ -139,7 +140,12 @@ class Proof:
 
     def choose(self) -> Tuple[str, dict]:
         if self.ref_hint:
-            return self.ref_hint, self.read(self.ref_hint)
+            rd = self.read(self.ref_hint)
+            if not rd.get("has3D"):
+                # the engine ignores console writes (ForceActorValue, SetPos ...) on an actor that is not loaded, and a stand-in next to it is not in
+                # world.actors; every check below would fail for that reason alone (sweep 2026-10-22: --ref 104C70 with the save elsewhere)
+                raise NotReady(f"{self.ref_hint} is not loaded (has3D false, cell {rd.get('cell')}): load a save near it, or pass another --ref")
+            return self.ref_hint, rd
         actors = self.b.call("world.actors", {"max": 40}).get("actors", [])
         for a in actors:
             ref = a.get("ref") or ""
@@ -179,14 +185,15 @@ class Proof:
         x0, y0, z0, yaw0 = rd["x"], rd["y"], rd["z"], rd["rotZ"]
         self.dev(op="ai", ref=ref, on=False)
         hp0 = float(rd.get("av", {}).get("16", 100))
-        self.dev(op="place", ref=ref, x=x0 + 60.0, y=y0, z=z0, yaw=1.0, health=max(1, int(hp0) - 1))
+        want_hp = max(1, int(hp0) - HEALTH_STEP)   # a step the tolerance cannot hide: a write that never happened reads back hp0
+        self.dev(op="place", ref=ref, x=x0 + 60.0, y=y0, z=z0, yaw=1.0, health=want_hp)
         cx, cy, cz = self.pos_console(ref)
         self.r.check("place.pos", close(cx, x0 + 60.0, TOL_POS) and close(cy, y0, TOL_POS), f"console ({cx:.2f},{cy:.2f}) wanted ({x0 + 60:.2f},{y0:.2f})")
         ang = self.b.eval("GetAngle Z", ref=ref)
         self.r.check("place.heading_sign", angle_close(ang, 57.2958, TOL_ANGLE),
                      f"GetAngle Z after yaw 1.0 rad = {ang:.2f}; 57.30 = the port's SetAngle convention is right, -57.30 = the sign is flipped")
         hp = self.b.eval("GetAV Health", ref=ref)
-        self.r.check("place.health_written", close(hp, max(1, int(hp0) - 1), TOL_HEALTH), f"GetAV Health {hp} wanted {max(1, int(hp0) - 1)}")
+        self.r.check("place.health_written", close(hp, want_hp, TOL_HEALTH), f"GetAV Health {hp} wanted {want_hp}")
         self.dev(op="place", ref=ref, x=x0, y=y0, z=z0, yaw=yaw0, health=int(hp0))
         hp = self.b.eval("GetAV Health", ref=ref)
         self.r.check("place.health_restored", close(hp, hp0, TOL_HEALTH), f"{hp} vs {hp0}")
@@ -269,7 +276,10 @@ class Proof:
     def check_ledger_file(self, ref: str) -> None:
         if not self.game_dir:
             return
-        path = Path(self.game_dir) / "Data" / "NVSE" / "Plugins" / "nvcoop_actors_ledger.txt"
+        plug = Path(self.game_dir) / "Data" / "NVSE" / "Plugins"
+        # the split build loads the core from plugins/nvcoop_cache and the core writes the file next to ITSELF; the monolith writes next to nvcoop.dll
+        cands = [plug / "nvcoop_cache" / "nvcoop_actors_ledger.txt", plug / "nvcoop_actors_ledger.txt"]
+        path = max((c for c in cands if c.exists()), key=lambda c: c.stat().st_mtime, default=cands[1])
         self.dev(op="ai", ref=ref, on=False)
         self.sleep(1.5)   # the ledger file is written at most once a second, at a frame flush
         self.dev(op="scan")

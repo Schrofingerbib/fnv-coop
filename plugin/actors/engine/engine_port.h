@@ -79,6 +79,8 @@ public:
     void setBase(NetId id, const FormRef& pick) override;
     void kill(NetId id) override;
     void revive(NetId id) override;
+    bool sampleInventory(NetId id, InvList& out) override;
+    bool applyInventory(NetId id, const InvList& want) override;
 
     // ---- diagnostics ----
     const PortStats& stats() const { return st_; }
@@ -144,7 +146,12 @@ private:
     void applyAi(Entry& e, bool on);
     bool deleteRef(RefId r);          // disable + mark for delete; false = the engine refused (retried by sweepOrphans)
     bool makeClone(Entry& e, CloneKind kind, uint32_t baseId, RefId anchor, CellId cell, const live::Vec3& pos, float yaw);
-    void dropClone(Entry& e, bool reenableReal);
+    // `immediate`: delete now (a save is about to be written, a session ends); otherwise the ref waits Config::deleteQuietMs after its last
+    // write in `doomed_` (the engine may still hold a queued SetPos for its id: in game 2026-10-22 it ran one on a recycled id and crashed).
+    void dropClone(Entry& e, bool reenableReal, bool immediate = false);
+    void retireClone(RefId c, bool immediate);   // take a clone out of the world: now, or once the quiet period has passed
+    void reapDoomed(bool all);         // delete the quiet-period refs that are due (all: now, whatever the clock says)
+    bool isDoomed(RefId r) const;
     bool sameSpace(CellId a, CellId b);
 
     IActorEngine& eng_;
@@ -158,6 +165,7 @@ private:
     uint64_t frameStartLines_ = 0;
     uint64_t lastSweepMs_ = 0, cloneHoldUntilMs_ = 0;
     std::map<NetId, uint64_t> spawnRetryAt_;        // stand-in attempts that failed: not before this time
+    std::vector<std::pair<RefId, uint64_t>> doomed_;   // removed clones waiting out the quiet period: (ref, delete not before)
     PortStats st_;
 };
 

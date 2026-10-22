@@ -57,6 +57,14 @@ class UnguardedAimBot(Bot):
         return super().aim_at(ref, min_dist=0.0, max_pitch=1e9, **kw)
 
 
+class BlindWalkBot(Bot):
+    """Twin: a failed walk says how far it still was but not how far the avatar got (the 2026-10-22 matrix runs: "857 units left" could not
+    tell an avatar that never moved from one stopped by a wall)."""
+
+    def _walk_fail(self, code, d, radius, start=None, **data):
+        return super()._walk_fail(code, d, radius, start=None, **data)
+
+
 class BlindFireBot(Bot):
     """Twin: a failed shot reports neither the weapon state nor the ammo."""
 
@@ -91,6 +99,16 @@ def _problems(bot_cls):
     nv.world.add_wall(-5000, 400, 5000, 420)
     r = b.goto((0, 1000, 0), radius=80, timeout_s=60)
     check("walk_wall", r.code == "stuck" and _has(r, "units left", "no menu is open") and r.data.get("menu_open") is False)
+    # a wall half way: the avatar got somewhere, and it says how far
+    nv, b = make(bot_cls)
+    nv.world.add_wall(-5000, 400, 5000, 420)
+    r = b.goto((0, 1000, 0), radius=80, timeout_s=60)
+    check("walk_progress", _has(r, "moved") and "never left" not in r.reason and r.data.get("moved", 0) > 300)
+    # boxed in at the start: nothing moves at all, and the message says the avatar never left its spot (input dead or blocked, not a long way)
+    nv, b = make(bot_cls)
+    nv.world.add_wall(-100, -100, 100, 100)
+    r = b.goto((0, 1000, 0), radius=80, timeout_s=60)
+    check("walk_boxed_in", r.code == "stuck" and _has(r, "never left its start") and r.data.get("moved", 99) < 25)
     # the same without the input driver (stepped SetPos) and a walk that runs out of time
     nv, b = make(bot_cls, input_driver=False)
     r = b.goto((50000, 0, 0), timeout_s=2)
@@ -152,6 +170,7 @@ class SaysWhy(unittest.TestCase):
         self.assertEqual(_problems(QuietMenuBot), ["crosshair_menu", "fire_menu", "open_menu", "talk_menu", "walk_menu", "walk_timeout", "walk_wall"])
         self.assertEqual(_problems(UnguardedAimBot), ["aim_pitch", "aim_too_close"])
         self.assertEqual(_problems(BlindFireBot), ["fire_ammo", "fire_ammo_ok", "fire_unarmed"])
+        self.assertEqual(_problems(BlindWalkBot), ["walk_boxed_in", "walk_progress"])
 
     def test_the_short_code_survives_the_explanation(self):
         r = ActionResult(False, "stuck: 340 units left, no menu is open")

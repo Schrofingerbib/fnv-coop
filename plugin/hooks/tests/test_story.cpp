@@ -13,9 +13,11 @@
 #include "../hook_patch.h"
 #include "../move_queue.h"
 #include "../ref_ops.h"
+#include "../said_once.h"
 #include "../story_addrs.h"
 #include "../story_animgroups.h"
 #include "common/minijson.h"
+#include "common/nvse_opcode_base.h"
 #include "fnvcoop/refop.h"
 
 using namespace nvhooks;
@@ -167,10 +169,11 @@ TEST(argument_layout_matches_the_engine_command_table) {
             CHECK(classOfEngineType(type) == s.sig[k]);
             CHECK(optional == (k >= s.minArgs));                         // minArgs = the number of non-optional parameters
             const char d = s.slots[k];
-            if (s.sig[k] == 'o') CHECK(d == 'a' || d == 'b');
+            const bool wide = fnvcoop::refOpIsWide(s.op);                 // the second shape also has the forms c d and the integer m
+            if (s.sig[k] == 'o') CHECK(d == 'a' || d == 'b' || (wide && (d == 'c' || d == 'd')));
             else if (s.sig[k] == 'f') CHECK(d == 'f');
             else if (s.sig[k] == 's') CHECK(d == 's');
-            else CHECK(d == 'i' || d == 'j' || d == 'k' || d == 'l');
+            else CHECK(d == 'i' || d == 'j' || d == 'k' || d == 'l' || (wide && d == 'm'));
             CHECK(!usedSlot[(unsigned char)d]);                          // two parameters never share a slot
             usedSlot[(unsigned char)d] = true;
         }
@@ -280,7 +283,7 @@ TEST(commands_become_exact_console_lines) {
     for (size_t i = 0; i < kStorySpecCount; ++i) {
         RefCommand k;
         k.op = kStorySpecs[i].op;
-        k.ref = Q(1); k.a = Q(2); k.b = Q(3); k.i = 1; k.j = 1; k.k = 1; k.l = 1; k.f = 1.f; k.s = "IdleStretch";
+        k.ref = Q(1); k.a = Q(2); k.b = Q(3); k.c = Q(4); k.d = Q(5); k.i = 1; k.j = 1; k.k = 1; k.l = 1; k.m = 1; k.f = 1.f; k.s = "IdleStretch";
         if (k.op == fnvcoop::kOpSetPlayerTagSkill) k.i = 33;
         LineResult lr = line(k);
         CHECK(lr.ok);
@@ -300,7 +303,7 @@ TEST(only_the_owner_performs_actor_ai_orders) {
     CHECK(!opPerformedHere(spec(fnvcoop::kOpFireWeapon), 0x500, remote));
     size_t ai = 0;
     for (size_t i = 0; i < kStorySpecCount; ++i) ai += (kStorySpecs[i].flags & kRoAiOrder) != 0;
-    CHECK(ai == 17);
+    CHECK(ai == 18);   // 17 + UseWeapon (the shooter's AI performs it)
 }
 
 TEST(activate_is_limited_to_object_types_without_a_menu) {
@@ -421,6 +424,42 @@ TEST(capture_and_apply_agree_for_every_op) {
     }
 }
 
+// A5 (2026-10-22): UseWeapon has nine parameters (four forms, five integers), more than a RefCommand's a / b / i..l: the second shape also fills c, d and m.
+TEST(use_weapon_uses_the_second_command_shape) {
+    const RefOpSpec& s = spec(fnvcoop::kOpUseWeapon);
+    CHECK(s.op == fnvcoop::kOpUseWeapon && fnvcoop::refOpIsWide(fnvcoop::kOpUseWeapon) && !fnvcoop::refOpIsWide(fnvcoop::kOpStartCombat));
+    CHECK(std::strlen(s.sig) == 9 && (s.flags & kRoNeedsRef) && (s.flags & kRoAiOrder));
+    // `ref.useWeapon weapon target1 target2 4 1 1 0 0 extraForm` as ExtractArgs hands it over
+    ArgValue a[kMaxStoryArgs];
+    a[0].form = 0x00001000; a[1].form = 0x00002000; a[2].form = 0x00003000;
+    a[3].i = 4; a[4].i = 1; a[5].i = 1; a[6].i = 2; a[7].i = 7;
+    a[8].form = 0x02004000;
+    RefCommand c;
+    std::string why;
+    CHECK(buildRefCommand(s, 0x00005000, a, toForm, &c, &why));
+    CHECK(c.ref == Q(0x5000) && c.a == Q(0x1000) && c.b == Q(0x2000) && c.c == Q(0x3000) && c.d == FormRef("honesthearts.esm", 0x4000));
+    CHECK(c.i == 4 && c.j == 1 && c.k == 1 && c.l == 2 && c.m == 7);
+    LineResult r = buildRefCommandLine(c, fromForm);
+    CHECK(r.ok && r.callingRef == 0x5000 && r.line == "UseWeapon 00001000 00002000 00003000 4 1 1 2 7 02004000");
+    // trailing optionals at their default are left out, the required four stay
+    c.d = FormRef(); c.m = 0; c.l = 0; c.k = 0; c.j = 0;
+    r = buildRefCommandLine(c, fromForm);
+    CHECK(r.ok && r.line == "UseWeapon 00001000 00002000 00003000 4");
+    // an optional integer cannot be skipped over a later one that is set
+    c.m = 3;
+    CHECK(buildRefCommandLine(c, fromForm).line == "UseWeapon 00001000 00002000 00003000 4 0 0 0 3");
+    // the missing weapon (required) is refused at capture
+    ArgValue none[kMaxStoryArgs];
+    CHECK(!buildRefCommand(s, 0x5000, none, toForm, &c, &why));
+    // JSON: the second shape's slots survive
+    RefCommand w;
+    w.op = fnvcoop::kOpUseWeapon; w.ref = Q(7); w.a = Q(1); w.b = Q(2); w.c = Q(3); w.d = FormRef("honesthearts.esm", 4); w.i = 4; w.l = 2; w.m = 9;
+    fnvcoop::Effect e = w, back;
+    std::string err;
+    CHECK(effectFromJson(effectToJson(e), &back, &err) && back == e);
+    CHECK(effectToJson(e).get("m").asInt() == 9 && effectToJson(e).get("c").asString("") == "falloutnv.esm:000003");
+}
+
 TEST(parked_moves_keep_the_newest_and_give_up) {
     auto mv = [](uint32_t r, float x) { fnvcoop::MoveRef m; m.ref = Q(r); m.cell = Q(0x900); m.x = x; return m; };
     MoveQueue q;
@@ -452,6 +491,28 @@ TEST(an_applier_without_its_own_executor_uses_the_process_wide_one) {
     CHECK(forceActiveQuestCmd(0x00ABCDEF) == "ForceActiveQuest 00ABCDEF");
 }
 
+TEST(a_said_once_effect_sets_the_flag_byte_of_the_info) {
+    // door_terminal_container_matrix / pnr_vote / fast_travel_tether 2026-10-22: the client could not apply SayOnceFlag, so its dump never held the
+    // host's said-once INFOs and the digest resent them every round. The flag is TESTopicInfo + 0x22.
+    CHECK(kInfoSaidOnceOffset == 0x22);
+    uint8_t info[0x40] = {};
+    CHECK(markInfoSaidOnce(info));
+    CHECK(info[0x22] == 1);
+    for (int i = 0; i < 0x40; ++i) CHECK(i == 0x22 || info[i] == 0);        // only that byte
+    CHECK(!markInfoSaidOnce(info) && info[0x22] == 1);                       // already set: nothing changed
+    CHECK(!markInfoSaidOnce(nullptr));
+}
+
+TEST(the_opcode_base_given_to_nvse_is_one_a_release_nvse_serializes) {
+    // actor_port_save_check 2026-10-22: autosaveaclgcheck.nvse had no 'ACLG' record. NVSE (Serialization.cpp HandleSaveGame) skips the save callback
+    // of a plugin whose opcode base is 0, which is what the default base 0x2000 (or none at all) gives in a release NVSE.
+    CHECK(nvcoop::opcodeBaseSerializes(nvcoop::opcodeBaseToRegister()));
+    CHECK(nvcoop::opcodeBaseToRegister() != nvcoop::kNvseDefaultOpcodeBase);
+    CHECK(!nvcoop::opcodeBaseSerializes(0) && !nvcoop::opcodeBaseSerializes(nvcoop::kNvseDefaultOpcodeBase));
+    CHECK(!nvcoop::opcodeBaseSerializes(nvcoop::kNvseOpcodeLimit));            // NVSE asserts opcode < 0x8000
+    CHECK(nvcoop::kNvseOpcodeBase == 0x7F10);                                  // saves written by an older build are keyed by it: it must not move
+}
+
 int main() {
     run("spec_table_matches_the_wire_op_table", spec_table_matches_the_wire_op_table);
     run("story_address_table_is_sane", story_address_table_is_sane);
@@ -466,8 +527,11 @@ int main() {
     run("skill_names_cover_barter_to_unarmed_only", skill_names_cover_barter_to_unarmed_only);
     run("json_codec_round_trips_ref_commands_and_rejects_bad_ones", json_codec_round_trips_ref_commands_and_rejects_bad_ones);
     run("capture_and_apply_agree_for_every_op", capture_and_apply_agree_for_every_op);
+    run("use_weapon_uses_the_second_command_shape", use_weapon_uses_the_second_command_shape);
     run("parked_moves_keep_the_newest_and_give_up", parked_moves_keep_the_newest_and_give_up);
     run("an_applier_without_its_own_executor_uses_the_process_wide_one", an_applier_without_its_own_executor_uses_the_process_wide_one);
+    run("a_said_once_effect_sets_the_flag_byte_of_the_info", a_said_once_effect_sets_the_flag_byte_of_the_info);
+    run("the_opcode_base_given_to_nvse_is_one_a_release_nvse_serializes", the_opcode_base_given_to_nvse_is_one_a_release_nvse_serializes);
     std::printf("%d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }
