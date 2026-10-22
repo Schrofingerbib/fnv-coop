@@ -95,6 +95,11 @@ void PuppetManager::RemovePlayer(Slot slot) {
     if (!avatarFaults().staleMapEntries) staleMap_.erase(slot);
 }
 
+void PuppetManager::SetLocalSlot(Slot slot) {
+    cfg_.localSlot = slot;
+    if (!avatarFaults().allowLocalSlot) RemovePlayer(slot);
+}
+
 void PuppetManager::SetEquipment(Slot slot, const std::vector<EquipEntry>& wanted) {
     if (Puppet* p = Find(slot)) p->equip.SetDesired(wanted);
 }

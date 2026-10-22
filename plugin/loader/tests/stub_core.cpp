@@ -6,6 +6,7 @@
 // Env var NVSTUB_VETO=1 (read with the Win32 API; this DLL has its own CRT) makes before_unload refuse.
 // Config: at init the stub reads [stub] value= from nvcoop.ini and the text of nvcoop_stub.json, both from the folder
 // of its OWN module file (the same lookup as IniPath() in the real modules). Method stub.cfg returns what it read.
+#include <cstddef>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -109,6 +110,8 @@ int CoreInit() {
     std::snprintf(onlyName, sizeof onlyName, "stub.only_v%d", STUB_VERSION);   // exists only in this build
     g_api->register_method(onlyName, &MOnlyThisVersion, nullptr, 1);
     g_api->set_state_provider(&SState);
+    if (g_api->size >= offsetof(NvLoaderApi, set_cosave) + sizeof(void*) && g_api->set_cosave)
+        g_api->set_cosave([](void*) {}, [](void*) {});   // like the actor engine's ledger cosave
     g_api->push_event("stub.init", nullptr);
     return 1;
 #endif

@@ -6,6 +6,7 @@ from typing import Optional, Set, Tuple
 from . import probe as P
 from .core import Ctx, Machine, Playbook, StepFailure
 from .fakecoop import FakeCoop
+from .pb_combat import goto_or_teleport
 
 ITEM_REF = "FalloutNV.esm:B00001"
 ITEM_BASE = "STIMPAK"
@@ -27,7 +28,7 @@ class LootRacePlaybook(Playbook):
     def run(self, ctx: Ctx) -> None:
         item, base = ctx.refs["item"], ctx.refs["item_base"]
         with ctx.step("everyone stands at the item"):
-            res = ctx.on_all(lambda m: m.bot.goto_ref(item, 150))
+            res = ctx.on_all(lambda m: goto_or_teleport(ctx, m, item, 150))     # placement: a stuck walk teleports
             for n, r in res.items():
                 ctx.must(r, f"{n} walks to the item")
         before = total_held(ctx, base)
@@ -84,7 +85,8 @@ class ContainerSharePlaybook(Playbook):
                 r = P.seed_items(host.bot, c, seed["item"], int(seed["count"]))
                 ctx.expect(r.ok, f"additem failed: {r.reason}")
         with ctx.step("everyone walks to the container"):
-            res = ctx.on_all(lambda m: m.bot.goto_ref(c, 120))
+            # placement only: the checks come after. In game 2026-10-22 client1 stood still 857 units from the dresser while the host got there
+            res = ctx.on_all(lambda m: goto_or_teleport(ctx, m, c, 120))
             for n, r in res.items():
                 ctx.must(r, f"{n} walks to the container")
             init_a, init_b = ctx.same_everywhere("container contents", contents)

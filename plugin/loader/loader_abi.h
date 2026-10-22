@@ -63,6 +63,11 @@ typedef struct NvLoaderApi {
     // its text in `out`. Runs the method on the calling thread (call from the main thread for main-thread methods).
     int (*has_method)(const char* name);
     int (*call_method)(const char* name, const char* paramsJson, NvOut* out);
+    // Cosave (NVSE serialization) callbacks of the current core; NULL clears. NVSE accepts serialization callbacks only during the
+    // first plugin load and can never drop them, so the loader registers its own once and forwards to these, and clears them
+    // before a core is unloaded. `intfc` is the NVSESerializationInterface*. (A core that called GetPluginHandle / SetSaveCallback
+    // itself crashed NVSE on a hot reload, and its callbacks would have pointed into the unloaded image.)
+    void (*set_cosave)(void (*save)(void* intfc), void (*load)(void* intfc));
     // Appended fields go below this line.
 } NvLoaderApi;
 

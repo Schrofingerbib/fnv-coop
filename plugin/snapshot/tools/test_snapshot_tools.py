@@ -298,11 +298,26 @@ class VolatileQuestVars(unittest.TestCase):
         for key in (("falloutnv.esm:1572e8", "icounter"), ("falloutnv.esm:10c721", "time"), ("falloutnv.esm:10c721", "fdays")):
             self.assertIn(key, snaplib.load_volatile_vars())
         host, guest = self.fight_snap(41, 6.333857, 6.333857, 0, 18), self.fight_snap(40, 5.959093, 6.028465, 1, 0)
-        # only the night-stalker quest still differs: its script ran on the host and not on the guest (a real difference)
-        self.assertEqual(sorted(d["path"] for d in snaplib.diff(host, guest)),
-                         ["shared/quests/FalloutNV.esm:1617A2/vars/StalkersOn", "shared/quests/FalloutNV.esm:1617A2/vars/iCount"])
+        # iCount is the night-stalker spawner's step counter (a host-private cursor, listed since 2026-10-22); only its StalkersOn flag still
+        # differs: the script ran on the host and not on the guest (a real difference)
+        self.assertEqual(sorted(d["path"] for d in snaplib.diff(host, guest)), ["shared/quests/FalloutNV.esm:1617A2/vars/StalkersOn"])
         # twin: without the volatile classification all five differ, as in the failing run
         self.assertEqual(len(snaplib.diff(host, guest, local_split=False)), 5)
+
+    def test_spawner_step_counters_are_per_machine(self):
+        # enemy_fight / npc_sync / enemy_parallel_pairs in game 2026-10-22: VERNovac01 iSpawnMonsters host 0 / guest 3 (the host-only spawner
+        # walks it 0..3 on every update; the guest never runs that script)
+        for key in (("falloutnv.esm:15f958", "ispawnmonsters"), ("falloutnv.esm:15f958", "iframe"), ("falloutnv.esm:157b4e", "ispawnmonsters")):
+            self.assertIn(key, snaplib.load_volatile_vars())
+
+        def snap(n, frame):
+            q = {"FalloutNV.esm:15F958": {"edid": "VERNovac01", "vars": {"iSpawnMonsters": n, "iFrame": frame, "bVipersDead": 0}}}
+            return {"schemaVersion": 1, "meta": {}, "perPlayer": {"0": {}}, "shared": {"quests": q}}
+        self.assertEqual(snaplib.diff(snap(0, 0), snap(3, 4)), [])
+        self.assertEqual(len(snaplib.diff(snap(0, 0), snap(3, 4), local_split=False)), 2)   # twin: the pre-fix compare
+        bad = snap(3, 0)
+        bad["shared"]["quests"]["FalloutNV.esm:15F958"]["vars"]["bVipersDead"] = 1   # a story-ish flag of the same quest still counts
+        self.assertEqual([d["path"] for d in snaplib.diff(snap(0, 0), bad)], ["shared/quests/FalloutNV.esm:15F958/vars/bVipersDead"])
 
 
 class GoldensProtected(unittest.TestCase):

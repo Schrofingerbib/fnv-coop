@@ -13,8 +13,10 @@ Script calls synced, game wide (`python -I tools/coverage/build.py`, `out/covera
 | before | 51 840 | 21 201 | 4 752 | 4 178 | 66.6 % |
 | after | 77 631 | 13 | 0 | 4 327 | 99.98 % (rounds to 100.0) |
 
-What is left: `UseWeapon` (13 calls), which has nine parameters (four forms, five integers), more than a `RefCommand` has slots. It needs either a second command
-shape or a packed layout; it is the only open script function of the census.
+`UseWeapon` (13 calls) was the last one: nine parameters (four forms, five integers), more than a `RefCommand` has slots. Track A, 2026-10-22: it is op 78 with the
+**second shape**: a wide op (`refOpIsWide`) also carries the forms `c` / `d` and the integer `m` (wire: after the recipient, only for wide ops; JSON: `c`, `d`, `m`).
+Capture uses nine ExtractArgs outputs (`kMaxStoryArgs`), the applier prints `UseWeapon <w> <o1> <o2> <i> [<i> <i> <i> <i>] [<o3>]` on the shooter's machine only (an AI
+order). Game-free tests only; the hook is off with `story_capture=0`.
 
 How the number is made, honestly:
 * **Real code** (new in this round): the `RefCommand` effect and its 77 hooked commands (below), `AddItemHealthPercent`, `ModFactionRank`, `PlayGroup`, `PlayIdle`,
@@ -118,7 +120,7 @@ The flight golden traces (`synccore/flight/golden/*.nvfr`) were regenerated: the
 
 ## Open items
 
-* `UseWeapon` (13 calls, nine parameters): needs a second RefCommand shape. Not started.
+* `UseWeapon` (13 calls, nine parameters): done 2026-10-22 as the second RefCommand shape (op 78, forms `c` `d`, integer `m`); unit-tested, not run in a game.
 * `ReleaseWeatherOverride` has no handler hook (see above); it relies on the weather poll.
 * The static census tables and `census.json` were not regenerated; the live scan with `evidence.json` is the number to read. `questlines/systems/run_tests.py` already failed before this work
   (`m_bad_kind`, empty `patch.add`) and is not in the gate.

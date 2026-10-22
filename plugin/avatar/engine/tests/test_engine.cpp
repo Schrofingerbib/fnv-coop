@@ -26,6 +26,7 @@
 #include "avatar_runtime.h"
 #include "local_sampler.h"
 #include "puppet_game_engine.h"
+#include "run_state.h"
 #include "testing/fake_backend.h"
 #include "../../avatar_groups.h"
 #include "../../loco.h"
@@ -1661,6 +1662,20 @@ void runtime_remote_look_update_and_local_look() {
     CHECK(r.be.badLines.empty());
 }
 
+// Twin 72 (live wiring 2026-10-22): the runtime waits for a player in a loaded cell and the status says so.
+void runtime_starts_only_with_a_player_and_says_why_not() {
+    using namespace nvcoop::avatar;
+    CHECK(!shouldCreateRuntime(true, true, false, 30, false));    // main menu: nothing to place a puppet in (twin 72: created anyway)
+    CHECK(shouldCreateRuntime(true, true, false, 30, true));      // a save is loaded
+    CHECK(!shouldCreateRuntime(true, true, false, 31, true));     // checked every 30th frame only
+    CHECK(!shouldCreateRuntime(true, true, true, 60, true));      // exists already
+    CHECK(!shouldCreateRuntime(false, true, false, 30, true));    // [avatar] enabled=0 and no live switch
+    CHECK(!shouldCreateRuntime(true, false, false, 30, true));    // no console interface
+    CHECK(std::string(notRunningBecause(true, true)).empty());
+    CHECK(std::string(notRunningBecause(true, false)).find("loaded game") != std::string::npos);
+    CHECK(std::string(notRunningBecause(false, false)).find("enabled=0") != std::string::npos);
+}
+
 struct TestCase {
     const char* name;
     void (*fn)();
@@ -1684,7 +1699,7 @@ const TestCase kTests[] = {
     T(runtime_game_events), T(runtime_status_json_contract),
     T(appearance_height_is_matched_with_setscale), T(weapon_mod_lines_and_readback), T(hit_target_health_lines),
     T(stack_weapon_mods_converge_and_follow_changes), T(stack_hit_target_puppet_survives_and_is_replaced), T(stack_look_update_keeps_the_puppet),
-    T(equip_watcher_carries_weapon_mods), T(runtime_remote_look_update_and_local_look),
+    T(equip_watcher_carries_weapon_mods), T(runtime_remote_look_update_and_local_look), T(runtime_starts_only_with_a_player_and_says_why_not),
 };
 
 }  // namespace

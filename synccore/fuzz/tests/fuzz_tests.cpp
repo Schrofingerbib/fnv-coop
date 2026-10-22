@@ -307,7 +307,7 @@ TEST(fuzz, saved_regression_scenarios) {
     }
     std::printf("    %d saved scenarios\n", n);
 #ifdef FNVCOOP_FUZZ_EM
-    CHECK(n >= 13);   // 11 for the mini target, 2 shrunk repros for the engine-model fixes
+    CHECK(n >= 14);   // 11 for the mini target, 3 shrunk repros for the engine-model fixes
 #else
     CHECK(n >= 11);
 #endif

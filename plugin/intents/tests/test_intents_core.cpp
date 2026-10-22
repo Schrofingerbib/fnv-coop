@@ -1,5 +1,5 @@
 // Game-free tests of the guest-intents core: wire, ini, guest and host policy, container redirect, the host pipeline, the guest client, the save gate.
-// Runtime twins 301..329 (tools/mut/fnvcoop_mut.h): the same binary is run once per twin with FNVCOOP_MUT=<n> and every one must fail a check.
+// Runtime twins 301..331 (330: actor mode reported on every action, 331: a stand-in is never reported) (tools/mut/fnvcoop_mut.h): the same binary is run once per twin with FNVCOOP_MUT=<n> and every one must fail a check.
 #include <cstring>
 
 #include "fnvcoop/wire.h"
@@ -247,6 +247,27 @@ TEST(intents_host, actor_choice_puppet_ghost_standin) {
     CHECK(h.run(1, Kind::Activate, R(0x500), 1).result == Result::NoPuppet);
     h.puppets[1] = 0x1001;
     CHECK(h.run(1, Kind::Activate, R(0x500), 2).result == Result::Executed && h.eng.calls.back().actor == 0x1001);
+}
+
+// A3 (2026-10-22): with [live] avatars=1 a guest's action runs as its avatar puppet (actedAs.puppet), never as the host's player; with avatars off the
+// stand-in stays but is reported (the module logs ACTING-STANDIN), once per change, not once per action.
+TEST(intents_host, puppet_wins_and_the_stand_in_is_reported_on_change) {
+    HostRig h;
+    h.add(0x500, TargetClass::Door);
+    for (uint32_t i = 1; i <= 3; ++i) CHECK(h.run(1, Kind::Activate, R(0x500), i).result == Result::Executed);   // avatars=1: puppet 0x1001
+    CHECK(h.host->stats().actedAsPuppet == 3 && h.host->stats().actedAsStandIn == 0);
+    for (const auto& c : h.eng.calls) CHECK(c.actor == 0x1001 && c.actor != kHostPlayerRef);                       // never the host player
+    REQUIRE(h.modes.size() == 1);
+    CHECK(std::get<0>(h.modes[0]) == 1 && std::get<1>(h.modes[0]) == ActorMode::Puppet && std::get<2>(h.modes[0]) == 0x1001);
+    h.puppets.clear();                                                                                              // avatars off (or the puppet is gone)
+    for (uint32_t i = 4; i <= 5; ++i) CHECK(h.run(1, Kind::Activate, R(0x500), i).result == Result::Executed);
+    CHECK(h.host->stats().actedAsStandIn == 2 && h.eng.calls.back().actor == kHostPlayerRef);
+    REQUIRE(h.modes.size() == 2);                                                                                   // reported once for the change
+    CHECK(std::get<1>(h.modes[1]) == ActorMode::StandIn && std::get<2>(h.modes[1]) == kHostPlayerRef);
+    h.puppets[1] = 0x1001;
+    CHECK(h.run(1, Kind::Activate, R(0x500), 6).result == Result::Executed);
+    REQUIRE(h.modes.size() == 3);
+    CHECK(std::get<1>(h.modes[2]) == ActorMode::Puppet);
 }
 
 TEST(intents_host, container_without_puppet_still_locks_and_skips_the_script) {

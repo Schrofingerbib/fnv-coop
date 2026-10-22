@@ -321,6 +321,11 @@ class Plan:
         self.before_id, self.coop_before = before_id, coop_before
 
 
+def reload_connection(connect: Callable[[int, float], Any], instance: int, wait_s: float, nv: Any) -> Any:
+    """The connection dev.reload goes out on: always a new one (see swap_one), never `nv`, which already ran core methods."""
+    return connect(instance, wait_s)
+
+
 def swap_one(plan: Plan, src: Path, expected_id: str, *, reload_timeout_s: float, wait_s: float, force: bool,
              connect: Callable[[int, float], Any], sleep: Callable[[float], None], now: Callable[[], float],
              log: Callable[[str], None], inst_dir: Optional[Path] = None, sync_data: bool = True) -> Dict[str, Any]:
@@ -343,8 +348,20 @@ def swap_one(plan: Plan, src: Path, expected_id: str, *, reload_timeout_s: float
         t1 = now()
         reply: Any = None
         try:
+            # A fresh connection: the bridge serves each one on its own thread, and the thread that waits for dev.reload is scanned by the
+            # drain. One that already ran core methods (dev.status, coop.status ...) keeps an old core return address in its stack
+            # buffers, and the drain refused every reload because of it (in game 2026-10-21).
             # timeoutMs lifts the bridge's own 30 s wait for a main-thread request; timeout_s is our wait for the answer.
-            reply = nv.call("dev.reload", {"reason": "hotswap", "timeoutMs": int(reload_timeout_s * 1000)}, timeout_s=reload_timeout_s)
+            rnv = reload_connection(connect, i, wait_s, nv)
+            try:
+                reply = rnv.call("dev.reload", {"reason": "hotswap", "timeoutMs": int(reload_timeout_s * 1000)}, timeout_s=reload_timeout_s)
+            finally:
+                close = getattr(rnv, "close", None)
+                if callable(close) and rnv is not nv:
+                    try:
+                        close()
+                    except Exception:  # noqa: BLE001 - the pipe may already be gone after the reload
+                        pass
         except GameCrashed as e:
             raise SwapFailed(f"the game process died during the reload: {e}") from e
         except ConnectionLost as e:

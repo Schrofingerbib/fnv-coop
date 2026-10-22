@@ -68,7 +68,10 @@ Engine-facing code compiles into `nvcoop.dll` and is OFF by default.
 Used: inventory totals call `0x4C8F30`, `0x4BF220` (data), `0x4BFFB0` (base container), top menu `0x714F00`, `InterfaceManager` `0x11D8A80` + crosshair ref `+0xFC`, menu id `0x3F0`
 (prologues pinned and compared at start, docs/re/dialogmenu-menus-vats-inventory.md). Writes are `AddItem` / `RemoveItem <id> <n> 1` console lines on the container or the player, inside
 `ApplyScope` so a guest's script gate lets them through.
-- **Closing the container menu from code:** no verified call. `RealLootEngine::setCloseMenuHook` is where it plugs in. Without it a refused player keeps a menu that does nothing: every move
+- **Closing the container menu from code (the test side):** the bridge method `bot.menu.close {kind:"container"}` (plugin/bots, dev only) calls `CloseAllMenusCore` 0x7037E0, the function the
+  CloseAllMenus script command runs (it walks the menu stack at InterfaceManager+0x114 and closes every menu through its vtable). `plugin/loot/tools/loot_proof.py` uses it, so the proof has no
+  hand step. It is unproven in the game for this menu (static RE only); the module's own refusal close is still not wired.
+- **Closing the container menu from the module (refused second opener):** no verified call. `RealLootEngine::setCloseMenuHook` is where it plugs in (`bot.menu.close`'s call would do). Without it a refused player keeps a menu that does nothing: every move
   in it is refused by the host (NotHolder) and rolled back, so nothing is duplicated, but the menu stays on screen.
 - **Which ref the menu shows:** the crosshair ref when the menu becomes the top menu (assumption).
 - **OnActivate parameters:** the order is not verified; the handler finds the player by ref id 0x14 and tries the other refs as the picked item (`describeItem` refuses anything that is not a world item).

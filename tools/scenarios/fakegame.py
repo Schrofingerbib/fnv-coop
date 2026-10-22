@@ -280,14 +280,17 @@ class CoopSim:
     arrives every `every` s. digests picks the host's judgement of them:
       "ok" every digest ok | "mismatch_same" every digest mismatches on the same keys and the repair never fixes it |
       "mismatch_once" the first digest mismatches (a repair), the rest are ok | "stale" every digest is stale | "silent" none arrives |
-      "mismatch_moving" every digest mismatches on other keys (the repairs make progress, so it is not given up on)
+      "mismatch_moving" every digest mismatches on other keys (the repairs make progress, so it is not given up on) |
+      "mismatch_late" every digest is ok except the first one at or after `late_at` s, which mismatches once (a repair of 256 effects): the
+      guest's late load-time scripts, seen after the jump's first sync wait
     stuck_at: client applied stops at this count (None = catches up). rejected: the clients refuse the join. disconnected: their
     transport is down. joined=False: they never join."""
 
     def __init__(self, join_at=2.0, catch_up_s=4.0, head=100, digest_from=6.0, every=2.0, digests="ok", stuck_at=None,
-                 rejected=False, disconnected=False, joined=True):
+                 rejected=False, disconnected=False, joined=True, late_at=75.0):
         self.join_at, self.catch_up_s, self.head, self.digest_from, self.every = join_at, catch_up_s, head, digest_from, every
         self.digests, self.stuck_at, self.rejected, self.disconnected, self.joined = digests, stuck_at, rejected, disconnected, joined
+        self.late_at = late_at
         self.t0 = 0.0
 
     def on_load(self, t):
@@ -311,6 +314,14 @@ class CoopSim:
             d["mismatch"] = d["repairs"] = min(n, 1)
             d["ok"] = max(0, n - 1)
             if n:
+                reports.append({"id": 1, "repaired": True, "entries": [{"key": "quest:0010A214.stage", "host": "25", "client": "0"}]})
+        elif self.digests == "mismatch_late":
+            m = int(max(0.0, self.late_at - self.digest_from) / self.every + 0.999999) + 1   # 1-based index of the first digest at or after late_at
+            late = 1 if n >= m else 0
+            d["mismatch"] = d["repairs"] = late
+            d["effectsRepaired"] = 256 * late
+            d["ok"] = n - late
+            if late:
                 reports.append({"id": 1, "repaired": True, "entries": [{"key": "quest:0010A214.stage", "host": "25", "client": "0"}]})
         elif self.digests == "stale":
             d["stale"] = n

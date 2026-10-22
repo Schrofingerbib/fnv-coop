@@ -28,6 +28,8 @@ struct FakeActor {
     float vx = 0, vy = 0;           // what the native AI does while ai is on (a straight walk)
     int placeCalls = 0, drives = 0, standInSpawns = 0, standInRemoves = 0, aiOn = 0, aiOff = 0, kills = 0, revives = 0, baseSets = 0, protOn = 0, protOff = 0;
     live::ActorSnapshot lastPlaced;
+    std::map<FormRef, int32_t> inv;   // inventory totals
+    int invWrites = 0;
 };
 
 class FakeEngine : public IActorPort {
@@ -123,6 +125,22 @@ public:
     }
     void kill(NetId id) override { FakeActor& f = a[id]; f.dead = true; ++f.kills; ops.push_back("kill:" + std::to_string(id)); }
     void revive(NetId id) override { FakeActor& f = a[id]; f.dead = false; ++f.revives; ops.push_back("revive:" + std::to_string(id)); }
+    bool refuseInventory = false;
+    bool sampleInventory(NetId id, InvList& out) override {
+        auto it = a.find(id);
+        if (it == a.end() || !(it->second.real || it->second.standIn)) return false;
+        out.clear();
+        for (const auto& kv : it->second.inv) if (kv.second > 0) out.push_back({kv.first, kv.second});
+        return true;
+    }
+    bool applyInventory(NetId id, const InvList& want) override {
+        auto it = a.find(id);
+        if (it == a.end() || !(it->second.real || it->second.standIn) || refuseInventory) return false;
+        it->second.inv.clear();
+        for (const auto& w : want) it->second.inv[w.form] = w.count;
+        ++it->second.invWrites;
+        return true;
+    }
 };
 
 struct NetOpts {

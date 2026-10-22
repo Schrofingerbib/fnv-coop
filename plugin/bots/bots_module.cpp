@@ -184,6 +184,16 @@ struct LiveGame : nvbots::IEngine {
         unsigned r = 0;
         return GuardedThis<unsigned>(&r, fn, reinterpret_cast<void*>(menu), id, (unsigned)tile);
     }
+    // ---- bot.menu.close ----
+    bool closeAllMenus() override {
+        if (!g_callsOk || !onMainThread()) return false;
+        __try {
+            reinterpret_cast<void(__cdecl*)()>(nvbots::addr::CloseAllMenusCore.addr)();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+        return true;
+    }
     // ---- bot.vats ----
     nvbots::Addr32 menuByType(uint32_t id) override {
         if (!g_callsOk) return 0;
@@ -319,7 +329,15 @@ void CheckPins() {
     g_callsOk = true;
     for (const nvbots::addr::CallPin* p : nvbots::addr::kAllCalls) {
         unsigned char got[16] = {};
-        if (!g_mem.read(p->addr, got, 16) || std::memcmp(got, p->bytes, 16) != 0) {
+        bool ok = g_mem.read(p->addr, got, 16);
+        if (ok && std::memcmp(got, p->bytes, 16) != 0) {
+            // another module of ours may have detoured this entry already (world_time on PendingTravelSet): compare its trampoline instead
+            unsigned char tr[16] = {};
+            const nvhooks::Addr t = nvhooks::trampolineOfAny(p->addr);
+            const bool haveTramp = t && g_mem.read(t, tr, 16);
+            ok = nvbots::pinBytesOk(got, p->bytes, haveTramp ? tr : nullptr);
+        }
+        if (!ok) {
             nvcoop::Log("bots: engine pin %s @%08X does not match this exe: dialogue/menu/inventory glue disabled", p->name, p->addr);
             g_callsOk = false;
         }
@@ -364,6 +382,10 @@ struct LiveEngine : nvbots::IBotEngine {
         return true;
     }
     bool hooked() override { return g_hooked; }
+    bool testHelpers() override {
+        const char* gate = std::getenv("NVCOOP_TEST_HELPERS");
+        return gate && gate[0] == '1';
+    }
     nvbots::IEngine* engine() override { return g_callsOk ? &g_game : nullptr; }
     int alwaysRun() override { return g_runPinsOk ? nvbots::alwaysRunState(g_game) : -1; }   // SEH-guarded byte reads only
     bool pressBox(int button, uint32_t* menuId, std::string* err) override {
@@ -435,7 +457,7 @@ void Init() {
     InstallHook();
     InstallDropHandler();
     static const char* const kMethods[] = {"bot.status", "bot.move", "bot.stop", "bot.look", "bot.fire", "bot.reload", "bot.sneak",
-                                           "bot.jump", "bot.activate", "bot.input", "bot.menu", "bot.menu.press", "bot.consent", "bot.inventory",
+                                           "bot.jump", "bot.activate", "bot.input", "bot.menu", "bot.menu.press", "bot.menu.close", "bot.consent", "bot.inventory",
                                            "bot.say", "bot.dialog", "bot.vats", "test.vats.hit", "test.fasttravel", "bot.fasttravel", "bot.drops", "dev.refsOf", "dev.countRefs",
                                            "dev.terminal", "dev.terminalState"};
     for (const char* m : kMethods) {

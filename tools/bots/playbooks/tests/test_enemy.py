@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
@@ -471,13 +472,83 @@ class AnimationWiring(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
+def scenlib_load():
+    sys.path.insert(0, os.path.join(REPO, "tools", "scenarios"))
+    import scenlib
+    return scenlib.load_scenario(os.path.join(REPO, "scenarios", "goodsprings_enemies.json"))
+
+
+def fight_ref_problems(fight, sc, forms):
+    """What is wrong with enemy_fight's refs for the goodsprings_enemies scenario (empty list: nothing)."""
+    f = {k: d["ref"] for k, d in sc["forms"].items()}
+    out = []
+    if fight["hostiles"] != [f["gang1"], f["gang2"]]:
+        out.append(f"hostiles are {fight['hostiles']}, want the two powder gangers only (the geckos are hostile to the gang and die first)")
+    if any(h in (f["gecko1"], f["gecko2"]) for h in fight["hostiles"]):
+        out.append("the geckos are among the hostiles")
+    if fight.get("weapon") != f["pistol"]:
+        out.append(f"weapon is {fight.get('weapon')}, want the scenario's pistol {f['pistol']}")
+    for h in fight["hostiles"]:
+        if h not in forms:
+            out.append(f"{h} is not a known form")
+            continue
+        base = fight["hostile_base_of"].get(h)
+        if base not in forms or forms[base]["sig"] not in ("NPC_", "CREA"):
+            out.append(f"{h}: base {base} is not an NPC_ or CREA")
+    return out
+
+
+def corpse_loot_problems(refs, sc):
+    """What is wrong with corpse_loot_race's loot for the goodsprings_enemies scenario (empty list: nothing). Game 2026-10-22: the scenario put
+    3 Stimpaks on the living ganger, who drank one in the fight on the host (his owner): loot on the ganger host 2 / guest 3 before anyone looted."""
+    out = []
+    by_ref = {d["ref"]: d for d in sc["forms"].values()}
+    item = by_ref.get(refs["item"])
+    if item is None:
+        return [f"the loot item {refs['item']} is not a form of the scenario"]
+    if item["sig"] != "MISC":
+        out.append(f"the loot item {item.get('edid')} is a {item['sig']}, not a MISC: the AI of a ganger in a fight drinks / wears / fires it, "
+                   f"so the machines differ before anyone loots (a living NPC's use of his items is not replicated)")
+    def ref_of(tok):   # "$name" -> the scenario form's ref
+        return sc["forms"][tok[1:]]["ref"] if tok.startswith("$") else tok
+    adds = [st for st in sc["setup"] if st.get("op") == "additem" and ref_of(st["who"]) == refs["victim"] and ref_of(st["item"]) == refs["item"]]
+    if not adds:
+        out.append("no setup step puts the loot item on the victim")
+    elif sum(int(a.get("count", 1)) for a in adds) != refs["item_count"]:
+        out.append(f"the setup puts {sum(int(a.get('count', 1)) for a in adds)} on the victim, the playbook expects {refs['item_count']}")
+    return out
+
+
+class CorpseLootItem(unittest.TestCase):
+    def test_the_loot_is_a_misc_item_on_the_victim_in_the_expected_count(self):
+        sc = scenlib_load()
+        refs = scenario_adapter.refs_for("corpse_loot_race", REPO)
+        self.assertEqual(corpse_loot_problems(refs, sc), [])
+
+    def test_twin_the_old_stimpak_loot_is_caught(self):   # the item a ganger uses up in a fight
+        sc = scenlib_load()
+        refs = dict(scenario_adapter.refs_for("corpse_loot_race", REPO), item=sc["forms"]["stimpak"]["ref"])
+        problems = corpse_loot_problems(refs, sc)
+        self.assertTrue(any("ALCH" in p for p in problems), problems)
+        self.assertTrue(any("no setup step" in p for p in problems), problems)   # the scenario no longer puts stimpaks on him either
+
+    def test_twin_a_wrong_count_is_caught(self):
+        sc = scenlib_load()
+        refs = dict(scenario_adapter.refs_for("corpse_loot_race", REPO), item_count=5)
+        self.assertTrue(any("expects 5" in p for p in corpse_loot_problems(refs, sc)))
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
 class ScenarioAndAdapter(unittest.TestCase):
     def test_scenario_is_valid_and_its_refs_reach_the_playbooks(self):
         import gzip
         sys.path.insert(0, os.path.join(REPO, "tools", "scenarios"))
         import scenlib
+        fp = os.path.join(REPO, "out", "questdata", "forms.json.gz")
+        if not os.path.exists(fp):   # generated from the game's own data files: the public repository does not ship it
+            self.skipTest("no out/questdata/forms.json.gz (generate it with tools/questdata from your game)")
         self.assertEqual(scenlib.validate_file(os.path.join(REPO, "scenarios", "goodsprings_enemies.json")), [])
-        forms = json.load(gzip.open(os.path.join(REPO, "out", "questdata", "forms.json.gz"), "rt", encoding="utf-8"))
+        forms = json.load(gzip.open(fp, "rt", encoding="utf-8"))
         sc = scenlib.load_scenario(os.path.join(REPO, "scenarios", "goodsprings_enemies.json"))
         self.assertEqual(sc["players"], 2)
         sigs = {d["sig"] for d in sc["forms"].values()}
@@ -487,15 +558,53 @@ class ScenarioAndAdapter(unittest.TestCase):
             pb = registry.make(n, REPO)
             self.assertFalse([k for k in pb.needs_scenario_refs if k not in refs], n)
         fight = scenario_adapter.refs_for("enemy_fight", REPO)
-        self.assertEqual(len(fight["hostiles"]), 4)
-        for h in fight["hostiles"]:
-            self.assertIn(h, forms)
-            base = fight["hostile_base_of"][h]
-            self.assertIn(forms[base]["sig"], ("NPC_", "CREA"), f"{h}: base {base}")
+        self.assertEqual(fight_ref_problems(fight, sc, forms), [])
         self.assertEqual(scenario_adapter.refs_for("corpse_loot_race", REPO)["item_count"], 3)
         steps = [s["op"] for s in sc["setup"]]
         self.assertIn("additem", steps, "the first ganger must carry loot")
         self.assertTrue(any(s["op"] == "console" and "Health" in s["cmd"] for s in sc["setup"]), "the bots must survive the fight")
+
+    def test_the_fight_hostiles_are_the_two_gangers_and_the_geckos_would_be_caught(self):
+        """Twin for the gecko removal (in game 2026-10-21 the VCG02 geckos, moved next to the gang, died before step 01): the
+        fight lists the two powder gangers only, each an NPC_, and carries the scenario's pistol. The old four-hostile list
+        (gangers plus geckos) and a missing weapon are named problems. Needs no questdata: the forms are a small stand-in."""
+        sc = scenlib_load()
+        f = {k: d["ref"] for k, d in sc["forms"].items()}
+        forms = {f["gang1"]: {"sig": "ACHR", "base": "B1"}, f["gang2"]: {"sig": "ACHR", "base": "B2"},
+                 f["gecko1"]: {"sig": "ACRE", "base": "B3"}, f["gecko2"]: {"sig": "ACRE", "base": "B4"},
+                 "B1": {"sig": "NPC_"}, "B2": {"sig": "NPC_"}, "B3": {"sig": "CREA"}, "B4": {"sig": "CREA"}}
+        orig = dict(scenario_adapter._BASES)
+        scenario_adapter._BASES[os.path.join(REPO, "out", "questdata", "forms.json.gz")] = {k: v["base"] for k, v in forms.items() if v.get("base")}
+        try:
+            good = scenario_adapter.refs_for("enemy_fight", REPO)
+        finally:
+            scenario_adapter._BASES.clear()
+            scenario_adapter._BASES.update(orig)
+        self.assertEqual(good["hostiles"], [f["gang1"], f["gang2"]])
+        self.assertEqual(good["weapon"], f["pistol"])
+        self.assertEqual(fight_ref_problems(good, sc, forms), [])
+        old = dict(good, hostiles=good["hostiles"] + [f["gecko1"], f["gecko2"]],
+                   hostile_base_of=dict(good["hostile_base_of"], **{f["gecko1"]: "B3", f["gecko2"]: "B4"}))
+        self.assertTrue(any("geckos" in p for p in fight_ref_problems(old, sc, forms)), "the old gecko list is caught")
+        self.assertTrue(any("weapon" in p for p in fight_ref_problems({k: v for k, v in good.items() if k != "weapon"}, sc, forms)),
+                        "a fight without the scenario's pistol is caught")
+
+    def test_the_scenario_revives_the_gangers_before_the_test_needs_them_alive(self):
+        """The scenario starts from the newest autosave. In game 2026-10-22 enemy_chaos_bad_wifi step 01 failed '104C77 should start alive': a test before
+        it had killed the gangers and the game autosaved. The setup resurrects both gangers (a living one is unchanged). Twin: the setup without the two
+        steps is flagged."""
+        sc = scenlib_load()
+
+        def revived(setup):
+            idx = {st["id"]: i for i, st in enumerate(setup)}
+            out = []
+            for g in ("$gang1", "$gang2"):
+                steps = [i for i, st in enumerate(setup) if st.get("op") == "resurrect" and st.get("ref") == g]
+                enable = [i for i, st in enumerate(setup) if st.get("op") == "enable" and st.get("ref") == g]
+                out.append(bool(steps) and bool(enable) and idx and max(steps) < min(i for i, st in enumerate(setup) if st["id"] == "players_to_gang"))
+            return all(out)
+        self.assertTrue(revived(sc["setup"]))
+        self.assertFalse(revived([st for st in sc["setup"] if st.get("op") != "resurrect"]))
 
     def test_handoff_refs_name_a_far_and_a_near_place(self):
         refs = scenario_adapter.refs_for("enemy_handoff", REPO)
@@ -923,8 +1032,13 @@ class FightCli(unittest.TestCase):
         import run_coop
         import run_fight
 
+        pings = []
+
         class Nv:
             def call(self, method, params=None, timeout_s=0):
+                pings.append(method) if method == "ping" else None
+                if method == "ping":     # run_fight waits for a ready copy before it starts (nvready.wait_ready, harness4): this one is ready
+                    return {"pong": True, "menuReady": True, "mainLoopAgeMs": 5}
                 return {}
 
             def __enter__(self):
@@ -950,6 +1064,7 @@ class FightCli(unittest.TestCase):
                 args, extra = seen[0]
                 self.assertEqual(("--no-scenario" in args), no_scenario, extra_args)
                 self.assertEqual(extra, want, extra_args)
+            self.assertTrue(pings, "run_fight asks every copy for a ready ping before it starts (a copy still loading answers nothing)")
         finally:
             run_coop.main = old_main
             if old_mod is None:
@@ -1286,6 +1401,68 @@ class EquipAllGivesAMissingWeapon(unittest.TestCase):
         for m in ms:
             m.bot.me["inv"].pop(weapon, None)
         self.assertFalse(ms[0].bot.equip(weapon).ok)
+
+
+class DupCountsWaitForTheCellToLoad(unittest.TestCase):
+    """In game 2026-10-22 enemy_handoff step 01 failed 'live count of FalloutNV.esm:104C76 differs between machines: host 1, client1 0' right after
+    'client1: the walk ... did not arrive, teleported there': dev.countRefs counts the PLAYER'S cell, and a player teleported a moment ago is still
+    in the old cell. The count is taken once all machines agree (or the budget ends and the differing numbers are reported)."""
+
+    BASE = "FalloutNV.esm:104C76"
+
+    class Bot:
+        def __init__(self, answers):
+            self.answers = list(answers)
+            self.polls = 0
+
+        def ref_count(self, base, cell=""):
+            self.polls += 1
+            return self.answers[min(self.polls - 1, len(self.answers) - 1)]
+
+    class Ctx:
+        """The few Ctx members dup_counts uses; same_everywhere / optional are the real ones."""
+        same_everywhere = core.Ctx.same_everywhere
+        optional = core.Ctx.optional
+
+        def __init__(self, bots):
+            self.present = [types.SimpleNamespace(name=n, bot=b) for n, b in bots.items()]
+            self.refs = {"hostile_base_of": {"FalloutNV.esm:104C70": DupCountsWaitForTheCellToLoad.BASE}}
+            self.opts = {"spawn_s": 5}
+            self.notes = []
+            self.ticks = 0
+
+        def wait_until(self, label, pred, timeout_s=10.0, poll_s=0.1):
+            for _ in range(20):
+                if pred():
+                    return
+                self.ticks += 1
+            raise core.StepFailure(f"timed out waiting for: {label}", "check")
+
+    def ctx(self, host, client):
+        return self.Ctx({"host": self.Bot(host), "client1": self.Bot(client)})
+
+    def test_a_client_still_in_its_old_cell_catches_up(self):
+        c = self.ctx([1], [0, 0, 0, 1])
+        self.assertEqual(pb_enemy.dup_counts(c, ["FalloutNV.esm:104C70"]), {self.BASE: 1})
+        self.assertGreater(c.ticks, 0)
+
+    def test_twin_the_one_shot_count_of_the_old_code_fails_on_the_same_world(self):
+        c = self.ctx([1], [0, 0, 0, 1])
+        with self.assertRaises(core.StepFailure) as e:
+            c.same_everywhere(f"live count of {self.BASE}", lambda m: probe.ref_count(m.bot, self.BASE))   # what dup_counts did before the wait
+        self.assertIn("differs between machines", str(e.exception))
+
+    def test_machines_that_never_agree_still_fail_with_the_numbers(self):
+        c = self.ctx([1], [0])
+        with self.assertRaises(core.StepFailure) as e:
+            pb_enemy.dup_counts(c, ["FalloutNV.esm:104C70"])
+        self.assertIn("live count of FalloutNV.esm:104C76 differs between machines", str(e.exception))
+        self.assertIn("'host': 1", str(e.exception))
+
+    def test_machines_that_agree_are_counted_at_once(self):
+        c = self.ctx([2], [2])
+        self.assertEqual(pb_enemy.dup_counts(c, []), {self.BASE: 2})
+        self.assertEqual(c.ticks, 0)
 
 
 if __name__ == "__main__":

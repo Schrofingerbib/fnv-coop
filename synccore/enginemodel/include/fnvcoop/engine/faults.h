@@ -23,6 +23,7 @@ struct EngineFaults {
     bool digestBucketsPositions = false;   // digests round positions to 256 units and health to tens: differences below that are never healed
     bool digestNoSeq = false;           // the host judges every digest datagram it receives, so a link-duplicated or reordered report looks like a stable mismatch
     bool newOwnerNoWait = false;        // a forced commit starts the new owner's AI at once, while the old owner may not have heard of the handoff yet
+    bool grantEndsOwnerWait = false;    // a Grant that hands the actor back to the new owner (after its own aborted handoff) ends its wait for the previous owner's final state, so it drives the actor while that owner may still be driving it too
     bool createdKeyIsPlayer = false;    // digest keys of created actors (0xFF......) are read as player slots: a repair overwrites a player's own state
     // combat-core (FULL-SYNC-PLAN 3.4)
     bool deathNotIdempotent = false;    // a dead actor can be hit and declared dead again: its loot is rolled and its corpse rebuilt a second time

@@ -93,6 +93,7 @@ void ActorFeed::onWorldChanged() {
     rebase_.clear();
     port_.forgetWorld();
     if (sync_ && !FNV_MUT(52)) sync_->purgeStandIns();   // twin 52: ActorSync keeps believing in clones that died with the old world
+    if (sync_ && !FNV_MUT(68)) sync_->onWorldReloaded(); // twin 68: an actor that died in the old world can never die again in the loaded one
     if (!FNV_MUT(55)) port_.undoStale();                 // twin 55: what a save / crash left in the world stays there
     dirty_ = true;
 }

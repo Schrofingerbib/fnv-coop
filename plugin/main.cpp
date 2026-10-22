@@ -11,6 +11,7 @@
 
 #include "bridge/bridge.h"
 #include "common/nvcoop_api.h"
+#include "common/nvse_opcode_base.h"
 #include "common/registry.h"
 #include "bridge/screenshot.h"
 #ifdef NVCOOP_WITH_FOCUS_GUARD
@@ -225,6 +226,13 @@ int RunLineSEH(const char* line, TESObjectREFR* thisObj) {
         return -1;
     }
 }
+int RunLineLogged(const char* line, TESObjectREFR* thisObj) {
+    const int rc = RunLineSEH(line, thisObj);
+    // A fault swallowed here skips the engine's cleanup (the temporary Script on xNVSE's stack is never destroyed), so it can set up a
+    // later crash far away from this line (issue #33). Name it in the log.
+    if (rc < 0) Log("console line faulted and was abandoned: %.200s", line);
+    return rc;
+}
 
 // ---- exec {cmd, ref}: the engine's load order and form map (the same data plugin/hooks' DefaultResolver reads) ----
 constexpr UInt32 kDataHandlerPtr = 0x011C3F2C;  // DataHandler* (NVSE DataHandler::Get for runtime 1.4.0.525)
@@ -427,7 +435,7 @@ public:
         int rc;
         {
             ConsoleModeScope echo;
-            rc = RunLineSEH(line.c_str(), thisObj);
+            rc = RunLineLogged(line.c_str(), thisObj);
         }
         if (cof) {
             std::memcpy(cof, saved, sizeof saved);
@@ -522,6 +530,37 @@ bool PluginsMethod(const std::string&, std::string& out) {
 
 // Crash note: write exception code/address/module+offset to nvcoop.log from inside the dying process, then
 // let the normal handlers (WER, NVSE) continue. Tools collect nvcoop.log / nvse.log afterwards.
+// Copy n bytes of possibly unmapped memory. Raw pointers only (SEH).
+bool CrashPeek(const void* from, void* to, size_t n) {
+    __try {
+        std::memcpy(to, from, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// The stack words around ESP as hex and text. An EIP made of text (issue #33: 0x6C676E61 "angl") was popped from [esp-4], so these
+// lines show the whole string that overwrote it and the frames next to it.
+void LogCrashStack(const CONTEXT* c) {
+#ifdef _M_IX86
+    const uintptr_t esp = c->Esp;
+    Log("CRASH regs eax=%08lX ebx=%08lX ecx=%08lX edx=%08lX esi=%08lX edi=%08lX ebp=%08lX esp=%08lX", c->Eax, c->Ebx, c->Ecx, c->Edx,
+        c->Esi, c->Edi, c->Ebp, c->Esp);
+    for (int row = -2; row < 6; ++row) {
+        const uintptr_t at = esp + static_cast<intptr_t>(row) * 16;
+        uint32_t w[4] = {};
+        if (!CrashPeek(reinterpret_cast<const void*>(at), w, sizeof w)) continue;
+        char text[17] = {};
+        const auto* b = reinterpret_cast<const unsigned char*>(w);
+        for (int i = 0; i < 16; ++i) text[i] = (b[i] >= 0x20 && b[i] < 0x7F) ? static_cast<char>(b[i]) : '.';
+        Log("CRASH stack %08lX: %08X %08X %08X %08X  %s", static_cast<unsigned long>(at), w[0], w[1], w[2], w[3], text);
+    }
+#else
+    (void)c;
+#endif
+}
+
 LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     const auto* r = ep->ExceptionRecord;
     char mod[MAX_PATH] = "?";
@@ -534,6 +573,7 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     }
     Log("CRASH code=%08lX addr=%p module=%s offset=%lX frames=%llu", r->ExceptionCode, r->ExceptionAddress, mod,
         static_cast<unsigned long>(off), static_cast<unsigned long long>(g_bridge.frames()));
+    if (ep->ContextRecord) LogCrashStack(ep->ContextRecord);
     nvcoop::PushEvent("game.crash");
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -606,6 +646,7 @@ __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInf
 
 __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse) {
     g_nvse = nvse;
+    nvse->SetOpcodeBase(nvcoop::opcodeBaseToRegister());   // without a base NVSE never calls our save callback: no cosave record (nvse_opcode_base.h)
     g_pluginHandle = nvse->GetPluginHandle();
     const char* rd = nvse->GetRuntimeDirectory();
     g_gameDir = rd ? rd : "";
@@ -620,6 +661,13 @@ __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse) {
         return false;
     }
     g_msg->RegisterListener(g_pluginHandle, "NVSE", OnMessage);
+    // Cosave: NVSE takes serialization callbacks only now, during the first load. Register forwarders once; modules (or, in the
+    // split build, the current core through the loader) set the real callbacks with nvcoop::SetCosaveCallbacks.
+    if (auto* ser = static_cast<NVSESerializationInterface*>(nvse->QueryInterface(kInterface_Serialization))) {
+        static NVSESerializationInterface* s_ser = ser;
+        ser->SetSaveCallback(g_pluginHandle, [](void*) { nvcoop::RunCosave(true, s_ser); });
+        ser->SetLoadCallback(g_pluginHandle, [](void*) { nvcoop::RunCosave(false, s_ser); });
+    }
     SetUnhandledExceptionFilter(CrashFilter);
 
     if (EnvOr("NVCOOP_MULTI_INSTANCE", ReadIni("bridge", "multiInstance", "0")) == "1") {

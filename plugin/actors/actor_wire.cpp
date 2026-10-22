@@ -5,6 +5,7 @@ namespace nvcoop::actors {
 
 namespace {
 constexpr size_t kMaxAv = 64;
+constexpr size_t kMaxInvItems = 128;
 
 void ioVec(fnvcoop::Archive& a, live::Vec3& v) { a.f32(v.x); a.f32(v.y); a.f32(v.z); }
 
@@ -47,6 +48,13 @@ void io(fnvcoop::Archive& a, MDeath& m) { a.varu32(m.id); a.varu32(m.epoch); a.v
 void io(fnvcoop::Archive& a, MPick& m) { a.varu32(m.id); fnvcoop::io(a, m.pick); }
 void io(fnvcoop::Archive& a, MPickReport& m) { a.varu32(m.id); fnvcoop::io(a, m.base); }
 void io(fnvcoop::Archive& a, MResync& m) { a.varu32(m.id); }
+void io(fnvcoop::Archive& a, MInventory& m) {
+    a.varu32(m.id); a.varu32(m.epoch); a.varu(m.eventId);
+    size_t n = m.items.size();
+    if (!a.count(n, kMaxInvItems)) return;
+    if (a.reading()) m.items.assign(n, {});
+    for (auto& it : m.items) { fnvcoop::io(a, it.form); a.vari32(it.count); }
+}
 void io(fnvcoop::Archive& a, MAnimEvent& m) { a.varu32(m.id); a.varu32(m.epoch); a.varu(m.eventId); a.bytes(m.payload, 256); }
 
 template <size_t I>
@@ -68,7 +76,7 @@ bool readBody(fnvcoop::Archive& a, size_t idx, Body& out) {
 }  // namespace
 
 const char* bodyName(const Body& b) {
-    static const char* names[] = {"Own", "Track", "SnapFull", "Death", "Pick", "PickReport", "Resync", "AnimEvent"};
+    static const char* names[] = {"Own", "Track", "SnapFull", "Death", "Pick", "PickReport", "Resync", "AnimEvent", "Inventory"};
     return names[b.index()];
 }
 
