@@ -148,7 +148,18 @@ def check_find_steam():
 def check_find_steam_ansi_library_path():
     """A Steam client on a system whose code page is not UTF-8 (a Russian Windows, cp1251) writes
     libraryfolders.vdf in the ANSI code page, and the library path may hold non-ASCII characters.
-    Those must survive the read, or the install is never found - and nothing says why."""
+    Those must survive the read, or the install is never found - and nothing says why.
+    The reader falls back to this machine's ANSI code page, so the check pretends to be that Russian
+    Windows: without it the cp1251 bytes decode in the runner's code page (cp1252) and the path is wrong."""
+    real_encoding = fnv_ini.ini_encoding
+    fnv_ini.ini_encoding = lambda: "cp1251"
+    try:
+        _find_steam_ansi_library_path()
+    finally:
+        fnv_ini.ini_encoding = real_encoding
+
+
+def _find_steam_ansi_library_path():
     with tmp() as td:
         steam = td / "Steam"
         # A Cyrillic folder name ("Biblioteka Steam"), written with escapes so this file stays ASCII
