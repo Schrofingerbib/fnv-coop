@@ -52,6 +52,9 @@ public:
     void SetLog(std::function<void(const std::string&)> log);
     void SetLocalIdentity(live::NetId netId, live::OwnerEpoch epoch);
 
+    // This machine's own slot as the session assigned it (the ini default 0 is only right for the host). Call before AddRemote.
+    void SetLocalSlot(Slot slot);
+
     // ---- remote players ---------------------------------------------------------------------------------------------
     bool AddRemote(Slot slot, const Appearance& a);
     void RemoveRemote(Slot slot);

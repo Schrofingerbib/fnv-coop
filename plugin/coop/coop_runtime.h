@@ -173,6 +173,13 @@ public:
     fnvcoop::RulesEngine* rules() { return rules_.get(); }
     // Host: coalescing channel for quest script vars / globals polled from the engine (L5 pollHostState). null on clients.
     fnvcoop::StateReplicator* replicator() { return replicator_.get(); }
+    // Host: the engine poll that feeds the replicator (L5 pollHostState), run once per frame right before the replicator flushes. It runs
+    // WITH OR WITHOUT a world baseline: quest vars that object / NPC scripts write inline (`set VMS16.nGangerDeathCount to ... + 1` in a
+    // ganger's OnDeath) are inside no capture scope, so the poll is the only way they reach the shared state. `first` = the replicator is
+    // new (a new session): the poll resets its change tracker. `prime` = first AND no baseline: the machine's current values are taken as the
+    // known state (a baseline would have transferred them) and only later changes are reported, instead of flooding every quest var.
+    using StatePollFn = std::function<void(fnvcoop::StateReplicator& to, bool first, bool prime)>;
+    void setStatePoll(StatePollFn f) { statePoll_ = std::move(f); polledRep_ = nullptr; }
     // Host: the engine wants to advance `quest` to `stage`. false => DEFERRED (skip the engine call; stageApplier fires on release).
     // Calls made by the stage applier itself, and everything while no rules engine is loaded, proceed.
     bool stageRequested(const fnvcoop::FormRef& quest, uint32_t stage, fnvcoop::PlayerId initiator = 0);
@@ -272,6 +279,8 @@ private:
     bool haveRules_ = false;
     std::unique_ptr<fnvcoop::RulesEngine> rules_;
     std::unique_ptr<fnvcoop::StateReplicator> replicator_;
+    StatePollFn statePoll_;
+    const fnvcoop::StateReplicator* polledRep_ = nullptr;   // the replicator the poll last ran for (a new one = a new session)
     EdidResolver edid_;
     std::function<bool(fnvcoop::PlayerId, fnvcoop::FormRef&)> playerRef_;
     std::function<uint32_t(fnvcoop::PlayerId)> ghostOf_;

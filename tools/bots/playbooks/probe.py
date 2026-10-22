@@ -11,6 +11,11 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
 
+# The expression that says whether the player holds a weapon (a NUMBER: the bare "player.GetEquippedObject 5" is a Form and printc refuses it,
+# "Expected variable (got Form)", in game 2026-10-22). Same text as tools/bots/primitives.py equipped_weapon() (a test pins that).
+EQUIPPED_WEAPON_EXPR = "(player.GetEquippedObject 5) && 1"
+
+
 class MissingBridge(RuntimeError):
     """A bridge method this playbook needs is not in the build. The text says which."""
 
@@ -154,16 +159,23 @@ def objective_completed(bot, quest: str, obj: int) -> bool:
     return bot.nv.objective_completed(hexid(quest), obj)
 
 
+def _is_player(ref: str) -> bool:
+    return isinstance(ref, str) and ref.strip().lower() == "player"
+
+
 def _eval_ref(bot, ref: str, fn: str) -> float:
     """`fn` evaluated with `ref` as the calling reference (exec {cmd, ref}). The game's console does not accept
-    '<hexFormID>.Func' (in game, 2026-10-21). `ref` goes as it is: 'Plugin.esm:HEX' (the bridge adds the plugin's
-    load-order index) or a bare hex runtime id."""
+    '<hexFormID>.Func' (in game, 2026-10-21). `ref` goes as it is: 'Plugin.esm:HEX' (the bridge adds the
+    plugin's load-order index) or a bare hex runtime id. The player is the one exception: the bridge refuses the word 'player' as a ref
+    ("bad ref 'player': 'player' is not a hex number", in game 2026-10-22), "player.X" is the console's own form for him."""
+    if _is_player(ref):
+        return bot.nv.eval(f"player.{fn}")
     return bot.nv.eval(fn, ref=ref)
 
 
 def _exec_ref(bot, ref: str, cmd: str) -> Result:
     """Console line `cmd` with `ref` as the calling reference (see _eval_ref)."""
-    r = bot.nv.exec(cmd, ref=ref)
+    r = bot.nv.exec(f"player.{cmd}") if _is_player(ref) else bot.nv.exec(cmd, ref=ref)
     ok = r.get("ok", True)
     return Result(bool(ok), "" if ok else str(r.get("output", "")))
 

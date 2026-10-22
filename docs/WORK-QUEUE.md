@@ -66,15 +66,20 @@ and the flight dumps (`python -I tools/flight/flight.py diverge`). Do not edit T
    are enabled in the fight cell on the host but disabled with no parent cell on the guest (flags 0xC09, cell 0), restrained by
    the port. The guest made 15 stand-ins during the run. Look at how a host MoveRef of a non-owned actor into another cell meets
    the stand-in path.
-3. **A1c: the strict playbook counts a heal after a reload.** On the first run after a reload the session found one digest
+3. **A1c (CODE DONE 2026-10-22, needs a game run): the strict playbook counts a heal after a reload.** `Runner.jump` now waits, as its last step, for a digest that is ok
+   AFTER the newest mismatch (`coopSync.settledAfterSetup`), so the heal caused by the boxes, reset and setup steps belongs to the jump. Original note: On the first run after a reload the session found one digest
    mismatch and repaired 256 effects (the guest rejoining). Either the jump waits until that first digest round settles, or the
    playbook starts its counters after it.
 4. **A2: everything Track B reports** as a game-side desync.
-5. **A3: guest actions without a ghost ref.** With avatars off, a guest's activation runs as the host player
+5. **A3 (CODE DONE 2026-10-22, needs a game run): guest actions without a ghost ref.** The intents path already used `glueAvatarRef` first; it now reports the acting
+   player per slot (`intents: acting player for slot N = avatar puppet ...` or `ACTING-STANDIN ... [live] avatars=0 / puppet does not exist yet`), so the log says which one ran.
+   Original note: With avatars off, a guest's activation runs as the host player
    (`ACTING-STANDIN ... host player 14 acts`). With `[live] avatars=1` the puppet map exists; check the intents path uses it and
    test it in game.
-6. **A4: actor adapter engine pins.** On one copy the three direct calls (placeAtMe, getActorValue, isDisabled) refused their
+6. **A4 (CODE DONE 2026-10-22, needs a game run): actor adapter engine pins.** Likely causes, now removed: the check ran once and the answer stayed for the process
+   (an early read gave a permanent refusal), and placeAtMe alone refused a function another patch had detoured (E9). `pin_check.h`: a refusal is re-checked every 3 s
+   (20 times), a detour is callable, and every refusal logs the 16 bytes found next to the 16 expected. Original note: On one copy the three direct calls (placeAtMe, getActorValue, isDisabled) refused their
    prologue check and the console fallback ran; on the two-copy run they passed. Find out why they differ.
-7. **A5: the last script command** without sync: `UseWeapon` (13 calls) needs a second command shape.
+7. **A5 (CODE DONE 2026-10-22, game-free tests only): the last script command** without sync: `UseWeapon` (13 calls) is RefCommand op 78 with the second shape (forms c d, integer m).
 8. **A6: switch features on by default** once their in-game tests pass, area by area.
 9. **A7: merge Track B's PRs** about every hour.

@@ -530,7 +530,8 @@ void OnMessage(uint32_t type, void*, uint32_t) {
 
 bool MStatus(const std::string&, std::string& out) {
     Value o = Value::object();
-    o.set("enabled", g_cfg.enabled).set("hooked", g_hooked).set("pins", Pins()).set("partyTravel", g_cfg.partyTravel)
+    o.set("enabled", g_cfg.enabled).set("hooked", g_hooked).set("pins", Pins())
+        .set("partyTravel", g_st.session ? g_st.session->partyTravel() : g_cfg.partyTravel)   /* a client: the host's last beacon */
         .set("session", g_st.session != nullptr).set("role", g_st.role == nvwt::Role::Host ? "host" : "client");
     if (g_st.session) {
         const auto& s = g_st.session->stats();

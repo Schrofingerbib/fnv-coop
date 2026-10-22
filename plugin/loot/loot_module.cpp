@@ -26,7 +26,7 @@
 namespace nvcoop::loot {
 namespace {
 
-bool g_inited = false, g_enabled = false;
+bool g_created = false, g_inited = false, g_enabled = false;
 std::unique_ptr<RealLootEngine> g_engine;
 std::unique_ptr<LootSync> g_sync;
 NVSEInterface* g_nvse = nullptr;
@@ -94,9 +94,11 @@ void RemoveHandlers() {
     g_dropHandler = g_activateHandler = false;
 }
 
-void Init() {
-    if (g_inited) return;
-    g_inited = true;
+// The service itself: ini, engine, LootSync. The live hub is built before DeferredInit (and before this module's OnLoad ran), and needs the service
+// to register it, so this half is asked for early (service()); handlers and listeners need the NVSE interface and wait for Init().
+void Create() {
+    if (g_created) return;
+    g_created = true;
     const std::string ini = IniPath();
     SyncConfig cfg;
     cfg.enabled = GetPrivateProfileIntA("loot", "enabled", 0, ini.c_str()) != 0;
@@ -106,8 +108,33 @@ void Init() {
     cfg.corpseDelayMs = static_cast<uint32_t>(GetPrivateProfileIntA("loot", "corpse_delay_ms", 700, ini.c_str()));
     g_enabled = cfg.enabled;
     g_engine = std::make_unique<RealLootEngine>();
+    // The actor port copies an owner's item use (a ganger drinks a Stimpak) to the other machines; the engine calls are this module's.
+    nvcoop::actors::engine::setInventoryAccess(
+        [](nvcoop::actors::NetId net, nvcoop::actors::InvList& out) {
+            if (!g_engine) return false;
+            Items have;
+            bool exact = true;
+            if (!g_engine->readContents(net, have, exact) || !exact) return false;
+            out.clear();
+            for (const auto& kv : have)
+                if (kv.second > 0) out.push_back({kv.first, kv.second});
+            return true;
+        },
+        [](nvcoop::actors::NetId net, const nvcoop::actors::InvList& want) {
+            if (!g_engine) return false;
+            Items items;
+            for (const auto& it : want) items[it.form] += it.count;
+            return g_engine->setContents(net, items);
+        });
     g_sync = std::make_unique<LootSync>(*g_engine, cfg);
+}
+
+void Init() {
+    if (g_inited) return;
+    g_inited = true;
+    Create();
     if (!g_enabled) { nvcoop::Log("loot: disabled (nvcoop.ini [loot] enabled=0)"); return; }
+    const std::string ini = IniPath();
     if (GetPrivateProfileIntA("intents", "enable", 0, ini.c_str()) != 0 &&
         (GetPrivateProfileIntA("intents", "pickup", 1, ini.c_str()) != 0 || GetPrivateProfileIntA("intents", "container", 1, ini.c_str()) != 0))
         nvcoop::Log("loot: WARNING nvcoop.ini [intents] pickup / container are on as well: a pickup or a container would be handled twice. Set [intents] pickup=0 and container=0 (docs/tools/loot.md)");
@@ -115,14 +142,16 @@ void Init() {
     g_diedListener = nvcoop::actors::engine::addActorDiedListener([](const nvcoop::actors::engine::DiedEvent& e) {
         if (g_sync && e.mine && e.authorised) g_sync->onActorDied(e.netId, e.ref);
     });
-    nvcoop::Log("loot: enabled; the service must be added to the live hub (loot_glue.h) for it to run in a session");
+    nvcoop::Log("loot: enabled (the live hub runs it in a session: live_glue.cpp adds nvcoop::loot::service())");
 }
 
 void Uninit() {
+    nvcoop::actors::engine::setInventoryAccess(nullptr, nullptr);
     if (g_diedListener) { nvcoop::actors::engine::removeListener(g_diedListener); g_diedListener = 0; }
     RemoveHandlers();
     g_sync.reset();
     g_engine.reset();
+    g_created = false;
     g_inited = false;
     g_enabled = false;
 }
@@ -145,7 +174,7 @@ void OnMessage(uint32_t type, void*, uint32_t) {
 bool enabled() { return g_enabled && g_sync != nullptr; }
 
 LootSync& service() {
-    if (!g_sync) Init();   // asked before DeferredInit (the hub is built early): read the ini now
+    Create();   // asked before DeferredInit (the hub is built early): read the ini now, the handlers follow in Init()
     return *g_sync;
 }
 

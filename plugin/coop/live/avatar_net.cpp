@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <ctime>
 
-#include "fnvcoop_mut.h"   // FNV_MUT(n): twins 41..51 of the live wiring suite, 105..109 of the avatar suite (plugin/avatar/full)
+#include "fnvcoop_mut.h"   // FNV_MUT(n): twins 41..51 of the live wiring suite, 105..110 of the avatar suite (plugin/avatar/full)
 
 namespace nvcoop::livewire {
 
@@ -80,6 +80,7 @@ void AvatarNet::sessionBegin(const SessionInfo& info, ILiveLink& link) {
     lookSentValid_ = false;
     lastAck_ = lastLookCheck_ = lastPoseReport_ = 0;
     haveLocal_ = reportedLocalValid_ = false;
+    if (!FNV_MUT(110) && self_ != kNoPlayer) side_.setLocalSlot(static_cast<nvcoop::avatar::Slot>(self_));   // MUTANT 110: the avatar layer is never told its slot (a client keeps the ini default 0 and refuses the host's puppet)
     side_.setLocalIdentity(playerNetId(self_), epoch_);
     side_.setSnapshotSink([this](const live::ActorSnapshot& s) { localOut_.push_back(s); });
     side_.setEquipSink([this](const std::vector<nvcoop::avatar::EquipEntry>& e) { equip_ = e; haveEquip_ = true; });

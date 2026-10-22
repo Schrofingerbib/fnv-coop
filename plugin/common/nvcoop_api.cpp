@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <deque>
 #include <map>
+#include <atomic>
 #include <mutex>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -143,4 +144,20 @@ void SetLogFile(const std::string& path) {
 }
 
 }  // namespace registry
+
+namespace {
+std::atomic<void (*)(void*)> g_cosaveSave{nullptr}, g_cosaveLoad{nullptr};
+}  // namespace
+
+void SetCosaveCallbacks(void (*save)(void* intfc), void (*load)(void* intfc)) {
+    g_cosaveSave = save;
+    g_cosaveLoad = load;
+}
+
+void RunCosave(bool save, void* intfc) {
+    if (auto* f = (save ? g_cosaveSave : g_cosaveLoad).load()) f(intfc);
+}
+
+bool HasCosaveCallbacks() { return g_cosaveSave.load() || g_cosaveLoad.load(); }
+
 }  // namespace nvcoop

@@ -1,6 +1,7 @@
 #include "hook_patch.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 namespace nvhooks {
@@ -20,6 +21,21 @@ constexpr bool kMutNoLiveCount = false;
 constexpr bool kMutSuspendNoop = false;
 constexpr bool kMutDtorKeepsHooks = false;
 constexpr bool kMutTrampolineOfLive = false;
+#endif
+
+// Chaining twins (rule 4), picked at run time from NVHOOKS_CHAIN_MUT, compiled in only for the nvcoop_hooks_core_twins test library
+// (plugin/hooks/CMakeLists.txt): 1 = the foreign jump is copied into the trampoline without relocating it, 2 = a foreign jump is
+// chained over even when the caller did not opt in, 3 = the rest of the signature is not checked before chaining.
+#ifdef NVHOOKS_CHAIN_TWINS
+static int chainMut() {
+    static const int v = [] {
+        const char* e = std::getenv("NVHOOKS_CHAIN_MUT");
+        return e ? std::atoi(e) : 0;
+    }();
+    return v;
+}
+#else
+static constexpr int chainMut() { return 0; }
 #endif
 
 namespace {
@@ -87,7 +103,26 @@ static void putRel32(uint8_t* p, Addr from /*addr of the E9 byte*/, Addr to) {
     std::memcpy(p + 1, &rel, 4);
 }
 
-PatchStatus HookRegistry::acquire(const HookSpec& spec, Addr detour, Addr* trampolineOut, Addr* origSlot) {
+// Rule 4: is `cur` (the live entry bytes) another patcher's `jmp rel32` laid over this function? The bytes after the stolen region
+// must still be the function's own; the bytes between the jump and `stolen` may be the original ones or NOP padding a detour left
+// behind. Returns the jump target, or 0.
+static Addr foreignJmpTarget(const HookSpec& spec, const uint8_t* cur, Addr detour) {
+    if (cur[0] != 0xE9) return 0;
+    if (chainMut() != 3) {
+        for (unsigned i = spec.stolen; i < spec.expectedLen; ++i)
+            if (cur[i] != spec.expected[i]) return 0;
+        for (unsigned i = 5; i < spec.stolen; ++i)
+            if (cur[i] != spec.expected[i] && cur[i] != 0x90) return 0;
+    }
+    uint32_t rel;
+    std::memcpy(&rel, cur + 1, 4);
+    const Addr to = spec.target + 5 + rel;
+    if (to == detour) return 0;                                              // our own jump (bookkeeping lost): never chain to ourselves
+    if (to >= spec.target && to < spec.target + spec.expectedLen) return 0;  // a jump into the patched bytes is not a detour
+    return to;
+}
+
+PatchStatus HookRegistry::acquire(const HookSpec& spec, Addr detour, Addr* trampolineOut, Addr* origSlot, bool chainForeignJmp) {
     std::string why;
     if (!specIsValid(spec, &why)) {
         lastError_ = spec.name + std::string(": ") + why;
@@ -109,16 +144,23 @@ PatchStatus HookRegistry::acquire(const HookSpec& spec, Addr detour, Addr* tramp
         lastError_ = std::string(spec.name) + ": read failed";
         return PatchStatus::ReadFailed;
     }
+    Addr chainTo = 0;
     if (!kMutSkipPrologueCheck && std::memcmp(cur, spec.expected, spec.expectedLen) != 0) {
-        lastError_ = std::string(spec.name) + ": prologue mismatch (wrong exe version or already patched)";
-        return (cur[0] == 0xE9 || cur[0] == 0xE8) ? PatchStatus::AlreadyHooked : PatchStatus::PrologueMismatch;
+        if (chainForeignJmp || chainMut() == 2) chainTo = foreignJmpTarget(spec, cur, detour);
+        if (!chainTo) {
+            lastError_ = std::string(spec.name) + ": prologue mismatch (wrong exe version or already patched)";
+            return (cur[0] == 0xE9 || cur[0] == 0xE8) ? PatchStatus::AlreadyHooked : PatchStatus::PrologueMismatch;
+        }
     }
+    // Chained (rule 4): only the foreign 5-byte jump is ours to replace; whatever follows it stays as the other patcher left it.
+    const uint8_t stolen = chainTo ? 5 : spec.stolen;
 
     Installed h;
     h.detour = detour;
-    h.stolen = spec.stolen;
+    h.stolen = stolen;
+    h.chainedTo = chainTo;
     std::memcpy(h.original, cur, 16);
-    h.trampSize = spec.stolen + 5u;
+    h.trampSize = stolen + 5u;
     h.trampoline = mem_.allocExec(h.trampSize);
     if (!h.trampoline) {
         lastError_ = std::string(spec.name) + ": trampoline alloc failed";
@@ -127,8 +169,9 @@ PatchStatus HookRegistry::acquire(const HookSpec& spec, Addr detour, Addr* tramp
 
     // Build + write the trampoline first: if anything fails past this point the game code is still untouched.
     uint8_t tramp[32] = {};
-    std::memcpy(tramp, cur, spec.stolen);
-    putRel32(tramp + spec.stolen, h.trampoline + spec.stolen, spec.target + spec.stolen);
+    std::memcpy(tramp, cur, stolen);
+    if (chainTo && chainMut() != 1) putRel32(tramp, h.trampoline, chainTo);   // their jump, relocated to run from the trampoline
+    putRel32(tramp + stolen, h.trampoline + stolen, spec.target + stolen);
     if (!mem_.write(h.trampoline, tramp, h.trampSize)) {
         mem_.freeExec(h.trampoline, h.trampSize);
         lastError_ = std::string(spec.name) + ": trampoline write failed";
@@ -140,8 +183,8 @@ PatchStatus HookRegistry::acquire(const HookSpec& spec, Addr detour, Addr* tramp
     if (origSlot) *origSlot = h.trampoline;
     bool patched;
     {
-        GuardScope gs(spec.target, spec.stolen, h.trampoline, true);
-        patched = mem_.write(spec.target, h.patch, spec.stolen);
+        GuardScope gs(spec.target, stolen, h.trampoline, true);
+        patched = mem_.write(spec.target, h.patch, stolen);
     }
     if (!patched) {
         if (origSlot) *origSlot = 0;
@@ -251,6 +294,11 @@ Addr HookRegistry::trampolineOf(Addr target) const {
     return kMutTrampolineOfLive ? target : it->second.trampoline;
 }
 
+Addr HookRegistry::chainedOver(Addr target) const {
+    auto it = hooks_.find(target);
+    return it == hooks_.end() ? 0 : it->second.chainedTo;
+}
+
 Addr trampolineOfAny(Addr target) {
     std::lock_guard<std::mutex> g(g_regsMu);
     for (auto* r : allRegs())
@@ -275,12 +323,15 @@ void collectAllTrampolines(std::vector<std::pair<Addr, size_t>>* out) {
     for (auto* r : allRegs()) r->collectTrampolines(out);
 }
 
-int HookRegistry::auditTampered() const {
+int HookRegistry::auditTampered(std::vector<Addr>* which) const {
     int bad = 0;
     for (const auto& [target, h] : hooks_) {
         if (h.suspended) continue;
         uint8_t cur[16] = {};
-        if (!mem_.read(target, cur, h.stolen) || std::memcmp(cur, h.patch, h.stolen) != 0) ++bad;
+        if (!mem_.read(target, cur, h.stolen) || std::memcmp(cur, h.patch, h.stolen) != 0) {
+            ++bad;
+            if (which) which->push_back(target);
+        }
     }
     return bad;
 }

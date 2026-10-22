@@ -14,6 +14,9 @@ reach the guest and only the guest, and `player` inside every script block that 
 plugin\intents\run_tests.cmd        # build (shared tree build\all) + 47 tests + 25 runtime twins + proof self-test + pin regeneration check; prints ALL OK
 python -I plugin/intents/tools/intents_proof.py --instances 0 1 2 --door .. --item .. --item-base .. --container ..    # in-game, NOT RUN
 ```
+The in-game run needs no human positioning: its step 0 reads the door, item and container positions (`ref.info`), picks one standing point within 400 units of all three, puts every player there
+(`player.MoveTo` the anchor reference + `player.SetPos X/Y` on each instance), retries up to 3 times and verifies with `ref.info`; it stops with the distances when a player stays out of range or when the
+references are too far apart. `--no-position` skips it, `--radius N` changes the 400.
 Registered in `tools/test_all.py` ("Guest intents ...").
 
 ## Files (`plugin/intents/`)
@@ -32,7 +35,7 @@ Registered in `tools/test_all.py` ("Guest intents ...").
 | `engine/intents_module.cpp` | x86: the NVCOOP module: ini, observers, the `TerminalEntryRun` and `CanSaveNow` hooks, bridge RPCs, hot-reload state |
 | `engine/intents_addrs.h` | GENERATED pins (`tools/gen_intents_addrs.py` reads `<reference exe>`) |
 | `testing/fake_engine.h`, `tests/*` | fake game + 47 tests (`test_intents_core.cpp`, `test_intents_service.cpp`, `test_intents_pins.cpp`) |
-| `tools/intents_proof.py` | the in-game proof (not run) and its self-test with 6 injected defects |
+| `tools/intents_proof.py` | the in-game proof (not run) and its self-test with 6 injected defects + 2 positioning twins (a player left out of range, references too far apart) + one run without the positioning step |
 
 Additive edits outside the folder: `plugin/coop/coop_runtime.{h,cpp}` (`Runtime::runAsGuest`, `Runtime::active()`, `Runtime::setDialogueRunner`), `plugin/CMakeLists.txt` (lane list),
 `tools/test_all.py`, `docs/protocol.md`.

@@ -145,6 +145,14 @@ def check_find_steam():
         assert found[0].path.name == "FNV Custom Folder" and found[0].edition == "steam"
 
 
+def _encodable(text, enc):
+    try:
+        text.encode(enc)
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
 def check_find_steam_ansi_library_path():
     """A Steam client on a system whose code page is not UTF-8 (a Russian Windows, cp1251) writes
     libraryfolders.vdf in the ANSI code page, and the library path may hold non-ASCII characters.
@@ -153,12 +161,17 @@ def check_find_steam_ansi_library_path():
         steam = td / "Steam"
         # A Cyrillic folder name ("Biblioteka Steam"), written with escapes so this file stays ASCII
         # and cannot be broken by the code page of whoever checks it out.
-        lib = td / "\u0411\u0438\u0431\u043b\u0438\u043e\u0442\u0435\u043a\u0430 Steam"
+        # The file is written in THIS machine's ANSI code page (what Steam does here), so pick a non-ASCII
+        # name that code page can hold: Cyrillic on cp1251, accented Latin on cp1252 and the like.
+        enc = fnv_ini.ini_encoding()
+        name = next(n for n in ("\u0411\u0438\u0431\u043b\u0438\u043e\u0442\u0435\u043a\u0430 Steam", "Biblioth\u00e8que Steam",
+                                "Bibliot\u00e9ka Steam") if _encodable(n, enc))
+        lib = td / name
         (steam / "steamapps").mkdir(parents=True)
         (lib / "steamapps" / "common").mkdir(parents=True)
         fg.make_game(lib / "steamapps" / "common" / "Fallout New Vegas")
         vdf = '"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"' + str(lib).replace("\\", "\\\\") + '"\n\t}\n}\n'
-        (steam / "steamapps" / "libraryfolders.vdf").write_bytes(vdf.encode("cp1251"))
+        (steam / "steamapps" / "libraryfolders.vdf").write_bytes(vdf.encode(enc))
         reg = FakeReg({("HKCU", r"Software\Valve\Steam", "SteamPath"): str(steam)})
         found = fnv_find.candidates(None, {}, reg, lambda: [])
         assert [c.path.name for c in found] == ["Fallout New Vegas"], found

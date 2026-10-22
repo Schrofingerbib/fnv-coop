@@ -13,7 +13,7 @@ namespace fnvcoop { class Archive; }
 
 namespace nvcoop::actors {
 
-constexpr uint8_t kActorWireVersion = 2;   // 2: ActorSnapshot carries the live schema v2 animation extension (synccore/live/live.h), + MAnimEvent
+constexpr uint8_t kActorWireVersion = 2;   // 2: ActorSnapshot carries the live schema v2 animation extension (synccore/live/live.h), + MAnimEvent (MInventory is appended: same version)
 enum Sub : uint8_t { SubBatch = 0, SubAck = 1, SubEnvelope = 2 };
 
 struct MOwn { fnvcoop::OwnMsg m; };                                   // host -> all; client -> host only for Ack
@@ -29,7 +29,10 @@ struct MResync { NetId id = 0; };                                     // client 
 // current epoch), de-duplicates by eventId and hands `payload` to the registered AnimEventHandler; it never looks inside.
 struct MAnimEvent { NetId id = 0; OwnerEpoch epoch = 0; uint64_t eventId = 0; Bytes payload; };
 
-using Body = std::variant<MOwn, MTrack, MSnapFull, MDeath, MPick, MPickReport, MResync, MAnimEvent>;   // append only: the index is on the wire
+// The owner's inventory totals for one actor (its AI used or picked up something). Everyone but the owner makes its copy match.
+struct MInventory { NetId id = 0; OwnerEpoch epoch = 0; uint64_t eventId = 0; InvList items; };
+
+using Body = std::variant<MOwn, MTrack, MSnapFull, MDeath, MPick, MPickReport, MResync, MAnimEvent, MInventory>;   // append only: the index is on the wire
 
 struct Envelope {
     PlayerId src = kNoPlayer;

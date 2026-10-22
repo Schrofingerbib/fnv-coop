@@ -7,9 +7,18 @@ namespace fnvcoop {
 // ================================ HostSession ==================================================
 
 namespace {
+// Identity of a shared shadow for a resume cursor (Hello::cursorCheck): its shard hashes and seq. Never 0 (0 = no check).
+uint64_t cursorHashOf(const ShadowState& s) {
+    uint64_t h = 1469598103934665603ull;
+    auto mixIn = [&](uint64_t v) { for (int i = 0; i < 8; ++i) { h ^= (v >> (8 * i)) & 0xFF; h *= 1099511628211ull; } };
+    mixIn(s.seq);
+    for (uint32_t x : shardHashesOf(s)) mixIn(x);
+    return h ? h : 1;
+}
 struct RepairItem {
     HostSession::DesyncEntry d;
     bool clientOnly = false, race = false, revertToo = false;   // revertToo: additive entry, the client takes its own amount back before the host's is added
+    bool questRunning = false;   // client-only StartQuest / StopQuest entry: settled by the host's own running state (issue #25), fix = the client's entry
     Effect fix;
     uint64_t key = 0;
 };
@@ -194,6 +203,7 @@ void HostSession::sendWelcome(Client& c, uint64_t lastSeq, bool fresh) {
     }
     if (fresh) c.welcomeResends = 0;
     c.lastWelcomeAt = now_ ? now_ : 1;
+    c.welcomedEpoch = epoch_;
     Welcome w;
     w.session = c.session;
     w.slot = c.slot;
@@ -285,6 +295,27 @@ void HostSession::handle(PeerId from, const Message& m) {
         c.peer = from;
         bool fresh = h->session != c.session;
         if (!fresh && !c.joined) return;  // stale Hello of a session that was invalidated by a world epoch change
+        // A resume cursor (lastEpoch, lastSeq) from the client's own save sidecar is only meaningful against the timeline it was saved in.
+        // Epoch numbers are not unique across host runs: a fresh host that loads its prepared save reaches the same epoch number the
+        // client's (newer) sidecar was saved in during an earlier run, with a different history. Replaying from that cursor applies the
+        // wrong txns, and a snapshot diff from it rewinds per-player state (rewards the client's save holds are taken away); a rebase does not.
+        // The client sends a hash of its shadow at the cursor (Hello::cursorCheck) and the host compares it with its own state at that seq.
+        // A cursor past our head is foreign for certain; one the log no longer holds is ours only if we welcomed this token in this epoch.
+        bool foreign = false;
+        if (fresh && haveBaseline_ && !wantBase && !mutations().trustForeignCursor) {
+            foreign = h->lastSeq > log_.head();
+            if (!foreign && h->cursorCheck != 0) {
+                ShadowState at;
+                if (log_.stateAt(h->lastSeq, at)) foreign = cursorHashOf(at) != h->cursorCheck;
+                else foreign = c.welcomedEpoch != epoch_;
+            }
+        }
+        if (foreign) {
+            ++stats_.resumesRefused;
+            ++stats_.rebasesSent;
+            sendTo(from, Rebase{h->session, epoch_});
+            return;
+        }
         if (fresh && c.session != 0) releaseControlsOf(c.slot);   // a returning player never comes back frozen (their client released locally too)
         if (fresh || (mutations().chattyBaseline && wantBase)) {
             c.session = h->session;
@@ -321,6 +352,15 @@ void HostSession::handle(PeerId from, const Message& m) {
         c->lastDigestAt = now_ ? now_ : 1;
         auto st = std::make_shared<ShadowState>();
         if (!log_.stateAt(dg->seq, *st)) { ++stats_.digestsStale; return; }
+        // RefScriptVar (object / NPC script vars, polled by the host) is not digest state: the client's world dump (quests, globals, watched
+        // refs) has no way to produce it, so each such key was "missing" on the client and resent every round without ever converging
+        // (two-copy combat_proof 2026-10-22: 99 digests, 0 ok, window-script timers 171CDB / 1771EA / 1771EB repaired every 10 s). The values
+        // still reach the clients through the live stream and the join baseline; only the compare leaves them out.
+        if (!mutations().digestKeepsRefVars) st->refVars.clear();
+        // Weather and time scale are the same kind of key: the host shadow holds the last SetWeather / SetTimeScale, the client's world dump cannot read
+        // either one, so the client reported them "missing" and the host resent them every round (two-copy npc_sync / combat_proof / enemy_fight
+        // 2026-10-22: SetWeather 1237D7 and SetTimeScale 30, 'client (missing)', a new mismatch in every step). The live stream carries both.
+        if (!mutations().digestKeepsWorldEnv) { st->weatherSet = false; st->weatherForced = false; st->weather = FormRef(); st->timeScale = 0; }
         Client* cp = c;
         const uint32_t sess = c->session, dgId = dg->digestId, ep = epoch_;
         const uint64_t dseq = dg->seq;
@@ -390,6 +430,8 @@ void HostSession::handle(PeerId from, const Message& m) {
                     if (hostE.count(key)) continue;
                     RepairItem r;
                     r.key = key; r.clientOnly = true;
+                    r.questRunning = std::holds_alternative<StartQuest>(ce.effect) || std::holds_alternative<StopQuest>(ce.effect);
+                    if (r.questRunning) r.fix = ce.effect;
                     r.d.key = describeEntry(ce.effect); r.d.keyHash = key; r.d.client = r.d.key; r.d.host = "(absent)"; r.d.clientOnly = true;
                     r.race = touched.count(key) > 0;
                     items.push_back(std::move(r));
@@ -421,16 +463,37 @@ void HostSession::handle(PeerId from, const Message& m) {
                 auto lastSeqs = [&](uint64_t key) { auto it = recent.find(key); return it == recent.end() ? std::vector<uint64_t>() : it->second; };
                 std::vector<Effect> fix;
                 std::vector<uint64_t> revert;
+                std::vector<FormRef> adopt;   // client-only quest running keys (issue #25)
                 size_t n = 0;
                 for (auto& it : items) {
                     if (n++ < 64) it.d.lastSeqs = lastSeqs(it.key);
                     if (it.race) it.d.skippedRace = true;
+                    else if (it.clientOnly && it.questRunning && !mutations().questRunningReverted)
+                        adopt.push_back(std::holds_alternative<StartQuest>(it.fix) ? std::get<StartQuest>(it.fix).quest : std::get<StopQuest>(it.fix).quest);
                     else if (it.clientOnly) revert.push_back(it.key);
                     else { fix.push_back(it.fix); if (it.revertToo) revert.push_back(it.key); }
                     rep.entries.push_back(std::move(it.d));
                 }
                 rep.totalEntries = rep.entries.size();
                 if (rep.entries.size() > 64) rep.entries.resize(64);
+                // Issue #25: a quest's running flag has no inverse, so a revert key for it was skipped by the client and resent every round
+                // (the digest never converged). The host's shared world simply has no entry for these quests: settle them host-authoritatively
+                // by committing the host's OWN running state (the engine via hostQuestRunning, else the completeness default: not running).
+                // A normal txn: every client gets it, late joiners too, and the host's key space is complete afterwards.
+                size_t adopted = 0;
+                if (!adopt.empty() && !mutations().healDisabled) {
+                    std::map<FormRef, bool> running;
+                    const bool engineRead = hostQuestRunning && hostQuestRunning(adopt, running);
+                    std::vector<Effect> fx;
+                    for (auto& q : adopt) {
+                        auto r = running.find(q);
+                        if (r == running.end() && engineRead) continue;   // the engine could not read this one: leave it, it shows up again
+                        if (r != running.end() && r->second) fx.push_back(StartQuest{q}); else fx.push_back(StopQuest{q});
+                    }
+                    const size_t nFx = fx.size();
+                    Cause cause; cause.kind = CauseKind::Script;
+                    if (nFx && commit(kHostPlayer, cause, std::move(fx))) { adopted = nFx; stats_.questRunningAdopted += nFx; }
+                }
                 // bandwidth budget
                 if (repairTokens_ < 0) { repairTokens_ = double(dopt_.maxRepairEffectsPerMin); repairRefillAt_ = now_; }
                 repairTokens_ = std::min(double(dopt_.maxRepairEffectsPerMin), repairTokens_ + double(dopt_.maxRepairEffectsPerMin) * double(now_ - repairRefillAt_) / 60000.0);
@@ -449,6 +512,12 @@ void HostSession::handle(PeerId from, const Message& m) {
                     ++stats_.desyncRepairs;
                     stats_.desyncEffectsRepaired += rep.effectsSent;
                     sendTo(cp->peer, rp);
+                }
+                if (adopted) {
+                    if (!rep.repaired) ++stats_.desyncRepairs;
+                    rep.repaired = true;
+                    rep.effectsSent += adopted;
+                    stats_.desyncEffectsRepaired += adopted;
                 }
                 reports_.push_back(std::move(rep));
                 while (reports_.size() > dopt_.reportLimit) reports_.pop_front();
@@ -526,7 +595,8 @@ std::string HostSession::desyncsJson() const {
     std::ostringstream o;
     o << "{\"digests\":{\"received\":" << stats_.digestsReceived << ",\"ok\":" << stats_.digestsOk << ",\"mismatch\":" << stats_.digestsMismatch
       << ",\"rateLimited\":" << stats_.digestsRateLimited << ",\"stale\":" << stats_.digestsStale << ",\"repairs\":" << stats_.desyncRepairs
-      << ",\"effectsRepaired\":" << stats_.desyncEffectsRepaired << ",\"deferredByBudget\":" << stats_.repairsDeferredBudget << "},\"desyncs\":[";
+      << ",\"effectsRepaired\":" << stats_.desyncEffectsRepaired << ",\"deferredByBudget\":" << stats_.repairsDeferredBudget
+      << ",\"questRunningAdopted\":" << stats_.questRunningAdopted << "},\"desyncs\":[";
     bool firstR = true;
     for (auto& r : reports_) {
         if (!firstR) o << ',';
@@ -902,6 +972,8 @@ void ClientSession::sendDigest() {
     ShadowState w;
     uint64_t h = 0;
     if (!provider_ || !provider_(w, h)) return;
+    if (!mutations().digestKeepsRefVars) w.refVars.clear();   // not digest state, see the host side of the compare (SyncDigest handler)
+    if (!mutations().digestKeepsWorldEnv) { w.weatherSet = false; w.weatherForced = false; w.weather = FormRef(); w.timeScale = 0; }   // same
     auto world = std::make_shared<const ShadowState>(std::move(w));
     digestWorld_ = world;
     digestSeq_ = shadow_.seq;
@@ -1005,6 +1077,7 @@ void ClientSession::connect(uint64_t nowMs, uint32_t session) {
     digestOutstanding_ = false; digestWanted_ = false; touchedSince_.clear();
     lastDigest_ = nowMs;
     diffGot_.clear(); diffEffects_.clear(); diffReverts_.clear(); diffNext_ = diffTotal_ = 0; summaryNext_ = 0;
+    helloCursor_ = (!(wantBaseline_ && !baselineDone_) && worldEpoch_ != 0) ? cursorHashOf(shadow_) : 0;
     send(makeHello());
 }
 
@@ -1013,6 +1086,7 @@ Hello ClientSession::makeHello() const {
     h.lastEpoch = worldEpoch_;
     h.hs = hs_;
     if (wantBaseline_ && !baselineDone_) { h.flags = kHelloWantBaseline; h.contentHash = contentHash_; }
+    else h.cursorCheck = helloCursor_;
     return h;
 }
 
@@ -1339,7 +1413,8 @@ void ClientSession::handle(const Message& m) {
         if (dc->index >= diffNext_) diffGot_.emplace(dc->index, *dc);
         applyReadyDiffChunks();
     } else if (auto* rb = std::get_if<Rebase>(&m)) {
-        if (rb->session != session_ || rb->epoch == worldEpoch_) return;
+        // A Rebase to our own epoch answers this session's Hello: the host refused the resume cursor of our save (another timeline).
+        if (rb->session != session_ || (rb->epoch == worldEpoch_ && joined_)) return;
         doRebase();
     } else if (auto* dr = std::get_if<DigestRequest>(&m)) {
         if (dr->session == session_ && joined_) digestWanted_ = true;
@@ -1362,7 +1437,8 @@ void ClientSession::handle(const Message& m) {
         for (uint64_t key : rp->revertKeys) {   // reverts first: they undo what the client holds, the host's effects then build on that
             if (touchedSince_.count(key)) { ++syncStats_.repairEffectsSkipped; continue; }
             Effect rev;
-            if (digestWorld_ && revertEffectFor(*digestWorld_, key, rev)) { applyRepairEffect(rev); }
+            if (digestWorld_ && revertEffectFor(*digestWorld_, key, rev)) applyRepairEffect(rev);
+            else ++syncStats_.repairRevertsUnrevertable;   // no inverse for this kind: the key stays (was silent before issue #25)
         }
         for (auto& e : rp->effects) applyRepairEffect(e);
         digestOutstanding_ = false;

@@ -1,4 +1,5 @@
 // Save / load semantics inside a session: host sidecar, world epochs, rebase, client loads.
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <thread>
@@ -368,4 +369,53 @@ TEST(twin, unit_chatty_baseline) {
         if (!r.done || r.bytes >= 1200u * 1024 || r.welcomes > 4) ++bad;
     }
     CHECK(bad > 0);
+}
+
+// Issue #46: runAsync queued a completion that owned the MainQueue it sits in, so a session destroyed while a result was still queued leaked the
+// queue and the result (a shared_ptr cycle). Here the "session" drops its queue while the finished job's completion is still waiting.
+namespace {
+struct Tracked {
+    static inline std::atomic<int> alive{0};
+    int v = 0;
+    explicit Tracked(int x) : v(x) { ++alive; }
+    Tracked(const Tracked& o) : v(o.v) { ++alive; }
+    Tracked(Tracked&& o) noexcept : v(o.v) { ++alive; }
+    ~Tracked() { --alive; }
+};
+// true when dropping the queue frees it and the queued result
+bool queuedCompletionDoesNotKeepItsQueueAlive() {
+    bool ok = true;
+    std::weak_ptr<MainQueue> weak;
+    {
+        ThreadWorker worker;
+        auto q = std::make_shared<MainQueue>();
+        weak = q;
+        bool ran = false;
+        runAsync<Tracked>(&worker, q, [] { return Tracked(7); }, [&ran](Tracked) { ran = true; });
+        worker.waitIdle();                       // the completion is now queued on q, undrained
+        ok = ok && !ran && q->outstanding() == 1;
+        q.reset();                               // the owning session goes away without draining
+    }
+    ok = ok && weak.expired() && Tracked::alive.load() == 0;
+    return ok;
+}
+}  // namespace
+
+TEST(saveload, a_queued_async_completion_does_not_keep_its_queue_alive) {
+    CHECK(queuedCompletionDoesNotKeepItsQueueAlive());
+    // and the normal path still delivers the result on drain()
+    ThreadWorker worker;
+    auto q = std::make_shared<MainQueue>();
+    int got = 0;
+    runAsync<Tracked>(&worker, q, [] { return Tracked(41); }, [&got](Tracked t) { got = t.v + 1; });
+    worker.waitIdle();
+    CHECK(q->drain() == 1);
+    CHECK(got == 42);
+    CHECK(q->outstanding() == 0);
+}
+
+TEST(twin, unit_async_completion_leak) {
+    Mutations m; m.asyncDoneHoldsQueue = true;
+    MutationScope s(m);
+    CHECK(!queuedCompletionDoesNotKeepItsQueueAlive());
 }

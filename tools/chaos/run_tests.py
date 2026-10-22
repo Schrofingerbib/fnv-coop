@@ -26,26 +26,33 @@ UDP_MUTANTS = {
 }
 
 
-def run(args, mutant=""):
+PAIR_MUTANTS = {       # tools/chaos/chaos_pair.py (a pair joined through the relay), tested in test_chaos_pair.py
+    "pair_joins_direct": "PairTests.test_setup_joins_through_the_relay_and_waits_for_joined",
+    "pair_no_rejoin": "PairTests.test_teardown_puts_the_client_back_on_the_real_port",
+}
+
+
+def run(args, mutant="", test_file="test_chaos.py"):
     env = dict(os.environ, NVCHAOS_MUTANT=mutant)
-    return subprocess.run([sys.executable, "-I", str(HERE / "test_chaos.py"), *args], cwd=HERE, env=env,
+    return subprocess.run([sys.executable, "-I", str(HERE / test_file), *args], cwd=HERE, env=env,
                           capture_output=True, text=True, errors="replace")
 
 
 def main():
-    p = run([])
-    print((p.stdout + p.stderr).strip().splitlines()[-1] if (p.stdout + p.stderr).strip() else "no output")
-    if p.returncode != 0:
-        print(p.stdout + p.stderr)
-        print("RESULT: FAIL (real tests)")
-        return 1
+    for f in ("test_chaos.py", "test_chaos_pair.py"):
+        p = run([], test_file=f)
+        print(f + ": " + ((p.stdout + p.stderr).strip().splitlines()[-1] if (p.stdout + p.stderr).strip() else "no output"))
+        if p.returncode != 0:
+            print(p.stdout + p.stderr)
+            print("RESULT: FAIL (real tests)")
+            return 1
     if "--no-twins" in sys.argv:
         print("ALL OK (twins skipped)")
         return 0
     bad = []
-    for table in (MUTANTS, UDP_MUTANTS):
+    for table, f in ((MUTANTS, "test_chaos.py"), (UDP_MUTANTS, "test_chaos.py"), (PAIR_MUTANTS, "test_chaos_pair.py")):
         for m, test in table.items():
-            q = run([test], m)
+            q = run([test], m, f)
             caught = q.returncode != 0
             print(f"twin {m:13s} via {test.split('.')[-1]}: {'caught' if caught else 'NOT CAUGHT'}")
             if not caught:

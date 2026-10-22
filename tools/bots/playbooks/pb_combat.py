@@ -39,8 +39,26 @@ def walk_to(m: Machine, spec):
     return m.bot.goto_pos(spec["x"], spec["y"], spec["z"], spec.get("cell"))
 
 
+def goto_or_teleport(ctx: Ctx, m: Machine, ref: str, dist: float):
+    """Walk to `ref`. When the walk is stuck on terrain, teleport there and add a note. Use it only to place a player before the
+    checks: the sync checks come after. In game 2026-10-21 the host stuck on the slope between GSPG01 and
+    GoodspringsPowderGangMarker (1042 units, 290 up) and enemy_spawn failed at step 01 before it checked anything."""
+    r = m.bot.goto_ref(ref, dist)
+    reason = str(getattr(r, "reason", ""))
+    # a walk that times out far away is a placement problem too (in game 2026-10-22: the guest still 4774 units from the marker)
+    if getattr(r, "ok", False) or not any(w in reason for w in ("stuck", "timeout")):
+        return r
+    note = f"{m.name}: the walk to {ref} did not arrive ({reason}), teleported there"
+    ctx.notes.append(note)
+    ctx.log(note)
+    r = m.bot.goto_ref(ref, dist, mode="teleport")
+    ctx.settle()          # a teleport lands at once: let the engine and the session catch up (cell load, replication)
+    return r
+
+
 def gather(ctx: Ctx, near: str, dist: int = 600) -> None:
-    res = ctx.on_all(lambda m: m.bot.goto_ref(near, dist))
+    # placement only (the checks come after): a walk stuck on terrain teleports (in game 2026-10-21: stuck 612 units out, wanted 600)
+    res = ctx.on_all(lambda m: goto_or_teleport(ctx, m, near, dist))
     for name, r in res.items():
         ctx.must(r, f"{name} walk to {near}")
 

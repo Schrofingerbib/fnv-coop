@@ -24,6 +24,8 @@ void ioM(Archive& a, HandshakeInfo& h) {
 void ioM(Archive& a, Hello& m) {
     a.varu32(m.session); a.u64(m.token); a.varu(m.lastSeq); a.u8(m.flags); a.u64(m.contentHash); a.varu32(m.lastEpoch);
     ioM(a, m.hs);
+    if (a.reading() && a.atEnd()) m.cursorCheck = 0;   // a Hello from a build before the field
+    else a.u64(m.cursorCheck);
 }
 void ioM(Archive& a, Welcome& m) {
     a.varu32(m.session); a.u8(m.slot); a.varu(m.headSeq); io(a, m.policy);

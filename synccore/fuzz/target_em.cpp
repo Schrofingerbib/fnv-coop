@@ -43,6 +43,7 @@ const FaultNames kFaults[] = {
     {"visual_shot_damages", &EngineFaults::visualShotDamages, nullptr},
     {"blast_runs_everywhere", &EngineFaults::blastRunsEverywhere, nullptr},
     {"new_owner_no_wait", &EngineFaults::newOwnerNoWait, nullptr, false},
+    {"grant_ends_owner_wait", &EngineFaults::grantEndsOwnerWait, nullptr, true},   // random sessions do not hit it (needs a slow link, a handoff and a take-back in one window): its twin is the saved regress_leave_rejoin_host_walks_in.json
     {"digest_buckets_positions", &EngineFaults::digestBucketsPositions, nullptr, false},
     {"digest_no_seq", &EngineFaults::digestNoSeq, nullptr, true},
     {"created_key_is_player", &EngineFaults::createdKeyIsPlayer, nullptr, true},

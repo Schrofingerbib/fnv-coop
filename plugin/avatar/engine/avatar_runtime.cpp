@@ -45,6 +45,13 @@ void AvatarRuntime::SetLocalIdentity(live::NetId netId, live::OwnerEpoch epoch) 
 
 // ---- remote players --------------------------------------------------------------------------------------------------
 
+void AvatarRuntime::SetLocalSlot(Slot slot) {
+    cfg_.puppet.localSlot = slot;
+    if (!loopback_) cfg_.loopbackSlot = static_cast<Slot>(slot == 1 ? 2 : 1);
+    pm_.SetLocalSlot(slot);
+    remotes_.erase(slot);   // nobody streams the local player to himself
+}
+
 bool AvatarRuntime::AddRemote(Slot slot, const Appearance& a) {
     if (!pm_.AddPlayer(slot, a)) return false;
     remotes_[slot] = std::make_unique<Remote>(cfg_.interp);   // a re-added slot (reconnect) starts with an empty buffer

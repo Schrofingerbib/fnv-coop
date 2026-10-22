@@ -58,4 +58,13 @@ struct ModuleRegistrar {
 // ---- logging --------------------------------------------------------------
 void Log(const char* fmt, ...);
 
+// ---- cosave (NVSE serialization) ------------------------------------------
+// A module's cosave save / load callbacks (intfc = the NVSESerializationInterface*; null clears). NVSE takes serialization callbacks
+// only during the first plugin load and never drops them, so NVSEPlugin_Load registers forwarders once and they call these. In the
+// split build the core's call goes to the permanent loader, which clears them before a core is unloaded: a hot-reloaded core is
+// called, never the unloaded one. One owner today (the actor engine's ledger).
+void SetCosaveCallbacks(void (*save)(void* intfc), void (*load)(void* intfc));
+void RunCosave(bool save, void* intfc);   // the forwarders
+bool HasCosaveCallbacks();                 // tests: a save or load callback is set
+
 }  // namespace nvcoop

@@ -24,10 +24,16 @@ namespace nvcoop::avatar::glue {
 
 bool Enabled();       // nvcoop.ini [avatar] enabled=1 and the module loaded
 bool Running();       // the runtime exists (the first frame with a player has passed)
+// Why Running() is false, for the status line: "" when it runs, else what it waits for. The runtime needs a player in a loaded cell, so a copy
+// that sits at the main menu (nothing loaded yet) is enabled but not running; that is not a wiring fault.
+const char* NotRunningBecause();
 
 void SetSnapshotSink(std::function<void(const live::ActorSnapshot&)> sink);
 void SetEquipSink(std::function<void(const std::vector<EquipEntry>&)> sink);
 void SetLocalIdentity(live::NetId netId, live::OwnerEpoch epoch);
+// This machine's slot in the session (a client is 1, 2, ...). Overrides [avatar] localSlot (default 0, right for the host only): without it a
+// client refuses the HOST's puppet as "the local slot". Call at the session start, before AddRemote.
+void SetLocalSlot(Slot slot);
 
 bool AddRemote(Slot slot, const Appearance& a);
 void RemoveRemote(Slot slot);

@@ -104,8 +104,20 @@ while the other machines' frame counters keep advancing (world not paused) and t
 nobody's world pauses; (8) nothing spoofed / malformed on the channel. `--slowmo` adds the party slow-mo step. Class specifics: melee checks the engine's lunge brings
 the attacker to the target, explosive checks the blast hurts a neighbour (`--neighbor Plugin.esm:HEX`) and at most 2 hits land per action, gun and energy assume a
 single-projectile weapon (`hitsApplied` is read from `combat.status`). A live run needs `--weapon <class>=<editor id or Plugin.esm:HEX>`; there is no default on purpose
-(the editor ids were not verified). The fake `VatsWorld` has 12 deliberate bugs (pausing, kill-cam pause, dropped limb, double shot, unsynced crippled state, ...), each
+(the editor ids were not verified). The fake `VatsWorld` has 18 deliberate bugs (pausing, kill-cam pause, dropped limb, double shot, unsynced crippled state, ...), each
 caught by at least one playbook.
+
+`vats_world_moves` (`python -I tools/bots/run_vats.py --instances 0,1 --playbook vats_world_moves`; not in the default set, which stays the four weapon classes) replaces the
+old "by hand, once" checks with measurements, using bridge calls and `bot.input` / `bot.move` only. It needs no `--weapon`: it equips `--weapon any=<item>` when given, else uses the
+weapon the player already holds (clear failure when there is none). Steps: (1) everyone armed and at the target; (2) the host in VATS holds `bot.move` backwards for 1 s and moves
+at most 12 units, then after leaving VATS the same move covers at least 40 units; (3) for each player as shooter: a baseline window of 3 s with nobody in VATS, then the same window
+with the shooter in the VATS menu, while another player runs away from the target (`bot.look` + `bot.move`, the hostile Powder Ganger chases it). On every other copy it samples
+the game clock (`worldtime.clock`, falling back to the `GameHour` and `TimeScale` globals through the expression evaluator) and the NPC's position (`ref.info`, path length of 6
+samples). Pass: the clock moved at least half of the baseline and of what `TimeScale` x elapsed predicts, and the NPC walked at least 40 % of the baseline distance; a baseline that
+does not move (no chase, `TimeScale` 0) is a FAIL ("nothing to compare"), never a skip; (4) the limb: every limb reads back as highlighted after `vats.select_limb`, then a shot at
+a leg (arm if crippled) must drop that limb's condition by at least as much as any other limb (up to 3 tries, VATS can miss). Twins: `vats_world_paused`, `vats_clock_frozen`,
+`vats_npcs_frozen` (frames keep running, only the clock or the NPCs stop), `vats_player_walks`, `vats_controls_stay_locked`, `vats_limb_hits_neighbour`, plus the older
+`vats_pauses_others`, `vats_limb_ignored`, `vats_reports_wrong_limb`. The NPC chase is the one live assumption (a hostile NPC pursues a fleeing player); it is guarded by the baseline.
 
 ## In-game proof (for the helper; code-only agents did not run any of it)
 1. Two copies, host + client in one session, `nvcoop.ini` `[live] actors=1 avatars=1 combat=1`, `[dev] bots=1`, `[vats] enabled=1`. `nvbridge vats.status` on both: expect
@@ -113,12 +125,12 @@ caught by at least one playbook.
 2. `python -I plugin/vats/proof/vats_proof.py snapshot --out out/vats/before.json`.
 3. `python -I tools/bots/run_vats.py --instances 0,1 --weapon gun=... --weapon melee=... --weapon explosive=... --weapon energy=...` (add `--slowmo` once).
 4. `... snapshot --out out/vats/after.json`, then `... check out/vats/before.json out/vats/after.json --expect-autofire --expect-hooks-fired [--expect-slowmo]`: every line must PASS.
-5. By hand, once, with your own eyes: while one player is in the VATS menu, the other player's game keeps moving (NPCs walk, the clock runs); no screen freezes during the
-   kill cam; the VATS player cannot walk while the menu is open; the limb highlighted by `vats.select_limb` is the one the UI shows and the shot hits.
+5. `python -I tools/bots/run_vats.py --instances 0,1 --playbook vats_world_moves` (no `--weapon` needed): the formerly by-hand checks, measured, see "vats_world_moves" above.
+   The kill cam still freezing nothing is covered by the class playbooks of step 3.
 6. If something freezes: `[vats] pausesites=2` (more `MenuMode()` call sites), or `realtime=0` to compare with vanilla. If a crash: `[vats] enabled=0`, report the address.
 Things the helper decides: the real `grs_ap` number, the real `grs_edid`, the weapon items for the four classes.
 
-## Mutation twins (runtime, `FNVCOOP_MUT=n`; 60 in the C++ suite, 19 in the playbooks)
+## Mutation twins (runtime, `FNVCOOP_MUT=n`; 60 in the C++ suite, 28 in the playbooks)
 types 801 802; policy 811..817; slow-mo 821..829 831; wire 841 842; limb API 851..857; perks 861..865 871..875; sync 881..887 891..899 905 906; patcher 901..904.
 Each breaks one rule (a cap not enforced, a stale grant accepted, the limb read-back skipped, a spoofed author believed ...) and the suite must fail.
 

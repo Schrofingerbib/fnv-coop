@@ -6,6 +6,9 @@
 //  2. INFO result scripts and stage result scripts never run on a guest.
 //  3. Any OTHER script (object / NPC / magic effect) still runs on a guest, but a shared-state mutator it calls is
 //     dropped (blockMutation()).
+//     Exception to "still runs": an inline `set Quest.var to ...` is not a mutator call (the interpreter stores it, nothing to detour), so a
+//     guest brackets the object scripts that write shared quest variables and puts the variables back (guest_objvars.h; the host's value
+//     arrives through the state replicator).
 //  Everything is lifted while a host EffectTxn is being applied (applying > 0).
 #pragma once
 #include <cstdint>

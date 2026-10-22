@@ -52,6 +52,17 @@ ActorSync wants "AI off" on every actor this machine does not own, "AI on" on th
   loaded; entries for refs that are not loaded stay until they are. `engine::beforeSave()` additionally removes clones before a save you start yourself.
   (Unverified: that NVSE calls the save callback for a save made from the menu, and that `ResolveRefID` accepts every id we store.)
 
+## Inventory
+
+An owner's AI uses its items (a ganger drinks a Stimpak mid-fight); a replicated AddItem effect lands on every machine by itself, the AI's own use does not.
+`ActorSync` therefore reads the inventory totals of every actor it owns (`IActorPort::sampleInventory`, `invPollMs` 500, four actors per tick; the engine
+calls are plugin/loot's `readContents`, wired through `actors::engine::setInventoryAccess`, so they exist whether or not the loot service is on) and
+publishes a list that changed and then stayed the same for `invSettleMs` (1 s) as `MInventory` (reliable, owner and epoch judged by the host like an
+anim event). The first read is a silent baseline. Everybody else makes its copy match with `AddItem` / `RemoveItem` (`applyInventory`), retried up to
+five times, written when the actor loads. The owner's last use before a death or a handoff is flushed at once, a joining client is sent the lists
+already published, and a corpse's contents belong to the loot service from the death on. An actor with an unresolved leveled list is not synced
+(the reader says no).
+
 ## Driving
 
 `drive()` only records the wanted pose (and tells the drive listeners). `flush()` applies it once per frame:
@@ -82,7 +93,10 @@ its own message, a mirrored 0 would kill the copy before the owner's death arriv
 * **Stand-in:** `Call_PlaceAtMe` (plugin/hooks_world/world_addrs.h, prologue checked before the first call) next to an anchor ref in the target cell,
   restrained at once, moved to the pose, actor values applied, ledgered. Refused when the real actor is bound here, past `maxStandIns`, while a
   save is being written, or when there is no anchor or base form; a refusal backs off 500 ms (ActorSync asks every tick). Removal is
-  `Disable` + `MarkForDelete`; a removal the engine refuses stays in the ledger and is retried every 2 s.
+  `Disable` + `MarkForDelete`, run `deleteQuietMs` (750 ms) after the clone was taken out of the directory, never in the same frames as its last
+  `SetPos` (game 2026-10-22: three client crashes, the engine ran a queued `SetPos X` on a removed stand-in's id, found a NavMesh there and called
+  through text, EIP 6C676E61); the ledger entry stays until the delete ran, a save or the end of a session deletes at once. A removal the engine
+  refuses stays in the ledger and is retried every 2 s.
 * **Leveled pick:** there is **no verified in-place base change** (TODO-RE). When the shared pick differs from the local roll the port places a
   clone of the pick, disables the real actor (ledgered) and drives the clone; ownership of the AI follows `activeRef`. Story NPCs are never
   swapped. Losing the real actor, a session end, or a save puts everything back; after a save the swap is redone (`onNativeBase`) after `saveGraceMs`.
@@ -92,7 +106,8 @@ its own message, a mirrored 0 would kill the copy before the owner's death arriv
   Named = base form essential or ACBS "unique" (bit 0x20, FNVEdit meaning; xNVSE only names the creature bit) (TODO-RE: not checked in the exe).
 * **Death:** the feed polls tracked actors every 100 ms. Owner's engine killed it: `ActorSync::onLocalDeath` publishes it (a named NPC is refused
   and revived). A non-owned copy that died locally waits `deathGraceMs` (1.5 s) for the owner's message, then is revived; a story NPC's copy is
-  never revived (it can only be a host `KillActor`). The combat glue should call `engine::onLocalDeath(ref)` from the kill path instead of
+  never revived (it can only be a host `KillActor`). A dead or dying actor is never restrained: `SetRestrained 1` on one overwrites its life
+  state with 5, which every reader counts as alive (game 2026-10-22: the owner's ganger read alive, the other machine dead). The combat glue should call `engine::onLocalDeath(ref)` from the kill path instead of
   relying on the poll.
 
 ## What other lanes wire (state of this checkout)
@@ -148,3 +163,25 @@ Enable `[dev] actorport=1` on one game copy, load a save near an ordinary NPC, t
 PASS looks like `proof_actor_port: all N checks passed`; exit 3 means "not wired" (nothing judged), exit 1 prints the failed checks. The checks
 that most likely fail first: `place.heading_sign` (SetAngle sign), `wiring.pin.*` (exe differs), `console.no_refused_lines` (a command spelled or
 parameterised wrongly: the line count says how many), `clone.protect` (essential flag), `swap.*` (only with `--pick`).
+
+### Two scripted proofs that replace the old hand steps (INGAME-TESTS actor-port items 5 and 6)
+
+Both are bridge calls only (no desktop input, no human), each has `--selftest` with a fake world and twins, and both run in `python -I tools/actors/run_tests.py`.
+
+`python -I tools/actors/proof_actor_port_two_copy.py --host 0 --client 1 --ref FalloutNV.esm:104C70 [--away-ref Plugin.esm:HEX] [--allow-restrained Plugin.esm:HEX] [--outdir DIR]`
+Host and client in one session near an NPC the host owns (`[live] actors=1`, `[dev] bots=1`). It checks `actors.port` session and fed, `GetRestrained` on the NPC
+(console eval with the NPC as calling ref) 0 on the owner's copy and 1 on the other, then moves the host with `player.MoveTo` to `--away-ref` (default the Novac map marker
+`FalloutNV.esm:09289B`, the destination of `scenarios/ownership_handoff.json`) while sampling both copies continuously: ownership moves to the client with the epoch up by one,
+`GetRestrained` flips with it, NO sample has 0 on both copies (each pair is read as three reads, a b a, so the order of the reads cannot fake or hide a gap), the NPC never steps more
+than 350 units between samples on either copy (it keeps its walk position) and the copies end within 200 units. The host then returns, `KillActor` runs on whichever machine owns the NPC,
+`GetDead` must be 1 on both and `actors.port` `stats.deathsRefused` must not rise; `coop.leave` on the client and then the host must leave `session=false`, the whole ledger at 0 and nothing
+restrained in `world.actors`. A copy that cannot read the NPC (cell not loaded there while the host is away) gives an unreadable sample that is skipped and counted, never read as 0.
+Twins in the self-test: no session, not fed, owner copy restrained, non-owner copy free, no handoff, a gap where both copies are free, a position jump on the new owner, restraint that does
+not follow ownership, death not synced, death refused, ledger kept after leave, restraint kept after leave. Exit 3 = not ready (the host does not own the NPC, no session).
+
+`python -I tools/actors/proof_actor_port_save_check.py --instance 0 --ref FalloutNV.esm:104C70 --inst-dir <instance dir> [--save-name autosaveaclgcheck]`
+One copy with `[dev] actorport=1` (a session, if there is one, is ended with `coop.leave`). It restrains the NPC through the port, saves with the bridge `saveGame` (only its own save name,
+overwritten each run), ends the session and empties the live ledger (`actors.dev release`), loads the save with `loadSave`, waits for `worldReady` and a working console, then asserts the new
+part of `Data/NVSE/Plugins/nvcoop.log` has `actors: cosave of the loaded game added N ledger entries to undo` with N >= 1, `GetRestrained` is 0 within 30 s, the ledger's restrained count is 0 and
+`stats.consoleFailed` did not rise. The cosave count exists only in the log (no bridge counter; adding one is a small C++ change in `engine_module.cpp` `CosaveLoad`), so `--inst-dir` or `--log` is required.
+Twins: save refused, NPC not restrained by the port, live ledger not emptied, game never ready, no cosave line, cosave line with 0 entries, undo fails (NPC stays frozen), ledger leak, refused console lines, `coop.leave` that does nothing.
