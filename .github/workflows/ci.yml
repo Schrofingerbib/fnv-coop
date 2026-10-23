@@ -66,3 +66,36 @@ jobs:
           test "$got" = "${{ matrix.pointer_bytes }}"
       - run: cmake --build build --config Release --parallel
       - run: ctest --test-dir build -C Release -j 4 --timeout 300 --output-on-failure
+
+  plugin:
+    # nvcoop.dll as the game loads it (Win32/x86, static CRT), against xNVSE pinned to the version docs/tools/T4a-pool.md uses.
+    # xNVSE is public source, not game files. This only proves the DLL builds and is loadable by shape; nothing here runs it.
+    name: plugin build (windows-latest, Win32)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fetch xNVSE 6.4.9
+        run: git clone --depth 1 --branch 6.4.9 https://github.com/xNVSE/NVSE third_party/NVSE
+      - run: cmake -S plugin -B build/L1 -A Win32
+      - run: cmake --build build/L1 --config Release --parallel
+      # The packager's own DLL check: PE32/i386 and exports NVSEPlugin_Query and NVSEPlugin_Load.
+      # Twin: the same check must reject a 64-bit DLL (the runner's own kernel32.dll), so a pass above means something.
+      - name: Check nvcoop.dll (and that the check rejects a 64-bit DLL)
+        shell: bash
+        run: |
+          python -I - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "tools/installer")
+          import package_release as pkg
+          dll = Path("out/L1/nvcoop.dll")
+          problems = pkg.check_dll(dll)
+          print("nvcoop.dll:", problems or "OK", f"({dll.stat().st_size} bytes)")
+          twin = pkg.check_dll(Path(r"C:\Windows\System32\kernel32.dll"))
+          print("twin kernel32.dll (must be rejected):", twin)
+          sys.exit(1 if problems or not any("32-bit" in p for p in twin) else 0)
+          PY
