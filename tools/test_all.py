@@ -32,6 +32,8 @@ SUITES = [
     ("lint every Python file parses", [sys.executable, "-I", "tools/lint/check_py_compiles.py"], False, NO),
     ("lint loot service is in the live hub (+ twins)", [sys.executable, "-I", "tools/lint/check_loot_wiring.py", "--self-test"], False, NO),
     ("lint loot service wiring", [sys.executable, "-I", "tools/lint/check_loot_wiring.py"], False, NO),
+    ("lint workflow inputs stay out of run scripts, soak seed and count checked (+ twins)", [sys.executable, "-I", "tools/lint/check_workflow_inputs.py", "--self-test"], False, NO),
+    ("lint workflow inputs", [sys.executable, "-I", "tools/lint/check_workflow_inputs.py"], False, NO),
     ("test_all preflight", [sys.executable, "-I", "tools/test_all_selftest.py"], False, NO),
     ("canonical nvcoop.dll build", ["cmd", "/c", r"tools\runner\build_l1.cmd"], True, CM),
     ("T5 chaos box (+ chaos_pair: a pair joined through the relay)", [sys.executable, "-I", "tools/chaos/run_tests.py"], False, NO),
