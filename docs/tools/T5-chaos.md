@@ -84,8 +84,10 @@ finishing. `twin_loopback_relay_{bypass,partition}_needs_its_own_failure` (WILL_
 count as caught.
 
 Measured on Linux (2 clients, 150 transactions, 400 to 2300 datagrams per direction): `lan`, `good_wifi`, `bad_wifi`, `mobile_tether` and
-`transatlantic` converge in 3 to 5 s with the host's digest. **`hell` does not**: both clients apply all 150 transactions and hold the host's
-digest, but the host never reaches `allSynced()` within the loopback program's 90 s (so `fnvcoop_loopback` reports TIMEOUT), at about 40 percent
-dropped datagrams. Bisected by overriding one parameter at a time: it converges with `burst_enter=0` or with `latency_ms=20, jitter_ms=5`, and still
-fails with `reorder=0`, `duplicate=0` or `bandwidth_bps=0`, so it is the combination of long round trips and burst loss. A longer client
-linger (up to 15 s) did not help. Not investigated further (session layer); `hell` is therefore not a gated ctest. Not proven in the game.
+`transatlantic` converge in 3 to 5 s with the host's digest. **`hell` is too slow for the 90 s budget**: a client needs anywhere from about 25 s
+to more than 90 s to apply all 150 transactions (timed by when each client ends), so the host usually reports TIMEOUT. The host is not stuck.
+(A client prints OK whenever it got everything before its own 90 s end, so OK does not mean it finished early.) About 40 percent of datagrams are
+dropped. Bisected by overriding one parameter at a time: it converges with `burst_enter=0` or with `latency_ms=20, jitter_ms=5`, and still
+fails with `reorder=0`, `duplicate=0` or `bandwidth_bps=0`, so the long tail comes from long round trips and burst loss together. A longer
+client linger (up to 15 s) did not help. Details and the open questions are in issue #48 (session layer); `hell` is therefore not a gated ctest.
+Not proven in the game.
