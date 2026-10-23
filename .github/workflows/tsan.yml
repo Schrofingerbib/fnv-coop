@@ -52,5 +52,21 @@ jobs:
           "-DCMAKE_C_FLAGS=$TSAN_FLAGS" "-DCMAKE_CXX_FLAGS=$TSAN_FLAGS" "-DCMAKE_EXE_LINKER_FLAGS=$TSAN_FLAGS"
       - run: cmake --build build --parallel
       # Left out, with the reason: unit_perf / twin_perf_regression_still_fails / flight_perf have wall-clock budgets, meaningless at
-      # TSan speed (5 to 15 times slower). Everything else must pass with no TSan report.
-      - run: ctest --test-dir build -j 4 --timeout 900 --output-on-failure -E '^(unit_perf|twin_perf_regression_still_fails|flight_perf)$'
+      # TSan speed (5 to 15 times slower). Everything else must pass with no TSan report. Every report also goes to a file (log_path),
+      # because a report inside a WILL_FAIL test (the twins) only makes it exit non-zero, which WILL_FAIL counts as the expected failure.
+      - name: ctest (and no TSan report from any test, WILL_FAIL ones included)
+        env:
+          TSAN_OPTIONS: ${{ env.TSAN_OPTIONS }} log_path=${{ github.workspace }}/tsan-reports/tsan
+        run: |
+          # Twin: with exactly these options the planted race (built in the twin step above) must leave a report file.
+          mkdir -p tsan-twin
+          TSAN_OPTIONS="${TSAN_OPTIONS%% log_path=*} log_path=$PWD/tsan-twin/tsan" ./twin_tsan || true
+          [ -n "$(ls -A tsan-twin)" ] || { echo "::error::the planted race left no report file: log_path does not work here"; exit 1; }
+          mkdir -p tsan-reports
+          rc=0
+          ctest --test-dir build -j 4 --timeout 900 --output-on-failure -E '^(unit_perf|twin_perf_regression_still_fails|flight_perf)$' || rc=$?
+          if [ -n "$(ls -A tsan-reports)" ]; then
+            for f in tsan-reports/*; do echo "== $f"; head -60 "$f"; done
+            echo "::error::$(ls tsan-reports | wc -l) TSan report file(s) written during ctest"; exit 1
+          fi
+          exit $rc
