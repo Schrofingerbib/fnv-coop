@@ -74,7 +74,8 @@ jobs:
       # log_path: g++'s UBSan at -O1 ignores it and writes to stderr.
       - name: ctest (and no sanitizer report from any test, WILL_FAIL ones included)
         run: |
-          # -a: some test output holds NUL bytes, and grep would then only say "binary file matches" instead of showing the line.
+          # -a on every grep of ctest-all.log: some test output holds NUL bytes, and grep would then only say "binary file matches"
+          # instead of showing the lines (tools/lint/check_workflow_inputs.py checks it).
           reports() { grep -aE "ERROR: (AddressSanitizer|LeakSanitizer)|: runtime error: " "$1"; }
           # Twin: the planted overflow and signed overflow (built in the twin step above) must be found by the same search.
           for t in twin_asan twin_ubsan; do
@@ -83,12 +84,12 @@ jobs:
           done
           rc=0
           ctest --test-dir build -V -j 4 --timeout 900 -E '^(unit_perf|twin_perf_regression_still_fails|flight_perf|twin_unit_async_completion_leak)$' > ctest-all.log 2>&1 || rc=$?
-          grep -E "^[0-9]+/[0-9]+ Test|tests passed|tests failed|\(Failed\)|\(Timeout\)" ctest-all.log | tail -40
+          grep -aE "^[0-9]+/[0-9]+ Test|tests passed|tests failed|\(Failed\)|\(Timeout\)" ctest-all.log | tail -40
           if reports ctest-all.log > san-hits.txt; then
             head -40 san-hits.txt
             echo "::error::$(wc -l < san-hits.txt) sanitizer report line(s) in the output of ctest (see ctest-all.log)"; exit 1
           fi
-          [ "$rc" -eq 0 ] || { grep -B2 -A40 -E "\*\*\*(Failed|Timeout)|Subprocess aborted" ctest-all.log | tail -200; }
+          [ "$rc" -eq 0 ] || { grep -a -B2 -A40 -E "\*\*\*(Failed|Timeout)|Subprocess aborted" ctest-all.log | tail -200; }
           exit $rc
 
       - name: LSan catches the runAsync cycle of issue #46 (its twin)
