@@ -27,13 +27,19 @@ jobs:
       - run: python -I tools/test_all.py --quick
 
   synccore:
-    name: synccore tests (${{ matrix.os }})
+    name: synccore tests (${{ matrix.os }}${{ matrix.arch && format(', {0}', matrix.arch) || '' }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # Listed one by one: an include that only adds 'arch' to os: windows-latest would turn the x64 job into Win32
+        # instead of adding a job. The game is 32-bit and links synccore as Win32/x86 (tools/build/build.py defaults to
+        # x86), so that build is tested too: 4-byte pointers and size_t, x86 struct layout, the x86 MSVC code generator.
+        include:
+          - {os: ubuntu-latest,  pointer_bytes: 8}
+          - {os: windows-latest, pointer_bytes: 8}
+          - {os: windows-latest, pointer_bytes: 4, arch: Win32}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5   # the drift_effect_table test calls python
@@ -46,7 +52,17 @@ jobs:
         if: runner.os == 'Linux'
         run: cmake -S synccore -B build -G Ninja
       - name: Configure (Windows, newest installed Visual Studio, x64)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !matrix.arch
         run: cmake -S synccore -B build
+      - name: Configure (Windows, newest installed Visual Studio, ${{ matrix.arch }})
+        if: runner.os == 'Windows' && matrix.arch
+        run: cmake -S synccore -B build -A ${{ matrix.arch }}
+      # Each job must really build the pointer size it claims (the 64-bit jobs are the twin: the same check must see 8 there).
+      - name: Check the pointer size of the build
+        shell: bash
+        run: |
+          got=$(sed -n 's/^set(CMAKE_CXX_SIZEOF_DATA_PTR "\([0-9]*\)")$/\1/p' build/CMakeFiles/*/CMakeCXXCompiler.cmake)
+          echo "CMAKE_CXX_SIZEOF_DATA_PTR=$got (want ${{ matrix.pointer_bytes }})"
+          test "$got" = "${{ matrix.pointer_bytes }}"
       - run: cmake --build build --config Release --parallel
       - run: ctest --test-dir build -C Release -j 4 --timeout 300 --output-on-failure
