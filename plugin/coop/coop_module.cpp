@@ -304,6 +304,14 @@ void TryStart() {
 #endif
     g_rt.reset(new Runtime(g_cfg, hub, &g_world, NowMs));
     g_rt->setDumper(&g_dumper);
+    g_rt->setQuestStateReader([](const fnvcoop::FormRef& q, int32_t& stage, bool& completed, bool& failed) {
+        const int st = nvhooks::localQuestStage(q), fl = nvhooks::localQuestFlags(q);
+        if (st < 0 || fl < 0) return false;
+        stage = st;
+        completed = (fl & 0x02) != 0;   // a failed quest also has the completed bit
+        failed = (fl & 0x40) != 0;
+        return true;
+    });
 #ifdef NVCOOP_WITH_FLIGHT
     if (auto* fr = nvcoop::flight::service().recorder()) g_rt->setFlight(fr);   // T1a: record every datagram and applied / committed effect
 #endif

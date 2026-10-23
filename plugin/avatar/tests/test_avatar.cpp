@@ -908,6 +908,31 @@ static void t_snap_and_drift() {
     CHECK(r.pm.ActualPose(1, ac, ap) && ac == kCellA && std::fabs(ap.x - 100) < 0.01f);
 }
 
+// A body in the way (the real player standing in the puppet) pushes it hundreds of units. The place reported to the
+// interpolation buffer must stay the one the driver put it at, or the buffer eases the puppet back from the pushed place.
+// A small deviation is still reported as it is (the buffer corrects those at once).
+static void t_physics_push_not_adopted() {
+    g_test = "physics_push_not_adopted";
+    Rig r;
+    r.eng.reportsCurrentGroup = false;
+    r.Add(1, MkPose(kCellA, 100, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0}));
+    r.Run(1500);
+    CellId ac = 0;
+    Vec3 ap;
+    r.F(1)->pos.x += 60;
+    CHECK(r.pm.ActualPose(1, ac, ap) && std::fabs(ap.x - 160) < 0.01f);
+    CHECK(r.pm.stats().pushesIgnored == 0);
+    r.Step();
+    r.F(1)->pos.x += 300;
+    CHECK(r.pm.ActualPose(1, ac, ap) && std::fabs(ap.x - 100) < 0.01f && ac == kCellA);
+    CHECK(r.pm.stats().pushesIgnored == 1);
+    uint64_t d0 = r.pm.stats().drift;
+    r.Step();
+    CHECK(r.pm.stats().drift == d0 + 1);
+    CHECK(std::fabs(r.F(1)->pos.x - 100) < 0.01f);
+    CHECK(r.pm.StatusJson().find("\"pushesIgnored\":1") != std::string::npos);
+}
+
 static void t_group_refused_retries() {
     g_test = "group_refused_retries";
     Rig r;
@@ -1404,6 +1429,7 @@ static void RunSuite() {
     RUN(t_yaw_handling);
     RUN(t_position_rate);
     RUN(t_snap_and_drift);
+    RUN(t_physics_push_not_adopted);
     RUN(t_group_refused_retries);
     RUN(t_call_budget);
     RUN(t_ref_map);
@@ -1432,7 +1458,7 @@ static const Twin kTwins[] = {
     TWIN(noJumpLand), TWIN(ignoreBudget), TWIN(staleMapEntries), TWIN(noPostMenuSnap), TWIN(noSaveWait),
     TWIN(noWeaponMods), TWIN(modsIgnoredInSet), TWIN(modsRetryForever), TWIN(appearanceUpdateRespawns), TWIN(noPuppetHeal),
     TWIN(noPuppetDeathRespawn), TWIN(apiLocalGetsPuppet), TWIN(apiPlayerIsPuppet), TWIN(apiActingNeedsPuppet), TWIN(hitsForwardEmpty),
-    TWIN(puppetHitProceeds),
+    TWIN(puppetHitProceeds), TWIN(adoptPhysicsPush),
 };
 
 int main(int argc, char** argv) {

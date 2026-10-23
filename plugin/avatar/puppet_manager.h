@@ -58,7 +58,8 @@ public:
     RefId RefOf(Slot slot) const;                     // 0 = no usable puppet right now
     std::optional<Slot> SlotOf(RefId ref) const;
     std::vector<std::pair<Slot, RefId>> LivePuppets() const;   // every slot with a usable puppet right now, ascending by slot
-    // Where the engine says the puppet really is (for live::InterpBuffer::sample's ActualPose). False when none.
+    // Where the engine says the puppet really is (for live::InterpBuffer::sample's ActualPose). False when none. A place farther
+    // than Config::driftUnits from the last applied one is a push, not a place to ease from: the applied place is reported.
     bool ActualPose(Slot slot, CellId& cell, Vec3& pos) const;
 
     // ---- introspection (tests, bridge) -----------------------------------------------------------------------------
@@ -90,6 +91,7 @@ private:
         Vec3 appliedPos;
         float appliedYaw = 0;
         bool haveApplied = false;
+        bool posConfirmed = false;         // the engine place was seen within driftUnits of appliedPos since the last (re)spawn / cell move
         uint32_t appliedAt = 0;
         bool forcePose = false;
         uint32_t unloadedSince = 0;
@@ -129,7 +131,7 @@ private:
     Config cfg_;
     AnimConfig animCfg_;
     std::map<Slot, Puppet> puppets_;
-    Stats stats_;
+    mutable Stats stats_;   // mutable: ActualPose (const) counts the pushes it hides
     std::function<void(const std::string&)> log_;
     uint64_t nextGen_ = 1;
     uint32_t worldEpoch_ = 0;

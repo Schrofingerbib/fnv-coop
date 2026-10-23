@@ -269,6 +269,14 @@ a normal host txn (`HostSession::hostQuestRunning` reads the host engine; withou
 Every client receives it, the host's key space is complete afterwards, and the digest converges. Counted in `HostStats::questRunningAdopted`
 (`desyncs.digests.questRunningAdopted`) and in the repair counters.
 
+Client-only quest state that is real save state (a non-zero `SetStage`, `CompleteQuest`, `FailQuest`) is the same shape: both copies loaded
+it from the same save, but a host without a world baseline never recorded it, and neither stage merge (max) nor completion has an inverse.
+The host adopts such a key only after its OWN engine confirms it (`HostSession::hostQuestState`: engine stage >= the client's stage, or
+equal completed / failed flag), by committing the client's value as a normal host txn (`questStateAdopted`). When the engine disagrees the key
+is a real divergence: it is not adopted, not resent as a revert, and stays in the desync report (`questStateDisagreed`, counted per round).
+Without the hook (or when it fails) nothing is adopted and the old revert keys are sent. `SetObjective` / `CompleteAllObjectives` are not
+covered (no engine reader yet).
+
 ### 7.6 AppData
 
 Opaque, best effort, for adapters that want to ride the story channel (dialogue uses its own mux channel instead). `from` is the

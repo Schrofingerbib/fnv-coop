@@ -19,6 +19,8 @@ struct RepairItem {
     HostSession::DesyncEntry d;
     bool clientOnly = false, race = false, revertToo = false;   // revertToo: additive entry, the client takes its own amount back before the host's is added
     bool questRunning = false;   // client-only StartQuest / StopQuest entry: settled by the host's own running state (issue #25), fix = the client's entry
+    bool stageZero = false;      // client-only SetStage q = 0 entry (quest not started): the host commits the same stage 0, fix = the client's entry
+    uint8_t questState = 0;      // client-only real save state: 1 SetStage q = n (n > 0), 2 CompleteQuest, 3 FailQuest; adopted only when the host engine confirms it
     Effect fix;
     uint64_t key = 0;
 };
@@ -432,6 +434,10 @@ void HostSession::handle(PeerId from, const Message& m) {
                     r.key = key; r.clientOnly = true;
                     r.questRunning = std::holds_alternative<StartQuest>(ce.effect) || std::holds_alternative<StopQuest>(ce.effect);
                     if (r.questRunning) r.fix = ce.effect;
+                    if (auto* ss = std::get_if<SetStage>(&ce.effect); ss && ss->stage == 0) { r.stageZero = true; r.fix = ce.effect; }
+                    else if (auto* ss2 = std::get_if<SetStage>(&ce.effect); ss2 && ss2->stage > 0) { r.questState = 1; r.fix = ce.effect; }
+                    else if (std::holds_alternative<CompleteQuest>(ce.effect)) { r.questState = 2; r.fix = ce.effect; }
+                    else if (std::holds_alternative<FailQuest>(ce.effect)) { r.questState = 3; r.fix = ce.effect; }
                     r.d.key = describeEntry(ce.effect); r.d.keyHash = key; r.d.client = r.d.key; r.d.host = "(absent)"; r.d.clientOnly = true;
                     r.race = touched.count(key) > 0;
                     items.push_back(std::move(r));
@@ -464,12 +470,24 @@ void HostSession::handle(PeerId from, const Message& m) {
                 std::vector<Effect> fix;
                 std::vector<uint64_t> revert;
                 std::vector<FormRef> adopt;   // client-only quest running keys (issue #25)
+                std::vector<FormRef> adoptStage;   // client-only "SetStage q = 0" keys: not started on the client, simply absent on the host
+                struct StateItem { uint8_t kind; Effect fx; FormRef quest; uint64_t key; };
+                std::vector<StateItem> stateItems;   // client-only real quest state, adopted only when the host engine confirms it
                 size_t n = 0;
                 for (auto& it : items) {
                     if (n++ < 64) it.d.lastSeqs = lastSeqs(it.key);
                     if (it.race) it.d.skippedRace = true;
                     else if (it.clientOnly && it.questRunning && !mutations().questRunningReverted)
                         adopt.push_back(std::holds_alternative<StartQuest>(it.fix) ? std::get<StartQuest>(it.fix).quest : std::get<StopQuest>(it.fix).quest);
+                    else if (it.clientOnly && it.stageZero && !mutations().stageZeroReverted)
+                        adoptStage.push_back(std::get<SetStage>(it.fix).quest);
+                    else if (it.clientOnly && it.questState && hostQuestState && !mutations().questStateReverted) {
+                        FormRef q;
+                        if (auto* s1 = std::get_if<SetStage>(&it.fix)) q = s1->quest;
+                        else if (auto* s2 = std::get_if<CompleteQuest>(&it.fix)) q = s2->quest;
+                        else q = std::get<FailQuest>(it.fix).quest;
+                        stateItems.push_back({it.questState, it.fix, q, it.key});
+                    }
                     else if (it.clientOnly) revert.push_back(it.key);
                     else { fix.push_back(it.fix); if (it.revertToo) revert.push_back(it.key); }
                     rep.entries.push_back(std::move(it.d));
@@ -493,6 +511,44 @@ void HostSession::handle(PeerId from, const Message& m) {
                     const size_t nFx = fx.size();
                     Cause cause; cause.kind = CauseKind::Script;
                     if (nFx && commit(kHostPlayer, cause, std::move(fx))) { adopted = nFx; stats_.questRunningAdopted += nFx; }
+                }
+                // A stage-0 key only the client has: SetStage merges by max, so a revert key can never remove it and every digest round resent
+                // the same ~200 repair effects (the host never reached ok, and the repair traffic starved its frame budget). Commit the same
+                // stage 0 on the host: its shared world then has the key too, the digests agree, and every client and late joiner gets it.
+                if (!adoptStage.empty() && !mutations().healDisabled) {
+                    std::vector<Effect> fx;
+                    for (auto& q : adoptStage) fx.push_back(SetStage{q, 0});
+                    const size_t nFx = fx.size();
+                    Cause cause; cause.kind = CauseKind::Script;
+                    if (nFx && commit(kHostPlayer, cause, std::move(fx))) { adopted += nFx; stats_.stageZeroAdopted += nFx; }
+                }
+                // Client-only real quest state (the host runs without a world baseline, so its shared world never recorded what both copies
+                // loaded from the same save): settle it host-authoritatively, but only where the host's OWN engine confirms the value. A key
+                // the engine disagrees with is a real divergence: it is not adopted and stays in the report. A reader that fails leaves the
+                // old behaviour (revert keys); quests it cannot read are left alone this round.
+                if (!stateItems.empty() && !mutations().healDisabled) {
+                    std::vector<FormRef> qs;
+                    for (auto& si : stateItems) qs.push_back(si.quest);
+                    std::sort(qs.begin(), qs.end());
+                    qs.erase(std::unique(qs.begin(), qs.end()), qs.end());
+                    std::map<FormRef, HostQuestState> st;
+                    if (!hostQuestState(qs, st)) {
+                        for (auto& si : stateItems) revert.push_back(si.key);
+                    } else {
+                        std::vector<Effect> fx;
+                        for (auto& si : stateItems) {
+                            auto e = st.find(si.quest);
+                            if (e == st.end() || (si.kind == 1 && e->second.stage < 0)) continue;
+                            bool agree = false;
+                            if (si.kind == 1) agree = e->second.stage >= static_cast<int32_t>(std::get<SetStage>(si.fx).stage);
+                            else if (si.kind == 2) agree = e->second.completed && !e->second.failed;
+                            else agree = e->second.failed;
+                            if (agree) fx.push_back(si.fx); else ++stats_.questStateDisagreed;
+                        }
+                        const size_t nFx = fx.size();
+                        Cause cause; cause.kind = CauseKind::Script;
+                        if (nFx && commit(kHostPlayer, cause, std::move(fx))) { adopted += nFx; stats_.questStateAdopted += nFx; }
+                    }
                 }
                 // bandwidth budget
                 if (repairTokens_ < 0) { repairTokens_ = double(dopt_.maxRepairEffectsPerMin); repairRefillAt_ = now_; }
@@ -596,7 +652,8 @@ std::string HostSession::desyncsJson() const {
     o << "{\"digests\":{\"received\":" << stats_.digestsReceived << ",\"ok\":" << stats_.digestsOk << ",\"mismatch\":" << stats_.digestsMismatch
       << ",\"rateLimited\":" << stats_.digestsRateLimited << ",\"stale\":" << stats_.digestsStale << ",\"repairs\":" << stats_.desyncRepairs
       << ",\"effectsRepaired\":" << stats_.desyncEffectsRepaired << ",\"deferredByBudget\":" << stats_.repairsDeferredBudget
-      << ",\"questRunningAdopted\":" << stats_.questRunningAdopted << "},\"desyncs\":[";
+      << ",\"questRunningAdopted\":" << stats_.questRunningAdopted << ",\"stageZeroAdopted\":" << stats_.stageZeroAdopted
+      << ",\"questStateAdopted\":" << stats_.questStateAdopted << ",\"questStateDisagreed\":" << stats_.questStateDisagreed << "},\"desyncs\":[";
     bool firstR = true;
     for (auto& r : reports_) {
         if (!firstR) o << ',';

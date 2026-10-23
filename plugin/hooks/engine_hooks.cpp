@@ -1389,6 +1389,12 @@ int localQuestStage(const FormRef& quest) {
     char* q = static_cast<char*>(id ? g_res->lookup(id) : nullptr);
     return q ? *reinterpret_cast<UInt8*>(q + 0x60) : -1;
 }
+int localQuestFlags(const FormRef& quest) {
+    uint32_t id = g_res ? g_res->fromRef(quest) : 0;
+    TESForm* f = id ? static_cast<TESForm*>(g_res->lookup(id)) : nullptr;
+    if (!f || f->typeID != kFormType_TESQuest) return -1;
+    return static_cast<TESQuest*>(f)->flags;
+}
 bool execConsoleLine(const std::string& line) { return g_consoleExec && g_consoleExec(line, 0); }
 bool execConsoleLineOn(const std::string& line, uint32_t refID) { return g_consoleExec && g_consoleExec(line, refID); }
 

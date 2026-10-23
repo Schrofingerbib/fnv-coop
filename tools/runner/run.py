@@ -224,7 +224,8 @@ def launch_instance(i: int, *, via_nvse: Optional[bool] = None) -> int:
     env["NVCOOP_INSTANCE"] = str(i)
     si = subprocess.STARTUPINFO()  # start minimized, no activation (owner is using the PC)
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    si.wShowWindow = 7  # SW_SHOWMINNOACTIVE
+    visible = os.environ.get("NVCOOP_VISIBLE") == "1"  # watch the copies: shown without taking focus, never minimized
+    si.wShowWindow = 4 if visible else 7  # SW_SHOWNOACTIVATE / SW_SHOWMINNOACTIVE
     p = spawn_detached([str(exe)], str(d), env, si)
     pid = p.pid
     if exe.name.lower() == "nvse_loader.exe":
@@ -239,8 +240,23 @@ def launch_instance(i: int, *, via_nvse: Optional[bool] = None) -> int:
                 continue
             break
     register_pid(pid)
-    threading.Thread(target=winproc.minimize_windows, args=(pid,), daemon=True).start()
+    if not visible:
+        threading.Thread(target=winproc.minimize_windows, args=(pid,), daemon=True).start()
     return pid
+
+
+def start_diag_logger() -> None:
+    """Start tools/diag/session_log.py detached (it exits itself when every copy is gone). NVCOOP_DIAG=0 turns it off."""
+    if os.environ.get("NVCOOP_DIAG") == "0":
+        return
+    script = Path(__file__).resolve().parents[1] / "diag" / "session_log.py"
+    if not script.exists():
+        return
+    env = dict(os.environ)
+    try:
+        spawn_detached([sys.executable, "-I", str(script), "--auto"], str(script.parents[2]), env)
+    except OSError as e:
+        print(f"session logger not started: {e}", file=sys.stderr)
 
 
 def cmd_up(a) -> int:
@@ -250,6 +266,7 @@ def cmd_up(a) -> int:
     except SlotBusy as e:
         print(f"game slot busy: {e}", file=sys.stderr)
         return 3
+    start_diag_logger()
     st = load_state()
     running = winproc.list_pids("FalloutNV.exe")
     foreign = [p for p in running if p not in st["pids"].values()]

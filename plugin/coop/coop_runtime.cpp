@@ -272,6 +272,21 @@ bool Runtime::start(std::string* err) {
                 return true;
             };
         }
+        if (questState_) {
+            // Desync repair: client-only quest state (non-zero stage, completed, failed) is settled only where THIS engine confirms it.
+            // Works with or without a world baseline (a baseline-less host never recorded what both copies loaded from the same save).
+            QuestStateReader rd = questState_;
+            host_->hostQuestState = [rd](const std::vector<FormRef>& qs, std::map<FormRef, HostSession::HostQuestState>& out) {
+                for (auto& q : qs) {
+                    HostSession::HostQuestState s;
+                    int32_t stage = -1;
+                    if (!rd(q, stage, s.completed, s.failed)) continue;
+                    s.stage = stage;
+                    out[q] = s;
+                }
+                return true;
+            };
+        }
         {
             HostSession::DesyncOptions dopt;
             dopt.compareClasses = cfg_.compareClasses;
@@ -1046,7 +1061,8 @@ std::string Runtime::statusJson() const {
             .set("commits", (int64_t)s.commits).set("droppedByPolicy", (int64_t)s.droppedByPolicy)
             .set("epoch", (int64_t)host_->epoch()).set("welcomes", (int64_t)s.welcomes).set("snapshots", (int64_t)s.snapshots).set("replays", (int64_t)s.replays)
             .set("retransmitBatches", (int64_t)s.retransmitBatches).set("badMessages", (int64_t)s.badMessages)
-            .set("questRunningAdopted", (int64_t)s.questRunningAdopted).set("resumesRefused", (int64_t)s.resumesRefused);
+            .set("questRunningAdopted", (int64_t)s.questRunningAdopted).set("questStateAdopted", (int64_t)s.questStateAdopted)
+            .set("questStateDisagreed", (int64_t)s.questStateDisagreed).set("resumesRefused", (int64_t)s.resumesRefused);
         if (replicator_) {
             const auto& rp = replicator_->stats();
             Value r = Value::object();

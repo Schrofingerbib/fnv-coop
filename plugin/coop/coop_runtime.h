@@ -126,6 +126,9 @@ public:
 
     // How the host receives outermost-scope txns. Default hub->addSink (slot 0 stays with L5's capture.end bridge).
     void setDumper(IWorldDumper* d) { dumper_ = d; }
+    // Host: reads one quest's stage / completed / failed from the engine (false = unknown). Feeds HostSession::hostQuestState; before start().
+    using QuestStateReader = std::function<bool(const fnvcoop::FormRef& quest, int32_t& stage, bool& completed, bool& failed)>;
+    void setQuestStateReader(QuestStateReader f) { questState_ = std::move(f); }
     void setActionExecutor(ActionExecutor f) { executor_ = std::move(f); }
     // "Acting player" context (docs/protocol.md section 12): while the host runs a guest's interaction, the engine layer must resolve
     // `player` inside the target's script block to that guest. The hook is called (slot, true) before and (slot, false) after the executor.
@@ -291,6 +294,7 @@ private:
     bool applyingDeferred_ = false;
     std::unique_ptr<fnvcoop::MuxTransport> mux_;
     IWorldDumper* dumper_ = nullptr;
+    QuestStateReader questState_;
     std::unique_ptr<fnvcoop::ShadowState> usedBaseline_;
     uint64_t usedHash_ = 0;
     ActionExecutor executor_;

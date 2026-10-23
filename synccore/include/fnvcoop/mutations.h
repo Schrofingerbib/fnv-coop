@@ -52,6 +52,8 @@ struct Mutations {
     bool noGuestSuppression = false;  // guests keep script-originated effects (ghost-death double fire)
     bool overfullShardRequest = false; // a digest repair asks for every bad shard at once (the client's reply is cut off, the drift beyond it is never fixed)
     bool questRunningReverted = false; // issue #25: client-only quest running keys go out as revert keys again (no inverse: never converges)
+    bool stageZeroReverted = false;    // client-only "SetStage q = 0" keys go out as revert keys again (SetStage merges by max, no inverse: the digest never converges, a repair every round)
+    bool questStateReverted = false;   // client-only non-zero SetStage / CompleteQuest / FailQuest keys go out as revert keys again (no inverse: never converges, resent every round)
     bool digestKeepsRefVars = false;   // the host digest compares RefScriptVar (polled object / NPC script vars): the client's world dump never carries them, so every one is "missing" and repaired forever (digest never ok)
     bool digestKeepsWorldEnv = false;  // the digest compares the host's last SetWeather / SetTimeScale: the client's world dump cannot read either one, so both are "missing" and repaired every round
     bool trustForeignCursor = false;   // a Hello's resume cursor of the host's epoch is replayed / snapshotted without checking it is this host's timeline

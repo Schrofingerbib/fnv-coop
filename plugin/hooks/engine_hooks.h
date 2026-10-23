@@ -163,6 +163,8 @@ public:
 };
 // Local read of a quest's current stage (TESQuest+0x60) for scene-pass detection (e.g. VCG01 chargen finished). -1 if unknown.
 int localQuestStage(const fnvcoop::FormRef& quest);
+// Local read of a quest's TESQuest::flags byte (bit0 running, bit1 completed, bit6 failed; a failed quest also has bit1). -1 if unknown.
+int localQuestFlags(const fnvcoop::FormRef& quest);
 // Execute a console line through the injected executor (for the owner of a deferred stage: "setstage <hex> <n>").
 bool execConsoleLine(const std::string& line);
 // Same, with `refID` as the console's calling reference (so `KillActor`, `MoveTo ...`, `GetDead` act on that reference).

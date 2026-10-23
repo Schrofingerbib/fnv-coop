@@ -141,8 +141,8 @@ FALLOUT_INI_EDITS = [
 ]
 PREFS_EDITS = [
     ("Display", "bFull Screen", "0"),
-    ("Display", "iSize W", "640"),
-    ("Display", "iSize H", "480"),
+    ("Display", "iSize W", "1280"),   # not 640x480: measured 125 ms/frame (8 fps, GPU allocation churn in the AMD driver) vs 15 ms at 1280x720 in a window
+    ("Display", "iSize H", "720"),
     ("Display", "iPresentInterval", "0"),
     ("Display", "iMultiSample", "0"),
 ]
@@ -218,7 +218,10 @@ def _base_ini(name: str) -> str:
 
 def render_inis() -> Dict[str, str]:
     fo = _base_ini("Fallout.ini")
+    play = os.environ.get("NVCOOP_PLAY") == "1"   # a person plays: only the focused copy may read the keyboard and mouse
     for s, k, v in FALLOUT_INI_EDITS:
+        if play and k in ("bBackground Mouse", "bBackground Keyboard"):
+            v = "0"
         fo = ini_set(fo, s, k, v)
     pr = _base_ini("FalloutPrefs.ini")
     for s, k, v in PREFS_EDITS:
@@ -335,12 +338,34 @@ def stale_plugin_dlls(plugins: Path, keep: List[Path]) -> List[Path]:
     return [f for f in sorted(plugins.glob("*.dll")) if f.name.lower().startswith("nvcoop") and f.name.lower() not in names]
 
 
+DXVK_CONF = "d3d9.maxFrameRate = 60\n"   # the game's speed follows its frame rate: uncapped DXVK runs it at 100+ fps, i.e. too fast
+
+
+def deps_dir() -> Path:
+    """Cached third-party runtime files (tools/runner/fetch_deps.py fills it): out/cache/deps/{dxvk,nvse}."""
+    return Path(os.environ.get("NVCOOP_DEPS_DIR") or Path(__file__).resolve().parents[2] / "out" / "cache" / "deps")
+
+
+def install_dxvk(d: Path) -> bool:
+    """DXVK's 32-bit d3d9.dll next to FalloutNV.exe, plus a 60 fps cap. Measured on an AMD RX 6600: under NVSE the game's own D3D9 path
+    ran exteriors at about 6 fps with props and foliage jumping (the main thread sat in the driver creating and destroying GPU
+    allocations); with DXVK the same copy runs at 60+ fps. Returns False when the cached dll is missing or NVCOOP_NO_DXVK=1."""
+    if os.environ.get("NVCOOP_NO_DXVK") == "1":
+        return False
+    src = deps_dir() / "dxvk" / "d3d9.dll"
+    if not src.is_file():
+        return False
+    _replace(src, d / "d3d9.dll")
+    (d / "dxvk.conf").write_text(DXVK_CONF, encoding="ascii", newline="")
+    return True
+
+
 def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
               plugin_dll: Optional[Path] = None, plugin_files: Optional[List[Path]] = None,
               autoload: str = "", autoload_delay_frames: int = 600, modes=LINK_MODES,
               root: Optional[Path] = None, appid: Optional[str] = STEAM_APPID,
               extra_ini: Optional[Dict[str, Dict[str, str]]] = None, core_dll: Optional[Path] = None,
-              port_base: Optional[int] = None) -> Dict:
+              port_base: Optional[int] = None, dxvk: bool = False) -> Dict:
     # Check every input before the first write: a missing dll or a bad ini entry must not leave a half instance.
     sources, plan_ini = plugin_plan(plugin_dll, core_dll, plugin_files)
     ini_extra = provision_ini(plan_ini, extra_ini)
@@ -370,6 +395,8 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
             if f.is_file() and f.suffix.lower() in (".exe", ".dll") and f.name.lower().startswith(("nvse", "xnvse")):
                 _replace(f, d / f.name)
                 installed.append(f.name)
+    if dxvk and install_dxvk(d):
+        installed += ["d3d9.dll", "dxvk.conf"]
     removed: List[str] = []
     for f in stale_plugin_dlls(plugins, sources):
         f.unlink()
@@ -412,8 +439,10 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
 def write_plugin_ini(d: Path, i: int, role: str, autoload: str = "", delay: int = 600,
                      extra: Optional[Dict[str, Dict[str, str]]] = None) -> Dict:
     """nvcoop.ini read by plugin/main.cpp ([bridge] instance/autoload/autoloadDelayFrames); [coop] is ours."""
+    visible = os.environ.get("NVCOOP_VISIBLE") == "1"
     cfg = {
-        "bridge": {"instance": str(i), "autoload": autoload, "autoloadDelayFrames": str(delay), "minimized": "1", "multiInstance": "1"},
+        "bridge": {"instance": str(i), "autoload": autoload, "autoloadDelayFrames": str(delay), "minimized": "0" if visible else "1",
+                   "focusGuard": "1", "multiInstance": "1"},
         "coop": {"instanceId": str(i), "role": role, "pipe": rf"\\.\pipe\nvcoop-{i}"},
     }
     merge_ini(cfg, extra)
@@ -615,6 +644,7 @@ def main(argv=None) -> int:
                         "and coop.role are an error")
     p.add_argument("--autoload", default="")
     p.add_argument("--no-appid", action="store_true")
+    p.add_argument("--no-dxvk", action="store_true", help="do not install the cached DXVK d3d9.dll + 60 fps cap (python tools/runner/fetch_deps.py fills the cache)")
     p.add_argument("--modes", default=",".join(LINK_MODES))
     for c in ("show", "destroy"):
         q = sub.add_parser(c)
@@ -659,7 +689,8 @@ def main(argv=None) -> int:
                               plugin_dll=dll, core_dll=core, extra_ini=extra_ini,
                               autoload=a.autoload, modes=tuple(a.modes.split(",")),
                               appid=None if a.no_appid else STEAM_APPID,
-                              port_base=a.port_base if a.pairs else None)
+                              port_base=a.port_base if a.pairs else None,
+                              dxvk=not a.no_dxvk)
             except UnsafeInstance as e:
                 print(f"error: instance {i}: {e}", file=sys.stderr)
                 return 2

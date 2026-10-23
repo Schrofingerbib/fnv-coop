@@ -10,10 +10,10 @@ and a slot -> puppet ref map (the "ghost-ref map" of the acting-player design, `
 - `plugin\avatar\run_tests.cmd` (one command, ends in `avatar: ALL OK`). It builds standalone in `%TEMP%\nvav_build` (Ninja, 2 jobs,
   takes `out\locks\build.lock` only while compiling) and then runs:
   1. `python -I tools/avatar/check_groups.py` (+ its `--mutant`): `avatar_groups.h` equals the generated xNVSE group table.
-  2. `avatar_tests`: the suite, then the whole suite once per runtime mutation twin (25 twins, each must fail at least one check).
+  2. `avatar_tests`: the suite, then the whole suite once per runtime mutation twin (37 twins, each must fail at least one check).
      `--no-twins`, `--twin NAME`, `--list-twins`, `--verbose` for debugging.
   3. `avatar_live_tests`: the driver on top of the REAL `synccore/live` (sender delta codec, lossy jittery link, receiver, InterpBuffer),
-     judged by game-free versions of the T7 detectors (slide, skate, T-pose proxy, float, jitter, rubber band, silence). 4 twins incl. two live-layer faults.
+     judged by game-free versions of the T7 detectors (slide, skate, T-pose proxy, float, jitter, rubber band, silence). 5 twins incl. two live-layer faults and the engine push.
   4. `python -I tools/avatar/proof_puppet.py --selftest`: the in-game proof's analysis and its assertions on synthetic T7 streams,
      with 5 injected-defect twins (never touches a game).
 - Added to the parent build with one line (`plugin/CMakeLists.txt` sub-directory list). The targets are `EXCLUDE_FROM_ALL`:
@@ -69,6 +69,13 @@ commands, animation re-assert after menus, speed matching, cell borders vs trans
 | 24 | spawn fails / 3D never arrives | backoff 0.5 s doubling to 8 s, `Failed` after 8 attempts, 3D timeout 5 s replaces the ref | `spawn_retry` | (covered by #1, counts) |
 | 25 | snap and physics push | snapped sample forces SetPos + animation; drift > 2 m is corrected and counted | `snap_and_drift` | |
 | 26 | script text must be exact | `ScriptPuppetEngine` pins every line | `script_backend`, `manager_on_script_backend` | |
+| 26b | a body in the way (the real player standing in the puppet) pushes the puppet hundreds of units, and the buffer eases it back from the pushed place | `PuppetManager::ActualPose` reports the last applied place when the engine place is farther than `driftUnits` (the same Tick's drift check then undoes the push with one `SetPos`); `avatar.status` counts `pushesIgnored` | `physics_push_not_adopted`; live: 4 pushes in the integration scenario (`shoveFrames`) | `adoptPhysicsPush` |
+
+Bench note (2026-10-23, `tools/bench/coop_bench.py` step walk): the client's puppet of the host jumped about 6 times a minute while the host walked, the host's puppet of the
+client never did. The step walk issues `player.SetPos` console lines; on the host those are captured and replayed on the guest (a guest's own `player.` lines are muted,
+`suppress_policy.cpp`), so the guest's real player is carried along and stands inside its puppet of the host. The engine pushes the two bodies apart and the old
+`ActualPose` handed the pushed place to `InterpBuffer`, which eased the puppet back over 0.3 to 0.6 s (a 2 to 10 m error is eased, not snapped). The fix above removes the
+easing; the carrying of the guest's player by the host's console lines is outside this module and is not changed here. UNVERIFIED in the game.
 
 Live integration (`avatar_live_tests`): a scripted 24 s owner (stand, run 300 u/s, sneak-walk, strafe, draw/aim, jump, 28 m teleport, 2 s silence)
 through the real codec, 0% and 10% loss, 3 seeds each. Asserted: no slide, no skate, no T-pose proxy, no float, no jitter, exactly one big jump (the teleport),
@@ -223,7 +230,7 @@ counters of `avatar.status` (no console exceptions, no refused foreign write, no
 **Everything below is unit tested on a fake game / a simulated network and compiles into nvcoop.dll. NOTHING of it has run in the game.**
 Run: `plugin\avatar\full\run_tests.cmd` (one command, ends in `avatar full: ALL OK`; registered in `tools/test_all.py` as "M2 avatar full"). It builds in the
 shared tree, runs the new 3-machine suite once for real and once per runtime twin (101..109), re-runs the suites that share the changed code (`avatar_tests`
-with 36 twins, `avatar_engine_tests` with 69 twins, dll-wiring's `nvcoop_live_tests` with 34 twins) and `tools/avatar/proof_avatars.py --selftest`.
+with 37 twins, `avatar_engine_tests` with 69 twins, dll-wiring's `nvcoop_live_tests` with 34 twins) and `tools/avatar/proof_avatars.py --selftest`.
 
 | Piece | Where | What it does |
 |---|---|---|
