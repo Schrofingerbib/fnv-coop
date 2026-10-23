@@ -142,6 +142,10 @@ if(FNVCOOP_PYTHON)
     add_test(NAME twin_loopback_relay_${_t}_needs_its_own_failure COMMAND ${FNVCOOP_PYTHON} -I ${_relay_py} --loopback ${FNVCOOP_PYTHON} --profile bad_wifi --twin ${_t} --timeout 5)
     set_tests_properties(twin_loopback_relay_${_t}_needs_its_own_failure PROPERTIES WILL_FAIL TRUE)
   endforeach()
+  # The same with the real clients running: the host's port is taken, so only the host fails, and the clients' connect datagrams
+  # still reach the partitioned relay as drops. The partition twin must still not count that as caught.
+  add_test(NAME twin_loopback_relay_partition_needs_a_host COMMAND ${FNVCOOP_PYTHON} -I ${_relay_py} --loopback $<TARGET_FILE:fnvcoop_loopback> --profile bad_wifi --twin partition --timeout 5 --occupy-host-port)
+  set_tests_properties(twin_loopback_relay_partition_needs_a_host PROPERTIES WILL_FAIL TRUE)
 endif()
 
 # T5 chaos mirror (synccore/chaos/CMakeLists.txt)

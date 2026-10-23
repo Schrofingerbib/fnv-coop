@@ -80,8 +80,9 @@ ctest (synccore, needs Python): `loopback_relay_bad_wifi`, `loopback_relay_mobil
 twins that must be caught: `twin_loopback_relay_bypass` (clients connect straight to the host: nothing crosses the relay) and
 `twin_loopback_relay_partition` (the relay drops everything: the clients never join). A twin exits 0 when it is caught, like `twin_loopback_*`,
 and only by its own breakage: bypass needs a working direct session with nothing forwarded, partition needs partition drops and no client
-finishing. `twin_loopback_relay_{bypass,partition}_needs_its_own_failure` (WILL_FAIL) run each twin with no host at all, which must not
-count as caught.
+finishing, after a host that did start listening. `twin_loopback_relay_{bypass,partition}_needs_its_own_failure` (WILL_FAIL) run each twin
+with no host at all, and `twin_loopback_relay_partition_needs_a_host` (WILL_FAIL) runs the real clients with the host's port taken (their
+connect datagrams still show up as partition drops). None of these may count as caught.
 
 Measured on Linux (2 clients, 150 transactions, 400 to 2300 datagrams per direction): `lan`, `good_wifi`, `bad_wifi`, `mobile_tether` and
 `transatlantic` converge in 3 to 5 s with the host's digest. **`hell` is too slow for the 90 s budget**: a client needs anywhere from about 25 s

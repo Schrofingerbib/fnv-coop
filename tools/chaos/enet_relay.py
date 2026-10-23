@@ -53,10 +53,16 @@ def run(a):
     if a.twin == "partition":
         relay.partition("both", True)
     procs = []
+    blocker = None
+    host_started = False
+    if a.occupy_host_port:   # test of the twins: the host's port is taken, so the host cannot listen and exits at once
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        blocker.bind(("127.0.0.1", host_port))
     try:
         procs.append(subprocess.Popen([a.loopback, "host", "--port", str(host_port), *common, "--clients", str(a.clients),
                                        "--out", str(tmp / "host.txt")], stdout=subprocess.DEVNULL))
         time.sleep(0.3)   # the host must be listening before the first client Hello
+        host_started = procs[0].poll() is None   # a host that cannot listen has exited by now
         client_port = host_port if a.twin == "bypass" else relay.port
         for i in range(a.clients):
             procs.append(subprocess.Popen([a.loopback, "client", "--port", str(client_port), *common, "--token", str(1000 + i),
@@ -75,9 +81,11 @@ def run(a):
                 p.kill()
                 p.wait()
         relay.close()
+        if blocker:
+            blocker.close()
 
     problems = []
-    facts = {}
+    facts = {"host_started": host_started}
     host = read_result(tmp / "host.txt")
     clients = [read_result(tmp / ("c%d.txt" % i)) for i in range(a.clients)]
     print("profile %s: host    %s" % (a.profile, host or "(no result)"))
@@ -123,6 +131,8 @@ def twin_caught(name, problems, facts):
             return False, "the relay forwarded traffic although the clients bypassed it"
         return True, "the session worked directly and the relay forwarded nothing"
     if name == "partition":
+        if not facts["host_started"]:   # the clients' connect datagrams alone would also count as partition drops
+            return False, "the host never started listening, so the partition was not what stopped the session"
         if facts["partition_drops"] == 0:
             return False, "the relay dropped nothing as a partition"
         if not facts["no_client_ok"]:
@@ -141,6 +151,8 @@ def main(argv=None):
     ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
                     help="override one impairment parameter of the profile in both directions (loss, reorder, duplicate, bandwidth_bps, latency_ms, ...)")
     ap.add_argument("--twin", choices=["bypass", "partition"])
+    ap.add_argument("--occupy-host-port", action="store_true",
+                    help="test of the twins only: bind the host's port first, so the real host fails to listen while the clients run")
     a = ap.parse_args(argv)
     if not os.path.exists(a.loopback):
         print("no such executable: %s" % a.loopback)
