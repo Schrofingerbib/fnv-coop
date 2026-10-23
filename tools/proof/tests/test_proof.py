@@ -734,6 +734,7 @@ class Ram(unittest.TestCase):
 
 
 @unittest.skipIf(os.name == "nt", "the /proc answers of the process helpers are for Linux; Windows keeps kernel32")
+@unittest.skipIf(os.name != "nt" and not os.path.isdir("/proc/self"), "no /proc here (not mounted, or not Linux): the helpers answer from it")
 class PosixProcessHelpers(unittest.TestCase):
     """pf_safety / pf_crash off Windows, on real child processes (only processes this test starts are touched)."""
 
@@ -778,6 +779,26 @@ class PosixProcessHelpers(unittest.TestCase):
             got = w.exited()
             time.sleep(0.02)
         self.assertEqual(got, [{"instance": 0, "pid": p.pid, "exit_code": -9}], "killed by SIGKILL")
+        self.assertEqual(w.exited(), got, "the child is reaped now, and the second check still reads -9")
+
+    def test_kill_tree_stops_the_runner_and_the_child_it_started(self):
+        with tempfile.TemporaryDirectory() as d:
+            pidf = Path(d) / "grandchild.pid"
+            code = ("import subprocess, sys, time; g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+                    "open(sys.argv[1], 'w').write(str(g.pid)); time.sleep(30)")
+            p = prove.start([sys.executable, "-c", code, str(pidf)], Path(d) / "out.txt", False, None)
+            self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+            deadline = time.time() + 10
+            while time.time() < deadline and not (pidf.is_file() and pidf.read_text()):
+                time.sleep(0.02)
+            g = int(pidf.read_text())
+            self.addCleanup(lambda: S.pid_alive(g) and os.kill(g, 9))   # only if the bug left it: a process this test started
+            prove.kill_tree(p)
+            self.assertIsNotNone(p.poll(), "the runner is stopped")
+            deadline = time.time() + 5
+            while time.time() < deadline and S.pid_alive(g):
+                time.sleep(0.02)
+            self.assertFalse(S.pid_alive(g), "the child the runner started is stopped with it")
 
 
 class WatcherScope(unittest.TestCase):   # injected handles: runs on any OS (the Watcher only loads kernel32 when none are given)
@@ -789,6 +810,17 @@ class WatcherScope(unittest.TestCase):   # injected handles: runs on any OS (the
         self.assertEqual([d["instance"] for d in w.exited([2, 3])], [2])
         self.assertEqual([d["instance"] for d in w.exited()], [2], "no scope: every copy")
         w.unwatch(2)
+        self.assertEqual(w.exited(), [])
+
+    def test_a_dead_copy_keeps_its_exit_code_until_it_is_unwatched(self):
+        reads = {31: [7, -1, -1]}   # off Windows waitpid reaps on the first read, and later reads find no child
+        w = K.Watcher(open_handle=lambda pid: pid, get_exit=lambda h: reads[h].pop(0) if reads.get(h) else None)
+        w.watch(2, 31)
+        self.assertEqual([d["exit_code"] for d in w.exited()], [7])
+        self.assertEqual([d["exit_code"] for d in w.exited([2])], [7], "the second check must report the same exit")
+        w.unwatch(2)
+        reads[31] = [None]
+        w.watch(2, 31)                 # watched again (a new copy on the same pid): the old code is gone
         self.assertEqual(w.exited(), [])
 
 

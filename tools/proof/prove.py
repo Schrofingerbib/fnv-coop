@@ -522,7 +522,9 @@ def start(argv: List[str], out: Path, live: bool, trace: Optional[Path]) -> subp
     if full[0].endswith(".py"):
         full = PY + ([str(HERE / "pf_trace.py"), str(trace)] if (live and trace) else []) + [str(ROOT / full[0])] + full[1:]
     f = open(out, "w", encoding="utf-8", errors="replace")
-    return subprocess.Popen(full, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    # Off Windows the runner leads its own process group, so kill_tree stops the children it started too (taskkill /T on Windows).
+    group = {} if os.name == "nt" else {"start_new_session": True}
+    return subprocess.Popen(full, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **group)
 
 
 def kill_tree(p: subprocess.Popen) -> None:
@@ -531,7 +533,14 @@ def kill_tree(p: subprocess.Popen) -> None:
         if os.name == "nt":
             subprocess.run(["taskkill", "/PID", str(p.pid), "/F", "/T"], capture_output=True)
         else:
-            p.kill()   # off Windows (fake-world tests): the stub runner itself
+            try:
+                leads = os.getpgid(p.pid) == p.pid and MUTANT != "kill_runner_only"
+            except ProcessLookupError:
+                leads = False
+            if leads:
+                os.killpg(p.pid, 9)   # the group start() made: the runner and the children it started, nothing else
+            else:
+                p.kill()
         try:
             p.wait(5)
         except subprocess.TimeoutExpired:

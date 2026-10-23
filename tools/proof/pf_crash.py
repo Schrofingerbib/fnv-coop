@@ -85,6 +85,7 @@ class Watcher:
         self._exit = get_exit or exit_code
         self.handles: Dict[int, int] = {}       # instance -> handle
         self.pids: Dict[int, int] = {}
+        self.codes: Dict[int, int] = {}         # instance -> first exit code read: off Windows waitpid reaps, so it reads only once
         self._lock = threading.Lock()           # one thread per pair boots copies while the others poll
 
     def watch(self, instance: int, pid: int) -> None:
@@ -92,11 +93,13 @@ class Watcher:
         with self._lock:
             self.pids[instance] = pid
             self.handles[instance] = h
+            self.codes.pop(instance, None)
 
     def unwatch(self, instance: int) -> None:
         with self._lock:
             self.handles.pop(instance, None)
             self.pids.pop(instance, None)
+            self.codes.pop(instance, None)
 
     def exited(self, instances: Optional[List[int]] = None) -> List[Dict[str, Any]]:
         """[{instance, pid, exit_code}] for every watched copy that is gone now. With `instances` only those copies are looked at: a
@@ -109,8 +112,13 @@ class Watcher:
                 continue
             if instances is not None and MUTANT != "watcher_unscoped" and inst not in instances:
                 continue
-            c = self._exit(h)
+            c = self.codes.get(inst) if MUTANT != "watcher_forgets_exit" else None
+            if c is None:
+                c = self._exit(h)
             if c is not None:
+                with self._lock:
+                    if self.handles.get(inst) == h:   # not unwatched or watched again meanwhile
+                        self.codes[inst] = c
                 out.append({"instance": inst, "pid": self.pids[inst], "exit_code": f"{c:08X}" if c > 255 else c})
         return out
 
