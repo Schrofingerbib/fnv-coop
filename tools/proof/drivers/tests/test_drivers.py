@@ -216,6 +216,12 @@ class PublicTree(unittest.TestCase):
         self.assertFalse((REPO / "out" / "x-test-public" / "export").exists())
 
     def test_the_rescan_finds_what_must_never_be_published(self):
+        # The exporter and its pattern scan are not in the public tree, so on a public checkout (CI) a stand-in that finds
+        # nothing takes its place: the .git, out/ and binary checks still run, only the personal-path hit is not expected.
+        exporter = (REPO / "tools" / "publish" / "export_public.py").is_file()
+        if not exporter and "export_public" not in sys.modules:
+            sys.modules["export_public"] = SimpleNamespace(scan=lambda dest: [])
+            self.addCleanup(sys.modules.pop, "export_public", None)
         root = Path(self.tmp.name) / "tree"
         (root / "tools").mkdir(parents=True)
         (root / "tools" / "ok.py").write_text("print('fine')\n", encoding="utf-8")
@@ -229,7 +235,7 @@ class PublicTree(unittest.TestCase):
         (root / "plugin").mkdir()
         (root / "plugin" / "nvcoop.dll").write_bytes(b"MZ")
         hits = "\n".join(PT.scan_hits(root))
-        for need in ("bad.py", ".git/", "out/", "nvcoop.dll"):
+        for need in (("bad.py",) if exporter else ()) + (".git/", "out/", "nvcoop.dll"):
             self.assertIn(need, hits)
 
 

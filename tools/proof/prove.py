@@ -67,6 +67,17 @@ def load_manifest(path: Optional[Path] = None) -> Dict[str, Any]:
     return m
 
 
+def rel_or_abs(p) -> str:
+    """`p` relative to the checkout (posix), or absolute when it is on another drive: relpath has no answer from D: to C:,
+    which is how a CI runner lays out its checkout (D:) and its temp folder (C:)."""
+    if MUTANT == "relpath_cross_drive":
+        return Path(os.path.relpath(p, ROOT)).as_posix()
+    try:
+        return Path(os.path.relpath(p, ROOT)).as_posix()
+    except ValueError:
+        return Path(p).as_posix()
+
+
 def instances_of(test: Dict[str, Any]) -> List[int]:
     return X.instances_for(test)
 
@@ -655,7 +666,7 @@ class Prover:
                   if outdir.is_relative_to(ROOT) else str(outdir), "i0": ins[0] if ins else 0, "host": ins[0] if ins else 0,
                   "client": ins[1] if len(ins) > 1 else 1})
         if self.env.live:
-            v["inst_dir0"] = Path(os.path.relpath(self.env.idir(ins[0]), ROOT)).as_posix() if ins else "."    # type: ignore[attr-defined]
+            v["inst_dir0"] = rel_or_abs(self.env.idir(ins[0])) if ins else "."    # type: ignore[attr-defined]
         else:
             v["inst_dir0"] = "."
         v["game_dir"] = "."
