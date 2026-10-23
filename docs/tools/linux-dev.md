@@ -41,9 +41,17 @@ ASAN_OPTIONS=detect_leaks=1 ctest --test-dir build-san -j 2 -E '^(unit_perf|twin
 Left out: the perf tests, whose wall-clock budgets mean nothing at sanitizer speed, and `twin_unit_async_completion_leak`,
 which puts a reference cycle back on purpose, so LeakSanitizer rightly fails it.
 
-For ThreadSanitizer use `F="-fsanitize=thread -fno-omit-frame-pointer -O1 -g"` in a separate build folder (only the perf
-tests left out). On kernels with 32-bit mmap randomization (the GitHub Ubuntu runners, for example) TSan can stop with
-"unexpected memory mapping"; `sudo sysctl -w vm.mmap_rnd_bits=28` fixes that.
+ThreadSanitizer, in a separate build folder:
+```
+F="-fsanitize=thread -fno-omit-frame-pointer -O1 -g"
+cmake -S synccore -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug "-DCMAKE_C_FLAGS=$F" "-DCMAKE_CXX_FLAGS=$F" "-DCMAKE_EXE_LINKER_FLAGS=$F"
+cmake --build build-tsan
+TSAN_OPTIONS="second_deadlock_stack=1 log_path=$PWD/tsan-reports/tsan" ctest --test-dir build-tsan -j 2 -E '^(unit_perf|twin_perf_regression_still_fails|flight_perf)$'
+ls tsan-reports   # must be missing or empty: a report inside a WILL_FAIL test does not fail ctest
+```
+Only the perf tests are left out. `twin_unit_async_completion_leak` stays in: it passes when its own check catches the
+reference cycle, and only LeakSanitizer, which a TSan build does not have, fails it for the leak it plants. On kernels with 32-bit mmap randomization (the GitHub Ubuntu runners, for
+example) TSan can stop with "unexpected memory mapping"; `sudo sysctl -w vm.mmap_rnd_bits=28` fixes that.
 
 **Memory:** a sanitizer compile takes about 1 GB per compiler process. On a machine with 16 GB or less, build with
 `--parallel 3` (or `ninja -j3`) and run one sanitizer build or test run at a time.
