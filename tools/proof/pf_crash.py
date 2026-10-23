@@ -52,7 +52,16 @@ def parse_minidump(data: bytes) -> Optional[Dict[str, Any]]:
     return None
 
 
+WINDOWS = os.name == "nt"   # off Windows (the fake-world tests on Linux) a "handle" is the pid itself
+
+
 def exit_code(handle: int) -> Optional[int]:
+    if not WINDOWS:
+        try:
+            pid, status = os.waitpid(handle, os.WNOHANG)
+        except ChildProcessError:   # not our child: alive or gone, with no exit code to read
+            return None if os.path.exists("/proc/%d" % handle) else -1
+        return None if pid == 0 else os.waitstatus_to_exitcode(status)
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
     c = wintypes.DWORD()
@@ -65,10 +74,14 @@ class Watcher:
     """Holds a process handle for each pid prove.py launched, so the exit code is still readable after the process is gone."""
 
     def __init__(self, open_handle=None, get_exit=None):
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.OpenProcess.restype = wintypes.HANDLE
-        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        self._open = open_handle or (lambda pid: k32.OpenProcess(0x1000, False, pid) or 0)
+        if open_handle is None and not WINDOWS:
+            open_handle = lambda pid: pid   # noqa: E731
+        if open_handle is None:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            open_handle = lambda pid: k32.OpenProcess(0x1000, False, pid) or 0   # noqa: E731
+        self._open = open_handle
         self._exit = get_exit or exit_code
         self.handles: Dict[int, int] = {}       # instance -> handle
         self.pids: Dict[int, int] = {}

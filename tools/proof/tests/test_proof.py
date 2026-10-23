@@ -733,8 +733,54 @@ class Ram(unittest.TestCase):
         self.assertIn("RAM guard", S.preflight(ROOT, 4, 0, free_ram=free, reserve_gb=2.5, **kw) or "")
 
 
-@unittest.skipUnless(os.name == "nt", "the crash watcher reads Windows process handles")
-class WatcherScope(unittest.TestCase):
+@unittest.skipIf(os.name == "nt", "the /proc answers of the process helpers are for Linux; Windows keeps kernel32")
+class PosixProcessHelpers(unittest.TestCase):
+    """pf_safety / pf_crash off Windows, on real child processes (only processes this test starts are touched)."""
+
+    def child(self, code="import time; time.sleep(30)"):
+        import subprocess
+        p = subprocess.Popen([sys.executable, "-c", code])
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        return p
+
+    def test_pid_alive_running_exited_and_reaped(self):
+        p = self.child("import sys; sys.exit(3)")
+        deadline = time.time() + 10
+        while time.time() < deadline and S._proc_stat(p.pid) and S._proc_stat(p.pid)[0] not in ("Z", "X"):
+            time.sleep(0.02)
+        self.assertFalse(S.pid_alive(p.pid), "an exited child that was not reaped yet (a zombie) is not alive")
+        p.wait()
+        self.assertFalse(S.pid_alive(p.pid), "a reaped pid is not alive")
+        q = self.child()
+        self.assertTrue(S.pid_alive(q.pid))
+
+    def test_list_pids_image_path_and_start_time(self):
+        p = self.child()
+        name = os.path.basename(sys.executable)
+        deadline = time.time() + 10
+        while time.time() < deadline and p.pid not in S.list_pids(name):
+            time.sleep(0.02)
+        self.assertIn(p.pid, S.list_pids(name))
+        self.assertNotIn(p.pid, S.list_pids("FalloutNV.exe"))
+        self.assertEqual(os.path.realpath(S.image_path(p.pid)), os.path.realpath(sys.executable))
+        self.assertLess(abs(S.process_start(p.pid) - time.time()), 30)
+        self.assertEqual(S.window_titles(p.pid), [])
+
+    def test_taskkill_stops_the_child_and_the_watcher_reads_its_exit(self):
+        p = self.child()
+        w = K.Watcher()
+        w.watch(0, p.pid)
+        self.assertEqual(w.exited(), [])
+        S.taskkill(p.pid)
+        deadline = time.time() + 10
+        got = []
+        while time.time() < deadline and not got:
+            got = w.exited()
+            time.sleep(0.02)
+        self.assertEqual(got, [{"instance": 0, "pid": p.pid, "exit_code": -9}], "killed by SIGKILL")
+
+
+class WatcherScope(unittest.TestCase):   # injected handles: runs on any OS (the Watcher only loads kernel32 when none are given)
     def test_a_test_only_sees_the_copies_of_its_own_pair(self):
         w = K.Watcher(open_handle=lambda pid: pid, get_exit=lambda h: 0xC0000005 if h == 31 else None)
         w.watch(0, 30)

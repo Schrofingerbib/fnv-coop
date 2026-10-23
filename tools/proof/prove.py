@@ -52,6 +52,7 @@ METHOD_NOT_FOUND = -32601
 READY_WAIT_S = 240.0     # how long a booted (or still loading) copy may take to serve requests before the test is ENV
 EMIT_LOCK = threading.Lock()
 MUTANT = os.environ.get("PROOF_MUTANT", "")   # test-only: one deliberate bug per name (tools/proof/tests/run_tests.py)
+INI_ENCODING = "mbcs" if os.name == "nt" else None   # nvcoop.ini is in the ANSI code page; mbcs exists on Windows only (None: locale)
 
 
 def err(*a) -> None:
@@ -288,7 +289,7 @@ class LiveEnv(NullEnv):
             p = self.idir(i) / "Data" / "NVSE" / "Plugins" / "nvcoop.ini"
             cp = configparser.ConfigParser(strict=False, interpolation=None)
             try:
-                cp.read(p, encoding="mbcs")
+                cp.read(p, encoding=INI_ENCODING)
             except (OSError, configparser.Error) as e:
                 return f"instance {i}: cannot read nvcoop.ini ({e})"
             if not p.exists():
@@ -527,7 +528,10 @@ def start(argv: List[str], out: Path, live: bool, trace: Optional[Path]) -> subp
 def kill_tree(p: subprocess.Popen) -> None:
     """Stops a runner this tool started (and its children). Game copies are not its children: they are launched detached."""
     if p.poll() is None:
-        subprocess.run(["taskkill", "/PID", str(p.pid), "/F", "/T"], capture_output=True)
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/F", "/T"], capture_output=True)
+        else:
+            p.kill()   # off Windows (fake-world tests): the stub runner itself
         try:
             p.wait(5)
         except subprocess.TimeoutExpired:
