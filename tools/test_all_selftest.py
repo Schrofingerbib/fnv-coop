@@ -230,13 +230,20 @@ class Behaviour(unittest.TestCase):
         broken = {"cmake": "cmake not found", "msvc": "vcvars32.bat not found"}
         with mock.patch.object(test_all, "WINDOWS", False):
             for name, (slow, tools) in SUITE.items():
-                needs = any(t in ("cmake", "msvc") for t in tools)
+                needs = any(t in ("cmake", "msvc") for t in tools) or name in test_all.WINDOWS_ONLY
                 action, reason = self.decide(name, problems=broken)
                 if needs:
                     self.assertEqual(action, "skip", name)
                     self.assertIn("Windows only", reason)
                 else:
                     self.assertEqual(action, "run", name)
+
+    def test_windows_only_suites_exist_and_run_on_windows(self):
+        self.with_all_data()
+        self.assertTrue(test_all.WINDOWS_ONLY)
+        for name in test_all.WINDOWS_ONLY:
+            self.assertIn(name, SUITE, "a WINDOWS_ONLY name that is not a suite would never skip anything")
+            self.assertEqual(self.decide(name, problems={"cmake": "", "msvc": ""}), ("run", ""), name)
 
     def test_off_windows_preflight_checks_nothing_and_prints_nothing(self):
         out = io.StringIO()

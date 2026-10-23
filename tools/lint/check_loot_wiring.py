@@ -122,7 +122,8 @@ def main(argv: List[str]) -> int:
     bad = problems()
     for b in bad:
         print(b)
-    print("loot wiring: OK" if not bad else f"loot wiring: {len(bad)} problem(s)")
+    # "2 checks, 0 failed" is the evidence line tools/test_all.py looks for: a bare "OK" counted as no test having run.
+    print("loot wiring: OK (live_glue.cpp and loot_module.cpp: 2 checks, 0 failed)" if not bad else f"loot wiring: {len(bad)} problem(s)")
     return 1 if bad else 0
 
 

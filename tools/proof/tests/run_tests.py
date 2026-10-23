@@ -18,6 +18,7 @@ PY = [sys.executable, "-I", "-X", "utf8"]
 # name -> (what the bug does, the unit tests that must notice it)
 TWINS = {
     "repro_is_test": ("a classifier that labels a REPRODUCED sync failure as TEST", ["Classify", "Pipeline.test_reproduced_failure_is_routed_as_sync"]),
+    "relpath_cross_drive": ("an instance folder on another drive than the checkout (CI: D: and C:) kills the run on relpath", ["CrossDrive"]),
     "packet_oversize": ("a failure packet that ignores the 3 KB limit", ["Packet"]),
     "kill_foreign": ("kill_owned stops a pid that prove.py did not start", ["Safety"]),
     "no_clean_counters": ("a PASS with digest repairs or area heals still counts as clean", ["Classify", "Pipeline.test_pass_with_digest_repairs_is_not_clean"]),

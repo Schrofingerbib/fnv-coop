@@ -51,7 +51,8 @@ nothing in synccore was changed.
 ## Known limits (measured or unknown)
 - Latency precision: the relay sets the Windows 1 ms timer resolution while running. Added error was not measured
   beyond the test tolerance (mean RTT within 14 ms + 12 percent, lan round trip under 15 ms).
-- Real-game behaviour through the relay (ENet connect, timeouts) is unknown; it needs the lead's in-game run.
+- Real-game behaviour through the relay (ENet connect, timeouts) is unknown; it needs the lead's in-game run. The real ENet transport and session
+  protocol without the game are covered below ("Through the relay").
 - A client that changes source port looks like a new peer.
 - Python relay throughput was not benchmarked; tests use under 1000 packets per second.
 
@@ -68,3 +69,26 @@ corrupt, partition, disconnect, bandwidth, duplicate and reorder changes: identi
 Python switched from `random.Random` to the shared SplitMix64 `Rng`; chaos tests and twins still pass.
 Other L4 failures seen in the same run (unit_wire, unit_core, sim_seeds, drift_effect_table, flight_unit, several
 twins) come from the Effect variant count changing elsewhere (test_wire.cpp:65), not from chaos.
+
+## Through the relay (game-free ENet test)
+`tools/chaos/enet_relay.py` runs the real ENet transport and the full session protocol through the relay, no game: it starts
+`fnvcoop_loopback host` on a free loopback port, puts the relay (seeded profile) in front of it and starts the client processes against the
+relay, with the loopback programs' own fault wrapper off (`--loss 0`), so every lost, late, reordered or duplicated datagram is the relay's.
+It passes when the host and both clients finish, all digests are equal, and the relay forwarded traffic in both directions (and dropped some,
+for a profile with loss). Options: `--profile`, `--clients`, `--txns`, `--timeout`, `--set NAME=VALUE` (override one parameter in both directions).
+ctest (synccore, needs Python): `loopback_relay_bad_wifi`, `loopback_relay_mobile_tether`, `loopback_relay_transatlantic` (about 4 s each) and two
+twins that must be caught: `twin_loopback_relay_bypass` (clients connect straight to the host: nothing crosses the relay) and
+`twin_loopback_relay_partition` (the relay drops everything: the clients never join). A twin exits 0 when it is caught, like `twin_loopback_*`,
+and only by its own breakage: bypass needs a working direct session with nothing forwarded, partition needs partition drops and no client
+finishing, after a host that did start listening. `twin_loopback_relay_{bypass,partition}_needs_its_own_failure` (WILL_FAIL) run each twin
+with no host at all, and `twin_loopback_relay_partition_needs_a_host` (WILL_FAIL) runs the real clients with the host's port taken (their
+connect datagrams still show up as partition drops). None of these may count as caught.
+
+Measured on Linux (2 clients, 150 transactions, 400 to 2300 datagrams per direction): `lan`, `good_wifi`, `bad_wifi`, `mobile_tether` and
+`transatlantic` converge in 3 to 5 s with the host's digest. **`hell` is too slow for the 90 s budget**: a client needs anywhere from about 25 s
+to more than 90 s to apply all 150 transactions (timed by when each client ends), so the host usually reports TIMEOUT. The host is not stuck.
+(A client prints OK whenever it got everything before its own 90 s end, so OK does not mean it finished early.) About 40 percent of datagrams are
+dropped. Bisected by overriding one parameter at a time: it converges with `burst_enter=0` or with `latency_ms=20, jitter_ms=5`, and still
+fails with `reorder=0`, `duplicate=0` or `bandwidth_bps=0`, so the long tail comes from long round trips and burst loss together. A longer
+client linger (up to 15 s) did not help. Details and the open questions are in issue #48 (session layer); `hell` is therefore not a gated ctest.
+Not proven in the game.
