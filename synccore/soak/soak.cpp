@@ -1,6 +1,7 @@
 // Long-running soak simulation with a realistic Goodsprings traffic shape.
 //
 //   fnvcoop_soak [--seconds N] [--players P] [--seed S] [--threaded] [--profile F] [--rules F] [--quiet]
+//                [--late-disconnect] [--mutate late-reconnect]
 //
 // Simulates P players (1 host + P-1 clients) for N *virtual* seconds at 30 fps over a lossy link, replaying the effects of the
 // VCG01 / VCG02 / VMS16 stage and object scripts (from L3's static analysis, see tools/make_profile.py), per-frame quest-variable
@@ -125,6 +126,8 @@ struct Opts {
     int players = 4;
     uint64_t seed = 1;
     bool threaded = false, quiet = false;
+    bool lateDisconnect = false;   // client 1 drops on the last event frame with the longest reconnect delay (regression for issue #43)
+    bool mutLateReconnect = false; // TEST ONLY twin: reconnects are not pulled into the quiet window (the #43 harness bug)
     std::string profile, rules;
 };
 
@@ -275,6 +278,14 @@ int run(const Opts& o) {
     auto perFrameChance = [&](double perSecond) { return rng.chance(perSecond * double(dtMs) / 1000.0); };
 
     auto connect = [&](Cl& c) { c.cs->connect(now, c.cs->lastSession() + 1); c.want = true; };
+    // Issue #43: a client that dropped (or restarted) late in the event phase drew a reconnect delay of up to 25 s (30 s for a restart),
+    // which can land after the main loop ends. The settle loop below never reconnects anyone, so that client stayed away and the run
+    // failed as "want=0 joined=0", host slot without peer. It was never a worker race: the same seeds fail without --threaded; the worker
+    // only changes the timing of async results, which moves the rng draws and so samples other schedules. Every reconnect now lands at
+    // the latest halfway through the quiet window, so it has the rest of it plus the settle loop to rejoin and converge.
+    const uint64_t lastReconnectAt = totalMs - quietMs / 2;
+    auto reconnectBy = [&](uint64_t at) { return o.mutLateReconnect ? at : std::min(at, lastReconnectAt); };
+    bool lateDone = false;
     for (int i = 0; i < nClients; ++i) { cl[size_t(i)]->reconnectAt = 500 + uint64_t(i) * 2000; }
 
     while (now < totalMs) {
@@ -404,13 +415,17 @@ int run(const Opts& o) {
                     c.cs->submitIntent(kc, c.cap.take());
                 }
             }
-            if (!quiet) {
-                if (c.want && perFrameChance(1.0 / 240)) { c.want = false; c.cs->disconnect(); net.setConnected(PeerId(i + 1), false); c.reconnectAt = now + 5000 + rng.range(0, 25000); ++disconnects; host.peerDisconnected(PeerId(i + 1)); }
+            if (!quiet && o.lateDisconnect && i == 0 && !lateDone && now + dtMs > totalMs - quietMs) {   // the last event frame
+                lateDone = true;
+                if (c.want) { c.want = false; c.cs->disconnect(); net.setConnected(PeerId(i + 1), false); ++disconnects; host.peerDisconnected(PeerId(i + 1)); }
+                c.reconnectAt = reconnectBy(now + 5000 + 25000);   // the longest delay the random disconnect can draw
+            } else if (!quiet) {
+                if (c.want && perFrameChance(1.0 / 240)) { c.want = false; c.cs->disconnect(); net.setConnected(PeerId(i + 1), false); c.reconnectAt = reconnectBy(now + 5000 + rng.range(0, 25000)); ++disconnects; host.peerDisconnected(PeerId(i + 1)); }
                 else if (c.want && perFrameChance(1.0 / 900)) {   // restart the game from the player's own save, join again by baseline
                     c.want = false; c.cs->resetState(); net.setConnected(PeerId(i + 1), false);
                     c.engine.w = c.save;
                     c.cs->setBaselineWorld(c.engine.w, kContent);
-                    c.reconnectAt = now + 8000 + rng.range(0, 20000); ++restarts; host.peerDisconnected(PeerId(i + 1));
+                    c.reconnectAt = reconnectBy(now + 8000 + rng.range(0, 20000)); ++restarts; host.peerDisconnected(PeerId(i + 1));
                 }
                 else if (c.want && c.cs->joined() && perFrameChance(1.0 / 600)) {   // a missed engine apply / stray local script write
                     if (!c.engine.w.stages.empty()) { auto it = c.engine.w.stages.begin(); std::advance(it, rng.range(0, uint32_t(c.engine.w.stages.size() - 1))); it->second += 3; ++injected; }
@@ -492,6 +507,8 @@ int main(int argc, char** argv) {
         else if (a == "--rules") o.rules = next();
         else if (a == "--threaded") o.threaded = true;
         else if (a == "--quiet") o.quiet = true;
+        else if (a == "--late-disconnect") o.lateDisconnect = true;
+        else if (a == "--mutate") { std::string m = next(); if (m == "late-reconnect") o.mutLateReconnect = true; else { std::printf("unknown mutation %s\n", m.c_str()); return 2; } }
     }
 #ifdef FNVCOOP_PROFILE_DEFAULT
     if (o.profile.empty()) o.profile = FNVCOOP_PROFILE_DEFAULT;

@@ -32,6 +32,7 @@
 //   31 RETRYALL  retry every config copy error but "not found", and wait after the last try (the old loop)
 //   32 NORETRY   retry no config copy error (a file that an editor holds open for a moment is not copied)
 //   33 STALEID   keep the previous core's build id after a reload (tools/runner/hotswap.py could not tell the swap worked)
+//   34 STALECOSAVE keep an unloaded core's cosave callbacks (NVSE's forwarders would call into the freed image at the next save)
 
 namespace nvcoop::loader {
 namespace {
@@ -271,6 +272,7 @@ void PurgeCoreRegistrations(CoreHost& h) {
     if (!FNV_MUT(22)) nvcoop::UnregisterMethodsByOwner(kOwnerCore);
     h.stateFn = nullptr;
     nvcoop::SetStateProvider(nullptr);
+    if (!FNV_MUT(34)) nvcoop::SetCosaveCallbacks(nullptr, nullptr);   // NVSE keeps calling our forwarders: never into an unloaded core
 }
 
 uint64_t g_seq = 0;   // cache file sequence, unique per process
@@ -398,6 +400,7 @@ void CoreHost::FillApi(uint32_t generation, bool isReload) {
     api.request_reload = &ApiRequestReload;
     api.has_method = &ApiHasMethod;
     api.call_method = &ApiCallMethod;
+    api.set_cosave = &nvcoop::SetCosaveCallbacks;
 }
 
 bool CoreHost::LoadCoreFrom(const std::string& sourcePath, bool isReload, uint32_t generation, LoadedCore& out,

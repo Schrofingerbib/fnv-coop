@@ -19,7 +19,7 @@ EffectTxn randomTxn(Rng& r, uint64_t seq) {
 
 Message randomMessage(Rng& r) {
     switch (r.range(0, 6)) {
-        case 0: return Hello{r.range(1, 100), r.next(), r.range(0, 1000)};
+        case 0: { Hello h{r.range(1, 100), r.next(), r.range(0, 1000)}; if (r.chance(0.5)) h.cursorCheck = r.next(); return h; }
         case 1: {
             Welcome w;
             w.session = r.range(1, 100); w.slot = uint8_t(r.range(1, 3)); w.headSeq = r.range(0, 500);
@@ -208,11 +208,15 @@ TEST(wire, rejects_non_finite_floats) {
 TEST(wire, every_truncation_is_rejected) {
     Rng r(7);
     for (int i = 0; i < 200; ++i) {
-        Bytes a = encodeMessage(randomMessage(r));
+        Message orig = randomMessage(r);
+        Bytes a = encodeMessage(orig);
+        // A Hello cut right before its appended cursorCheck (8 bytes) IS a Hello of an older build: valid without the CRC check.
+        const size_t oldHello = std::holds_alternative<Hello>(orig) ? a.size() - 8 : 0;
         for (size_t cut = 0; cut < a.size(); ++cut) {
             Message m;
             CHECK(decodeMessage(a.data(), cut, m) != DecodeStatus::Ok);
-            if (cut > 8) CHECK(decodeMessage(a.data(), cut, m, false) != DecodeStatus::Ok || cut == a.size());
+            if (cut > 8) CHECK(decodeMessage(a.data(), cut, m, false) != DecodeStatus::Ok || cut == a.size() ||
+                               (cut == oldHello && std::get_if<Hello>(&m) && std::get<Hello>(m).cursorCheck == 0));
         }
     }
 }

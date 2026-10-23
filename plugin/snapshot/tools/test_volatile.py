@@ -14,6 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import synthetic  # noqa: E402
 import volatile_probe as vp  # noqa: E402
+import volatile_scan as vs  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 SCEN = os.path.join(ROOT, "out", "questdata", "scenarios")
@@ -169,6 +170,185 @@ class ShippedData(unittest.TestCase):
         with open(os.path.join(self.DATA, "volatile_keys.txt"), encoding="utf-8") as f:
             text = f.read() + "field FalloutNV.esm:104C2A running" + chr(10)
         self.assertTrue(vp.check_txt(text, {"FalloutNV.esm:104C2A": "VMS01"}))
+
+
+POS_SCRIPT = """scn VCG04QuestScript
+float PlayerPositionX
+float PlayerPositionY
+short Done
+float fTimer
+float fStart
+float fLeft
+int iPick
+begin GameMode
+	set PlayerPositionX to (player.GetPos X)
+	set PlayerPositionY to (player.GetPos Y)
+	set fTimer to fTimer - GetSecondsPassed
+	set fLeft to (fTimer - 5)
+	if Done == 0
+		set fStart to GameDaysPassed
+		set iPick to GetRandomPercent
+	endif
+end
+"""
+
+
+class StaticScan(unittest.TestCase):
+    """volatile_scan.py: script vars that hold a position or a per-frame clock are per-machine (Track A, 2026-10-22: VCG04 held
+    the player's Y position and showed up as a desync of SetScriptVar 11649E var 16)."""
+    NAMES = {"playerpositionx", "playerpositiony", "done", "ftimer", "fstart", "fleft", "ipick"}
+
+    def test_position_timer_and_derived_vars_found_one_shots_left_out(self):
+        got = {v: k for v, (k, _) in vs.scan_script(POS_SCRIPT, self.NAMES).items()}
+        self.assertEqual(got, {"playerpositionx": "pos", "playerpositiony": "pos", "ftimer": "timer", "fleft": "derived"})
+
+    def test_twin_without_the_position_rule_misses_the_player_position(self):
+        got = vs.scan_script(POS_SCRIPT, self.NAMES, rules=("timer", "frametime", "derived"))
+        self.assertNotIn("playerpositiony", got)   # the scan that does not know GetPos would let VCG04 var 16 stay shared
+
+    def test_shipped_list_has_the_known_cases(self):
+        vars_, _ = vs.shipped_vars()
+        for key in (("falloutnv.esm:11649e", "playerpositionx"), ("falloutnv.esm:11649e", "playerpositiony"),
+                    ("falloutnv.esm:171cdc", "1"), ("falloutnv.esm:171cdd", "1")):
+            self.assertIn(key, vars_)
+
+    def test_missing_reports_what_the_list_lacks(self):   # twin: a list without the VCG04 lines is flagged
+        vars_, owners = vs.shipped_vars()
+        cands = [("FalloutNV.esm:11649E", "VCG04", "playerpositiony", "pos", "x")]
+        self.assertEqual(vs.missing(cands, vars_, owners), [])
+        self.assertEqual(len(vs.missing(cands, vars_ - {("falloutnv.esm:11649e", "playerpositiony")}, owners)), 1)
+
+    @unittest.skipUnless(os.path.exists(os.path.join(ROOT, "out", "questdata", "scripts.json.gz")), "L3 quest data not generated")
+    def test_every_scanned_quest_var_is_in_the_shipped_list(self):
+        cands = vs.scan(*vs.load_questdata(os.path.join(ROOT, "out", "questdata")))
+        self.assertGreater(len(cands), 30)
+        vars_, owners = vs.shipped_vars()
+        self.assertEqual(vs.missing(cands, vars_, owners), [])
+
+
+
+
+CURSOR_SCRIPT = """scn VERNovac01QuestScript
+short iSpawnMonsters
+short iFrame
+short bGeckosDead
+short bPlayed
+begin GameMode
+	if iSpawnMonsters == 0
+		if iFrame == 0
+			set iFrame to 1
+			return
+		else
+			set iFrame to 0
+			set iSpawnMonsters to 1
+		endif
+	elseif iSpawnMonsters == 1
+		set iSpawnMonsters to 2
+	elseif iSpawnMonsters == 2
+		set iSpawnMonsters to 3
+	else
+		set iSpawnMonsters to 0
+	endif
+	if bGeckosDead == 1
+		set bGeckosDead to 0
+	else
+		set bGeckosDead to 1
+	endif
+	set bPlayed to 1
+end
+"""
+
+
+class CursorScan(unittest.TestCase):
+    """Fight tests 2026-10-22 (enemy_fight, npc_sync, enemy_parallel_pairs): VERNovac01 iSpawnMonsters differed host 0 / guest 3. The
+    spawner script runs on the host only and walks the counter 0..3 on every update: a per-machine cursor, never shared state."""
+    NAMES = {"ispawnmonsters", "iframe", "bgeckosdead", "bplayed"}
+    RULES = ("pos", "timer", "frametime", "derived", "cursor")
+
+    def test_step_counters_found_flags_left_out(self):
+        got = {v: k for v, (k, _) in vs.scan_script(CURSOR_SCRIPT, self.NAMES, self.RULES).items()}
+        self.assertEqual(got, {"ispawnmonsters": "cursor"})   # iFrame has only 2 values here, the flags toggle 0/1
+
+    def test_twin_without_the_cursor_rule_misses_the_spawn_counter(self):
+        self.assertNotIn("ispawnmonsters", vs.scan_script(CURSOR_SCRIPT, self.NAMES))   # default rules: no cursor rule
+
+    def test_only_encounter_quests_get_the_rule(self):
+        scripts = [{"ref": "FalloutNV.esm:15F959", "script": {"type": "quest", "source": CURSOR_SCRIPT,
+                                                              "vars": [{"name": n} for n in self.NAMES]}}]
+        enc = {"falloutnv.esm:15f959": ("FalloutNV.esm:15F958", "VERNovac01")}
+        self.assertEqual([(c[1], c[2], c[3]) for c in vs.scan(scripts, {}, encounters=enc)], [("VERNovac01", "ispawnmonsters", "cursor")])
+        self.assertEqual(vs.scan(scripts, {}, encounters={}), [])   # twin: an ordinary quest script is not touched by the rule
+
+    def test_shipped_list_has_the_spawner_counters(self):
+        vars_, _ = vs.shipped_vars()
+        for key in (("falloutnv.esm:15f958", "ispawnmonsters"), ("falloutnv.esm:157b4e", "ispawnmonsters"),
+                    ("falloutnv.esm:1617a2", "icount"), ("falloutnv.esm:173faa", "icount")):
+            self.assertIn(key, vars_)
+
+    def test_shipped_list_has_the_per_machine_quest_vars_of_the_2026_10_22_sweep(self):
+        # door_terminal_container_matrix: VMS31 iStoneSneak host 0 / guest 1 (cleared in GameMode by a day-of-week compare);
+        # (VMS16 nGangerDeathCount is NOT per-machine: it is story progress that must sync; it stays off the list.)
+        vars_, _ = vs.shipped_vars()
+        for key in (("falloutnv.esm:1214ab", "istonesneak"),):
+            self.assertIn(key, vars_)
+        for key in (("falloutnv.esm:1214ab", "istonesneak"),):
+            self.assertNotIn(key, vars_ - {key})      # twin: the list without the line misses the var (what the sweep saw)
+        manual = json.load(open(os.path.join(HERE, "volatile_manual.json"), encoding="utf-8"))["add"]["vars"]
+        self.assertIn("istonesneak", {v["name"].lower() for v in manual}, "the manual list keeps it across a regenerate")
+
+    def test_inventory_lists_the_spawner_quests(self):
+        enc = vs.load_encounters()
+        self.assertEqual(enc["falloutnv.esm:15f959"], ("FalloutNV.esm:15F958", "VERNovac01"))
+
+
+RAIN_SCRIPT = """scn NVDLC02rainscript
+float UPang
+float fTimer
+short bRainSwap
+begin GameMode
+	set UPang to player.getangle x
+	if (fTimer >= 0)
+		set fTimer to ( fTimer - GetSecondsPassed )
+	endif
+end
+"""
+
+
+class QuestsJsonScan(unittest.TestCase):
+    """Two-copy tests 2026-10-22: NVDLC02RainQuest var 138 (UPang = player.getangle x) differed host 0.42 / guest 0 in every step of every
+    test. The scan found nothing there: forms.json lists only some QUSTs, and the rain quest (like every DLC quest and ~270 base-game ones)
+    is only in quests.json."""
+    RAIN = "HonestHearts.esm:00EDE7"
+    QUESTS = {"quests": [{"ref": RAIN, "edid": "NVDLC02RainQuest", "script": "HonestHearts.esm:00EDE5"},
+                         {"ref": "FalloutNV.esm:104C1C", "edid": "VCG01", "script": "FalloutNV.esm:104C1D"}]}
+    FORMS = {"FalloutNV.esm:104C1C": {"sig": "QUST", "edid": "VCG01", "script": "FalloutNV.esm:104C1D"}}
+    SCRIPTS = [{"ref": "HonestHearts.esm:00EDE5", "script": {"type": "quest", "source": RAIN_SCRIPT,
+                                                              "vars": [{"name": "UPang"}, {"name": "fTimer"}, {"name": "bRainSwap"}]}}]
+
+    def merged(self):
+        return dict(self.FORMS, **vs.quests_missing_from_forms(self.FORMS, self.QUESTS))
+
+    def test_quest_only_in_quests_json_is_scanned(self):
+        got = [(c[1], c[2], c[3]) for c in vs.scan(self.SCRIPTS, self.merged(), encounters={})]
+        self.assertEqual(got, [("NVDLC02RainQuest", "ftimer", "timer"), ("NVDLC02RainQuest", "upang", "pos")])
+
+    def test_twin_forms_json_alone_misses_the_rain_quest(self):
+        self.assertEqual(vs.scan(self.SCRIPTS, self.FORMS, encounters={}), [])   # the pre-fix scan: nothing, UPang stayed shared
+
+    def test_quests_forms_already_has_are_not_replaced(self):
+        self.assertEqual(list(vs.quests_missing_from_forms(self.FORMS, self.QUESTS)), [self.RAIN])
+
+    def test_shipped_list_has_the_retest_cases(self):
+        vars_, _ = vs.shipped_vars()
+        for key in (("honesthearts.esm:00ede7", "upang"), ("honesthearts.esm:00ede7", "ftimer"), ("falloutnv.esm:11649e", "done"),
+                    ("falloutnv.esm:127e9d", "lightson"), ("falloutnv.esm:13aaca", "lightson")):
+            self.assertIn(key, vars_)
+
+    def test_twin_a_list_without_the_rain_lines_is_flagged(self):
+        vars_, owners = vs.shipped_vars()
+        cands = vs.scan(self.SCRIPTS, self.merged(), encounters={})
+        self.assertEqual(vs.missing(cands, vars_, owners), [])
+        self.assertEqual(len(vs.missing(cands, vars_ - {("honesthearts.esm:00ede7", "upang")}, owners)), 1)
 
 
 class SettleWindow(unittest.TestCase):

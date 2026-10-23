@@ -682,7 +682,9 @@ std::string glueStatusJson() {
                   "\"stats\":{\"engineHits\":%llu,\"proceeded\":%llu,\"clamped\":%llu,\"neutralized\":%llu,\"ghostHitsNeutralized\":%llu,"
                   "\"hitsSent\":%llu,\"hitsReceived\":%llu,\"hitsApplied\":%llu,\"hitsRejected\":%llu,\"hitDuplicates\":%llu,"
                   "\"nacksSent\":%llu,\"hitRetries\":%llu,\"hitsAbandoned\":%llu,\"damageApplied\":%llu,"
-                  "\"deathsDeclared\":%llu,\"deathsAccepted\":%llu,\"xpAwards\":%llu}}",
+                  "\"deathsDeclared\":%llu,\"deathsAccepted\":%llu,\"xpAwards\":%llu,"
+                  "\"deathsRejected\":%llu,\"deathsDeferred\":%llu,\"deathsRefusedLocal\":%llu,\"undecodable\":%llu,\"spoofed\":%llu,\"unroutable\":%llu,"
+                  "\"rebuilds\":%llu,\"droppedUnknownPeer\":%llu}}",
                   g_set.enabled ? "true" : "false", cs ? "true" : "false",
                   g_patches ? g_patches->installed() : 0, (unsigned long long)g_gateCalls, (unsigned long long)g_gateErrors, (unsigned long long)g_gateOffThread,
                   g_nativeOk ? "true" : "false", (long)g_nativeFaults, (unsigned long long)g_nativeReplays, (unsigned long long)g_consoleDamage,
@@ -690,7 +692,10 @@ std::string glueStatusJson() {
                   u(&Stats::engineHits), u(&Stats::proceeded), u(&Stats::clamped), u(&Stats::neutralized), u(&Stats::ghostHitsNeutralized),
                   u(&Stats::hitsSent), u(&Stats::hitsReceived), u(&Stats::hitsApplied), u(&Stats::hitsRejected), u(&Stats::hitDuplicates),
                   u(&Stats::nacksSent), u(&Stats::hitRetries), u(&Stats::hitsAbandoned), u(&Stats::damageApplied),
-                  u(&Stats::deathsDeclared), u(&Stats::deathsAccepted), u(&Stats::xpAwards));
+                  u(&Stats::deathsDeclared), u(&Stats::deathsAccepted), u(&Stats::xpAwards),
+                  u(&Stats::deathsRejected), u(&Stats::deathsDeferred), u(&Stats::deathsRefusedLocal), u(&Stats::undecodable), u(&Stats::spoofed),
+                  u(&Stats::unroutable),   // a death or hit the host had nobody to send to: the client was never seen as joined
+                  (unsigned long long)(g_rt ? g_rt->rebuilds() : 0), (unsigned long long)(g_rt ? g_rt->droppedUnknownPeer() : 0));
     return b;
 }
 

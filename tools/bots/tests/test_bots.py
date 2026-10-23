@@ -851,8 +851,17 @@ def _scenario(name):
         "exec_ref_ignored": lambda b: b.take(ref(CHEST), ITEM, 1),
         "msgbox_stuck": lambda b: _dismiss_two_boxes(b),
         "msgbox_ui_only": lambda b: _dismiss_two_boxes(b),
+        "menu_close_ignored": lambda b: _open_then_close_container(b),
         "drops_base_text": lambda b: _drop_ref_check(b),
     }[name]
+
+
+def _open_then_close_container(b):
+    """Open the chest (its menu is up), then close it from code: the twin where the plugin's close does nothing must fail the postcondition."""
+    r = b.open(ref(CHEST))
+    if not r.ok:
+        return r
+    return b.close_container(ref(CHEST), timeout_s=1.0)
 
 
 def _dismiss_two_boxes(b):
@@ -872,7 +881,7 @@ def _drop_ref_check(b):
 
 MUTANTS = ["move_ignored", "look_ignored", "stop_ignored", "jump_noop", "fire_noop", "setpos_ignored", "angle_ignored", "activate_noop", "transfer_noop", "transfer_dup", "equip_noop",
            "drop_noop", "fire_miss", "health_stuck", "dialog_never", "drop_wrong_ref", "travel_ignored", "exec_ref_ignored", "msgbox_stuck", "msgbox_ui_only",
-           "drops_base_text"]
+           "drops_base_text", "menu_close_ignored"]
 
 
 class MutationTwins(unittest.TestCase):
@@ -900,6 +909,29 @@ class MutationTwins(unittest.TestCase):
                 nv, b = make(m, query_av=False)
                 r = b.fire(ref(RAIDER), expect_hit=True)
                 self.assertFalse(r.ok, f"mutant {m} slipped through the health fallback: {r}")
+
+    def test_close_menu_closes_only_the_asked_kind_and_says_why_not(self):
+        nv, b = make(None)
+        self.assertEqual(b.close_menu().reason, "rpc_error:no menu is open")                     # nothing open
+        self.assertTrue(b.open(ref(CHEST)).ok)
+        self.assertEqual(nv._menu, "container")
+        r = b.close_menu("terminal")                                                              # a terminal request leaves the container up
+        self.assertFalse(r.ok)
+        self.assertIn("left open", r.reason)
+        self.assertEqual(nv._menu, "container")
+        r = b.close_container(ref(CHEST))
+        self.assertTrue(r.ok, r)
+        self.assertEqual((nv._menu, r.data["closed"]), ("none", "container"))
+        self.assertEqual(b.menu_info()["kind"], "none")
+        again = b.close_container(ref(CHEST))                                                     # idempotent: a menu the module already closed
+        self.assertTrue(again.ok and again.data.get("already"), again)
+        nv.native_boxes = [2]                                                                     # "any" never closes a message box
+        self.assertFalse(b.close_menu("any").ok)
+        self.assertEqual(nv.native_boxes, [2])
+
+    def test_close_menu_without_the_bridge_method_is_unsupported(self):
+        nv, b = make(None, menu_method=False)
+        self.assertEqual(b.close_menu().reason, "unsupported")
 
     def test_ref_info_error_reports_rpc_failure(self):
         nv, b = make("ref_info_error")

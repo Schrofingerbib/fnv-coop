@@ -9,6 +9,7 @@
 
 #include "fake_world.h"
 #include "baseline_file.h"
+#include "change_tracker.h"
 #include "udp_transport.h"
 
 using namespace nvcoop::coop;
@@ -498,6 +499,47 @@ static void testNoFlood() {
     m.snapshotFloodAfterBaseline = true;
     fnvcoop::MutationScope scope(m);
     CHECK(floodCount() > 8);   // twin: with the L4 filter off the same scenario floods, so the assertion above would fail
+}
+
+// Quest vars that an OBJECT script writes inline (the gangers' OnDeath: `set VMS16.nGangerDeathCount to ... + 1`) are inside no capture scope,
+// so the host's per-frame poll is the only way they reach the shared state and the guests. Real retest (enemy_spawn, baseline=0): the host
+// reached 3, the host's shared state stayed 0 (replicator writes 0), the guest kept its own count.
+static bool questVarReachesGuests(bool baseline, bool* quietVarSent) {
+    Node::Opt o;
+    o.baseline = baseline;
+    o.seed = 4;
+    Node host(Role::Host, 0, 0, o);
+    Node c(Role::Client, host.rt->boundPort(), 7001, o);
+    // the host engine's quest variable table (owner, index) -> value, and the host poll exactly as the module wires it
+    std::map<std::pair<uint32_t, uint16_t>, double> engine;
+    engine[{0x104EAE, 1}] = 0;   // nGangerDeathCount
+    engine[{0x104EAE, 2}] = 5;   // a var nobody writes during the test
+    nvhooks::ChangeTracker tracker;
+    host.rt->setStatePoll([&](fnvcoop::StateReplicator& to, bool first, bool prime) {
+        if (first) { tracker.clear(); tracker.endPrime(); if (prime) tracker.beginPrime(); }
+        for (auto& [k, v] : engine)
+            if (tracker.update(nvhooks::ChangeTracker::varKey(k.first, k.second), v)) to.setScriptVar(R("FalloutNV.esm", k.first), k.second, v);
+        tracker.endPrime();
+    });
+    auto fr = [&] { host.rt->frame(); c.rt->frame(); };
+    bool ok = pumpUntil(fr, [&] { return c.rt->client()->joined() && !c.rt->client()->baselineActive(); });
+    for (int death = 1; death <= 3; ++death) {   // three gangers die one after the other: their OnDeath scripts run on the host, in no scope
+        engine[{0x104EAE, 1}] = death;
+        for (int i = 0; i < 10; ++i) fr();
+    }
+    ok = ok && pumpUntil(fr, [&] { return c.world.questVars.count("falloutnv.esm:104EAE#1") && c.world.questVars["falloutnv.esm:104EAE#1"] == 3.0; }, 3000);
+    *quietVarSent = host.rt->host()->state().scriptVars.count({R("FalloutNV.esm", 0x104EAE), 2}) > 0;
+    ok = ok && host.rt->host()->state().scriptVars.at({R("FalloutNV.esm", 0x104EAE), 1}) == 3.0;
+    return ok;
+}
+
+static void testObjectScriptQuestVarsReachGuests() {
+    std::printf("quest vars written by object scripts reach the guests (with and without a world baseline, + twin 8)\n");
+    for (bool baseline : {false, true}) {
+        bool quiet = false;
+        CHECK(questVarReachesGuests(baseline, &quiet));
+        CHECK(quiet == baseline);   // no baseline: the present values are taken as known, not flooded; with one the first poll sends all
+    }
 }
 
 static void testSaveLoad() {
@@ -1073,6 +1115,7 @@ int main(int argc, char** argv) {
     testBaseline();
     testSaveLoad();
     testNoFlood();
+    testObjectScriptQuestVarsReachGuests();
     testRules();
     testPartyWarp();
     testRealSidecar();

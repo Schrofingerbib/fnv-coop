@@ -54,8 +54,8 @@ class PlaybookBot:
         return self._b.choose_topic(info_id)
 
     def close_container(self, ref):
-        # the menu closes with the next action; T6a has no close primitive
-        return Result(True, "", {"note": "no explicit close"})
+        # bot.menu.close (CloseAllMenusCore): the container menu is really closed, so the loot lock is released at once
+        return self._b.close_container(ref)
 
     def unlock(self, ref, key=None, timeout_s=10.0):
         """UNVERIFIED console primitive: `unlock` with `ref` as the calling reference (exec {cmd, ref}; the console has

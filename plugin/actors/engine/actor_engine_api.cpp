@@ -120,6 +120,7 @@ void setPlayerPose(PlayerId slot, const PlayerPose& pose) {
 
 void setRefExclusion(RefFilter f) { registry().exclude = std::move(f); }
 void setCreatedIdResolver(CreatedIdResolver f) { registry().createdId = std::move(f); }
+void setInventoryAccess(InventoryReader read, InventoryWriter write) { registry().invRead = std::move(read); registry().invWrite = std::move(write); }
 
 void onEffect(const fnvcoop::Effect& e) {
     Registry& reg = registry();

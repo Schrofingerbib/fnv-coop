@@ -30,6 +30,11 @@ set "FNVCOOP_MUT=7"
 "%REPO%\out\L10\coop_tests.exe" >nul 2>&1
 if !errorlevel! EQU 0 ( echo TWIN SURVIVED: FNVCOOP_MUT=7 & exit /b 1 )
 echo   twin 7 killed
+echo === a baseline-less host still polls the quest vars object scripts write (twin 8) ===
+set "FNVCOOP_MUT=8"
+"%REPO%\out\L10\coop_tests.exe" >nul 2>&1
+if !errorlevel! EQU 0 ( echo TWIN SURVIVED: FNVCOOP_MUT=8 & exit /b 1 )
+echo   twin 8 killed
 set "FNVCOOP_MUT="
 echo === two-process integration + mutation twins (FNVCOOP_MUT=1..4 peers) ===
 "%PYTHON%" -I "%~dp0tests\test_integration.py" || exit /b 1

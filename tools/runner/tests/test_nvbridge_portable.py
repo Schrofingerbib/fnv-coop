@@ -43,7 +43,10 @@ def problems(source: str):
                        ("NvBridge()", lambda: m.NvBridge(object())),
                        ("_pid_alive", lambda: m._pid_alive(1))):
         try:
-            call()
+            # No real pipe may be touched: on Windows the game's named pipe can exist (a running game), and a connect() that skipped its
+            # platform check would open it and still end in WindowsOnlyError from NvBridge(), hiding the bug. Pretend the pipe does not exist, as on Linux.
+            with mock.patch("builtins.open", side_effect=FileNotFoundError("no such pipe")):
+                call()
         except m.WindowsOnlyError as e:
             if "Windows only" not in str(e):
                 out.append(f"{what}: message does not say Windows only: {e}")

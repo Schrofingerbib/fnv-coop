@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "goodsprings_enemies",
   "title": "Goodsprings enemies: 2 players, powder gangers and geckos",
-  "description": "Start state of the four enemy-sync tests (tools/bots/run_fight.py: enemy_fight, enemy_handoff, enemy_spawn, corpse_loot_race). Two powder gangers (GSPG01, GSPG02) and the two VCG02 geckos are enabled at the Goodsprings gang spot and both players stand next to them with their health raised so a real fight cannot end the test. The host puts 3 stimpaks on the first ganger so his corpse has something to loot. The steps are the console version of the fight: the host kills a ganger, the guest kills a gecko, and after each kill every machine must agree on who is dead, on the owner of the survivors and on their health. Owner checks need the bridge method coop.owner. UNVERIFIED in game: the raised-health console line, additem on a living NPC replicating to the guest, and that the VCG02 geckos can be enabled by the console outside their quest.",
+  "description": "Start state of the four enemy-sync tests (tools/bots/run_fight.py: enemy_fight, enemy_handoff, enemy_spawn, corpse_loot_race). Two powder gangers (GSPG01, GSPG02) and the two VCG02 geckos are enabled at the Goodsprings gang spot and both players stand next to them with their health raised so a real fight cannot end the test. The host puts 3 duct tape on the first ganger so his corpse has something to loot (not stimpaks: a ganger in a fight uses them up on his own machine). The steps are the console version of the fight: the host kills a ganger, the guest kills a gecko, and after each kill every machine must agree on who is dead, on the owner of the survivors and on their health. Owner checks need the bridge method coop.owner. UNVERIFIED in game: the raised-health console line, additem on a living NPC replicating to the guest, and that the VCG02 geckos can be enabled by the console outside their quest.",
   "players": 2,
   "tags": [
     "combat",
@@ -60,6 +60,12 @@
       "edid": "Stimpak",
       "sig": "ALCH"
     },
+    "lootItem": {
+      "ref": "FalloutNV.esm:13B2B2",
+      "edid": "DuctTape",
+      "sig": "MISC",
+      "note": "the unit the corpse_loot_race tests loot: a MISC item no AI ever uses (a ganger in a fight drinks his Stimpaks: in game 2026-10-22 the loot count was host 2 / guest 3 on the LIVING ganger before anyone touched him)"
+    },
     "pistol": {
       "ref": "FalloutNV.esm:0E3778",
       "edid": "WeapNV9mmPistol",
@@ -73,6 +79,12 @@
   },
   "setup": [
     {
+      "id": "enable_gang_marker",
+      "op": "enable",
+      "ref": "$gangMarker",
+      "note": "GSPG01Ref and GSPG02Ref have GoodspringsPowderGangMarker as their enable parent: after the VCG01 reset the marker is disabled, and enabling the gangers themselves does nothing (in game 2026-10-21: disabled, no collision, every shot missed)"
+    },
+    {
       "id": "enable_gang1",
       "op": "enable",
       "ref": "$gang1"
@@ -83,6 +95,18 @@
       "ref": "$gang2"
     },
     {
+      "id": "revive_gang1",
+      "op": "resurrect",
+      "ref": "$gang1",
+      "note": "the scenario starts from the newest autosave, and an earlier test (enemy_parallel_pairs, corpse_loot_race) may have killed the gangers before the game autosaved: in game 2026-10-22, enemy_chaos_bad_wifi step 01 failed 'FalloutNV.esm:104C77 should start alive'. Resurrect on a living actor changes nothing"
+    },
+    {
+      "id": "revive_gang2",
+      "op": "resurrect",
+      "ref": "$gang2",
+      "note": "same as revive_gang1 (GSPG02Ref, 104C77)"
+    },
+    {
       "id": "enable_gecko1",
       "op": "enable",
       "ref": "$gecko1"
@@ -91,22 +115,6 @@
       "id": "enable_gecko2",
       "op": "enable",
       "ref": "$gecko2"
-    },
-    {
-      "id": "gecko1_to_gang",
-      "op": "moveto",
-      "who": "$gecko1",
-      "to": "$gangMarker",
-      "on": "host",
-      "note": "VCG02Gecko1REF stands about 11k units away (Goodsprings Source): bring it into the fight"
-    },
-    {
-      "id": "gecko2_to_gang",
-      "op": "moveto",
-      "who": "$gecko2",
-      "to": "$gangMarker",
-      "on": "host",
-      "note": "VCG02Gecko2REF, same"
     },
     {
       "id": "players_to_gang",
@@ -144,10 +152,10 @@
       "note": "WeapNV9mmPistol: the save starts with nothing equipped, so the bots' shots were bare-handed swings at range"
     },
     {
-      "id": "stimpaks_on_gang1",
+      "id": "loot_on_gang1",
       "op": "additem",
       "who": "$gang1",
-      "item": "$stimpak",
+      "item": "$lootItem",
       "count": 3,
       "on": "host"
     },

@@ -49,6 +49,4 @@ jobs:
         if: runner.os == 'Windows'
         run: cmake -S synccore -B build
       - run: cmake --build build --config Release --parallel
-      # soak_smoke_threaded fails about 15% of runs (a real race with the worker thread, issue #43): excluded here until it is
-      # fixed, so a red CI means something else. It still runs in a local ctest. Remove the -E when #43 is closed.
-      - run: ctest --test-dir build -C Release -j 4 --timeout 300 --output-on-failure -E '^soak_smoke_threaded$'
+      - run: ctest --test-dir build -C Release -j 4 --timeout 300 --output-on-failure

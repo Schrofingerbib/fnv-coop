@@ -19,6 +19,7 @@ It implements the console grammar and bridge methods in primitives.py over a tin
   drop_wrong_ref    the OnDrop event names a different ref than the one the engine created
   travel_ignored    bot.fasttravel is accepted but the player never moves
   exec_ref_ignored  exec {cmd, ref} checks the ref, then runs the line with no calling reference
+  menu_close_ignored  bot.menu.close says closed but the container menu stays open (the plugin's call did nothing)
   msgbox_stuck      bot.menu.press presses the engine's message box natively, but the box never closes
   msgbox_ui_only    bot.menu.press only answers the UI layer's box (the plugin before the native path existed)
   run_is_key        bot.move holds Run for run:true whatever the always-run toggle is (the plugin before run = speed)
@@ -299,6 +300,8 @@ class FakeBridge:
 
     def _rid(self, ref: str) -> int:
         """exec's ref -> the runtime form id (the bridge's parsing and its -32602 / -32013 errors)."""
+        if ref.lower() == "player":     # the real bridge: ParseRefSpec refuses it ("player.X" lines need no ref); in game 2026-10-22 vats_classes
+            raise RpcError(-32602, f"exec: bad ref '{ref}': '{ref}' is not a hex number", "exec")
         plugin, colon, hexpart = ref.rpartition(":")
         hexpart = hexpart[2:] if hexpart[:2] in ("0x", "0X") and len(hexpart) > 2 else hexpart
         if not re.fullmatch(r"[0-9A-Fa-f]{1,8}", hexpart) or (colon and (not plugin or int(hexpart, 16) > 0xFFFFFF)):
@@ -377,6 +380,20 @@ class FakeBridge:
             if self.box is not None or self.native_boxes:
                 return {"kind": "message", "id": 0x3E9}
             return {"kind": getattr(self, "_menu", "none")}
+        if method == P.M_BOT_MENU_CLOSE:
+            if not self.menu_method:
+                raise RpcError(-32601, "unknown method: " + method, method)
+            top = getattr(self, "_menu", "none")
+            want = params.get("kind") or "container"
+            if self.box is not None or self.native_boxes:
+                top = "message"
+            if top == "none":
+                raise RpcError(-32000, "no menu is open", method)
+            if (want == "any" and top in ("message", "dialogue")) or (want != "any" and top != want):
+                raise RpcError(-32000, f"the top menu is {top}, not {want}: left open", method)
+            if self.mutant != "menu_close_ignored":
+                self._menu = "none"
+            return {"closed": True, "menu": 0x3F0 if top == "container" else 0x421, "kind": top}
         if method == P.M_BOT_DIALOG:
             d = self.me.in_dialogue
             if d is None:

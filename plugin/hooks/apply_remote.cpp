@@ -15,6 +15,7 @@
 #include "effect_json.h"
 #include "engine_addrs.h"
 #include "ref_ops.h"
+#include "said_once.h"
 
 using namespace fnvcoop;
 
@@ -325,6 +326,13 @@ ApplyStatus RemoteApplier::apply(const Effect& e) {
         }
         if (auto* x = std::get_if<AddNote>(&e)) { uint32_t n; if (!idOf(x->note, &n)) return ApplyStatus::FormMissing; gate.reset(); return run(addNoteCmd(n), 0); }
         if (auto* x = std::get_if<RemoveNote>(&e)) { uint32_t n; if (!idOf(x->note, &n)) return ApplyStatus::FormMissing; gate.reset(); return run(removeNoteCmd(n), 0); }
+        if (auto* x = std::get_if<SayOnceFlag>(&e)) {   // a client's INFO learns it was spoken (said_once.h)
+            TESForm* f = static_cast<TESForm*>(form(x->info));
+            if (!f) return ApplyStatus::FormMissing;
+            if (f->typeID != kFormType_TESTopicInfo) { err_ = "SayOnceFlag: the form is not an INFO"; return ApplyStatus::Unsupported; }
+            markInfoSaidOnce(f);
+            return ApplyStatus::Ok;
+        }
         if (auto* x = std::get_if<AddTopic>(&e)) { uint32_t t; if (!idOf(x->topic, &t)) return ApplyStatus::FormMissing; gate.reset(); return run(addTopicCmd(t), 0); }
         if (auto* x = std::get_if<SetWeather>(&e)) { uint32_t w; if (!idOf(x->weather, &w)) return ApplyStatus::FormMissing; gate.reset(); return run(setWeatherCmd(w, x->force), 0); }
         if (auto* x = std::get_if<SetMapMarker>(&e)) {

@@ -72,6 +72,21 @@ bool playerCommandFollowsTheRewardRule() {
     };
     return onPlayer(CauseKind::QuestResult).mask == p.allMask() && onPlayer(CauseKind::Script) == Recipient::slot(3);
 }
+// A5: UseWeapon is a wide op: its forms c / d and integer m travel the wire (and a state-key hash would see them), so the receiver shoots the right target.
+bool wideCommandSurvivesTheWire() {
+    RefCommand c = cmd(kOpUseWeapon, Q(0x5000), Q(0x1000), 4);
+    c.b = Q(0x2000); c.c = Q(0x3000); c.d = FormRef("honesthearts.esm", 0x4000); c.l = 2; c.m = 9;
+    EffectTxn t;
+    t.seq = 3;
+    t.effects = {c};
+    Archive w = Archive::writer();
+    io(w, t);
+    std::vector<uint8_t> bytes = w.finish();
+    Archive r = Archive::reader(bytes.data(), bytes.size());
+    EffectTxn back;
+    io(r, back);
+    return r.ok() && back == t && std::get<RefCommand>(back.effects[0]).c == Q(0x3000) && std::get<RefCommand>(back.effects[0]).m == 9;
+}
 bool eventsLeaveNoState() {
     ShadowState s;
     fold(s, 0, {cmd(kOpStartCombat, Q(8), Q(0x14))});
@@ -137,6 +152,21 @@ TEST(refcmd, wire_round_trip_and_unknown_ops_are_rejected) {
     EffectTxn cut;
     io(tr, cut);
     CHECK(!tr.ok());
+}
+
+TEST(refcmd, the_wide_op_carries_the_second_shape_on_the_wire) {
+    CHECK(refOpIsWide(kOpUseWeapon) && !refOpIsWide(kOpSetLevel) && !refOpIsWide(kOpAddSpell) && refOpKnown(kOpUseWeapon) && !refOpInfo(kOpUseWeapon)->kind);
+    CHECK(kOpUseWeapon == 78);   // pinned: on the wire and in sidecars
+    CHECK(wideCommandSurvivesTheWire());
+    // every other op's bytes are unchanged by the second shape: a plain command encodes exactly as before (no c / d / m)
+    RefCommand plain = cmd(kOpSetLevel, Q(0x14), Q(2), 7);
+    RefCommand plainWithJunk = plain;
+    plainWithJunk.c = Q(9); plainWithJunk.m = 5;   // unused slots of a narrow op are not sent
+    auto enc = [](const RefCommand& c) { EffectTxn t; t.effects = {c}; Archive w = Archive::writer(); io(w, t); return w.finish(); };
+    CHECK(enc(plain) == enc(plainWithJunk));
+    // a joiner's baseline diff carries a wide state-like command intact too (events are not stored, so this is the live path only)
+    ShadowState s;
+    CHECK(fold(s, 0, {cmd(kOpUseWeapon, Q(1), Q(2))}).size() == 1 && s.refOps.empty());
 }
 
 TEST(refcmd, state_ops_keep_the_last_command_per_key_and_events_keep_nothing) {
@@ -306,6 +336,11 @@ TEST(twin, refcmd_keeps_first) {
 TEST(twin, refcmd_player_shared) {
     MutationScope m([] { Mutations x; x.refCmdPlayerShared = true; return x; }());
     CHECK(!playerCommandFollowsTheRewardRule());   // a script-driven spell on the player would reach the whole party
+}
+
+TEST(twin, refcmd_wide_op_narrowed) {
+    MutationScope m([] { Mutations x; x.refCmdNarrow = true; return x; }());
+    CHECK(!wideCommandSurvivesTheWire());   // the extra forms and the integer were dropped: UseWeapon would aim at nothing
 }
 
 TEST(twin, refcmd_events_become_state) {
