@@ -99,3 +99,32 @@ jobs:
           print("twin kernel32.dll (must be rejected):", twin)
           sys.exit(1 if problems or not any("32-bit" in p for p in twin) else 0)
           PY
+      # The split build (small loader nvcoop.dll + reloadable core nvcoop_mod.dll) that run.py swap needs, same flags as
+      # plugin/loader/build_split.cmd. Built here so a tester without Visual Studio (Linux, Proton) can download it.
+      - run: cmake -S plugin -B build/L1split -A Win32 -DNVCOOP_SPLIT_LOADER=ON -DNVCOOP_OUT_DIR="${{ github.workspace }}/out/L1split"
+      - run: cmake --build build/L1split --config Release --parallel
+      - name: Check the split loader
+        shell: bash
+        run: |
+          python -I - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "tools/installer")
+          import package_release as pkg
+          for name in ("nvcoop.dll", "nvcoop_mod.dll"):
+              if not (Path("out/L1split") / name).is_file():
+                  sys.exit(f"out/L1split/{name} is missing")
+          problems = pkg.check_dll(Path("out/L1split/nvcoop.dll"))
+          print("split loader nvcoop.dll:", problems or "OK")
+          sys.exit(1 if problems else 0)
+          PY
+      # Not a release: a test build of this commit, kept for 14 days.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nvcoop-plugin-win32-${{ github.sha }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            out/L1/nvcoop.dll
+            out/L1split/nvcoop.dll
+            out/L1split/nvcoop_mod.dll
