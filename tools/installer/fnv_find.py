@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+import fnv_ini
 import fnv_mut
 import fnv_pe
 
@@ -123,7 +124,7 @@ def _steam_roots(reg: Registry, env: Dict[str, str]) -> List[Path]:
                              ("HKLM", r"SOFTWARE\Valve\Steam", "InstallPath")):
         v = reg.get(hive, key, value)
         if v:
-            roots.append(Path(v.replace("/", "\\")))
+            roots.append(Path(v.replace("/", "\\")) if fnv_mut.on("find_windows_only_separators") else Path(v))
     pf = env.get("ProgramFiles(x86)")
     if pf:
         roots.append(Path(pf) / "Steam")
@@ -131,10 +132,26 @@ def _steam_roots(reg: Registry, env: Dict[str, str]) -> List[Path]:
 
 
 def _read(p: Path) -> str:
+    """Read a Steam text file (libraryfolders.vdf, appmanifest_*.acf).
+
+    Steam writes UTF-8, but a client whose system code page is not UTF-8 (a Russian Windows,
+    cp1251) writes the ANSI code page. Decoding such a file as UTF-8 with errors="replace" turns
+    every non-ASCII character of a library path into U+FFFD: the folder does not exist any more and
+    the install is never found, with no error anywhere. So decode UTF-8 first and fall back to the
+    ANSI code page instead of mangling the path.
+    """
     try:
-        return p.read_text(encoding="utf-8", errors="replace")
+        raw = p.read_bytes()
     except OSError:
         return ""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        if fnv_mut.on("find_no_ansi_fallback"):
+            return raw.decode("utf-8", errors="replace")
+        return raw.decode(fnv_ini.ini_encoding(), errors="replace")
 
 
 def candidates(arg: Optional[str] = None, env: Optional[Dict[str, str]] = None, reg: Optional[Registry] = None,
@@ -185,14 +202,14 @@ def candidates(arg: Optional[str] = None, env: Optional[Dict[str, str]] = None, 
         if v:
             add(v, "retail", "retail")
     for d in drives():
-        d = d.rstrip("\\/") + "\\"
+        d = d.rstrip("\\/") + ("\\" if fnv_mut.on("find_windows_only_separators") else os.sep)
         for rel in (r"GOG Games\Fallout New Vegas", r"GOG Games\Fallout New Vegas Ultimate Edition",
                     r"Program Files (x86)\GOG Galaxy\Games\Fallout New Vegas", r"Program Files (x86)\GOG Galaxy\Games\Fallout New Vegas Ultimate Edition",
                     r"Program Files (x86)\Steam\steamapps\common\Fallout New Vegas", r"Program Files\Steam\steamapps\common\Fallout New Vegas",
                     r"SteamLibrary\steamapps\common\Fallout New Vegas", r"Steam\steamapps\common\Fallout New Vegas",
                     r"Games\Fallout New Vegas", r"Games\Steam\steamapps\common\Fallout New Vegas",
                     r"Program Files (x86)\Bethesda Softworks\Fallout New Vegas", r"Program Files\Bethesda Softworks\Fallout New Vegas"):
-            add(Path(d) / rel, "common")
+            add(Path(d) / rel if fnv_mut.on("find_windows_only_separators") else Path(d, *rel.split("\\")), "common")
     return found
 
 

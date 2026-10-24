@@ -42,7 +42,12 @@ public:
 struct HostStats { uint64_t commits = 0, droppedByPolicy = 0, retransmitBatches = 0, welcomes = 0, snapshots = 0,
                    replays = 0, baselineJoins = 0, baselineChunksSent = 0, baselineEffectsSent = 0, baselineReverts = 0,
                    baselineRetransmits = 0, welcomesThrottled = 0, bulkDeferred = 0, baselineEntriesKept = 0, handshakeRejects = 0, digestsReceived = 0, digestsOk = 0, digestsMismatch = 0, digestsRateLimited = 0, digestsStale = 0,
-                   desyncRepairs = 0, desyncEffectsRepaired = 0, repairsDeferredBudget = 0, reloads = 0, rebasesSent = 0, staleEpochAcks = 0, intentsCommitted = 0, actionsExecuted = 0, intentsDuplicate = 0, rejected = 0, badMessages = 0, followerCapDrops = 0, controlReleases = 0; };
+                   desyncRepairs = 0, desyncEffectsRepaired = 0, repairsDeferredBudget = 0, reloads = 0, rebasesSent = 0, staleEpochAcks = 0, intentsCommitted = 0, actionsExecuted = 0, intentsDuplicate = 0, rejected = 0, badMessages = 0, followerCapDrops = 0, controlReleases = 0,
+                   questRunningAdopted = 0,   // client-only quest running keys settled by committing the host's own running state (issue #25)
+                   stageZeroAdopted = 0,      // client-only "SetStage q = 0" keys settled by committing the same stage 0 on the host (its key space is then complete)
+                   questStateAdopted = 0,     // client-only non-zero SetStage / CompleteQuest / FailQuest keys the host engine confirmed and committed
+                   questStateDisagreed = 0,   // client-only quest state keys the host engine does NOT agree with (a real divergence: not adopted, reported every round)
+                   resumesRefused = 0; };     // Hellos whose resume cursor this host never handed out in this epoch (a save of another timeline): rebased
 
 // Empty string = compatible; otherwise a player-facing explanation and the reject reason code.
 std::string checkHandshake(const HandshakeInfo& host, const HandshakeInfo& client, uint8_t& reason);
@@ -157,6 +162,23 @@ public:
     std::function<void(PlayerId slot, IntentKind kind, const FormRef& ref, uint32_t epoch, uint32_t id)> onAction;
     // Optional hook run on every committed txn BEFORE policy normalization (the quest rules engine rewrites recipients here).
     std::function<void(EffectTxn&)> txnFilter;
+    // Desync repair, issue #25: a client reported quest running states the host's shared world has no entry for. A quest's running
+    // flag has no inverse a client could revert to, so the host settles the key itself: it commits ITS OWN running state for each such
+    // quest (StartQuest / StopQuest, a normal host txn every client receives), which also completes the host's key space. This hook
+    // reads the host engine: fill `running` for the quests it can read and return true (quests left out are not settled this round).
+    // Unset or returning false: the completeness rule's default (a quest the host's dump does not list is not running) is committed.
+    std::function<bool(const std::vector<FormRef>& quests, std::map<FormRef, bool>& running)> hostQuestRunning;
+    // Desync repair: a client reported real save state (a non-zero SetStage, CompleteQuest, FailQuest) the host's shared world has no entry
+    // for, because the host runs without a world baseline and never recorded what both copies loaded from the same save. SetStage merges by
+    // max and a completed quest cannot be un-completed, so a revert key is skipped by the client and resent every round. The host settles
+    // such a key itself, but ONLY after its own engine confirms the value, so a diverged client can never push state into the host world.
+    // This hook reads the host engine: fill `out` for the quests it can read (stage < 0 = unknown) and return true.
+    // A key is adopted (committed as a normal host txn of the client's value) when the engine's stage is >= the client's stage, or its
+    // completed / failed flag equals the client's. When the engine disagrees the key is NOT adopted: it stays an open desync and keeps
+    // being reported. Quests the hook leaves out are not settled this round.
+    // Unset (the game-free default) or returning false: the old behaviour, such keys go out as revert keys (nothing is adopted blindly).
+    struct HostQuestState { int32_t stage = -1; bool completed = false, failed = false; };
+    std::function<bool(const std::vector<FormRef>& quests, std::map<FormRef, HostQuestState>& out)> hostQuestState;
     std::function<void(PlayerId slot, uint16_t channel, const Bytes& payload)> onApp;
     void sendApp(PlayerId toSlot, uint16_t channel, const Bytes& payload);  // kNoPlayer = every joined client
     void relayApp(PlayerId fromSlot, uint16_t channel, const Bytes& payload);  // to every joined client except fromSlot
@@ -178,6 +200,7 @@ private:
         bool rebasePending = false; uint64_t lastRebaseSend = 0;
         std::shared_ptr<Sync> sync; uint64_t lastDigestAt = 0; bool digestRequested = false;
         double bulkTokens = -1; uint64_t bulkAt = 0, lastWelcomeAt = 0; uint32_t welcomeResends = 0;
+        uint32_t welcomedEpoch = 0;   // the world epoch this host instance last welcomed this token in (a resume cursor is only ours if it matches)
     };
     bool bulkOk(Client& c);
     size_t enforceFollowerCaps(EffectTxn& t);
@@ -260,7 +283,8 @@ public:
     // See HostSession::setWorker: digest hashing and the join summary are built off the main thread.
     void setWorker(IWorker* w) { worker_ = w; }
     int asyncOutstanding() const { return mq_->outstanding(); }
-    struct SyncStats { uint64_t digestsSent = 0, repairsApplied = 0, effectsRepaired = 0, repairEffectsSkipped = 0; };
+    // repairRevertsUnrevertable: SyncRepair revert keys this client had no inverse for (left as they are; before issue #25 this was silent).
+    struct SyncStats { uint64_t digestsSent = 0, repairsApplied = 0, effectsRepaired = 0, repairEffectsSkipped = 0, repairRevertsUnrevertable = 0; };
     const SyncStats& syncStats() const { return syncStats_; }
     uint32_t lastSession() const { return session_; }   // next connect() must use a larger one (rebase/load bump it internally)
     bool canSaveState() const { return joined_ && intents_.empty() && !baselineActive_ && pending_.empty(); }
@@ -327,6 +351,7 @@ private:
     uint32_t nextIntent_ = 1, seenIntent_ = 0;  // seenIntent_: highest own intent known committed
     uint64_t now_ = 0, lastHello_ = 0, lastIntentSend_ = 0;
     uint32_t helloRetries_ = 0, summarySent_ = 0, summaryBackoff_ = 0;
+    uint64_t helloCursor_ = 0;   // Hello::cursorCheck of this connect (hash of the shadow we resume from)
     Stats stats_;
     // baseline join state
     bool wantBaseline_ = false, baselineActive_ = false, baselineDone_ = false;

@@ -623,7 +623,7 @@ struct Node {
         be.vanishAfterFrames = 2;
         RuntimeConfig rc;
         rc.puppet.defaultTemplate = kTemplate;
-        rc.puppet.localSlot = slot;
+        // localSlot stays at the ini default 0, exactly as the shipped module has it: the session start (AvatarNet::sessionBegin) must tell the runtime its slot
         rt.reset(new AvatarRuntime(be, rc));
         side.reset(new RuntimeSide(*rt));
         an.reset(new AvatarNet(*side, AvatarNetOptions{}, [this] { return epoch++; }));

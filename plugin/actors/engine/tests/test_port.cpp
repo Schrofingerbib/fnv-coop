@@ -387,6 +387,88 @@ TEST(port, a_stand_in_is_a_restrained_clone_at_the_remote_pose_and_is_recorded) 
     CHECK(r.lost.size() == 1);
 }
 
+// In game 2026-10-22 three client crashes ran the engine's own "SetPos X" handler on a stand-in's id AFTER the stand-in was removed: the id
+// had been recycled by a NavMesh and the handler called through text (EIP 6C676E61 = "angl"). The engine can keep a SetPos for a created
+// ref queued, so a removed clone is left alone for deleteQuietMs after its last write. Twin 73 deletes it at once.
+TEST(port, a_removed_stand_in_is_deleted_only_after_the_quiet_period_and_never_written_to_again) {
+    Config qc = quietRigConfig();
+    qc.deleteQuietMs = 3000;       // longer than the 2 s sweep, so the sweep gets its chance to jump the queue
+    PortRig r(qc);
+    r.eng.addNpc(0x300, 0x500, {0, 0, 0});
+    ActorMeta m;
+    m.ref = fnvcoop::FormRef("falloutnv.esm", 0x777);
+    m.netId = deriveNetId(m.ref);
+    m.base = fnvcoop::FormRef("falloutnv.esm", 0x500);
+    r.eng.form("falloutnv.esm", 0x500);
+    live::ActorSnapshot at;
+    at.cell = 1; at.pos = {400, 500, 600};
+    CHECK(r.port.spawnStandIn(m, at));
+    const RefId c = r.port.activeRef(m.netId);
+    r.frame();
+    r.port.drive(m.netId, interpAt({450, 500, 600}));
+    r.port.flush();
+    CHECK(std::fabs(r.eng.a[c].pos.x - 450) < 0.01f);                    // the clone was being driven
+    const int writesBefore = r.eng.count("setpos", c);
+    r.port.removeStandIn(m.netId);
+    CHECK(!r.port.loaded(m.netId) && r.port.standInCount() == 0);        // gone for ActorSync at once
+    CHECK(!r.eng.a[c].deleted && !r.eng.a[c].disabled);                  // but not touched in the engine yet
+    CHECK(r.led.has(LedgerKind::StandIn, c) && r.led.has(LedgerKind::Restrained, c));   // a crash or a save here still finds it
+    r.port.drive(m.netId, interpAt({600, 500, 600}));                    // a late drive for the removed actor changes nothing
+    for (int i = 0; i < 12; ++i) r.step(40);                             // 480 ms
+    CHECK(!r.eng.a[c].deleted && r.eng.count("setpos", c) == writesBefore);
+    r.step(2000);                                                        // a sweep runs in here (every 2 s): it must not jump the queue
+    CHECK(!r.eng.a[c].deleted && r.led.has(LedgerKind::StandIn, c));
+    r.step(1000);                                                        // 3.5 s after the removal
+    CHECK(r.eng.a[c].deleted && r.eng.a[c].disabled);
+    CHECK(!r.led.has(LedgerKind::StandIn, c) && !r.led.has(LedgerKind::Restrained, c));
+    CHECK(r.eng.count("setpos", c) == writesBefore);                     // the last write was before the removal, and nothing came after
+}
+
+TEST(port, a_save_or_the_end_of_a_session_deletes_a_waiting_clone_at_once) {
+    PortRig r(quietRigConfig());
+    r.eng.addNpc(0x300, 0x500, {0, 0, 0});
+    ActorMeta m;
+    m.ref = fnvcoop::FormRef("falloutnv.esm", 0x777);
+    m.netId = deriveNetId(m.ref);
+    m.base = fnvcoop::FormRef("falloutnv.esm", 0x500);
+    r.eng.form("falloutnv.esm", 0x500);
+    live::ActorSnapshot at;
+    at.cell = 1; at.pos = {400, 500, 600};
+    CHECK(r.port.spawnStandIn(m, at));
+    const RefId c = r.port.activeRef(m.netId);
+    r.port.removeStandIn(m.netId);
+    CHECK(!r.eng.a[c].deleted);
+    r.port.beforeSave();                                                 // the save must not contain a clone
+    CHECK(r.eng.a[c].deleted && !r.led.has(LedgerKind::StandIn, c));
+    // a clone still waiting when the session ends goes too
+    r.step(3500);                                                        // past the save's no-clone grace
+    CHECK(r.port.spawnStandIn(m, at));
+    const RefId c2 = r.port.activeRef(m.netId);
+    r.port.removeStandIn(m.netId);
+    CHECK(!r.eng.a[c2].deleted);
+    r.port.releaseAll();
+    CHECK(r.eng.a[c2].deleted && r.led.empty());
+}
+
+TEST(port, inventory_goes_through_the_providers_for_a_bound_live_actor_only) {
+    PortRig r;
+    const NetId id = r.npc(0x100);
+    InvList stored{{fnvcoop::FormRef("falloutnv.esm", 0x15169), 2}};
+    int reads = 0, writes = 0;
+    registry().invRead = [&](NetId n, InvList& out) { ++reads; out = stored; return n != 0; };
+    registry().invWrite = [&](NetId, const InvList& w) { ++writes; stored = w; return true; };
+    InvList got;
+    CHECK(r.port.sampleInventory(id, got) && got.size() == 1 && got[0].count == 2 && reads == 1);
+    CHECK(r.port.applyInventory(id, InvList{{fnvcoop::FormRef("falloutnv.esm", 0x15169), 1}}) && stored[0].count == 1 && writes == 1);
+    CHECK(!r.port.sampleInventory(deriveNetId(fnvcoop::FormRef("falloutnv.esm", 0x999)), got) && reads == 1);    // not bound: no engine read
+    CHECK(!r.port.applyInventory(deriveNetId(fnvcoop::FormRef("falloutnv.esm", 0x999)), stored) && writes == 1);
+    r.port.kill(id);
+    CHECK(!r.port.applyInventory(id, stored) && writes == 1);                                                      // a dying actor's contents are the loot service's
+    registry().invRead = nullptr;
+    registry().invWrite = nullptr;
+    CHECK(!r.port.sampleInventory(id, got));                                                                       // no provider: nothing is synced
+}
+
 TEST(port, no_clone_when_the_real_actor_is_here_and_none_beyond_the_cap) {
     Config c = rigConfig();
     c.maxStandIns = 2;

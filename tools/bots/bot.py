@@ -399,14 +399,30 @@ class Bot:
             return data
         return self._act("goto", run)
 
-    def _walk_fail(self, code: str, d: float, radius: float, **data: Any) -> _Fail:
-        """A walk that did not arrive: how far it still was and whether a menu is open (a message box eats Forward, so the avatar stands still)."""
+    STANDING_STILL = 25.0       # a walk that gained less than this many units did not move the avatar at all
+
+    def _walk_fail(self, code: str, d: float, radius: float, start: Optional[Pos] = None, **data: Any) -> _Fail:
+        """A walk that did not arrive: how far it still was and whether a menu is open (a message box eats Forward, so the avatar stands still).
+        With `start` it also says how far the avatar got from where the walk began: ~0 means the avatar never moved (input not reaching the
+        game, or boxed in at the start), a few hundred means a wall or slope stopped it on the way. In game 2026-10-22 both players of a
+        matrix run stood at their start while the NPC / container was 220..857 units away, and the message could not tell the two apart."""
         note = self._menu_note()
-        return _Fail(code, say=f"{d:.0f} units left (wanted within {radius:g}), {self._menu_words(note)}", distance=d, **note, **data)
+        say = f"{d:.0f} units left (wanted within {radius:g}), {self._menu_words(note)}"
+        if start is not None:
+            try:
+                moved = dist(self.pos(), start)
+            except Exception:       # the position read must never hide the failure
+                moved = None
+            if moved is not None:
+                data["moved"] = moved
+                say += (f", the avatar never left its start ({moved:.0f} units moved)" if moved < self.STANDING_STILL
+                        else f", moved {moved:.0f} units from the start")
+        return _Fail(code, say=say, distance=d, **note, **data)
 
     def _walk_step(self, target: Target, radius: float, timeout_s: float) -> Dict[str, Any]:
         end = self.clock.monotonic() + timeout_s
         stuck = 0
+        start = self.pos()
         while True:
             cur = self.pos()
             dest = self.target_pos(target)  # moving targets are tracked
@@ -414,7 +430,7 @@ class Bot:
             if d <= radius:
                 return {"distance": d, "via": "step"}
             if self.clock.monotonic() >= end:
-                raise self._walk_fail("timeout", d, radius)
+                raise self._walk_fail("timeout", d, radius, start=start)
             step = min(self.speed * self.step_s, d - radius * 0.5)
             f = step / d
             nxt = (cur[0] + (dest[0] - cur[0]) * f, cur[1] + (dest[1] - cur[1]) * f, cur[2] + (dest[2] - cur[2]) * f)
@@ -424,7 +440,7 @@ class Bot:
             if dist(self.pos(), cur) < 1.0:
                 stuck += 1
                 if stuck >= 4:
-                    raise self._walk_fail("stuck", d, radius, at=tuple(cur))
+                    raise self._walk_fail("stuck", d, radius, start=start, at=tuple(cur))
             else:
                 stuck = 0
 
@@ -434,6 +450,7 @@ class Bot:
         end = self.clock.monotonic() + timeout_s
         window_s, tries = 1.0, 0
         w_start, w_pos = self.clock.monotonic(), self.pos()
+        start = w_pos
         yaw = self._eval(P.get_angle("Z")) % 360.0
         try:
             while True:
@@ -443,7 +460,7 @@ class Bot:
                 if d <= radius:
                     return {"distance": d, "via": "input", "unstick": tries}
                 if self.clock.monotonic() >= end:
-                    raise self._walk_fail("timeout", d, radius, unstick=tries)
+                    raise self._walk_fail("timeout", d, radius, start=start, unstick=tries)
                 want, _ = heading_deg(cur, dest)
                 delta = (want - yaw + 180.0) % 360.0 - 180.0
                 maxturn = turn_dps * self.step_s
@@ -455,10 +472,10 @@ class Bot:
                     moved = dist(self.pos(), w_pos)
                     if moved < 0.25 * 200.0 * window_s and abs(delta) < 45.0:
                         if self._menu_blocks():   # standing still under a menu: sidesteps and jumps cannot help, say so now
-                            raise self._walk_fail("stuck", d, radius, at=tuple(cur), unstick=tries)
+                            raise self._walk_fail("stuck", d, radius, start=start, at=tuple(cur), unstick=tries)
                         tries += 1
                         if tries > 4:
-                            raise self._walk_fail("stuck", d, radius, at=tuple(cur), unstick=tries)
+                            raise self._walk_fail("stuck", d, radius, start=start, at=tuple(cur), unstick=tries)
                         if tries % 2:  # sidestep one way, later the other
                             side = 1 if (tries // 2) % 2 == 0 else -1
                             self.nv.call(P.M_BOT_MOVE, {"forward": 1, "strafe": side, "run": True})
@@ -794,6 +811,37 @@ class Bot:
         if items:
             p["items"] = [self._norm(i)[0] for i in items]
         return {i["item"]: i["count"] for i in self._need(P.M_BOT_INVENTORY, p)["items"]}
+
+    def close_menu(self, kind: str = "container", timeout_s: float = 5.0) -> ActionResult:
+        """Close the open menu from code, the engine's own way (bridge method bot.menu.close, CloseAllMenusCore 0x7037E0). Only a menu of `kind`
+        ("container" by default; "terminal", "barter", ...; "any" = whatever a player can cancel out of, never a message box) is closed: another
+        menu on top is refused and left open. Post: bot.menu reports no menu ("any") or a menu that is not `kind` any more."""
+        def run():
+            r = self._try_call(P.M_BOT_MENU_CLOSE, {"kind": kind})
+            if r is None:
+                raise _Fail("unsupported", need=P.M_BOT_MENU_CLOSE, why="this build cannot close a menu from code")
+            if not r.get("closed"):
+                raise _Fail("postcondition", why="bot.menu.close did not say closed", reply=r)
+
+            def gone() -> bool:
+                k = (self._optional_call(P.M_BOT_MENU) or {}).get("kind")
+                return k in P.MENU_FREE if kind == "any" else k != kind
+            if not self._poll(gone, timeout_s):
+                raise _Fail("postcondition", say=f"the {kind} menu is still open {timeout_s:g} s after bot.menu.close", **self._menu_note())
+            return {"closed": r.get("kind"), "menu": r.get("menu")}
+        return self._act("close_menu", run)
+
+    def close_container(self, ref: Optional[Ref] = None, timeout_s: float = 5.0) -> ActionResult:
+        """Leave the container menu (the loot lock is released by the module when the menu is gone). `ref` is unused: the menu on top is closed."""
+        def run():
+            m = self._optional_call(P.M_BOT_MENU)
+            if m is not None and m.get("kind") in P.MENU_FREE:
+                return {"already": True}      # the loot module (a refused second opener) or a script already closed it
+            r = self.close_menu("container", timeout_s)
+            if not r.ok:
+                raise _Fail(r.reason, **r.data)
+            return dict(r.data)
+        return self._act("close_container", run)
 
     def press_box(self, button: int) -> ActionResult:
         """Answer a message box with `button` (0-based, in the order the box lists its buttons). The UI layer's own box (consent prompt,

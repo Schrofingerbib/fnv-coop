@@ -134,6 +134,7 @@ struct Stats {
     uint64_t puppetDeaths = 0, heals = 0;                            // a hit-target puppet that died (respawned) / health top-ups sent
     uint64_t appearanceUpdates = 0;                                  // a look change applied to an existing puppet (no respawn)
     uint64_t modOps = 0, modFailures = 0, modGaveUp = 0;             // weapon modification writes (EnableWeaponMod) and their outcome
+    uint64_t pushesIgnored = 0;                                      // engine pushes (body in the way) not handed to the interpolation buffer
 };
 
 }  // namespace nvcoop::avatar

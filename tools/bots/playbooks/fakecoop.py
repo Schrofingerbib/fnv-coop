@@ -40,6 +40,7 @@ BUGS = {
     "ready_veto_ignored": "a No vote does not stop the one-way step",
     "tether_off": "tether radius is not enforced",
     "consent_ignored": "fast travel proceeds without party consent",
+    "travel_mode_free": "the world-time module runs fast travel as free (the shipped default) although the test needs party consent",
     "travel_in_combat": "fast travel is allowed in combat",
     "owner_split": "ownership transfer is not delivered to clients",
     "flap_owner": "no hysteresis: ownership flips back and forth near the border",
@@ -109,6 +110,8 @@ class FakeNv:
             return self.bot.anim_probe()
         if method == "coop.owner":
             return self.bot.owner_info(params["ref"])
+        if method == "worldtime.status":
+            return {"enabled": True, "session": True, "partyTravel": "travel_mode_free" not in self.bot.world.bugs}
         if method == "events":
             return {"events": [], "next": 0}
         if method == "flight.dump":

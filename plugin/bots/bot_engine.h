@@ -39,6 +39,18 @@
 
 namespace nvbots {
 
+// A call pin compares 16 bytes at an engine entry with the prologue pinned in bots_addrs.h. Another module of ours may have detoured that entry
+// before the bots module looks (world_time's pending-travel hook sits on PendingTravelSet 0x93BE30; after a core reload the bots module starts
+// second and read "pin does not match this exe", which switched off all of bot.menu / bot.inventory / bot.dialog / bot.fasttravel: worldtime_proof
+// "bot.menu: unsupported: engine glue not wired", sweep 2026-10-22). A detoured entry is accepted when it holds a `jmp rel32` AND the trampoline
+// of our own hook there starts with the pinned bytes (the stolen prologue). `tramp` = nvhooks::trampolineOfAny(entry) contents, or null.
+inline bool pinBytesOk(const unsigned char* got, const unsigned char* want, const unsigned char* tramp) {
+    if (std::memcmp(got, want, 16) == 0) return true;
+    if (FNV_MUT(65) || !tramp) return false;                       // twin 65: a detoured entry is never accepted
+    if (got[0] != 0xE9) return false;
+    return FNV_MUT(66) || std::memcmp(tramp, want, 5) == 0;         // twin 66: any jmp is accepted, whatever the trampoline holds
+}
+
 using nvcoop::json::Value;
 using Addr32 = uint32_t;
 
@@ -107,6 +119,7 @@ struct IEngine {
     // native message box
     virtual bool onMainThread() = 0;                                 // the calling thread is the game main thread
     virtual bool msgMenuHandleClick(Addr32 menu, int id, Addr32 tile) = 0;   // MessageMenu vtable slot 3 (0x7AA070); false = refused or faulted
+    virtual bool closeAllMenus() = 0;                                // 0x7037E0 CloseAllMenusCore (cdecl, no arguments), main thread; false = refused or faulted
     // bot.vats (all main thread; false / 0 / -1 = refused or faulted)
     virtual Addr32 menuByType(uint32_t id) = 0;                      // 0xA09030: TileMenu* of an open menu, 0 when it is not open
     virtual bool closeTutorial() = 0;                                // 0x7E8D60 (cdecl, no arguments)
@@ -247,6 +260,41 @@ inline bool pressNativeMessageButton(IEngine& e, int button, Value* out, std::st
     }
     if (!e.msgMenuHandleClick(menu, eng::kMsgClickId, pick.tile)) { *err = "the live glue refused the HandleClick call (pins or vtable did not match)"; return false; }
     out->set("menu", (int64_t)eng::kMenuIdMessage).set("button", (int64_t)button).set("value", (int64_t)pick.value).set("buttons", (int64_t)bs.size());
+    return true;
+}
+
+// ---- bot.menu.close {kind?} ----
+// Closes the open menu the engine's own way: CloseAllMenusCore (0x7037E0, what the CloseAllMenus command calls, bots_addrs.h) closes every menu of
+// the stack, the path the game takes when the player leaves a container with Tab or B. Gates, in this order: the game main thread; the interface
+// manager is ready; a menu is open; the top menu is of the wanted kind. `kind` defaults to "container". "any" accepts every kind a human could leave
+// with the cancel key, but never the message box (bot.menu.press answers those, closing one here skips its callback), the loading screen, the pause
+// menu, VATS or the tutorial box. A kind is a bot.menu kind name (container, barter, terminal, lockpick, hacking, pipboy, dialogue, other).
+// The close happens inside the call; the menu is gone from bot.menu a frame or two later (the caller polls). On success `out` gets {closed, menu, kind}.
+inline bool kindIsLeavable(const std::string& kind) {
+    if (FNV_MUT(63)) return kind != "none";
+    return kind != "none" && kind != "message" && kind != "loading" && kind != "pause" && kind != "vats" && kind != "tutorial" && kind != "hud";
+}
+inline bool closeOpenMenu(IEngine& e, const std::string& want, Value* out, std::string* err) {
+    if (!FNV_MUT(60)) {
+        if (!e.onMainThread()) { *err = "the menu close must run on the game main thread"; return false; }
+    }
+    uint32_t mgr = 0;
+    if (!e.rd32(eng::kInterfaceMgrPtr, &mgr) || !mgr) { *err = "interface manager not ready"; return false; }
+    const uint32_t top = e.topMenuId(mgr);
+    const std::string kind = menuKindOf(top);
+    if (!top && !FNV_MUT(61)) { *err = "no menu is open"; return false; }
+    const std::string wanted = want.empty() ? "container" : want;
+    if (!FNV_MUT(59)) {
+        if (wanted == "any") {
+            if (!kindIsLeavable(kind)) { *err = "the top menu is " + kind + " (id " + std::to_string(top) + "): not closed from code"; return false; }
+        } else if (kind != wanted) {
+            *err = "the top menu is " + kind + " (id " + std::to_string(top) + "), not " + wanted + ": left open";
+            return false;
+        }
+    }
+    const bool called = e.closeAllMenus();
+    if (!called && !FNV_MUT(62)) { *err = "the live glue refused the CloseAllMenusCore call (pins did not match, or it faulted)"; return false; }
+    out->set("closed", true).set("menu", (int64_t)top).set("kind", kind);
     return true;
 }
 

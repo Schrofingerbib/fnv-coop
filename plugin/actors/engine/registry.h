@@ -21,6 +21,8 @@ public:
     std::function<bool(RefId)> localDeath;                      // the feed's decision for onLocalDeath(ref)
     RefFilter exclude;                                          // refs another layer owns (puppets, ghosts)
     CreatedIdResolver createdId;                                // spawn-arb: identity of a created ref
+    InventoryReader invRead;                                    // plugin/loot: inventory totals of a tracked actor
+    InventoryWriter invWrite;
     std::function<void()> beforeSave;                           // the feed's clone clean-up
     std::function<PortStats()> stats;
     PlayerNetIdResolver playerNetByRef;

@@ -47,10 +47,18 @@ struct Mutations {
     bool angleKeepsFirst = false;     // RefAngle: a later committed angle for the same (ref, axis) is ignored (host order no longer wins)
     bool refCmdKeepsFirst = false;    // RefCommand state ops: a later command for the same key is ignored (host order no longer wins)
     bool refCmdPlayerShared = false;  // a RefCommand on the player is shared with the whole party whatever the cause (a vending machine would pay everybody)
+    bool refCmdNarrow = false;        // wide RefCommand ops (UseWeapon) travel and hash without their extra forms / integer: the receiver fires with the wrong target
     bool refCmdAllState = false;      // RefCommand events are remembered like state ops (a late joiner replays them, an event fires twice)
     bool noGuestSuppression = false;  // guests keep script-originated effects (ghost-death double fire)
     bool overfullShardRequest = false; // a digest repair asks for every bad shard at once (the client's reply is cut off, the drift beyond it is never fixed)
+    bool questRunningReverted = false; // issue #25: client-only quest running keys go out as revert keys again (no inverse: never converges)
+    bool stageZeroReverted = false;    // client-only "SetStage q = 0" keys go out as revert keys again (SetStage merges by max, no inverse: the digest never converges, a repair every round)
+    bool questStateReverted = false;   // client-only non-zero SetStage / CompleteQuest / FailQuest keys go out as revert keys again (no inverse: never converges, resent every round)
+    bool digestKeepsRefVars = false;   // the host digest compares RefScriptVar (polled object / NPC script vars): the client's world dump never carries them, so every one is "missing" and repaired forever (digest never ok)
+    bool digestKeepsWorldEnv = false;  // the digest compares the host's last SetWeather / SetTimeScale: the client's world dump cannot read either one, so both are "missing" and repaired every round
+    bool trustForeignCursor = false;   // a Hello's resume cursor of the host's epoch is replayed / snapshotted without checking it is this host's timeline
     // Host-load revert twins, one effect at a time (originsIgnored above switches all of them off at once). Bits of PreimageBit.
+    bool asyncDoneHoldsQueue = false;   // issue #46: runAsync's queued completion owns the queue it sits in (a reference cycle: leaks when a session dies with a result queued)
     uint32_t preimageOff = 0;
 };
 // One bit per effect whose host-load revert has its own twin.

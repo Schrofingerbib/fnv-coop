@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """In-game proof of loot sync (FULL-SYNC-PLAN 3.5): shared containers, one lock, drops, first-claim-wins pickups.
 
-NOT RUN by the lane that wrote it (code only). The helper runs it on a PC where two or three game instances are already in one co-op
-session (host = instance 0), standing together next to a lootable container, with nvcoop built with NVCOOP_WITH_LOOT, nvcoop.ini
-[loot] enabled=1 on every instance and the wiring line of plugin/loot/loot_glue.h in place (docs/tools/loot.md, "In-game proof").
+Fully scripted: no step needs a human. It runs on a PC where two or three game instances are already in one co-op session (host = instance 0),
+standing together next to a lootable container, with nvcoop built with NVCOOP_WITH_LOOT, nvcoop.ini [loot] enabled=1 and [dev] bots=1 on every
+instance and the wiring line of plugin/loot/loot_glue.h in place (docs/tools/loot.md, "In-game proof"). tools/proof/prove.py provisions all of it.
 
     python -I plugin/loot/tools/loot_proof.py --instances 0 1 [2] --container Plugin.esm:HEX --item Stimpak
     python -I plugin/loot/tools/loot_proof.py --selftest          # game-free: the script's own pass / fail logic against a fake world
 
 How the player moves things: the console on a calling reference. `RemoveItemTarget <item> <player> 1 1` run on the container moves one item from
 it to the player, the same container read the plugin's watcher uses to see a take. `Activate 14 1` run on a container opens its menu for the
-player. Closing the container menu is not scriptable (docs/tools/loot.md, TODO-RE): the script asks you to close it by hand and waits.
+player. The container menu is closed by the bridge method bot.menu.close {kind:"container"} (plugin/bots, CloseAllMenusCore 0x7037E0, the engine's
+own CloseAllMenus path); the script then waits until bot.menu reports no menu. A build without that method fails the step, it never waits for a hand.
 
 Steps (each prints PASS / FAIL with the numbers it saw):
   1 module     coop.loot answers on every instance, the session is up, the same table digest everywhere
@@ -23,23 +24,28 @@ Exit code 0 only if every step passed.
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+# test-only: one deliberate bug, set by the selftest's twin: "no_session_wait" checks the session at once, the way the first real sweep did
+MUTANT = os.environ.get("LOOT_PROOF_MUTANT", "")
+SESSION_S = 90.0     # the copies were booted a moment ago: the guests may still be joining when the script starts
 SETTLE_S = 3.0
 LOCK_S = 3.0
+MENU_GONE_S = 5.0
 
 
 class Proof:
-    def __init__(self, nvs: List[Any], sleep: Callable[[float], None], container: str, item: str, log=print, ask: Optional[Callable[[str], None]] = None):
+    def __init__(self, nvs: List[Any], sleep: Callable[[float], None], container: str, item: str, log=print):
         self.nvs = nvs
         self.sleep = sleep
         self.container = container
         self.item = item
         self.log = log
-        self.ask = ask or (lambda msg: self.log("  >> " + msg))
         self.failures: List[str] = []
         self.passes = 0
 
@@ -64,6 +70,18 @@ class Proof:
             return int(it.get("count", 0))
         return 0
 
+    def close_container_menu(self, nv, who: str) -> bool:
+        """Close the container menu on `nv` from code (bot.menu.close) and wait until bot.menu reports that no menu is open."""
+        try:
+            r = nv.call("bot.menu.close", {"kind": "container"})
+        except Exception as e:  # noqa: BLE001
+            if type(e).__name__ in ("ConnectionLost", "GameCrashed"):
+                raise
+            return self.check(False, f"{who}: bot.menu.close closed the container menu", str(e)[:160])
+        self.check(bool(r.get("closed")), f"{who}: bot.menu.close answered closed", r)
+        gone = self.wait(lambda: nv.call("bot.menu", {}).get("kind") == "none", MENU_GONE_S)
+        return self.check(gone, f"{who}: bot.menu reports no menu after the close")
+
     def wait(self, pred: Callable[[], bool], timeout: float) -> bool:
         t = 0.0
         while t <= timeout:
@@ -80,7 +98,14 @@ class Proof:
         ok = True
         for i, nv in enumerate(self.nvs):
             s = self.status(nv)
-            ok &= self.check(bool(s.get("enabled")) and bool(s.get("session")), f"instance {i}: loot sync is enabled and in the session", s.get("enabled"))
+            if MUTANT != "no_session_wait":
+                t = 0.0
+                while not (s.get("enabled") and s.get("session")) and t < SESSION_S:   # a join still in progress is not a failure
+                    self.sleep(1.0)
+                    t += 1.0
+                    s = self.status(nv)
+            ok &= self.check(bool(s.get("enabled")) and bool(s.get("session")), f"instance {i}: loot sync is enabled and in the session",
+                             (s.get("enabled"), s.get("session")))
             digs.append(s.get("digest"))
         self.check(len(set(digs)) == 1, "every instance has the same table digest", digs)
         return ok
@@ -110,8 +135,8 @@ class Proof:
         self.check(after[1] == before[1] + 1, "instance 1 has one more", (before[1], after[1]))
         digs = [self.table(nv).get("digest") for nv in self.nvs]
         self.check(len(set(digs)) == 1, "every instance's table of the container is the same", digs)
-        self.ask("close the container menu on instance 1 (Tab / B) now")
-        self.check(self.wait(lambda: int(self.status(a).get("openContainer", 0)) == 0, 30.0), "the menu was closed")
+        self.close_container_menu(a, "instance 1")
+        self.check(self.wait(lambda: int(self.status(a).get("openContainer", 0)) == 0, LOCK_S * 2), "the loot module saw the menu close")
         self.sleep(SETTLE_S)
         hosted = self.nvs[0].call("coop.loot", {"container": self.container_net})
         self.check(hosted.get("holder") == -1, "the lock is released after the close", hosted.get("holder"))
@@ -200,8 +225,19 @@ class FakeNv:
         if method == "coop.loot":
             if "container" in params:
                 return {"known": True, "holder": -1 if w.holder is None else w.holder, "stacks": 1, "digest": f"{w.stock}-{w.items}"}
-            return {"enabled": True, "session": True, "openContainer": 256 if w.open.get(self.i) else 0, "items": w.items,
+            return {"enabled": True, "session": w.t >= w.session_after, "openContainer": 256 if w.open.get(self.i) else 0, "items": w.items,
                     "digest": f"{w.stock}-{w.items}", "hostStats": {"closeMismatch": 0}}
+        if method == "bot.menu.close":
+            if w.close_missing:
+                raise RuntimeError("unknown method bot.menu.close")
+            if not w.open.get(self.i):
+                raise RuntimeError("no menu is open")
+            if not w.close_ignored:
+                w.open[self.i] = False
+                w.holder = None
+            return {"closed": True, "menu": 1008, "kind": "container"}
+        if method == "bot.menu":
+            return {"kind": "container" if w.open.get(self.i) else "none", "id": 1008 if w.open.get(self.i) else 0}
         if method == "bot.inventory":
             return {"items": [{"item": params["items"][0], "count": w.inv[self.i]}]}
         if method == "bot.drops":
@@ -213,8 +249,11 @@ class FakeNv:
 
 
 class FakeWorld:
-    def __init__(self, dupes: bool, players: int = 3):
+    def __init__(self, dupes: bool, players: int = 3, close_missing: bool = False, close_ignored: bool = False, session_after: float = 0.0):
         self.dupes = dupes
+        self.session_after = session_after        # seconds until the guests have joined (session false before that)
+        self.close_missing = close_missing        # the build has no bot.menu.close
+        self.close_ignored = close_ignored        # bot.menu.close says closed but the menu stays up (and the lock with it)
         self.container = "Fake.esm:100"
         self.item_ref = "00ABCD01"
         self.holder: Optional[int] = None
@@ -245,22 +284,29 @@ class FakeWorld:
 
 def selftest() -> int:
     rc = 0
-    for dupes, expect_ok in ((False, True), (True, False)):
-        w = FakeWorld(dupes)
+    # (name, world arguments, the script must pass). The close twins prove the menu close is judged, not assumed: a build without the
+    # bridge method and a close that does nothing both fail the take step, and neither waits for a human.
+    cases = (("healthy", {}, True), ("dupes", {"dupes": True}, False),
+             ("close_missing", {"close_missing": True}, False), ("close_ignored", {"close_ignored": True}, False),
+             ("late_session", {"session_after": 12.0}, True))
+    for name, kw, expect_ok in cases:
+        w = FakeWorld(kw.get("dupes", False), close_missing=kw.get("close_missing", False), close_ignored=kw.get("close_ignored", False),
+                      session_after=kw.get("session_after", 0.0))
         nvs = [FakeNv(w, i) for i in range(3)]
-
-        def ask(msg: str, w=w) -> None:
-            w.open[1] = False
-            w.holder = None
-
         quiet = lambda *_a, **_k: None
-        p = Proof(nvs, w.sleep, w.container, "Stimpak", log=quiet, ask=ask)
+        p = Proof(nvs, w.sleep, w.container, "Stimpak", log=quiet)
         passed = p.run() == 0
-        print(f"selftest dupes={dupes}: script said {'PASS' if passed else 'FAIL'} (expected {'PASS' if expect_ok else 'FAIL'}), {p.passes} checks, {len(p.failures)} failed")
+        print(f"selftest {name}: script said {'PASS' if passed else 'FAIL'} (expected {'PASS' if expect_ok else 'FAIL'}), {p.passes} checks, {len(p.failures)} failed")
         if passed != expect_ok:
             rc = 1
+    if rc == 0 and not MUTANT:   # twin: a script that checks the session before the guests joined must be noticed by the late_session world
+        cp = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()), "--selftest"], capture_output=True, text=True,
+                            env=dict(os.environ, LOOT_PROOF_MUTANT="no_session_wait"))
+        if cp.returncode == 0:
+            print("selftest: the no_session_wait twin was not caught (a join still in progress must not fail the module step)")
+            rc = 1
     if rc == 0:
-        print("selftest: ok (the duplicating world is caught by the race step)")
+        print("selftest: ok (the duplicating world and both broken menu closes are caught)")
     return rc
 
 
@@ -278,8 +324,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools" / "runner"))
     from nvbridge import NvBridge  # noqa: E402
+    import nvready  # noqa: E402
+
     nvs = [NvBridge.connect(instance=i, wait_s=10) for i in a.instances]
     try:
+        why = nvready.wait_ready(nvs)
+        if why:
+            print("cannot reach the game instances: " + why)
+            return 2
         return Proof(nvs, time.sleep, a.container, a.item).run()
     finally:
         for nv in nvs:

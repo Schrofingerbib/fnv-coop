@@ -34,6 +34,7 @@ struct HostRig {
     std::set<PlayerId> joined{1, 2};
     std::map<PlayerId, RefId> puppets{{1, 0x1001}, {2, 0x1002}};
     std::map<PlayerId, RefId> ghosts;
+    std::vector<std::tuple<PlayerId, ActorMode, RefId>> modes;                              // HostDeps::actorMode reports (the module logs them)
     std::vector<std::pair<FormRef, PlayerId>> dialogues;
     std::function<bool(PlayerId, const FormRef&)> allowActivation;                         // plugin/companions question (empty = allow)
     std::vector<std::tuple<PlayerId, bool, FormRef>> interactions;                           // plugin/companions report: (slot, pickup, target)
@@ -63,6 +64,7 @@ struct HostRig {
         };
         d.puppetOf = [this](PlayerId s) { auto it = puppets.find(s); return it == puppets.end() ? RefId(0) : it->second; };
         d.ghostOf = [this](PlayerId s) { auto it = ghosts.find(s); return it == ghosts.end() ? RefId(0) : it->second; };
+        d.actorMode = [this](PlayerId s, ActorMode m, RefId a) { modes.emplace_back(s, m, a); };
         d.joined = [this](PlayerId s) { return joined.count(s) != 0; };
         d.dialogueStart = [this](const FormRef& n, PlayerId s) { dialogues.emplace_back(n, s); };
         d.allowActivation = [this](PlayerId s, const FormRef& t) { return !allowActivation || allowActivation(s, t); };

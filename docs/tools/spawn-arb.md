@@ -105,7 +105,7 @@ Each must make its suite fail; `run_tests.cmd` checks that.
 
 ## In-game proof (for the helper)
 Precondition: 2 or 3 instances in one session, standing together in an exterior cell, `[live] spawns=1 actors=1`, `[actors] engine=1`.
-1. `python -I plugin/spawn/tools/spawn_proof.py --instances 0 1 2 --base RadRoach --type 60 --respawn` (verify the EditorID with the console first).
+1. `python -I plugin/spawn/tools/spawn_proof.py --instances 0 1 2 --base 0001CF7C --type 60 --respawn` (a hex FormID, CrRadroach; the bridge console does not resolve editor ids, and a refused roll is reported as such).
    PASS = every step prints PASS and the exit code is 0.
 2. By hand: `coop.spawn {}` on each instance (link true, same `digest`), `coop.spawn {"list":true}` (same state / owner / epoch / members per site),
    `coop.owner {"ref":"fnvcoop.created:FFC00001"}` for an issued id.

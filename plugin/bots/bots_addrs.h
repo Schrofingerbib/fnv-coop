@@ -93,8 +93,13 @@ inline constexpr CallPin VatsQueueCount = {"VatsQueueCount", 0x5AE380U, {0x55, 0
 inline constexpr CallPin VatsExecute = {"VatsExecute", 0x705780U, {0x55, 0x8b, 0xec, 0x83, 0xec, 0x0c, 0xe8, 0x85, 0x1a, 0xdb, 0xff, 0x85, 0xc0, 0x74, 0x65, 0xe8}, 0};
 inline constexpr unsigned VatsMenuVtbl = 0x10700D4U;   // VATSMenu vftable (RTTI COL 0x1118558); slot 13 (+0x34) GetID 0x720100 returns 0x420
 inline constexpr unsigned kMenuSlotGetId = 0x34U;
+// ---- bot.menu.close (static RE on the 1.4.0.525 exe, same pin as plugin/hooks_ui and plugin/intents). cdecl void(), plain ret. It is what the CloseAllMenus
+// script command calls: if the InterfaceManager exists and 0x9373F0 says a menu is up, it calls InterfaceManager::CloseAllMenus (0x714C60), which walks the menu
+// stack at InterfaceManager+0x114 (10 slots, top first), looks each menu up with GetMenuByType (0xA09030) and calls the menu vtable slot 0 with 1 (close).
+// That is the same path the game takes when the player leaves the container menu with Tab or B.
+inline constexpr CallPin CloseAllMenusCore = {"CloseAllMenusCore", 0x7037E0U, {0x55, 0x8b, 0xec, 0xe8, 0x28, 0x3a, 0xdb, 0xff, 0x85, 0xc0, 0x74, 0x1f, 0xe8, 0x1f, 0x3a, 0xdb}, 0};
 inline constexpr const CallPin* kAllCalls[] = {&PlayerCanTravel, &PendingTravelSet, &TravelObjCtor, &HeapAlloc, &TermClick, &GetContainerData, &ItemTotal, &TopMenuId, &LbSelect, &LbSelected, &ItemInfo, &InfoFlag80, &InfoSpecialB, &InfoSpecialC, &DlgItemClick, &LbAfter, &DlgSpeak, &Tick, &MsgMenuHandleClick,
-                                               &GetMenuByType, &TutorialClose, &VatsMenuHandleClick, &VatsQueueCount, &VatsExecute};
+                                               &GetMenuByType, &TutorialClose, &VatsMenuHandleClick, &VatsQueueCount, &VatsExecute, &CloseAllMenusCore};
 // ---- data pins: a dword in the exe image that must hold `value` (vtable slots in .rdata). Checked at init with the call pins.
 struct DataPin { const char* name; unsigned addr; unsigned value; };
 inline constexpr DataPin MsgMenuSlotHandleClick = {"MessageMenu.vtbl[3]", MessageMenuVtbl + kMenuSlotHandleClick, 0x7AA070U};

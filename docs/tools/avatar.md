@@ -10,10 +10,10 @@ and a slot -> puppet ref map (the "ghost-ref map" of the acting-player design, `
 - `plugin\avatar\run_tests.cmd` (one command, ends in `avatar: ALL OK`). It builds standalone in `%TEMP%\nvav_build` (Ninja, 2 jobs,
   takes `out\locks\build.lock` only while compiling) and then runs:
   1. `python -I tools/avatar/check_groups.py` (+ its `--mutant`): `avatar_groups.h` equals the generated xNVSE group table.
-  2. `avatar_tests`: the suite, then the whole suite once per runtime mutation twin (25 twins, each must fail at least one check).
+  2. `avatar_tests`: the suite, then the whole suite once per runtime mutation twin (37 twins, each must fail at least one check).
      `--no-twins`, `--twin NAME`, `--list-twins`, `--verbose` for debugging.
   3. `avatar_live_tests`: the driver on top of the REAL `synccore/live` (sender delta codec, lossy jittery link, receiver, InterpBuffer),
-     judged by game-free versions of the T7 detectors (slide, skate, T-pose proxy, float, jitter, rubber band, silence). 4 twins incl. two live-layer faults.
+     judged by game-free versions of the T7 detectors (slide, skate, T-pose proxy, float, jitter, rubber band, silence). 5 twins incl. two live-layer faults and the engine push.
   4. `python -I tools/avatar/proof_puppet.py --selftest`: the in-game proof's analysis and its assertions on synthetic T7 streams,
      with 5 injected-defect twins (never touches a game).
 - Added to the parent build with one line (`plugin/CMakeLists.txt` sub-directory list). The targets are `EXCLUDE_FROM_ALL`:
@@ -69,6 +69,13 @@ commands, animation re-assert after menus, speed matching, cell borders vs trans
 | 24 | spawn fails / 3D never arrives | backoff 0.5 s doubling to 8 s, `Failed` after 8 attempts, 3D timeout 5 s replaces the ref | `spawn_retry` | (covered by #1, counts) |
 | 25 | snap and physics push | snapped sample forces SetPos + animation; drift > 2 m is corrected and counted | `snap_and_drift` | |
 | 26 | script text must be exact | `ScriptPuppetEngine` pins every line | `script_backend`, `manager_on_script_backend` | |
+| 26b | a body in the way (the real player standing in the puppet) pushes the puppet hundreds of units, and the buffer eases it back from the pushed place | `PuppetManager::ActualPose` reports the last applied place when the engine place is farther than `driftUnits` (the same Tick's drift check then undoes the push with one `SetPos`); `avatar.status` counts `pushesIgnored` | `physics_push_not_adopted`; live: 4 pushes in the integration scenario (`shoveFrames`) | `adoptPhysicsPush` |
+
+Bench note (2026-10-23, `tools/bench/coop_bench.py` step walk): the client's puppet of the host jumped about 6 times a minute while the host walked, the host's puppet of the
+client never did. The step walk issues `player.SetPos` console lines; on the host those are captured and replayed on the guest (a guest's own `player.` lines are muted,
+`suppress_policy.cpp`), so the guest's real player is carried along and stands inside its puppet of the host. The engine pushes the two bodies apart and the old
+`ActualPose` handed the pushed place to `InterpBuffer`, which eased the puppet back over 0.3 to 0.6 s (a 2 to 10 m error is eased, not snapped). The fix above removes the
+easing; the carrying of the guest's player by the host's console lines is outside this module and is not changed here. UNVERIFIED in the game.
 
 Live integration (`avatar_live_tests`): a scripted 24 s owner (stand, run 300 u/s, sneak-walk, strafe, draw/aim, jump, 28 m teleport, 2 s silence)
 through the real codec, 0% and 10% loss, 3 seeds each. Asserted: no slide, no skate, no T-pose proxy, no float, no jitter, exactly one big jump (the teleport),
@@ -223,7 +230,7 @@ counters of `avatar.status` (no console exceptions, no refused foreign write, no
 **Everything below is unit tested on a fake game / a simulated network and compiles into nvcoop.dll. NOTHING of it has run in the game.**
 Run: `plugin\avatar\full\run_tests.cmd` (one command, ends in `avatar full: ALL OK`; registered in `tools/test_all.py` as "M2 avatar full"). It builds in the
 shared tree, runs the new 3-machine suite once for real and once per runtime twin (101..109), re-runs the suites that share the changed code (`avatar_tests`
-with 36 twins, `avatar_engine_tests` with 69 twins, dll-wiring's `nvcoop_live_tests` with 34 twins) and `tools/avatar/proof_avatars.py --selftest`.
+with 37 twins, `avatar_engine_tests` with 69 twins, dll-wiring's `nvcoop_live_tests` with 34 twins) and `tools/avatar/proof_avatars.py --selftest`.
 
 | Piece | Where | What it does |
 |---|---|---|
@@ -234,7 +241,7 @@ with 36 twins, `avatar_engine_tests` with 69 twins, dll-wiring's `nvcoop_live_te
 | The ghost-ref map | `plugin/avatar/avatar_api.h/.cpp` | `puppetRefOf(slot)`, `slotOfPuppet(ref)`, `actingRefOf(slot)` (the local slot answers the player's own ref 0x14, a remote slot its puppet), `slotOfActingRef(ref)`, `isPuppet`, `puppetCount`, `forEachPuppet`. Registered by the avatar module as a `ManagerDirectory` over the runtime's manager; answers live puppets only. dll-wiring's `GhostOf(slot)` and `setPlayerRefMap` can call these instead of `avatar_glue.h`. |
 | Lifecycle | tests (`full/tests/test_full.cpp`) plus two real fixes | join, leave, rejoin, interior (parked), exterior neighbour cell (SetPos only, same object), another worldspace (parked), host load (orphans purged, one puppet per player), client load, link loss. Fixed on the way: equipment that arrived before the runtime existed was dropped (now remembered and replayed); a look change used to respawn the puppet. |
 | Bridge | `win/avatar_module.cpp` | new: `avatar.api`, `avatar.look`, `avatar.puppetlook {slot}`, `avatar.hit {slot, damage, limb?, attackerRef?}`; `coop.live` -> `avatars` now carries per slot `tier`, `rx` (accepted snapshots, the proof turns the difference into a rate), `lookInfo`, and `selfLook`. |
-| In-game proof | `tools/avatar/proof_avatars.py` (WRITTEN, NOT RUN) | Two instances: wiring, look (sent equals stored, puppet gear and weapon mods read back), rates (15..24 Hz near, 3.5..7.5 Hz after a 60 m teleport, near again), lifecycle (interior park, come back, client load, no orphan), hits (router forwarded, the client's combat counters). `--selftest` runs it against a scripted fake game with 16 injected defects (all caught). |
+| In-game proof | `tools/avatar/proof_avatars.py` (WRITTEN, NOT RUN) | Two instances: wiring, look (sent equals stored, puppet gear and weapon mods read back), rates (15..24 Hz near, 3.5..7.5 Hz after a 60 m teleport, near again), lifecycle (interior park, come back, client load, no orphan), hits (router forwarded, the client's combat counters). `--selftest` runs it against a scripted fake game with 24 injected defects, 8 of them in the scripted loadout (all caught). |
 
 ### New traps, test, twin
 
@@ -283,3 +290,15 @@ with 36 twins, `avatar_engine_tests` with 69 twins, dll-wiring's `nvcoop_live_te
   unit tested on a fake game (59 tests, 540 checks, 63 twins). The game side compiles into nvcoop.dll. Every pinned address is proven against the
   reference exe (24 checks); what the engine DOES when called that way (PlaceAtMe of the template, SetPos on a restrained actor, SetAlert drawing a weapon,
   the group numbering, the cost of a line, the cell map walk, the worn-item walk) is unknown until `proof_puppet.py --loopback` has run once.
+
+### Scripted client loadout for the look phase (replaces the hand step "give the client armor and a modified weapon")
+
+`tools/avatar/proof_avatars.py` has `--loadout auto|off` (default `auto`, applied when the look phase runs) with `--armor`, `--weapon`, `--weapon-mod` and `--mod-flags`. On the CLIENT it runs
+`player.additem` and `player.EquipItem` for the armor and the weapon, then the xNVSE function `player.SetEquippedWeaponModFlags <flags>` (xNVSE `Commands_Inventory.cpp`, flags 0..7, bit n-1 = mod
+slot n) on the worn weapon, and reads each step back: `player.GetEquipped`, `player.GetEquippedWeaponModFlags`, then the avatar layer's own `avatar.look` (worn item with `mods` equal to the flags).
+The look phase additionally FAILS (it no longer passes silently) if the client holds no modified weapon or no armor. Defaults, from `out/questdata/forms.json.gz`: armor `FalloutNV.esm:1264FE`
+(ArmorLeatherReinforced, ARMO), weapon `FalloutNV.esm:0CD539` (WeapNVTrailCarbine, WEAP), mod `FalloutNV.esm:0EEA70` (ModNVTrailCarbineScope, IMOD, the one IMOD of that dump whose name pairs with a WEAP),
+flags 1. There is no console function that attaches an IMOD to an inventory item (`AttachModToInventoryItem` is in neither the vanilla command table nor the xNVSE source of this repo; only
+`EnableWeaponMod`, whose meaning is still the open hypothesis above), so the flag byte is set directly: it is exactly what the avatar layer reads (`ExtraWeaponModFlags` of the worn instance) and syncs.
+Risk to read first: `SetEquippedWeaponModFlags` returns silently when the equipped item has no extra-data list; the read-back line then fails with "read back 0 wanted 1". Twins in the self-test:
+loadout skipped, `additem` refused, weapon or armor not equipped, flags line without effect, flags set but not visible to the avatar layer, wrong flags.

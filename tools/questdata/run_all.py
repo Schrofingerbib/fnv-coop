@@ -9,7 +9,8 @@ args = sys.argv[1:]
 extract.main(args)
 out = args[args.index('--out') + 1] if '--out' in args else None
 sub = ['--in', out, '--out', out] if out else []
-effects.main(sub + (['--data', args[args.index('--data') + 1]] if '--data' in args else []))
+data = ['--data', args[args.index('--data') + 1]] if '--data' in args else []
+effects.main(sub + data)
 classify.main(sub)
 scenarios.main(sub)
-m1.main(sub)
+m1.main(sub + data)     # m1 resolves form signatures from the game files; without --data it used the default path

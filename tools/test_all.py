@@ -30,9 +30,13 @@ SUITES = [
     ("lint split string literals", [sys.executable, "-I", "tools/lint/fix_newline_literals.py", "--check"], False, NO),
     ("lint tool tests (+ twin)", [sys.executable, "-I", "tools/lint/test_fix_newline_literals.py", "--twin"], False, NO),
     ("lint every Python file parses", [sys.executable, "-I", "tools/lint/check_py_compiles.py"], False, NO),
+    ("lint loot service is in the live hub (+ twins)", [sys.executable, "-I", "tools/lint/check_loot_wiring.py", "--self-test"], False, NO),
+    ("lint loot service wiring", [sys.executable, "-I", "tools/lint/check_loot_wiring.py"], False, NO),
+    ("lint workflow inputs stay out of run scripts, soak seed and count checked (+ twins)", [sys.executable, "-I", "tools/lint/check_workflow_inputs.py", "--self-test"], False, NO),
+    ("lint workflow inputs", [sys.executable, "-I", "tools/lint/check_workflow_inputs.py"], False, NO),
     ("test_all preflight", [sys.executable, "-I", "tools/test_all_selftest.py"], False, NO),
     ("canonical nvcoop.dll build", ["cmd", "/c", r"tools\runner\build_l1.cmd"], True, CM),
-    ("T5 chaos box", [sys.executable, "-I", "tools/chaos/run_tests.py"], False, NO),
+    ("T5 chaos box (+ chaos_pair: a pair joined through the relay)", [sys.executable, "-I", "tools/chaos/run_tests.py"], False, NO),
     ("L3 questdata", [sys.executable, "-I", "tools/questdata/run_tests.py"], False, NO),
     ("L7 snapshot", [sys.executable, "-I", "plugin/snapshot/tools/run_tests.py", "--no-engine"], False, MS_OPT),
     ("L9 coverage", [sys.executable, "-I", "tools/coverage/run_tests.py"], False, NO),
@@ -46,6 +50,8 @@ SUITES = [
     ("Live wiring in-game proof (selftest + injected defects)", [sys.executable, "-I", "tools/runner/live_wiring_proof.py", "--selftest"], False, NO),
     ("Release: installer, uninstaller, packager (fake game folder + twins)", [sys.executable, "-I", "tools/installer/run_tests.py"], False, NO),
     ("Release: launcher (settings, nvcoop.ini, port checks, start; + twins)", [sys.executable, "-I", "tools/launcher/run_tests.py"], False, NO),
+    ("Proof harness: prove.py classifier, packet, ledger, owner-PC safety, --pairs scheduler, RAM guard (fake worlds, stub runners + 22 twins)", [sys.executable, "-I", "tools/proof/tests/run_tests.py"], False, NO),
+    ("Proof drivers: release .cmd scripts, launcher loopback, public tree build, split-screen smoke (fake runners, damaged-release and launcher-fault twins + 5 twins)", [sys.executable, "-I", "tools/proof/drivers/tests/run_tests.py"], False, NO),
     ("T4b scenarios", [sys.executable, "-I", "-X", "utf8", "tools/scenarios/run_tests.py"], False, NO),
     ("T1b flight analyzer (fast)", [sys.executable, "-I", "tools/flight/run_tests.py"], False, NO),
     ("T1b flight analyzer (full + mutation twin)", [sys.executable, "-I", "tools/flight/run_tests.py", "--full"], True, NO),
@@ -88,6 +94,9 @@ SUITES = [
     ("social-core (companions, crime, kill rewards: rules + 66 runtime twins)", ["cmd", "/c", r"synccore\social\run_tests.cmd"], True, CM),
     ("companions-crime (SocialSync on 3 machines: companions, crime, kill rewards + 28 twins)", ["cmd", "/c", r"plugin\companions\run_tests.cmd"], True, CM),
     ("companions-crime in-game proof checker (selftest)", [sys.executable, "-I", "plugin/companions/proof/social_proof.py", "--selftest"], False, NO),
+    ("Readiness wait shared by prove.py and the proof scripts (+ twins, wiring of every script)", [sys.executable, "-I", "tools/runner/tests/test_nvready.py"], False, NO),
+    ("loot in-game proof checker (selftest + late-session twin)", [sys.executable, "-I", "plugin/loot/tools/loot_proof.py", "--selftest"], False, NO),
+    ("world-time in-game proof checker (selftest + press-blind twin)", [sys.executable, "-I", "plugin/world_time/tools/worldtime_proof.py", "--selftest"], False, NO),
     ("T1a flight recorder", ["cmd", "/c", r"plugin\flight\run_tests.cmd"], True, CM),
     ("T3b reload state", ["cmd", "/c", r"plugin\reload\run_tests.cmd"], True, CM),
     ("T3a loader", ["cmd", "/c", r"plugin\loader\run_tests.cmd"], True, CM),
@@ -116,6 +125,7 @@ NEEDS = {
 }
 
 MUTANT = os.environ.get("TEST_ALL_MUTANT", "")
+WINDOWS = sys.platform == "win32"   # MSVC and the build scripts (vcvars, build_l1.cmd) exist on Windows only
 
 # Public export: suites that need your own game install or generated game data skip with a reason instead of failing.
 # Each list holds every file the suite opens (found by reading its loaders and by tracing a run). A partial
@@ -139,6 +149,14 @@ NEEDS = {
     # (scenarios/VCG02.json: without it the jump tests fail on an assertion, not on a missing file)
     "T4b scenarios": (tuple(QD + f for f in ("forms.json.gz", "quests.json", "dials.json.gz", "infos.jsonl.gz",
                                              "m1_goodsprings.json", "scenarios/VCG02.json")), QUESTDATA),
+}
+
+
+# Suites that drive Windows processes themselves (kernel32 through ctypes, taskkill, the mbcs codec, C:\ paths), not
+# through MSVC: off Windows they skip with this reason instead of failing on the missing API.
+WINDOWS_ONLY = {
+    "Proof harness: prove.py classifier, packet, ledger, owner-PC safety, --pairs scheduler, RAM guard (fake worlds, stub runners + 22 twins)":
+        "prove.py watches and stops game processes through kernel32 and taskkill",
 }
 
 
@@ -194,6 +212,10 @@ def decide(name: str, slow: bool, tools: tuple, quick: bool, problems: dict):
     if missing:
         shown = ", ".join(missing[:3]) + (f" and {len(missing) - 3} more" if len(missing) > 3 else "")
         return "skip", f"{NEEDS[name][1]}. Missing: {shown}"
+    if not WINDOWS and MUTANT != "no_platform_skip" and any(t in ("cmake", "msvc") for t in required_tools(slow, tools)):
+        return "skip", f"needs the MSVC/CMake toolchain, which is Windows only (this is {sys.platform})"
+    if not WINDOWS and MUTANT != "no_platform_skip" and name in WINDOWS_ONLY:
+        return "skip", f"{WINDOWS_ONLY[name]}, which is Windows only (this is {sys.platform})"
     reasons = [problems[t] for t in required_tools(slow, tools) if problems.get(t)]
     if reasons:
         return "fail", ". ".join(reasons)
@@ -295,6 +317,8 @@ def select_affected(files=None, base: str = "HEAD") -> list:
 def preflight(quick: bool, names=None) -> dict:
     """Checks only the tools that the suites of this run need (`names`: the suites picked by --affected / --only; default all).
     Prints one line per tool. Returns tool -> problem."""
+    if not WINDOWS and MUTANT != "no_platform_skip":
+        return {}   # decide() skips every suite that needs the toolchain, with the reason; nothing to check here
     users = {}
     for name, _, slow, tools in SUITES:
         if names is not None and name not in names:
