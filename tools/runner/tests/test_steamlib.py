@@ -210,7 +210,8 @@ class SteamLib(unittest.TestCase):
         """`python -I tools/runner/steamlib.py ...` as a real process: -I leaves tools/runner off sys.path."""
         d = Deck(self.base)
         env = {k: v for k, v in os.environ.items() if not k.startswith("FNV_")}
-        for what, extra, want in (("game", {"HOME": str(d.home)}, d.game),
+        home = {"HOME": str(d.home), "USERPROFILE": str(d.home)}   # Path.home(): HOME off Windows, USERPROFILE on it
+        for what, extra, want in (("game", home, d.game),
                                   ("documents", {"FNV_DOCUMENTS_DIR": str(d.docs)}, d.docs.resolve())):
             with self.subTest(what=what):
                 r = subprocess.run([sys.executable, "-I", str(HERE.parent / "steamlib.py"), what], env={**env, **extra},
