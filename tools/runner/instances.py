@@ -28,7 +28,9 @@ instances 2k (host) and 2k+1 (client) on co-op port <port-base>+k (default 27960
 Without --pairs the port is not written and every client joins the plugin's default port, as before. With --pairs,
 --ini coop.port / coop.host are an error (exit 2), and --n must match or be left out. show and destroy take --pairs too.
 
-Environment overrides: FNV_GAME_DIR, FNV_INSTANCES_ROOT.
+Environment overrides: FNV_GAME_DIR, FNV_INSTANCES_ROOT. Without FNV_GAME_DIR the game is the Steam default in Program
+Files on Windows, and the install in a Steam library under the home folder elsewhere (steamlib.py); the owner's INIs then
+come from the game's Proton prefix (mygames.py), so a Steam Deck needs neither FNV_GAME_DIR nor FNV_DOCUMENTS_DIR.
 """
 from __future__ import annotations
 
@@ -46,6 +48,7 @@ from typing import Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mygames  # noqa: E402
 import pairs  # noqa: E402
+import steamlib  # noqa: E402
 
 DEFAULT_GAME = r"C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas"
 DEFAULT_ROOT = str(Path(__file__).resolve().parents[3] / "fnv-instances")
@@ -60,7 +63,11 @@ LINK_MODES = ("hardlink", "symlink", "copy")
 
 
 def game_dir() -> Path:
-    return Path(os.environ.get("FNV_GAME_DIR", DEFAULT_GAME))
+    env = os.environ.get("FNV_GAME_DIR")
+    if env:
+        return Path(env)
+    found = steamlib.find_game() if steamlib.OFF_WINDOWS else None
+    return found or Path(DEFAULT_GAME)
 
 
 def instances_root() -> Path:

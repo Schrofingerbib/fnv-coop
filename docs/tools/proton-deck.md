@@ -46,14 +46,16 @@ game-free work (see `docs/tools/linux-dev.md`).
 
 ## Each time the plugin or the settings change: provision two copies
 ```
-export FNV_GAME_DIR=~/.steam/steam/steamapps/common/"Fallout New Vegas"
-export FNV_DOCUMENTS_DIR=~/.steam/steam/steamapps/compatdata/22380/pfx/drive_c/users/steamuser/Documents
 export NVCOOP_VISIBLE=1
 python -I tools/runner/instances.py provision --n 2 --nvse-dir out/cache/deps/nvse --no-dxvk --ini coop.enable=1 --ini coop.baseline=1 --ini coop.handshake=1 --ini coop.dialogue=1 --ini live.avatars=1 --ini dev.bots=1 --ini dev.animprobe=1
 ```
 - The copies go to `fnv-instances` next to the checkout. Every game file is hardlinked, so the copies take almost no disk
   space, and nothing is written to the Steam folder.
-- `FNV_DOCUMENTS_DIR` points provision at the prefix's Documents. Without it, provision stops with `PrefsUnavailable`.
+- Provision finds the game and its Proton prefix by itself (`tools/runner/steamlib.py`): the Steam libraries under your
+  home folder, an SD card library included, and the prefix in the game's library. Your INIs come from the prefix's
+  Documents. If the game is somewhere Steam doesn't list, set `FNV_GAME_DIR` to the game folder, and `FNV_DOCUMENTS_DIR`
+  to the folder that has `My Games/FalloutNV` if the prefix isn't next to it. If the game never ran under Proton (no
+  prefix yet), provision stops with `PrefsUnavailable`: start it once through Steam first.
 - `NVCOOP_VISIBLE=1`: without it the copies start minimized.
 - `coop.baseline=1 handshake=1 dialogue=1` are the player launcher's session defaults (`tools/launcher/fnv_launcher_core.py`),
   so the copies run what players run. Without `baseline=1` the host's desync repair stops quests on the client that
