@@ -13,7 +13,11 @@ RAIDERS = ["FalloutNV.esm:A00001", "FalloutNV.esm:A00002", "FalloutNV.esm:A00003
 
 def volley(ctx: Ctx, target: str, max_volleys: int = 12) -> None:
     """Every machine aims at the same actor and fires, at the same time, until it is dead on every machine."""
+    from .pb_enemy import standoff     # at call time: pb_enemy imports this module
     ctx.equip_all()
+    # The scenario's setup MoveTo puts the players on the first raider, and gather() leaves a player within its distance alone
+    # (in game under Proton 2026-10-25: "host could not shoot ...104C70: too_close: the player is 4 units from the target").
+    standoff(ctx, target, list(ctx.machines))
     for _ in range(max_volleys):
         def shoot(m: Machine):
             r = m.bot.aim_at(target)

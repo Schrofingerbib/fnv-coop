@@ -248,6 +248,37 @@ class PlacementWalks(unittest.TestCase):
                 self.assertIn("walks to", r.reason)
 
 
+class FightStandoff(unittest.TestCase):
+    """In game under Proton 2026-10-25 the fight stopped at "both kill raider 1": the scenario's setup MoveTo had put the host on the
+    raider, gather() left it there (within its 600 units) and Bot.aim_at refused, "too_close: the player is 4 units from the target
+    (minimum 100)". volley() now steps every shooter back first (pb_enemy.standoff), as enemy_fight already did."""
+
+    def go(self, no_standoff=False):
+        from playbooks import pb_enemy
+        e = registry.REGISTRY["fight"]
+        w, refs = e.fake(e.players, set())
+        w.stand_on_target, w.aim_min_dist = True, 100.0       # the in-game situation: players on the raider, the real aim limit
+        d = tempfile.mkdtemp(prefix="t6b-")
+        atexit.register(shutil.rmtree, d, True)
+        w.flight_dir = os.path.join(d, "flight")
+        orig = pb_enemy.standoff
+        if no_standoff:        # twin: the old volley, which shot from wherever the placement left the player
+            pb_enemy.standoff = lambda ctx, target, shooters: None
+        try:
+            return core.run_playbook(registry.make("fight", REPO), fakecoop.make_machines(w), fakecoop.FakeComparer(), d, refs, dict(OPTS))
+        finally:
+            pb_enemy.standoff = orig
+
+    def test_players_on_the_raider_step_back_and_the_fight_passes(self):
+        r = self.go()
+        self.assertTrue(r.ok, r.reason)
+
+    def test_twin_without_the_standoff_the_fight_fails_too_close(self):
+        r = self.go(no_standoff=True)
+        self.assertFalse(r.ok, "the fight passed with the players standing on the raider")
+        self.assertIn("too_close", r.reason)
+
+
 CHAOS = dict(chaos_adapter.relaxed_options("bad_wifi"), settle_s=0.3, ui_s=0.2, barrier_s=0.3, stage_s=0.3,
              handoff_s=0.2, spawn_s=0.2, chaos="bad_wifi")
 LOSS = 1     # every first delivery is lost once: even single-commit playbooks see drops
