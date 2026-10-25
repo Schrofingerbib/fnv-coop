@@ -95,6 +95,7 @@ SUITES = [
     ("companions-crime (SocialSync on 3 machines: companions, crime, kill rewards + 28 twins)", ["cmd", "/c", r"plugin\companions\run_tests.cmd"], True, CM),
     ("companions-crime in-game proof checker (selftest)", [sys.executable, "-I", "plugin/companions/proof/social_proof.py", "--selftest"], False, NO),
     ("Readiness wait shared by prove.py and the proof scripts (+ twins, wiring of every script)", [sys.executable, "-I", "tools/runner/tests/test_nvready.py"], False, NO),
+    ("Proton launch scripts: Steam launch option and in-session runner (stubbed Steam client + 7 twins)", [sys.executable, "-I", "tools/runner/tests/test_proton_scripts.py"], False, NO),
     ("loot in-game proof checker (selftest + late-session twin)", [sys.executable, "-I", "plugin/loot/tools/loot_proof.py", "--selftest"], False, NO),
     ("world-time in-game proof checker (selftest + press-blind twin)", [sys.executable, "-I", "plugin/world_time/tools/worldtime_proof.py", "--selftest"], False, NO),
     ("T1a flight recorder", ["cmd", "/c", r"plugin\flight\run_tests.cmd"], True, CM),
