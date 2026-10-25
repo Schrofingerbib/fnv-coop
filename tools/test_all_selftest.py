@@ -9,7 +9,9 @@
 4. Without out/questdata, or with only part of it, the suites that read it (T6b, T4b, L8) SKIP with the command that
    generates it and the names of the missing files.
 5. Off Windows (no MSVC, no vcvars, no build_l1.cmd) the suites that need CMake or MSVC SKIP with that reason instead of FAIL.
-Twins (TEST_ALL_MUTANT): no_preflight, no_questdata_gate, questdata_one_file, no_vcvars_check, tools_from_quick, no_platform_skip.
+6. With out/questdata present, main() runs the suites that read it (it used to die on a leftover check of an older NEEDS table).
+Twins (TEST_ALL_MUTANT): no_preflight, no_questdata_gate, questdata_one_file, no_vcvars_check, tools_from_quick, no_platform_skip,
+stale_needs_check.
 Each must make the Behaviour tests fail.
 Run: python -I tools/test_all_selftest.py   (prints ALL OK)
 """
@@ -31,7 +33,8 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import test_all  # noqa: E402
 
-MUTANTS = ("no_preflight", "no_questdata_gate", "questdata_one_file", "no_vcvars_check", "tools_from_quick", "no_platform_skip")
+MUTANTS = ("no_preflight", "no_questdata_gate", "questdata_one_file", "no_vcvars_check", "tools_from_quick", "no_platform_skip",
+           "stale_needs_check")
 DATA_SUITES = ("T6b co-op playbooks", "T4b scenarios", "L8 dialogue")
 SUITE = {name: (slow, tools) for name, _, slow, tools in test_all.SUITES}
 OK_TOOLS = {"cmake": "", "msvc": ""}
@@ -294,6 +297,20 @@ class Behaviour(unittest.TestCase):
                     self.assertIn(f, reason)
                 finally:
                     (self.empty / (f + ".off")).rename(self.empty / f)
+
+    def test_main_runs_the_data_suites_when_questdata_is_there(self):
+        # decide() said "run" all along, but main() then died on "'tuple' object is not callable" (on Linux, Proton test 2026-10-25),
+        # so test_all could not run at all once out/questdata existed. The suites' own commands are stubs here.
+        self.with_all_data()
+        stub = [sys.executable, "-c", "print('Ran 1 test')"]
+        suites = [(name, stub, False, test_all.NO) for name in DATA_SUITES]
+        out = io.StringIO()
+        with mock.patch.object(test_all, "SUITES", suites), mock.patch.object(test_all, "preflight", lambda quick, names=None: {}), \
+                mock.patch.object(sys, "argv", ["test_all.py", "--quick"]), redirect_stdout(out):
+            rc = test_all.main()
+        for name in DATA_SUITES:
+            self.assertIn(f"PASS {name}", out.getvalue())
+        self.assertEqual(rc, 0, out.getvalue())
 
 
 def run_twin(mutant: str) -> int:

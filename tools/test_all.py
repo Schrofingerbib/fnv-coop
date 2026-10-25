@@ -112,18 +112,6 @@ SUITES = [
 
 import re
 
-# Public export: suites that need your own game install or generated game data skip with a reason instead of failing.
-def _data(*parts):
-    return (ROOT.joinpath(*parts)).exists()
-
-
-NEEDS = {
-    "L6 nvmp sigs (pinned 9.4)": (lambda: _data("third_party", "nvmp", "nvmp", "client.dll"),
-                                  "needs your own NV:MP 9.4 client.dll under third_party/nvmp/nvmp/"),
-    "L8 dialogue": (lambda: _data("out", "questdata", "risk.json"),
-                    "needs out/questdata (python -I tools/questdata/run_all.py) and an MSVC x86 toolchain"),
-}
-
 MUTANT = os.environ.get("TEST_ALL_MUTANT", "")
 WINDOWS = sys.platform == "win32"   # MSVC and the build scripts (vcvars, build_l1.cmd) exist on Windows only
 
@@ -375,10 +363,13 @@ def main() -> int:
             print(f"FAIL {name}: {reason}")
             failed.append(name)
             continue
-        need = NEEDS.get(name)
-        if need and not need[0]():
-            print(f"SKIP {name}: {need[1]}")
-            continue
+        # The data check is decide()'s (missing_data). A second check here called NEEDS[name][0]() from an older NEEDS of lambdas, and
+        # NEEDS now maps to file lists: with out/questdata present every data suite died on "'tuple' object is not callable".
+        if MUTANT == "stale_needs_check":  # twin: the old check
+            need = NEEDS.get(name)
+            if need and not need[0]():
+                print(f"SKIP {name}: {need[1]}")
+                continue
         t0 = time.time()
         p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, errors="replace")
         out = p.stdout + p.stderr
