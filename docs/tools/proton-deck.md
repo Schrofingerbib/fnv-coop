@@ -33,7 +33,8 @@ game-free work (see `docs/tools/linux-dev.md`).
    The tools only need `drive_c/Python311/python.exe`. Run again over an existing install, the installer can fail with
    0x36b7; if `python.exe` is there, that's fine. `tools/runner/steamlib.py` prints the game's Proton prefix (`prefix`),
    the game folder (`game`) or the prefix's Documents (`documents`), wherever Steam installed the game (an SD card
-   too), so the commands here work as written for any library.
+   too; `documents` is `FNV_DOCUMENTS_DIR` when you set it, as for provision), so the commands here work as written
+   for any library.
 3. **xNVSE 6.4.9 and the quest data**, from the checkout:
    ```
    python -I tools/runner/fetch_deps.py

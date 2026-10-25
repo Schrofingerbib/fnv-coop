@@ -105,11 +105,25 @@ def find_documents(home: Optional[Path] = None, game: Optional[Path] = None) -> 
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Print one path, for shell commands that need it (docs/tools/proton-deck.md): `game` (the game folder), `prefix`
-    (its Proton prefix, pfx) or `documents` (the prefix's Documents). FNV_GAME_DIR, when set, is the game."""
+    (its Proton prefix, pfx) or `documents` (the Documents provision reads: FNV_DOCUMENTS_DIR when set, else the
+    prefix's). FNV_GAME_DIR, when set, is the game."""
     import argparse
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("what", choices=("game", "prefix", "documents"))
     a = ap.parse_args(argv)
+    if a.what == "documents" and os.environ.get("FNV_DOCUMENTS_DIR", "").strip():
+        sys.path.insert(0, str(Path(__file__).resolve().parent))   # python -I leaves the script's folder off the path
+        import mygames   # the same override parsing as mygames.documents_dir(), which provision uses
+        try:
+            path = mygames.normalize_override(os.environ["FNV_DOCUMENTS_DIR"])
+        except ValueError as e:
+            print(f"steamlib: {e}", file=sys.stderr)
+            return 1
+        if not path.is_dir():
+            print(f"steamlib: FNV_DOCUMENTS_DIR {path} doesn't exist", file=sys.stderr)
+            return 1
+        print(path)
+        return 0
     game = Path(os.environ["FNV_GAME_DIR"]) if os.environ.get("FNV_GAME_DIR") else find_game()
     if game is None:
         print("steamlib: no Steam install of Fallout: New Vegas under this home folder; set FNV_GAME_DIR", file=sys.stderr)

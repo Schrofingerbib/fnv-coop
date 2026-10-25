@@ -3,8 +3,9 @@ FNV_GAME_DIR nor FNV_DOCUMENTS_DIR. The fake home has the layout of a Deck with 
 Steam root lists the card in libraryfolders.vdf, the card has the game's appmanifest, the game and its prefix. A stale
 prefix in the Steam root (the game was moved) must not be picked.
 Twins: libraryfolders.vdf ignored, the prefix taken from the first library instead of the game's, the Windows
-Program Files default used off Windows, an old folder in an earlier library beating the manifest, and FNV_GAME_DIR
-without a prefix falling back to the found install's INIs must each fail the check.
+Program Files default used off Windows, an old folder in an earlier library beating the manifest, FNV_GAME_DIR
+without a prefix falling back to the found install's INIs, and `steamlib.py documents` ignoring FNV_DOCUMENTS_DIR
+must each fail the check.
 Run: python -I tools/runner/tests/test_steamlib.py
 """
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -86,13 +88,26 @@ def env_game_documents(deck: Deck) -> Path:
         return mygames.documents_dir()
 
 
-def run_cli(home: Path, argv: list):
+def run_cli(home: Path, argv: list, env: dict = None, main=None):
+    """steamlib.main(argv) (or `main`) with only the FNV_* variables in `env` set: (exit code, stdout)."""
     out = io.StringIO()
     with mock.patch.object(Path, "home", lambda *a: home), mock.patch.dict(os.environ), \
             contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
         os.environ.pop("FNV_GAME_DIR", None)
-        code = steamlib.main(argv)
+        os.environ.pop("FNV_DOCUMENTS_DIR", None)
+        os.environ.update(env or {})
+        code = (main or steamlib.main)(argv)
     return code, out.getvalue()
+
+
+def cli_documents_override_errors(deck: Deck, main=None) -> list:
+    """What `steamlib.py documents` gets wrong with FNV_DOCUMENTS_DIR set: it must print the folder provision reads."""
+    own = deck.home.parent / "own docs"
+    (own / "My Games" / "FalloutNV").mkdir(parents=True, exist_ok=True)
+    got = run_cli(deck.home, ["documents"], {"FNV_DOCUMENTS_DIR": str(own)}, main)
+    with mock.patch.object(Path, "home", lambda *a: deck.home), mock.patch.dict(os.environ, {"FNV_DOCUMENTS_DIR": str(own)}):
+        want = mygames.documents_dir()
+    return [] if got == (0, f"{want}\n") else [f"documents printed {got}, provision reads {want}"]
 
 
 class SteamLib(unittest.TestCase):
@@ -184,7 +199,31 @@ class SteamLib(unittest.TestCase):
                 self.assertEqual(run_cli(d.home, [what]), (0, f"{want}\n"))
         self.assertEqual(run_cli(self.base / "nobody", ["game"])[0], 1)
 
+    def test_cli_documents_follows_fnv_documents_dir(self):
+        """The doc's save copy reads from `documents`: with FNV_DOCUMENTS_DIR set, that folder, as provision (review)."""
+        d = Deck(self.base)
+        self.assertEqual(cli_documents_override_errors(d), [])
+        self.assertEqual(run_cli(d.home, ["documents"], {"FNV_DOCUMENTS_DIR": "relative/docs"})[0], 1)
+        self.assertEqual(run_cli(d.home, ["documents"], {"FNV_DOCUMENTS_DIR": str(self.base / "missing")})[0], 1)
+
+    def test_cli_runs_as_the_doc_runs_it(self):
+        """`python -I tools/runner/steamlib.py ...` as a real process: -I leaves tools/runner off sys.path."""
+        d = Deck(self.base)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("FNV_")}
+        for what, extra, want in (("game", {"HOME": str(d.home)}, d.game),
+                                  ("documents", {"FNV_DOCUMENTS_DIR": str(d.docs)}, d.docs.resolve())):
+            with self.subTest(what=what):
+                r = subprocess.run([sys.executable, "-I", str(HERE.parent / "steamlib.py"), what], env={**env, **extra},
+                                   capture_output=True, text=True, timeout=60)
+                self.assertEqual((r.returncode, r.stdout, r.stderr), (0, f"{want}\n", ""))
+
     # ---- twins
+    def test_twin_cli_documents_ignoring_the_override_is_caught(self):
+        def prefix_only(argv):   # the first version: always the prefix's Documents
+            print(steamlib.prefix_documents(steamlib.find_game()))
+            return 0
+        self.assertNotEqual(cli_documents_override_errors(Deck(self.base), prefix_only), [])
+
     def test_twin_first_library_folder_name_before_manifests_is_caught(self):
         def one_pass(home=None):   # the first version: each library's manifest, then its folder names, library by library
             for lib in steamlib.libraries(home):
