@@ -18,6 +18,7 @@ Every row is (file, section, key, value, why, status). status is
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -162,15 +163,23 @@ def prefs_startable(text: str) -> bool:
     return bool((instances.ini_get(text, "Display", "sD3DDevice") or "").strip())
 
 
+def provisioned_no_pad(instance_dir: Path) -> bool:
+    """Whether the copy was provisioned with --no-pad (its instance.json says so). False when there is no readable instance.json."""
+    try:
+        return bool(json.loads((Path(instance_dir) / "instance.json").read_text()).get("no_pad"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def restore(instance_dir: Path, check: bool = True) -> Dict[str, int]:
-    """Undo apply(): write the instance's two INIs exactly as provisioning writes them (instances.render_inis()).
+    """Undo apply(): write the instance's two INIs exactly as provisioning writes them (instances.render_inis()), --no-pad included.
 
     apply() touches only Fallout.ini and FalloutPrefs.ini, so only these two files are written. The same guard as
     apply() runs on both files before either is written: never the owner's My Games, the game dir, a hard link or a
     symlink. Returns {file: bytes written}. Idempotent. The pool calls it on every start with the profile off.
     """
     d = Path(instance_dir)
-    fresh = instances.render_inis()
+    fresh = instances.render_inis(no_pad=provisioned_no_pad(d))
     if set(fresh) != {FO, PR}:
         raise UnsafeTarget(f"render_inis() returned {sorted(fresh)}, expected {[FO, PR]}")
     if instances.ini_get(fresh[FO], "General", "bUseMyGamesDirectory") != "0":

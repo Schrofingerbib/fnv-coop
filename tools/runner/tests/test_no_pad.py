@@ -1,0 +1,113 @@
+"""provision --no-pad: the copies ignore game controllers (FalloutPrefs.ini [Interface] bDisable360Controller=1).
+In gamepad mode the game ignores the keyboard movement controls that bot.move holds. Under Proton on a Steam Deck, where
+Steam Input always answers as a pad, a 3 s bot.move forward moved the player 0 units; with the key set to 1, 1008 units
+(2026-10-25). Without --no-pad the owner's own value stays, so a person playing a copy keeps their controller.
+Twins: render_inis ignoring the flag, a restore that drops it, and a key written twice must each fail the check.
+Run: python -I -m unittest discover -s tools/runner/tests -p test_no_pad.py
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE.parents[1] / "pool"))
+import instances  # noqa: E402
+import lowcost  # noqa: E402
+
+KEY = ("Interface", "bDisable360Controller")
+
+
+def no_pad_errors(prefs: str) -> list:
+    """What is wrong with a FalloutPrefs.ini that should make the game ignore pads."""
+    errs = []
+    if instances.ini_get(prefs, *KEY) != "1":
+        errs.append(f"bDisable360Controller is {instances.ini_get(prefs, *KEY)!r}, not 1: the game stays in gamepad mode")
+    n = sum(1 for ln in prefs.splitlines() if ln.strip().lower().startswith("bdisable360controller"))
+    if n != 1:
+        errs.append(f"bDisable360Controller appears {n} times")
+    return errs
+
+
+class NoPad(unittest.TestCase):
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        self.game = root / "game"
+        self.game.mkdir()
+        (self.game / "FalloutNV.exe").write_bytes(b"MZ")
+        docs = root / "docs"
+        mg = docs / "My Games" / "FalloutNV"
+        mg.mkdir(parents=True)
+        (mg / "Fallout.ini").write_text("[General]\r\nbAlwaysActive=0\r\n", encoding="latin-1")
+        # as on the Deck: the owner's prefs have the key, set to 0
+        (mg / "FalloutPrefs.ini").write_text('[Display]\r\nsD3DDevice="Owner GPU"\r\n\r\n[Interface]\r\nbDisable360Controller=0\r\n'
+                                             'fDlgFocus=2.1000\r\n', encoding="latin-1")
+        self.root = root / "instances"
+        env = mock.patch.dict(os.environ, {"FNV_GAME_DIR": str(self.game), "FNV_DOCUMENTS_DIR": str(docs),
+                                           "FNV_INSTANCES_ROOT": str(self.root)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def provision(self, no_pad: bool) -> Path:
+        m = instances.provision(0, plugin_dll=None, no_pad=no_pad, root=self.root, appid=None)
+        return Path(m["dir"])
+
+    def test_no_pad_sets_the_key_once(self):
+        self.assertEqual(no_pad_errors(instances.render_inis(no_pad=True)["FalloutPrefs.ini"]), [])
+
+    def test_default_keeps_the_owners_value(self):
+        self.assertEqual(instances.ini_get(instances.render_inis()["FalloutPrefs.ini"], *KEY), "0")
+
+    def test_provision_writes_it_and_records_it(self):
+        d = self.provision(True)
+        self.assertEqual(no_pad_errors((d / "FalloutPrefs.ini").read_text(encoding="latin-1")), [])
+        self.assertIs(json.loads((d / "instance.json").read_text())["no_pad"], True)
+        d = self.provision(False)
+        self.assertEqual(instances.ini_get((d / "FalloutPrefs.ini").read_text(encoding="latin-1"), *KEY), "0")
+        self.assertIs(json.loads((d / "instance.json").read_text())["no_pad"], False)
+
+    def test_cli_passes_the_flag(self):
+        seen = []
+        fake = lambda i, **kw: seen.append(kw["no_pad"]) or {"dir": str(self.root / str(i)), "link_counts": {}}  # noqa: E731
+        with mock.patch.object(instances, "provision", fake), mock.patch("sys.stdout"):
+            self.assertEqual(instances.main(["provision", "--n", "1", "--plugin-dll", "", "--no-pad"]), 0)
+            self.assertEqual(instances.main(["provision", "--n", "1", "--plugin-dll", ""]), 0)
+        self.assertEqual(seen, [True, False])
+
+    def test_lowcost_restore_keeps_no_pad(self):
+        d = self.provision(True)
+        lowcost.restore(d, check=False)
+        self.assertEqual(no_pad_errors((d / "FalloutPrefs.ini").read_text(encoding="latin-1")), [])
+
+    def test_restore_without_instance_json_keeps_the_owners_value(self):
+        d = self.provision(True)
+        (d / "instance.json").unlink()
+        lowcost.restore(d, check=False)
+        self.assertEqual(instances.ini_get((d / "FalloutPrefs.ini").read_text(encoding="latin-1"), *KEY), "0")
+
+    # ---- twins
+    def test_twin_render_ignoring_the_flag_is_caught(self):
+        with mock.patch.object(instances, "NO_PAD_EDITS", []):
+            self.assertNotEqual(no_pad_errors(instances.render_inis(no_pad=True)["FalloutPrefs.ini"]), [])
+
+    def test_twin_restore_dropping_the_flag_is_caught(self):
+        d = self.provision(True)
+        with mock.patch.object(lowcost, "provisioned_no_pad", lambda _d: False):
+            lowcost.restore(d, check=False)
+        self.assertNotEqual(no_pad_errors((d / "FalloutPrefs.ini").read_text(encoding="latin-1")), [])
+
+    def test_twin_key_written_twice_is_caught(self):
+        prefs = instances.render_inis()["FalloutPrefs.ini"] + "\r\n[Interface]\r\nbDisable360Controller=1\r\n"
+        self.assertNotEqual(no_pad_errors(prefs), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
