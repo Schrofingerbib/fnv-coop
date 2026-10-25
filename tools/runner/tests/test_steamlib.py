@@ -2,12 +2,15 @@
 FNV_GAME_DIR nor FNV_DOCUMENTS_DIR. The fake home has the layout of a Deck with the game on an SD card library: the
 Steam root lists the card in libraryfolders.vdf, the card has the game's appmanifest, the game and its prefix. A stale
 prefix in the Steam root (the game was moved) must not be picked.
-Twins: libraryfolders.vdf ignored, the prefix taken from the first library instead of the game's, and the Windows
-Program Files default used off Windows must each fail the check.
+Twins: libraryfolders.vdf ignored, the prefix taken from the first library instead of the game's, the Windows
+Program Files default used off Windows, an old folder in an earlier library beating the manifest, and FNV_GAME_DIR
+without a prefix falling back to the found install's INIs must each fail the check.
 Run: python -I tools/runner/tests/test_steamlib.py
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -64,6 +67,32 @@ def deck_errors(deck: Deck) -> list:
     if docs != deck.docs:
         errs.append(f"Documents {docs}, want the game's prefix {deck.docs}" + (" (the stale one)" if docs == deck.stale_docs else ""))
     return errs
+
+
+def add_old_root_game(deck: Deck) -> None:
+    """What a moved game can leave behind: "Fallout New Vegas" with FalloutNV.exe in the Steam root, which has no manifest."""
+    old = deck.root / "steamapps" / "common" / "Fallout New Vegas"
+    old.mkdir(parents=True)
+    (old / "FalloutNV.exe").write_bytes(b"MZ")
+
+
+def env_game_documents(deck: Deck) -> Path:
+    """mygames.documents_dir() on the fake Deck with FNV_GAME_DIR set to another install that has no prefix."""
+    other = deck.home.parent / "elsewhere" / "steamapps" / "common" / "Fallout New Vegas"
+    other.mkdir(parents=True, exist_ok=True)
+    with mock.patch.object(Path, "home", lambda *a: deck.home), mock.patch.object(steamlib, "OFF_WINDOWS", True), \
+            mock.patch.dict(os.environ, {"FNV_GAME_DIR": str(other)}):
+        os.environ.pop("FNV_DOCUMENTS_DIR", None)
+        return mygames.documents_dir()
+
+
+def run_cli(home: Path, argv: list):
+    out = io.StringIO()
+    with mock.patch.object(Path, "home", lambda *a: home), mock.patch.dict(os.environ), \
+            contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        os.environ.pop("FNV_GAME_DIR", None)
+        code = steamlib.main(argv)
+    return code, out.getvalue()
 
 
 class SteamLib(unittest.TestCase):
@@ -135,7 +164,50 @@ class SteamLib(unittest.TestCase):
             self.assertEqual(instances.game_dir(), Path(instances.DEFAULT_GAME))
             self.assertEqual(mygames.documents_dir(), Path("W:/Docs"))
 
+    def test_manifest_beats_an_old_folder_in_an_earlier_library(self):
+        """The game moved to the card and left "Fallout New Vegas/FalloutNV.exe" in the root, which is listed first (review)."""
+        d = Deck(self.base)
+        add_old_root_game(d)
+        self.assertEqual(deck_errors(d), [])
+
+    def test_game_dir_env_without_a_prefix_takes_no_other_installs_inis(self):
+        """FNV_GAME_DIR names an install that never ran under Proton: the old home Documents fallback, not the Deck's (review)."""
+        d = Deck(self.base)
+        docs = env_game_documents(d)
+        self.assertNotIn(docs, (d.docs, d.stale_docs))
+        self.assertEqual(docs, d.home / "Documents")
+
+    def test_cli_prints_the_paths(self):
+        d = Deck(self.base)
+        for what, want in (("game", d.game), ("prefix", d.docs.parents[3]), ("documents", d.docs)):
+            with self.subTest(what=what):
+                self.assertEqual(run_cli(d.home, [what]), (0, f"{want}\n"))
+        self.assertEqual(run_cli(self.base / "nobody", ["game"])[0], 1)
+
     # ---- twins
+    def test_twin_first_library_folder_name_before_manifests_is_caught(self):
+        def one_pass(home=None):   # the first version: each library's manifest, then its folder names, library by library
+            for lib in steamlib.libraries(home):
+                inst = steamlib.fnv_find.parse_appmanifest_installdir(steamlib._read(lib / "steamapps" / "appmanifest_22380.acf"))
+                for name in ([inst] if inst else []) + list(steamlib.fnv_find.STEAM_NAMES):
+                    if (lib / "steamapps" / "common" / name / "FalloutNV.exe").is_file():
+                        return lib / "steamapps" / "common" / name
+            return None
+        d = Deck(self.base)
+        add_old_root_game(d)
+        with mock.patch.object(steamlib, "find_game", one_pass):
+            self.assertNotEqual(deck_errors(d), [])
+
+    def test_twin_env_game_falling_back_to_the_found_install_is_caught(self):
+        def with_fallback(home=None, game=None):   # the first version: FNV_GAME_DIR's prefix, then the found install's
+            for g in ([Path(game)] if game else []) + [steamlib.find_game(home)]:
+                if g and steamlib.prefix_documents(g).is_dir():
+                    return steamlib.prefix_documents(g)
+            return None
+        d = Deck(self.base)
+        with mock.patch.object(steamlib, "find_documents", with_fallback):
+            self.assertIn(env_game_documents(d), (d.docs, d.stale_docs))   # what the check above rejects
+
     def test_twin_libraryfolders_ignored_is_caught(self):
         with mock.patch.object(steamlib.fnv_find, "parse_libraryfolders", lambda text: []):
             self.assertNotEqual(deck_errors(Deck(self.base)), [])

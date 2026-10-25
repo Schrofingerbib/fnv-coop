@@ -65,30 +65,62 @@ def libraries(home: Optional[Path] = None) -> List[Path]:
 
 
 def find_game(home: Optional[Path] = None) -> Optional[Path]:
-    """The Steam install of the game (the folder with FalloutNV.exe), or None."""
-    for lib in libraries(home):
+    """The Steam install of the game (the folder with FalloutNV.exe), or None. Every library's appmanifest first: a moved
+    game can leave an old "Fallout New Vegas" folder in an earlier library, and only the manifest names the current one.
+    The usual folder names count only when no manifest names an existing game."""
+    libs = libraries(home)
+    for lib in libs:
         inst = fnv_find.parse_appmanifest_installdir(_read(lib / "steamapps" / f"appmanifest_{APPID}.acf"))
-        for name in ([inst] if inst else []) + list(fnv_find.STEAM_NAMES):
+        g = lib / "steamapps" / "common" / inst if inst else None
+        if g and (g / fnv_find.GAME_EXE).is_file():
+            return g
+    for lib in libs:
+        for name in fnv_find.STEAM_NAMES:
             g = lib / "steamapps" / "common" / name
             if (g / fnv_find.GAME_EXE).is_file():
                 return g
     return None
 
 
+def prefix_dir(game: Path) -> Path:
+    """The game's Proton prefix: <library>/steamapps/compatdata/22380/pfx (the library the game is installed in)."""
+    return Path(game).parent.parent / "compatdata" / APPID / PREFIX_DOCUMENTS[0]
+
+
 def prefix_documents(game: Path) -> Path:
     """The Documents folder of the game's Proton prefix: <library>/steamapps/compatdata/22380/pfx/.../Documents."""
-    return Path(game).parent.parent / "compatdata" / APPID / Path(*PREFIX_DOCUMENTS)
+    return prefix_dir(game) / Path(*PREFIX_DOCUMENTS[1:])
 
 
 def find_documents(home: Optional[Path] = None, game: Optional[Path] = None) -> Optional[Path]:
     """The Documents folder of the game's Proton prefix, or None (no Steam install found, or the game never ran under
-    Proton, so the prefix doesn't exist yet). `game`: the install to use first (FNV_GAME_DIR)."""
-    games = [Path(game)] if game else []
-    found = find_game(home)
-    if found:
-        games.append(found)
-    for g in games:
-        d = prefix_documents(g)
-        if d.is_dir():
-            return d
-    return None
+    Proton, so the prefix doesn't exist yet). `game` (FNV_GAME_DIR): use that install's prefix only, never another
+    install's INIs."""
+    g = Path(game) if game else find_game(home)
+    if g is None:
+        return None
+    d = prefix_documents(g)
+    return d if d.is_dir() else None
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Print one path, for shell commands that need it (docs/tools/proton-deck.md): `game` (the game folder), `prefix`
+    (its Proton prefix, pfx) or `documents` (the prefix's Documents). FNV_GAME_DIR, when set, is the game."""
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("what", choices=("game", "prefix", "documents"))
+    a = ap.parse_args(argv)
+    game = Path(os.environ["FNV_GAME_DIR"]) if os.environ.get("FNV_GAME_DIR") else find_game()
+    if game is None:
+        print("steamlib: no Steam install of Fallout: New Vegas under this home folder; set FNV_GAME_DIR", file=sys.stderr)
+        return 1
+    path = {"game": game, "prefix": prefix_dir(game), "documents": prefix_documents(game)}[a.what]
+    if not path.is_dir():
+        print(f"steamlib: {path} doesn't exist; start the game once through Steam", file=sys.stderr)
+        return 1
+    print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

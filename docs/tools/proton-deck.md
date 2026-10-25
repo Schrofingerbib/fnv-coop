@@ -23,18 +23,21 @@ game-free work (see `docs/tools/linux-dev.md`).
    `FalloutPrefs.ini`. In the game's Properties, pick the Proton version under Compatibility.
 2. **Windows Python 3.11 in the game's prefix.** The repo's tools are standard library only, so no pip packages are
    needed. Install Protontricks (Flatpak, from Discover or Flathub). Then, in a terminal in Desktop Mode (the installer
-   needs a display even with `/quiet`) and with the game closed:
+   needs a display even with `/quiet`), in the checkout and with the game closed:
    ```
-   mkdir -p ~/.steam/steam/steamapps/compatdata/22380/pfx/drive_c/nvcoop-setup
-   curl -sSfL -o ~/.steam/steam/steamapps/compatdata/22380/pfx/drive_c/nvcoop-setup/python-3.11.9-amd64.exe https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe
+   PFX="$(python -I tools/runner/steamlib.py prefix)"
+   mkdir -p "$PFX/drive_c/nvcoop-setup"
+   curl -sSfL -o "$PFX/drive_c/nvcoop-setup/python-3.11.9-amd64.exe" https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe
    flatpak run --command=protontricks-launch com.github.Matoking.protontricks --no-bwrap --appid 22380 'C:\nvcoop-setup\python-3.11.9-amd64.exe' /quiet InstallAllUsers=0 'TargetDir=C:\Python311' PrependPath=0 Include_test=0 Include_launcher=0 Shortcuts=0 AssociateFiles=0
    ```
    The tools only need `drive_c/Python311/python.exe`. Run again over an existing install, the installer can fail with
-   0x36b7; if `python.exe` is there, that's fine.
+   0x36b7; if `python.exe` is there, that's fine. `tools/runner/steamlib.py` prints the game's Proton prefix (`prefix`),
+   the game folder (`game`) or the prefix's Documents (`documents`), wherever Steam installed the game (an SD card
+   too), so the commands here work as written for any library.
 3. **xNVSE 6.4.9 and the quest data**, from the checkout:
    ```
    python -I tools/runner/fetch_deps.py
-   python -I tools/questdata/run_all.py --data ~/.steam/steam/steamapps/common/"Fallout New Vegas"/Data
+   python -I tools/questdata/run_all.py --data "$(python -I tools/runner/steamlib.py game)/Data"
    ```
    `fetch_deps.py` needs `7z` (SteamOS has it). It also fetches DXVK. Under Proton you don't need that one (Proton has
    its own), so provision below says `--no-dxvk`. The quest data reads the game's master files read-only (about
@@ -67,8 +70,9 @@ python -I tools/runner/instances.py provision --n 2 --nvse-dir out/cache/deps/nv
 Each copy loads saves from its own `Saves` folder. The playbooks' scenarios start from a save named `autosave`. Copy one of
 yours into both copies (they only read it):
 ```
-cp ~/.steam/steam/steamapps/compatdata/22380/pfx/drive_c/users/steamuser/Documents/"My Games"/FalloutNV/Saves/autosave.fos ../fnv-instances/0/Saves/autosave.fos
-cp ~/.steam/steam/steamapps/compatdata/22380/pfx/drive_c/users/steamuser/Documents/"My Games"/FalloutNV/Saves/autosave.fos ../fnv-instances/1/Saves/autosave.fos
+SAVES="$(python -I tools/runner/steamlib.py documents)/My Games/FalloutNV/Saves"
+cp "$SAVES/autosave.fos" ../fnv-instances/0/Saves/autosave.fos
+cp "$SAVES/autosave.fos" ../fnv-instances/1/Saves/autosave.fos
 ```
 
 ## Start copy 0 through Steam
