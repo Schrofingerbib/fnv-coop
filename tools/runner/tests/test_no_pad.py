@@ -2,8 +2,8 @@
 In gamepad mode the game ignores the keyboard movement controls that bot.move holds. Under Proton on a Steam Deck, where
 Steam Input always answers as a pad, a 3 s bot.move forward moved the player 0 units; with the key set to 1, 1008 units
 (2026-10-25). Without --no-pad the owner's own value stays, so a person playing a copy keeps their controller.
-Twins: render_inis ignoring the flag, a restore that drops it, a key written twice, and a broken instance.json read as
-"no --no-pad" must each fail the check.
+Twins: render_inis ignoring the flag, a restore that drops it, a key written twice, a broken instance.json read as
+"no --no-pad", and a no_pad of "false" read through bool() must each fail the check.
 Run: python -I -m unittest discover -s tools/runner/tests -p test_no_pad.py
 """
 from __future__ import annotations
@@ -95,10 +95,10 @@ class NoPad(unittest.TestCase):
         lowcost.restore(d, check=False)
         self.assertEqual(instances.ini_get((d / "FalloutPrefs.ini").read_text(encoding="latin-1"), *KEY), "0")
 
-    def check_broken_instance_json_stops_restore(self, provisioned_no_pad=None):
-        """A truncated instance.json must stop restore before it writes: the copy's no-pad prefs stay as they are."""
+    def check_broken_instance_json_stops_restore(self, provisioned_no_pad=None, text='{"instance": 0, "no_p'):
+        """A broken instance.json (truncated by default) must stop restore before it writes: the copy's prefs stay as they are."""
         d = self.provision(True)
-        (d / "instance.json").write_text('{"instance": 0, "no_p')
+        (d / "instance.json").write_text(text)
         before = (d / "FalloutPrefs.ini").read_bytes()
         patch = mock.patch.object(lowcost, "provisioned_no_pad", provisioned_no_pad) if provisioned_no_pad else contextlib.nullcontext()
         with patch, self.assertRaises(lowcost.UnsafeTarget):
@@ -112,7 +112,19 @@ class NoPad(unittest.TestCase):
         with self.assertRaises(lowcost.UnsafeTarget):
             lowcost.restore(d, check=False)
 
+    def test_non_boolean_no_pad_stops_restore(self):
+        """"no_pad": "false" (a string) is neither --no-pad nor its absence (review)."""
+        for value in ('"false"', '0', 'null'):
+            with self.subTest(no_pad=value):
+                self.check_broken_instance_json_stops_restore(text='{"instance": 0, "no_pad": %s}' % value)
+
     # ---- twins
+    def test_twin_no_pad_coerced_with_bool_is_caught(self):
+        def coercing(instance_dir):   # the second version: valid JSON, but no_pad passed through bool()
+            return bool(json.loads((Path(instance_dir) / "instance.json").read_text()).get("no_pad"))
+        with self.assertRaises(AssertionError):
+            self.check_broken_instance_json_stops_restore(coercing, text='{"instance": 0, "no_pad": "false"}')
+
     def test_twin_broken_instance_json_read_as_no_flag_is_caught(self):
         def lenient(instance_dir):   # the first version: anything unreadable counted as "no --no-pad"
             try:

@@ -165,8 +165,8 @@ def prefs_startable(text: str) -> bool:
 
 def provisioned_no_pad(instance_dir: Path) -> bool:
     """Whether the copy was provisioned with --no-pad (its instance.json says so). False when the copy has no instance.json.
-    An instance.json that can't be read or isn't a JSON object raises UnsafeTarget, so restore() writes nothing instead of
-    quietly turning the copy's controller back on."""
+    An instance.json that can't be read, isn't a JSON object or has a no_pad that isn't true/false raises UnsafeTarget, so
+    restore() writes nothing instead of guessing the copy's controller setting."""
     p = Path(instance_dir) / "instance.json"
     try:
         text = p.read_text()
@@ -180,7 +180,10 @@ def provisioned_no_pad(instance_dir: Path) -> bool:
         raise UnsafeTarget(f"{p}: not valid JSON ({e}); provision the copy again") from e
     if not isinstance(meta, dict):
         raise UnsafeTarget(f"{p}: not a JSON object; provision the copy again")
-    return bool(meta.get("no_pad"))
+    no_pad = meta.get("no_pad", False)   # provision() writes a JSON boolean; bool("false") would be True
+    if not isinstance(no_pad, bool):
+        raise UnsafeTarget(f"{p}: no_pad is {no_pad!r}, not true or false; provision the copy again")
+    return no_pad
 
 
 def restore(instance_dir: Path, check: bool = True) -> Dict[str, int]:
