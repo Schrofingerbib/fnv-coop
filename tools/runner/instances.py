@@ -28,9 +28,7 @@ instances 2k (host) and 2k+1 (client) on co-op port <port-base>+k (default 27960
 Without --pairs the port is not written and every client joins the plugin's default port, as before. With --pairs,
 --ini coop.port / coop.host are an error (exit 2), and --n must match or be left out. show and destroy take --pairs too.
 
-Environment overrides: FNV_GAME_DIR, FNV_INSTANCES_ROOT. Without FNV_GAME_DIR the game is the Steam default in Program
-Files on Windows, and the install in a Steam library under the home folder elsewhere (steamlib.py); the owner's INIs then
-come from the game's Proton prefix (mygames.py), so a Steam Deck needs neither FNV_GAME_DIR nor FNV_DOCUMENTS_DIR.
+Environment overrides: FNV_GAME_DIR, FNV_INSTANCES_ROOT.
 """
 from __future__ import annotations
 
@@ -63,6 +61,9 @@ LINK_MODES = ("hardlink", "symlink", "copy")
 
 
 def game_dir() -> Path:
+    """FNV_GAME_DIR, else (off Windows) the install in a Steam library under the home folder (steamlib.py), else the Steam
+    default in Program Files. Off Windows the owner's INIs then come from the game's Proton prefix (mygames.py), so a
+    Steam Deck needs neither FNV_GAME_DIR nor FNV_DOCUMENTS_DIR."""
     env = os.environ.get("FNV_GAME_DIR")
     if env:
         return Path(env)
