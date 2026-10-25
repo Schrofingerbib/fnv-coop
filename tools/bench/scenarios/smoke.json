@@ -1,0 +1,12 @@
+{
+  "name": "smoke",
+  "about": "A two minute check that the benchmark itself works: no playbooks, no network matrix.",
+  "steps": [
+    {"phase": "warmup", "secs": 10},
+    {"phase": "idle", "secs": 10},
+    {"phase": "walk", "who": "host", "course": "square", "secs": 25, "label": "host_walks"},
+    {"phase": "walk", "who": "client", "course": "square", "secs": 25, "label": "client_walks"},
+    {"phase": "walk", "who": "both", "course": "figure8", "secs": 20, "label": "both_walk"},
+    {"phase": "wait", "secs": 8, "label": "settle"}
+  ]
+}

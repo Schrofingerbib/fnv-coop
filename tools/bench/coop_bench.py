@@ -505,7 +505,15 @@ def run_once(a, label, stamp):
         print("running phases ...", flush=True)
         opts = {"probe": not a.no_probe, "area": not a.no_area, "playbooks": not a.no_playbooks}
         try:
-            walk, extras = run_phases(samp, bots, a.quick, opts, relay, out, log)
+            if a.scenario:   # a scenario file: tools/bench/scenarios/<name>.json (see scenario.py)
+                import scenario as scenario_mod
+                import arena as arena_mod
+                ctx = scenario_mod.Ctx(samp, bots, arena_mod.Arena.load(a.arena or None), k=0.5 if a.quick else 1.0, relay=relay, outdir=out,
+                                       log=log, walk_mode=a.walk_mode, phases_mod=phases)
+                scenario_mod.run(ctx, scenario_mod.load(a.scenario))
+                walk, extras = ctx.walk, ctx.extras
+            else:
+                walk, extras = run_phases(samp, bots, a.quick, opts, relay, out, log)
         finally:
             samp.stop_ev.set()
             samp.join(timeout=10)
@@ -575,10 +583,16 @@ def main():
     ap.add_argument("--no-area", action="store_true", help="skip the area-change phase")
     ap.add_argument("--no-playbooks", action="store_true", help="skip the fight and loot playbooks")
     ap.add_argument("--no-probe", action="store_true", help="skip the input-walk probe")
+    ap.add_argument("--scenario", default="", help="run a scenario file instead of the built-in phases: a name in tools/bench/scenarios (standard, smoke) or a path")
+    ap.add_argument("--arena", default="", help="arena layout file (default tools/bench/arena.json; without one the courses start where each player stands)")
     ap.add_argument("--full", action="store_true", help="everything: same as --net (the area, playbook and probe phases are on by default)")
     a = ap.parse_args()
     if a.full:
         a.net = True
+    if a.scenario:
+        import scenario as _sc
+        if any(s["phase"] == "net" for s in _sc.load(a.scenario)["steps"]):
+            a.net = True   # the scenario steps through the bad-network profiles, so the client must join through the relay
     if a.net and a.no_boot:
         raise SystemExit("--net needs a fresh boot (the client must join through the relay): drop --no-boot")
     WALK_MODE[0] = a.walk_mode

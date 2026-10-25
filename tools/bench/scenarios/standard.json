@@ -1,0 +1,18 @@
+{
+  "name": "standard",
+  "about": "Everything in one run: idle, walking (host, client, both), the input probe, an area change, the fight and loot playbooks, then the bad-network profiles. The same phases and durations as the original hard-coded run.",
+  "steps": [
+    {"phase": "warmup", "secs": 15},
+    {"phase": "idle", "secs": 30},
+    {"phase": "walk", "who": "host", "course": "square", "secs": 60, "label": "host_walks"},
+    {"phase": "walk", "who": "client", "course": "square", "secs": 60, "label": "client_walks"},
+    {"phase": "walk", "who": "both", "course": "square", "secs": 40, "label": "both_walk"},
+    {"phase": "wait", "secs": 10, "label": "settle"},
+    {"phase": "probe", "label": "input_probe"},
+    {"phase": "area"},
+    {"phase": "wait", "secs": 8, "label": "settle_area"},
+    {"phase": "playbook", "name": "fight", "label": "fight"},
+    {"phase": "playbook", "name": "loot_race", "label": "loot"},
+    {"phase": "net", "secs": 35, "recover_secs": 25}
+  ]
+}

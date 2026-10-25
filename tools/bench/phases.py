@@ -40,6 +40,61 @@ def input_probe(bots, log):
     return out
 
 
+# ------------------------------------------------------------------ arena: find a flat open cell where input walking works, and move both copies there
+CANDIDATE_CELLS = [(-18, 0), (-17, -2), (-19, 2), (-16, 1), (-20, -1), (-15, -3), (-14, 0), (-12, 2), (-21, 3), (-17, 4), (-13, -5), (-22, -2),
+                   (-10, 0), (-9, 4), (-11, -3), (-8, 6)]
+
+
+def probe_cell(bot, cell, log, leg=250):
+    """Teleport the bot to the exterior cell (cow) and take four short walks with REAL movement input (+x, -x, +y, -y). Returns what happened."""
+    out = {"cell": list(cell), "legs_ok": 0, "legs": 4, "moved": [], "pos": None}
+    try:
+        bot.nv.exec("cow WastelandNV %d %d" % cell)
+        bot.dismiss_messages(quiet_s=2, max_s=15, max_n=6)
+        time.sleep(4)
+        out["pos"] = [round(float(v)) for v in bot.pos()]
+        for dx, dy in ((leg, 0), (-leg, 0), (0, leg), (0, -leg)):
+            p = [float(v) for v in bot.pos()]
+            r = bot.goto_pos(p[0] + dx, p[1] + dy, p[2], timeout_s=8, mode="input")
+            q = [float(v) for v in bot.pos()]
+            out["moved"].append(round(dist(p, q)))
+            out["legs_ok"] += 1 if r.ok else 0
+    except Exception as e:   # noqa: BLE001
+        out["error"] = str(e)[:100]
+    log(f"arena probe {tuple(cell)}: {out['legs_ok']}/4 legs, moved {out['moved']}, at {out['pos']}")
+    return out
+
+
+def find_origin(bots, log, cells=None, stop_at=4):
+    """Try candidate cells with the host bot until one lets all four input legs arrive. Returns (best probe, every probe)."""
+    probes = []
+    for cell in (cells or CANDIDATE_CELLS):
+        pr = probe_cell(bots[0], cell, log)
+        probes.append(pr)
+        if pr["legs_ok"] >= stop_at:
+            break
+    best = max(probes, key=lambda p: (p["legs_ok"], sum(p["moved"])))
+    return best, probes
+
+
+def goto_arena(ctx_arena, bots, log):
+    """Move both copies into the arena cell, the client a little beside the host. No-op when the arena has no cell (they stay where they are)."""
+    if not ctx_arena.cell or not ctx_arena.origin:
+        return {"skipped": "the arena has no cell and origin (run tools/bench/find_arena.py)"}
+    ws, cx, cy = ctx_arena.cell
+    x, y, z = ctx_arena.origin
+    for i, b in enumerate(bots):
+        b.nv.exec("cow %s %d %d" % (ws, cx, cy))
+        b.dismiss_messages(quiet_s=2, max_s=15, max_n=6)
+    time.sleep(4)
+    for i, b in enumerate(bots):
+        r = b.goto_pos(x, y + 90 * i, z, timeout_s=10, mode="teleport")
+        if not r.ok:
+            log(f"arena: copy {i} did not reach the origin: {getattr(r, 'reason', '')}")
+    time.sleep(3)
+    return {"cell": [ws, cx, cy], "origin": [x, y, z]}
+
+
 # ------------------------------------------------------------------ area change
 def area_change(samp, bots, k, log):
     """The host walks into a building (coc) and back out to the exterior (cow). Phases area_interior and area_back; the analysis measures how long

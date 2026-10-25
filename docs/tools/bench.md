@@ -14,6 +14,28 @@ python -I tools/bench/compare.py out/bench/<before> out/bench/<after>   # deltas
 Needs: the two instances provisioned (tools/runner), Steam running and signed in, DXVK installed in the instances (tools/runner/fetch_deps.py,
 then provision), about 3 GB of free RAM, and the machine left alone while it runs (the bots drive the players).
 
+## Scenarios: scripting a run
+
+A run can be a short JSON script instead of the built-in phases: `python -I tools/bench/coop_bench.py --scenario standard` (or `smoke`, or a path).
+Files live in `tools/bench/scenarios/`. Each step is `{"phase": ..., ...}`; an optional `"label"` renames the phase the sampler records, so each
+step gets its own row of metrics.
+
+| Phase | Fields | What it does |
+|---|---|---|
+| `warmup`, `idle`, `wait` | `secs` | Do nothing and measure |
+| `walk` | `who` (host, client, both), `course` (square, line, figure8, circle), `secs` | The bots walk a named course |
+| `probe` | | Does real movement input move a player? |
+| `area` | | The host enters a building and comes back out; measures how long the puppet takes to catch up |
+| `playbook` | `name` (fight, loot_race, any playbook in tools/bots) | Runs the repo's playbook and scores its steps |
+| `net` | `profiles`, `secs`, `recover_secs` | Steps the client through the chaos relay profiles, then back to lan (starts the relay automatically) |
+
+Add a phase type with `@register("name")` in `scenario.py`. A phase that fails is recorded under `phase_errors` and the run carries on.
+Courses and spawn rings come from `arena.py`: offsets from an origin, so a scenario never needs coordinates. `tools/bench/arena.json` can pin the
+origin (and the `cow` cell) of a flat, open area; without it each course starts where the player stands.
+`tools/bench/find_arena.py` looks for a flat, open exterior cell where real movement input works and writes `arena.json`; the `arena` phase then moves both
+copies there at the start of a scenario. Both are written and parse-checked but have NOT been run in the game yet.
+The scenario runner and the arena layout are tested without the game: `python -I -m unittest discover -s tools/bench/tests -p test_scenario.py`.
+
 ## What a run does
 
 1. Boots two copies (`run.py up`), loads the save on both, clears the DLC message boxes, waits 15 s (the warm-up is excluded from every number).
