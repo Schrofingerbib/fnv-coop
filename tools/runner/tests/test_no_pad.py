@@ -3,7 +3,8 @@ In gamepad mode the game ignores the keyboard movement controls that bot.move ho
 Steam Input always answers as a pad, a 3 s bot.move forward moved the player 0 units; with the key set to 1, 1008 units
 (2026-10-25). Without --no-pad the owner's own value stays, so a person playing a copy keeps their controller.
 Twins: render_inis ignoring the flag, a restore that drops it, a key written twice, a broken instance.json read as
-"no --no-pad", and a no_pad of "false" read through bool() must each fail the check.
+"no --no-pad", a no_pad of "false" read through bool(), and run.py provision not forwarding the flag must each fail
+the check.
 Run: python -I -m unittest discover -s tools/runner/tests -p test_no_pad.py
 """
 from __future__ import annotations
@@ -24,6 +25,37 @@ import instances  # noqa: E402
 import lowcost  # noqa: E402
 
 KEY = ("Interface", "bDisable360Controller")
+
+
+def import_run():
+    """tools/runner/run.py. Its job queue imports msvcrt (Windows only, never called here), so off Windows a stand-in is
+    in sys.modules just for the import; subprocess is imported first, since it picks its platform code from msvcrt."""
+    import subprocess  # noqa: F401
+    import types
+    stub = sys.platform != "win32" and "msvcrt" not in sys.modules
+    if stub:
+        sys.modules["msvcrt"] = types.ModuleType("msvcrt")
+    try:
+        import run
+    finally:
+        if stub:
+            sys.modules.pop("msvcrt", None)
+    return run
+
+
+def run_forwarding_errors(provision_argv=None) -> list:
+    """What `run.py provision` gets wrong about --no-pad: instances.py must get it exactly when it was given."""
+    run, seen = import_run(), []
+    patches = [mock.patch.object(run.instances, "main", lambda argv: seen.append(argv) or 0)]
+    if provision_argv:
+        patches.append(mock.patch.object(run, "provision_argv", provision_argv))
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        run.main(["provision", "--n", "1", "--plugin-dll", "", "--no-pad"])
+        run.main(["provision", "--n", "1", "--plugin-dll", ""])
+    got = [argv.count("--no-pad") for argv in seen]
+    return [] if got == [1, 0] else [f"--no-pad reached instances.py {got} times (want [1, 0])"]
 
 
 def no_pad_errors(prefs: str) -> list:
@@ -84,6 +116,10 @@ class NoPad(unittest.TestCase):
             self.assertEqual(instances.main(["provision", "--n", "1", "--plugin-dll", ""]), 0)
         self.assertEqual(seen, [True, False])
 
+    def test_run_py_provision_forwards_the_flag(self):
+        """run.py provision is the other provision command; it passes --no-pad on to instances.py (review)."""
+        self.assertEqual(run_forwarding_errors(), [])
+
     def test_lowcost_restore_keeps_no_pad(self):
         d = self.provision(True)
         lowcost.restore(d, check=False)
@@ -119,6 +155,12 @@ class NoPad(unittest.TestCase):
                 self.check_broken_instance_json_stops_restore(text='{"instance": 0, "no_pad": %s}' % value)
 
     # ---- twins
+    def test_twin_run_py_dropping_the_flag_is_caught(self):
+        run = import_run()
+        real = run.provision_argv
+        dropping = lambda a: [x for x in real(a) if x != "--no-pad"]  # noqa: E731  (the first version never forwarded it)
+        self.assertNotEqual(run_forwarding_errors(dropping), [])
+
     def test_twin_no_pad_coerced_with_bool_is_caught(self):
         def coercing(instance_dir):   # the second version: valid JSON, but no_pad passed through bool()
             return bool(json.loads((Path(instance_dir) / "instance.json").read_text()).get("no_pad"))
