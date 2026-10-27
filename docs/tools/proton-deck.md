@@ -43,8 +43,9 @@ game-free work (see `docs/tools/linux-dev.md`).
    (`nvcoop_guest_local_run.json`; without it a guest blocks every DLC setup script). Build it on Windows
    (`tools/runner/build_l1.cmd`), or take CI's build of the commit you have checked out: every CI run keeps the plugin
    job's DLL and data files as the artifact `nvcoop-plugin-win32` for 14 days. With the GitHub CLI (`gh`, logged in
-   through `gh auth login`), from the checkout:
+   through `gh auth login`), from the checkout (the first line removes an earlier download, which `gh` won't overwrite):
    ```
+   rm -f out/L1/nvcoop.dll out/L1/nvcoop_*.json
    gh run download -R cranebeaker/fnv-coop -n nvcoop-plugin-win32 -D out/L1 "$(gh run list -R cranebeaker/fnv-coop --workflow ci --commit "$(git rev-parse HEAD)" --limit 1 --json databaseId --jq '.[0].databaseId')"
    ```
    That needs a commit CI ran on: one on `main`, or the head of a pull request (CI builds a pull request merged into
