@@ -448,6 +448,7 @@ static bool scn_codec_fuzz() {
 
 #include "scn_round3.inc"
 #include "scn_round4.inc"
+#include "scn_round5.inc"
 
 struct Case { const char* name; bool (*fn)(); const char* twin; Mutations mut; };
 static Mutations M(void (*f)(Mutations&)) { Mutations m; f(m); return m; }
@@ -515,6 +516,20 @@ int main(int argc, char** argv) {
         {"consent_leaver_does_not_block", scn_consent_leaver_does_not_block, nullptr, {}},
         {"consent_not_needed_for_other_buttons", scn_consent_not_needed_for_other_buttons, nullptr, {}},
         {"consent_only_required_players_answer", scn_consent_only_required_players_answer, "anyone_replies_consent", M([](Mutations& m) { m.anyoneRepliesMenu = true; })},
+        // G08 (D3): party vote with the host breaking ties, personal decisions, fork INFOs held before any script
+        {"vote_majority_approves", scn_vote_majority_approves, "vote_is_unanimous", M([](Mutations& m) { m.voteIsUnanimous = true; })},
+        {"vote_one_dissent_does_not_veto", scn_vote_one_dissent_does_not_veto, "vote_is_unanimous_dissent", M([](Mutations& m) { m.voteIsUnanimous = true; })},
+        {"vote_majority_declines", scn_vote_majority_declines, nullptr, {}},
+        {"vote_tie_goes_to_the_host", scn_vote_tie_goes_to_the_host, "vote_no_host_tie_break", M([](Mutations& m) { m.voteNoHostTieBreak = true; })},
+        {"vote_timeout_counts_the_answers", scn_vote_timeout_counts_the_answers, "vote_timeout_approves", M([](Mutations& m) { m.voteTimeoutApproves = true; })},
+        {"vote_any_button_is_irreversible", scn_vote_any_button_is_irreversible, "vote_skip_consent", M([](Mutations& m) { m.skipConsent = true; })},
+        {"actor_decides_alone", scn_actor_decides_alone, "actor_asks_party", M([](Mutations& m) { m.actorAsksParty = true; })},
+        {"fork_info_waits_for_the_party", scn_fork_info_waits_for_the_party, "no_choice_consent", M([](Mutations& m) { m.noChoiceConsent = true; })},
+        {"fork_info_denied_runs_nothing", scn_fork_info_denied_runs_nothing, "no_choice_consent_denied", M([](Mutations& m) { m.noChoiceConsent = true; })},
+        {"fork_info_other_infos_are_not_held", scn_fork_info_other_infos_are_not_held, nullptr, {}},
+        {"fork_info_leaver_does_not_block", scn_fork_info_leaver_does_not_block, nullptr, {}},
+        {"consent_table_modes", scn_consent_table_modes, nullptr, {}},
+        {"consent_denied_codec", scn_consent_denied_codec, nullptr, {}},
     };
     int fail = 0, ran = 0;
     for (auto& c : cases) {

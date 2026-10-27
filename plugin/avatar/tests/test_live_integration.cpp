@@ -92,6 +92,7 @@ OwnerState Owner(uint32_t t) {
 struct Metrics {
     unsigned slideFrames = 0, slideEpisodes = 0, tposeFrames = 0, floatFrames = 0, jitterFrames = 0, rubberJumps = 0, bigJumps = 0;
     unsigned skateFrames = 0;
+    unsigned shoveFrames = 0;    // frames within 700 ms of an engine push where the puppet is still far from the owner
     float maxStep = 0, resumeStep = 0;
     uint32_t maxStepAt = 0;
     unsigned idleAfterGapMs = 0;
@@ -108,7 +109,8 @@ struct Result {
     unsigned violations = 0;
 };
 
-static Result RunScenario(unsigned lossPercent, uint32_t seed) {
+// `shoves`: a body in the way pushes the puppet 3 to 5 m away four times (twice while it walks, twice while it stands).
+static Result RunScenario(unsigned lossPercent, uint32_t seed, bool shoves = false) {
     Result res;
     FakePuppetEngine eng;
     eng.loadedCells = {kCell};
@@ -144,6 +146,11 @@ static Result RunScenario(unsigned lossPercent, uint32_t seed) {
 
     const uint32_t kEnd = 24000;
     uint32_t nextSend = 0;
+    struct Shove { uint32_t at; Vec3 d; };
+    const Shove kShoves[] = {{7000, {300, 0, 0}}, {9000, {-100, -450, 0}}, {12500, {0, 500, 0}}, {13500, {-250, 0, 0}}};
+    size_t nextShove = 0;
+    uint32_t lastShoveAt = 0;
+    bool haveShove = false;
     for (uint32_t now = 0; now <= kEnd; now += 16) {
         // owner: 20 Hz snapshots
         OwnerState o = Owner(now);
@@ -182,6 +189,15 @@ static Result RunScenario(unsigned lossPercent, uint32_t seed) {
         }
 
         // receiver: one frame
+        if (shoves && nextShove < sizeof kShoves / sizeof kShoves[0] && now >= kShoves[nextShove].at) {
+            if (auto* pf = eng.Get(pm.RefOf(1))) {
+                pf->pos.x += kShoves[nextShove].d.x;
+                pf->pos.y += kShoves[nextShove].d.y;
+                lastShoveAt = now;
+                haveShove = true;
+            }
+            ++nextShove;
+        }
         live::ActualPose ap;
         bool haveActual = false;
         CellId ac = 0;
@@ -204,6 +220,10 @@ static Result RunScenario(unsigned lossPercent, uint32_t seed) {
             continue;
         }
         ++res.drivingFrames;
+        if (haveShove && now - lastShoveAt < 700) {
+            const Vec3 truth = Owner(now).pos;
+            if (std::hypot(f->pos.x - truth.x, f->pos.y - truth.y) > 100.f) ++res.m.shoveFrames;
+        }
         if (!havePrev) {
             prev = f->pos;
             havePrev = true;
@@ -275,6 +295,7 @@ static int Judge(const Result& r) {
     chk(r.m.skateFrames == 0);
     chk(r.m.tposeFrames == 0);
     chk(r.m.floatFrames == 0);
+    chk(r.m.shoveFrames == 0);   // an engine push is undone in the frame it is seen, never eased back over a few hundred ms
     chk(r.m.jitterFrames == 0);
     chk(r.m.bigJumps == 1);     // exactly the planned teleport, no rubber banding
     // 300 u/s at 62 fps is 4.8 u/frame. With 25 ms of latency jitter the live InterpBuffer's clock-offset filter makes the shown
@@ -305,6 +326,13 @@ int main() {
             g_fail += bad;
         }
     }
+    for (unsigned loss : {0u, 10u}) {
+        Result r = RunScenario(loss, 4, true);
+        std::printf("  pushes loss=%u%%: shoveFrames=%u bigJumps=%u maxStep=%.1f@%ums\n", loss, r.m.shoveFrames, r.m.bigJumps, r.m.maxStep, (unsigned)r.m.maxStepAt);
+        int bad = Judge(r);
+        if (bad) std::printf("  FAIL: %d judgements failed\n", bad);
+        g_fail += bad;
+    }
     std::printf("avatar live: %d checks, %d failed\n", g_checks, g_fail);
     if (g_fail) return 1;
 
@@ -333,6 +361,12 @@ int main() {
         lf.extrapolateOnly = true;     // the live layer never interpolates
         live::LiveFaultScope sc(lf);
         survivors += Twin("live.extrapolateOnly", Judge(RunScenario(10, 2))) ? 0 : 1;
+    }
+    {
+        AvatarFaults f;
+        f.adoptPhysicsPush = true;     // the buffer is told the pushed place: it eases the puppet back from it
+        AvatarFaultScope sc(f);
+        survivors += Twin("adoptPhysicsPush", Judge(RunScenario(0, 4, true))) ? 0 : 1;
     }
     if (survivors) {
         std::printf("avatar live: %d twins survived\n", survivors);

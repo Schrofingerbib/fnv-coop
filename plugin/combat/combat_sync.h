@@ -60,6 +60,8 @@ struct Config {
     uint32_t blastSettleMs = 120;         // explosions: plan hits for victims the engine did not iterate this long after the first hit
     uint32_t deathDecorTtlMs = 5000;      // a declaration waits this long for its corpse to exist here
     uint32_t deferDeathMs = 1500;         // a declaration the ownership table was behind for is retried this long
+    uint32_t lethalSettleMs = 1500;       // owner: a victim a NATURAL (engine-applied) hit left at health <= 0 gets this long to be dead by the engine's own life state (a VATS kill cam), then the owner kills it
+    uint32_t killConfirmMs = 400;         // owner: a hit the rules call lethal must show the victim dead after this long, or the owner kills it
     SocialHooks social;
 };
 
@@ -95,7 +97,7 @@ struct GateDecision {
 struct Stats {
     uint64_t engineHits = 0, proceeded = 0, clamped = 0, neutralized = 0, ghostHitsNeutralized = 0, envHitsNeutralized = 0, friendlyNeutralized = 0;
     uint64_t hitsSent = 0, hitsRelayed = 0, hitsReceived = 0, hitsApplied = 0, hitsRejected = 0, hitDuplicates = 0, hitsForwarded = 0, hopLimit = 0;
-    uint64_t nacksSent = 0, nacksReceived = 0, hitRetries = 0, hitsAbandoned = 0, resyncHints = 0;
+    uint64_t nacksSent = 0, nacksReceived = 0, hitRetries = 0, hitsAbandoned = 0, resyncHints = 0, hitsResolvedLate = 0, killsForced = 0, naturalLethal = 0, naturalLethalStuck = 0;
     uint64_t damageApplied = 0, damageRefused = 0, limbsCrippled = 0, provoked = 0, engineRefused = 0, naturalHits = 0;
     uint64_t vitalsSent = 0, vitalsApplied = 0, vitalsStale = 0;
     uint64_t deathsDeclared = 0, deathsAccepted = 0, deathsRejected = 0, deathsDeferred = 0, deathsRefusedLocal = 0, corpsesDecorated = 0;
@@ -147,6 +149,7 @@ public:
     size_t inflightHits() const { return inflight_.size(); }
     uint8_t crippledMask(const cc::Entity& e) const;
     std::string lastRejections() const;     // newest rejection lines
+    const std::string& lastGate() const { return lastGate_; }   // newest gate decision on a synced victim: "clamp: forwarded to the victim's owner (victim 7, owner 0)"
     uint64_t nowMs() const { return now_; }
 
 private:
@@ -168,6 +171,7 @@ private:
     uint64_t nextId() { return (static_cast<uint64_t>(cfg_.self) << 48) | ++counter_; }
     bool buildHit(const EngineHit& e, const cc::Entity& atk, const EntityView& av, const cc::Entity& vic, const EntityView& vv, cc::HitEvent& out);
     void forwardHit(const cc::HitEvent& h, PlayerId owner);
+    void noteNaturalLethal(const cc::Entity& who);   // owner: after a natural hit's vitals went out, a victim at health <= 0 must get a life state death
 
     // inbound
     void dispatch(PlayerId from, const Envelope& e);
@@ -228,10 +232,13 @@ private:
     std::map<cc::Entity, PendingDecor> decor_;
     std::map<std::tuple<PlayerId, uint8_t, FormRef>, uint64_t> socialCrimeAt_;   // (criminal, murder?, faction) -> when it was last reported (burst throttle)
     std::vector<DeferredDeath> deferredDeaths_;
+    struct PendingKill { cc::Entity who; uint64_t dueAt = 0; bool natural = false; };   // natural: the engine's own hit took the health, not our replay
+    std::vector<PendingKill> pendingKills_;                     // owner side: victims an accepted lethal hit must have left dead
     std::vector<VisualBlast> visualBlasts_;                     // explosions shown here for another machine: their hits are harmless
     uint64_t visualProjectileUntil_ = 0;                        // a visual projectile was spawned recently: sourceless projectile hits are harmless
     std::set<PlayerId> joined_;
     std::deque<std::string> rejections_;
+    std::string lastGate_;                                      // the last gate decision that was not a plain proceed on a non-actor (diagnostics)
     uint64_t now_ = 0, counter_ = 0;
     bool localPlayerDead_ = false;
     Stats stats_;

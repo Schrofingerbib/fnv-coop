@@ -82,6 +82,12 @@ public:
     // ---- companions: per-owner view of the shared follower variables (every machine keeps a registry)
     CompanionRegistry& companions() { return companions_; }
     const std::set<FormRef>& ownerOnlyTopics() const { return cfg_.ownerOnlyTopics; }
+    // The node is built by the runtime before the data files are known: the glue module fills these in afterwards (idempotent).
+    void setOwnerOnlyTopics(std::set<FormRef> s) {
+        cfg_.ownerOnlyTopics = std::move(s);
+        if (host_) host_->setCompanions(&companions_, cfg_.ownerOnlyTopics);
+    }
+    void setCompanionRules(const CompanionRules& r) { cfg_.companionRules = r; companions_.setRules(r); }
     PlayerId self() const { return cfg_.self; }
     // Engine hook for GetQuestVariable evaluated for dialogue conditions / result-script reads: the value as seen by
     // `slot` (default: this machine's player). Quests without a rule are returned untouched.

@@ -29,6 +29,8 @@ sys.path.insert(0, str(HERE.parent))
 import instances  # noqa: E402
 import run  # noqa: E402
 
+os.environ["NVCOOP_NO_DXVK"] = "1"   # these tests count what provision installs; out/cache/deps must not change that (test_dxvk.py covers DXVK)
+
 REAL_PLAN = instances.plugin_plan
 REAL_RUN_ARGV = run.provision_argv
 PLUGINS = Path("Data") / "NVSE" / "Plugins"

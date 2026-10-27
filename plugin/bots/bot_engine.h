@@ -15,7 +15,11 @@
 #include "common/minijson.h"
 
 #include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
-// Runtime twins for this file (13..56), every one must make tests/test_bots.cpp fail:
+// Runtime twins for this file (13..73), every one must make tests/test_bots.cpp fail:
+//  67 the tutorial box is refused by bot.menu.close again   68 the terminal entry list is walked from the wrong node (the head's own item is skipped)
+//  69 a tutorial box over the terminal menu is left open before the click
+//  70 the accept gate answers "pressed" without a limit   71 a tutorial box over the accept/playback step is not seen
+//  72 the accept goes out in the frame after the queue    73 an accept that started no playback is not repeated (and never ends in an error)
 //  13 dialogue pick ignores the ready state    14 pick matches the wrong list index        15 pick skips the special-topic refusal
 //  16 menu id map has 0x3F1/0x3F0 swapped      17 VATS wins nothing over the menu id       18 inventory counts deltas, not totals
 //  19 vats job never gives up on a bad target  20 pick leaves the click gate untouched     21 consent buttons swapped
@@ -38,6 +42,18 @@
 //  54 the accept gate forces every slot and the held query     55 the VATSMenu vtable check is skipped    56 the hit-chance gate is skipped
 
 namespace nvbots {
+
+// A call pin compares 16 bytes at an engine entry with the prologue pinned in bots_addrs.h. Another module of ours may have detoured that entry
+// before the bots module looks (world_time's pending-travel hook sits on PendingTravelSet 0x93BE30; after a core reload the bots module starts
+// second and read "pin does not match this exe", which switched off all of bot.menu / bot.inventory / bot.dialog / bot.fasttravel: worldtime_proof
+// "bot.menu: unsupported: engine glue not wired", sweep 2026-10-22). A detoured entry is accepted when it holds a `jmp rel32` AND the trampoline
+// of our own hook there starts with the pinned bytes (the stolen prologue). `tramp` = nvhooks::trampolineOfAny(entry) contents, or null.
+inline bool pinBytesOk(const unsigned char* got, const unsigned char* want, const unsigned char* tramp) {
+    if (std::memcmp(got, want, 16) == 0) return true;
+    if (FNV_MUT(65) || !tramp) return false;                       // twin 65: a detoured entry is never accepted
+    if (got[0] != 0xE9) return false;
+    return FNV_MUT(66) || std::memcmp(tramp, want, 5) == 0;         // twin 66: any jmp is accepted, whatever the trampoline holds
+}
 
 using nvcoop::json::Value;
 using Addr32 = uint32_t;
@@ -107,6 +123,7 @@ struct IEngine {
     // native message box
     virtual bool onMainThread() = 0;                                 // the calling thread is the game main thread
     virtual bool msgMenuHandleClick(Addr32 menu, int id, Addr32 tile) = 0;   // MessageMenu vtable slot 3 (0x7AA070); false = refused or faulted
+    virtual bool closeAllMenus() = 0;                                // 0x7037E0 CloseAllMenusCore (cdecl, no arguments), main thread; false = refused or faulted
     // bot.vats (all main thread; false / 0 / -1 = refused or faulted)
     virtual Addr32 menuByType(uint32_t id) = 0;                      // 0xA09030: TileMenu* of an open menu, 0 when it is not open
     virtual bool closeTutorial() = 0;                                // 0x7E8D60 (cdecl, no arguments)
@@ -250,6 +267,48 @@ inline bool pressNativeMessageButton(IEngine& e, int button, Value* out, std::st
     return true;
 }
 
+// ---- bot.menu.close {kind?} ----
+// Closes the open menu the engine's own way: CloseAllMenusCore (0x7037E0, what the CloseAllMenus command calls, bots_addrs.h) closes every menu of
+// the stack, the path the game takes when the player leaves a container with Tab or B. Gates, in this order: the game main thread; the interface
+// manager is ready; a menu is open; the top menu is of the wanted kind. `kind` defaults to "container". "any" accepts every kind a human could leave
+// with the cancel key, but never the message box (bot.menu.press answers those, closing one here skips its callback), the loading screen, the pause
+// menu, VATS or the tutorial box. A kind is a bot.menu kind name (container, barter, terminal, lockpick, hacking, pipboy, dialogue, other).
+// The close happens inside the call; the menu is gone from bot.menu a frame or two later (the caller polls). On success `out` gets {closed, menu, kind}.
+inline bool kindIsLeavable(const std::string& kind) {
+    if (FNV_MUT(63)) return kind != "none";
+    return kind != "none" && kind != "message" && kind != "loading" && kind != "pause" && kind != "vats" && kind != "tutorial" && kind != "hud";
+}
+inline bool closeOpenMenu(IEngine& e, const std::string& want, Value* out, std::string* err) {
+    if (!FNV_MUT(60)) {
+        if (!e.onMainThread()) { *err = "the menu close must run on the game main thread"; return false; }
+    }
+    uint32_t mgr = 0;
+    if (!e.rd32(eng::kInterfaceMgrPtr, &mgr) || !mgr) { *err = "interface manager not ready"; return false; }
+    const uint32_t top = e.topMenuId(mgr);
+    const std::string kind = menuKindOf(top);
+    if (!top && !FNV_MUT(61)) { *err = "no menu is open"; return false; }
+    const std::string wanted = want.empty() ? "container" : want;
+    // The tutorial box (TutorialMenu 0x423, the first-use hint of a terminal, VATS, lockpicking...) is not closed by CloseAllMenusCore and stops every
+    // other input while it is open. It has its own close (0x7E8D60), the one the VATS job uses.
+    if (kind == "tutorial" && (wanted == "tutorial" || wanted == "any") && !FNV_MUT(67)) {
+        if (!e.closeTutorial()) { *err = "the live glue refused the TutorialClose call (pins did not match, or it faulted)"; return false; }
+        out->set("closed", true).set("menu", (int64_t)top).set("kind", kind);
+        return true;
+    }
+    if (!FNV_MUT(59)) {
+        if (wanted == "any") {
+            if (!kindIsLeavable(kind)) { *err = "the top menu is " + kind + " (id " + std::to_string(top) + "): not closed from code"; return false; }
+        } else if (kind != wanted) {
+            *err = "the top menu is " + kind + " (id " + std::to_string(top) + "), not " + wanted + ": left open";
+            return false;
+        }
+    }
+    const bool called = e.closeAllMenus();
+    if (!called && !FNV_MUT(62)) { *err = "the live glue refused the CloseAllMenusCore call (pins did not match, or it faulted)"; return false; }
+    out->set("closed", true).set("menu", (int64_t)top).set("kind", kind);
+    return true;
+}
+
 // ---- bot.say ----
 struct Choice { int idx; Addr32 item, info; uint32_t formId; };
 
@@ -386,8 +445,12 @@ inline bool terminalEntries(IEngine& e, const std::string& ref, std::vector<Term
     Addr32 want = 0, shown = 0;
     if (!e.resolveRef(ref, &want) || !want) { *err = "terminal reference not loaded"; return false; }
     if (!e.rd32(menu + eng::kTermRef, &shown) || shown != want) { *err = "the open terminal is a different reference"; return false; }
-    uint32_t node = 0;
-    e.rd32(menu + eng::kTermList + 4, &node);
+    // The tList head node is EMBEDDED in the ListBox at +4 (data@+4, next@+8), the same layout as the message box buttons (menu+0x44). Reading the
+    // value at +4 as a node pointer (this code before 2026-10-27) walked into the Tile and the string and returned a vtable as the "tile": the click
+    // found no entry, no text was readable, and the unlock terminal's "Disengage Lock" never ran (measured on the second PC: the list head's data
+    // was the item {Tile*, String*}, String = {char*}).
+    uint32_t node = menu + eng::kTermList + 4;
+    if (FNV_MUT(68)) e.rd32(menu + eng::kTermList + 8, &node);   // twin 68: the walk starts after the head node, so the first entry (the only one of the lab terminal) is lost
     for (int i = 0; node && i < 64; ++i) {
         uint32_t item = 0, next = 0, tile = 0, entry = 0, text = 0;
         if (!e.rd32(node, &item) || !e.rd32(node + 4, &next)) break;
@@ -413,6 +476,11 @@ inline bool terminalEntries(IEngine& e, const std::string& ref, std::vector<Term
 inline bool terminalPick(IEngine& e, const std::string& ref, int entry, Value* out, std::string* err) {
     std::vector<TermEntry> es;
     Addr32 menu = 0;
+    // The first-use tutorial box (0x423) lies over the terminal menu and eats the click: close it first (twin 69: it is left open)
+    if (!FNV_MUT(69) && e.menuByType(eng::kMenuIdTutorial)) {
+        if (!e.closeTutorial()) { *err = "the tutorial box is open over the terminal and the live glue refused to close it"; return false; }
+        out->set("tutorialClosed", true);
+    }
     if (!terminalEntries(e, ref, &es, &menu, err)) return false;
     Value names = Value::array();
     for (const TermEntry& t : es) names.push(t.text);
@@ -589,9 +657,13 @@ public:
     bool armed() const { return armed_; }
     int forced() const { return forced_; }
     // The detour asks this first. True = answer "pressed" and do not call the original.
+    // A gate answers "pressed" at most kMaxForced times per arm. If the engine ever asks the same question in a loop (the first in-game run froze the main
+    // thread for more than 50 s with the gate armed), the answer turns false after that many and the loop ends; the job then reports a refusal.
+    static constexpr int kMaxForced = 16;
     bool force(int slot, int held, int queueCount) {
         if (!armed_) return false;
         if (queueCount > base_) { armed_ = false; return false; }
+        if (forced_ >= kMaxForced && !FNV_MUT(70)) { armed_ = false; return false; }   // twin 70: no limit
         if (!FNV_MUT(54)) {   // twin 54: the gate also forces the other slots and the held query
             if (slot != 1 || held != 0) return false;
         }
@@ -621,6 +693,10 @@ public:
     enum Phase { kIdle, kEnter, kTutorial, kZoom, kTarget, kQueue, kExecute, kPlayback, kDone, kFailed };
     static constexpr uint64_t kSettleMs = 1500;   // kQueue: how long a 0 hit chance / missing body part may last before it is a failure
     static constexpr int kMaxCycles = 12;
+    static constexpr uint64_t kExecDelayMs = 400;       // the queued attack waits this long before the accept (the vats module's auto fire waits 350 ms; an accept
+                                                        // in the very next frame started no playback in game, 2026-10-27)
+    static constexpr uint64_t kPlaybackWaitMs = 1500;   // no camera mode 4 this long after an accept: accept again
+    static constexpr int kMaxExec = 3;
     bool start(IEngine& e, const std::string& ref, const std::string& limb, uint64_t now, std::string* err) {
         if (!FNV_MUT(22)) {
             if (!limb.empty()) { *err = "unsupported: limb selection in VATS is not implemented"; return false; }
@@ -632,7 +708,7 @@ public:
         uint32_t mode = 0;
         e.rd32(eng::kVatsCamera + eng::kVatsMode, &mode);
         if (mode != 0) { *err = "VATS is already active"; return false; }
-        phase_ = kEnter; reason_.clear(); t0_ = tPhase_ = tClick_ = tClose_ = now; cycles_ = 0; closeCalls_ = 0;
+        phase_ = kEnter; reason_.clear(); t0_ = tPhase_ = tClick_ = tClose_ = now; cycles_ = 0; closeCalls_ = 0; execs_ = 0;
         sawPlayback_ = false; tapped_ = false; armed_ = false; queued_ = false; queueBase_ = 0; hit_ = ap_ = 0.0f;
         return true;
     }
@@ -650,8 +726,11 @@ public:
         if (phase_ != kEnter && phase_ != kExecute && phase_ != kPlayback && mode == 0) return fail(e, "vats_closed (camera mode 0 before the attack was queued)");
         // In game 2026-10-21 the VATS tutorial box (1059) opened AFTER the job had passed the tutorial step, and the hit chance then read 0
         // (VATSMenu::Update does nothing while it is open). So a tutorial box sends the job back to the tutorial step from any later step.
-        if ((phase_ == kZoom || phase_ == kTarget || phase_ == kQueue) && !FNV_MUT(57) && e.menuByType(eng::kMenuIdTutorial)) {
-            // the attack may already be in the queue: keep that, so the job does not queue a second one after the box (PR #27 review)
+        const bool lateBox = (phase_ == kExecute || (phase_ == kPlayback && !sawPlayback_)) && !FNV_MUT(71);   // twin 71: a box over the accept is not seen
+        if ((phase_ == kZoom || phase_ == kTarget || phase_ == kQueue || lateBox) && !FNV_MUT(57) && e.menuByType(eng::kMenuIdTutorial)) {
+            // the attack may already be in the queue: keep that, so the job does not queue a second one after the box (PR #27 review). A box that opens
+            // over the accept swallows it (measured 2026-10-27: the queue stayed at 1 with the VATS menu behind the box): same, the attack is kept.
+            if (lateBox) queued_ = true;
             if (armed_ && !FNV_MUT(58) && e.vatsQueueCount() > queueBase_) queued_ = true;
             if (armed_) disarm(e);
             armed_ = false;
@@ -743,18 +822,27 @@ public:
                 break;
             }
             case kExecute: {
+                if (now - tPhase_ < kExecDelayMs && !FNV_MUT(72)) break;   // twin 72: the accept goes out in the frame after the queue
                 const int n = e.vatsQueueCount();
                 if (n < 1 && !FNV_MUT(50)) {   // twin 50: execute is called with an empty queue (that leaves VATS)
                     std::snprintf(b, sizeof b, "queue_empty_at_execute (queue %d: the queued attack was removed)", n);
                     return fail(e, b);
                 }
                 if (!e.vatsExecute()) return fail(e, "vats_execute_refused (pins did not match or not on the main thread)");
+                ++execs_;
                 to(kPlayback, now);
                 break;
             }
             case kPlayback:
                 if (mode == 4) sawPlayback_ = true;
                 if (mode == 0) { if (sawPlayback_) phase_ = kDone; else fail(e, "left_vats_without_playback"); }
+                else if (!sawPlayback_ && mode == 2 && now - tPhase_ >= kPlaybackWaitMs && !FNV_MUT(73)) {   // twin 73: an accept that started nothing is never repeated
+                    if (execs_ >= kMaxExec) {
+                        std::snprintf(b, sizeof b, "playback_never_started (accept called %d times, queue %d, camera mode %u)", execs_, e.vatsQueueCount(), mode);
+                        return fail(e, b);
+                    }
+                    to(kExecute, now);
+                }
                 break;
             default: break;
         }
@@ -808,7 +896,7 @@ private:
     Addr32 want_ = 0;
     std::string reason_;
     uint64_t t0_ = 0, tPhase_ = 0, tClick_ = 0, tClose_ = 0;
-    int cycles_ = 0, closeCalls_ = 0, queueBase_ = 0;
+    int cycles_ = 0, closeCalls_ = 0, queueBase_ = 0, execs_ = 0;
     float hit_ = 0.0f, ap_ = 0.0f;
     bool sawPlayback_ = false, tapped_ = false, armed_ = false, queued_ = false;
 };

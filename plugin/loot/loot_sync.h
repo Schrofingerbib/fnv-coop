@@ -52,6 +52,7 @@ public:
     void onActorDied(NetId actor, RefId ref);                // this machine owns the actor and it died: its corpse becomes a shared container
     void onDrop(RefId dropper, RefId dropped);               // xNVSE OnDrop
     void onPickup(RefId picker, RefId item);                 // the player picked a world item up
+    void noteActivate(bool byPlayer) { ++stats_.activateEvents; if (byPlayer) ++stats_.activateByPlayer; }   // OnActivate fired (counters of the pickup detector)
     void onTouch(RefId ref);                                 // the local player is pushing a physics object (TODO-RE: no verified detector; bots / glue call it)
     void onCellReset(lc::CellId cell);                       // host: the engine reset a cell (TODO-RE: no verified hook)
 
@@ -76,6 +77,7 @@ private:
     void deliver(lc::LootHost::Out& out);
     void pump();                                             // local inbox -> client, then actions
     void poll();                                             // read the open container now
+    void revertBlockedMenu();                                // a refused menu the engine could not close: undo what the player moves in it
     void pollMenu(uint64_t now);
     void openMenu(RefId ref);
     void closeMenu();
@@ -84,9 +86,16 @@ private:
     void applyContents(NetId net, const Items& want);
     void tickResolve(uint64_t now);
     void tickCreates(uint64_t now);
+    void tickRemoves(uint64_t now);
+    void grantNotes(const lc::LootHost::Out& out);
     void tickSweep(uint64_t now);
     void tickAudit(uint64_t now);
     void tickClutter(uint64_t now);
+    void tickTransfers(uint64_t now);
+    bool screenTransfer(NetId net, const Items& engineItems);   // true: the difference is a menu-less transfer's (or may become one): the caller leaves the container alone
+    void seedPlayer(NetId net, const Items& shared);
+    void scanIds(std::vector<NetId>& ids);                     // containers to compare: the engine's loaded ones + every shared one with a ref on this machine
+    void shiftPlayerSeen(const FormRef& base, int32_t delta, NetId except);
     bool readExact(NetId net, Items& out);
 
     struct Resolve { RefId ref = 0; bool corpse = false; NetId actor = 0; uint64_t due = 0; int tries = 0; bool deferredForOwner = false; };
@@ -107,15 +116,26 @@ private:
     RefId menuRef_ = 0;
     NetId menuNet_ = 0;
     uint64_t lastPollMs_ = 0;
+    std::set<NetId> blockedMenu_;                            // menus the host refused (busy, lock lost) that are still up: nothing the player moves in them stays
     std::set<NetId> suppressClose_;                          // menus WE closed (busy, lock lost): the close is not a player close
     // scheduled work
     std::deque<Resolve> resolves_;
     std::vector<lc::WorldItem> creates_;
     std::vector<uint64_t> createsDue_;
+    struct PendingRemove { NetId id = 0; FormRef placed; uint64_t due = 0; uint32_t tries = 0; };
+    std::set<NetId> notesDone_;            // host: notes already granted to the journal (a repeated claim of the same note is answered Ok again)
+    std::vector<PendingRemove> removes_;   // taken placed items whose world ref is not loaded here yet (a late joiner, or a player in another cell)
     std::set<NetId> ownedClutter_;
     std::function<bool(lc::CellId)> ownsCell_;
     uint64_t nextSweep_ = 0, nextAudit_ = 0, nextClutter_ = 0;
     size_t sweepCursor_ = 0, auditCursor_ = 0;
+    // menu-less transfers
+    std::map<NetId, std::map<FormRef, int32_t>> playerSeen_;  // container -> base -> the local player's count of it when the container last matched the shared contents
+    std::map<NetId, uint64_t> suspect_;                       // container -> since when its engine copy differs without the player's inventory explaining it
+    std::map<NetId, Items> engineBase_;                       // container -> what its engine copy held when it last matched a shared state (a remote change cannot hide a local move from this)
+    std::set<NetId> implicit_;                                // containers with a menu-less transfer under way (no menu to close for them)
+    uint64_t nextTransfer_ = 0;
+    size_t transferCursor_ = 0;
 };
 
 }  // namespace nvcoop::loot

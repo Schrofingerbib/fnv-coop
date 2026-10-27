@@ -1,0 +1,110 @@
+{
+ "config": {
+  "clients": 1
+ },
+ "evidence": {
+  "desync_keys": [
+   "StartQuest 4ADEE@falloutnv.esm: host (absent) / client StartQuest 4ADEE@falloutnv.esm",
+   "StopQuest 152E8A@falloutnv.esm: host (absent) / client StopQuest 152E8A@falloutnv.esm",
+   "StartQuest 14ADAE@falloutnv.esm: host (absent) / client StartQuest 14ADAE@falloutnv.esm",
+   "StopQuest 10A214@falloutnv.esm: host (absent) / client StopQuest 10A214@falloutnv.esm",
+   "StartQuest 11F460@falloutnv.esm: host (absent) / client StartQuest 11F460@falloutnv.esm",
+   "StartQuest 131E7C@falloutnv.esm: host (absent) / client StartQuest 131E7C@falloutnv.esm",
+   "StartQuest 140E14@falloutnv.esm: host (absent) / client StartQuest 140E14@falloutnv.esm",
+   "StartQuest 139B8D@falloutnv.esm: host (absent) / client StartQuest 139B8D@falloutnv.esm"
+  ],
+  "found": {
+   "at_ms": 19174.075,
+   "class": "divergence",
+   "detail": "effect 0 of txn seq 3 differs between machines: slot(s) [1] hash 48c4576dc096c9db; slot(s) [1] hash 77657f03ec901d00",
+   "healed": true,
+   "key": "txn:3[0]",
+   "kind": "txn-hash",
+   "suspects": [
+    1
+   ]
+  },
+  "symptoms": [
+   "digest mismatch x21",
+   "7 repair(s), 1411 effect(s) repaired",
+   "sync lag: slot 1 acked 3559 of 3560"
+  ]
+ },
+ "expect": {
+  "bug_signature": "divergence txn:#[#]",
+  "converges": false,
+  "meaning": "recorded evidence of the failure"
+ },
+ "format": "trace-1",
+ "headers": {
+  "0": "4e56465201004000000000000600000088fa016aa101000010f9ed0d000000000000000000000000ecdd00000000000000000000000000000000000000000000",
+  "1": "4e564652010040000101000006000000280a026aa101000092f9b00d000000000000000000000000ebb200000000000000000000000000000000000000000000"
+ },
+ "shrunk": {
+  "complete": true,
+  "first": {
+   "category": "divergence",
+   "key": "txn:185[1]"
+  },
+  "oracle_runs": 80,
+  "original_steps": 102615,
+  "reduced_steps": 2,
+  "seconds": 1.73,
+  "signature": "divergence txn:#[#]",
+  "stages": [
+   "window +-60000ms: 102615 -> 24571 records",
+   "dropped all NetIn (2235 records)",
+   "dropped all NetOut (2239 records)",
+   "dropped all Marker (17140 records)",
+   "dropped all Digest (42 records)",
+   "dropped all Meta (2 records)"
+  ],
+  "violations": [
+   "divergence txn:185[1]",
+   "divergence txn:185[1]"
+  ]
+ },
+ "source": {
+  "failure": "FAIL-1-01-everyone_at_the_ganger_he_carries_the_same_loot_everywhere",
+  "kind": "settle",
+  "playbook": "corpse_loot_race",
+  "reason": "machines did not converge within 38.4653s: lastSeq per machine {'host': 3559, 'client1': 3559}, host allSynced=False",
+  "recordings": [
+   {
+    "dropped": 0,
+    "file": "nvcoop-manual-1792780110932-10.nvfr",
+    "name": "host",
+    "records": 56812,
+    "role": "host",
+    "slot": 0
+   },
+   {
+    "dropped": 0,
+    "file": "nvcoop-manual-1792780111063-6.nvfr",
+    "name": "client1",
+    "records": 45803,
+    "role": "client",
+    "slot": 1
+   }
+  ],
+  "run": "fight",
+  "step": "01-everyone at the ganger, he carries the same loot everywhere"
+ },
+ "steps": [
+  {
+   "at_ms": 67097.428,
+   "hex": "05001c001e0a000039d5c00300000000b900000000000000010000000001000000000602486e97c577044a8c",
+   "op": "rec",
+   "slot": 1,
+   "ty": "TxnApplied"
+  },
+  {
+   "at_ms": 75145.235,
+   "hex": "05001c00e20b0000f8a13b0400000000b900000000000000020000000001000000000602e9304e0549eb9ccb",
+   "op": "rec",
+   "slot": 1,
+   "ty": "TxnApplied"
+  }
+ ],
+ "version": 1
+}

@@ -115,5 +115,129 @@ class CompanionData(unittest.TestCase):
                 C.HEADER = orig
 
 
+DATA = os.path.join(HERE, '..', 'data')
+
+
+def _read(path):
+    with open(path, encoding='utf8') as f:
+        return f.read()
+
+
+class WaveOneData(unittest.TestCase):
+    """Gaps G05 (say-once, facts), G07 (MenuMode scripts), G08 (consent forks), G33 (follower rules): the generated tables are current and mean what the owner decisions say."""
+
+    def test_follower_rules_are_current_and_cover_the_dlc_follower_quests(self):
+        import gen_follower_rules as R
+        lines, problems = R.generate()
+        self.assertEqual(problems, [])
+        self.assertEqual('\n'.join(lines) + '\n', _read(os.path.join(DATA, 'follower_rules.txt')))
+        text = '\n'.join(lines)
+        for q in ('NVDLC01Followers', 'NVDLC02FollowersQuest', 'VNPCFollowers'):
+            self.assertIn(q, text)
+        for c in ('Dean', 'Christine', 'Dog', 'FollowsChalk', 'WakingCloud', 'JoshuaGraham', 'Boone', 'EDE'):
+            self.assertIn('companion %s ' % c, text)
+
+    def test_twin_follower_var_name_that_the_script_lacks_is_rejected(self):
+        import gen_follower_rules as R
+        orig = list(R.QUESTS)
+        try:
+            q = orig[1]
+            comps = [('Dean', 'humanoid', ['NVDLC01Dean'], 'bDeanHiredTYPO', 'bDeanFired', 'bDeanAvailable')] + list(q[3][1:])
+            R.QUESTS[:] = [orig[0], (q[0], q[1], q[2], comps), orig[2]]
+            _, problems = R.generate()
+            self.assertTrue(any('bDeanHiredTYPO' in p for p in problems))
+        finally:
+            R.QUESTS[:] = orig
+
+    def test_player_data_is_current_and_sayonce_is_shared_except_speech_xp_and_trainers(self):
+        import gen_player_data as P
+        rows, forms = P.load()
+        so = P.sayonce(rows, forms)
+        self.assertEqual({k for k, _ in so}, {'speech', 'trainer'})
+        text = '\n'.join('%s %s' % x for x in so)
+        self.assertIn('FalloutNV.esm:08F070', text)                       # Ranger Takedown trainer
+        self.assertNotIn('FalloutNV.esm:1258AA', text)                     # an ordinary say-once greeting stays shared
+        committed = [l for l in _read(os.path.join(DATA, 'sayonce_per_player.txt')).splitlines() if l and not l.startswith('#')]
+        self.assertEqual(committed, ['%s %s' % x for x in so])
+        facts = P.facts(rows, forms)
+        committed_f = [l for l in _read(os.path.join(DATA, 'info_facts.txt')).splitlines() if l and not l.startswith('#')]
+        self.assertEqual(committed_f, ['%s %s' % (r, ','.join(facts[r])) for r in sorted(facts)])
+
+    def test_twin_trainer_rule_that_matches_everything_changes_the_table(self):
+        import gen_player_data as P
+        import re
+        rows, forms = P.load()
+        base = P.sayonce(rows, forms)
+        orig = P.TRAINER
+        try:
+            P.TRAINER = re.compile('.')
+            self.assertGreater(len(P.sayonce(rows, forms)), len(base))      # the committed file would be stale: the current-table test above catches it
+        finally:
+            P.TRAINER = orig
+
+    def test_menumode_script_table_is_current(self):
+        import gen_menumode_scripts as M
+        import gzip, json
+        scr = json.load(gzip.open(os.path.join(M.QD, 'scripts.json.gz'), 'rt'))
+        want = sorted('%s:%s %s' % (s['ref'].rpartition(':')[0], s['ref'].rpartition(':')[2].upper(), s['edid'])
+                      for s in scr if s.get('ref') and 1001 in {int(m.group(1)) for m in M.BLOCK.finditer((s.get('script') or {}).get('source') or '') if m.group(1)})
+        got = [l for l in _read(os.path.join(DATA, 'menumode_scripts.txt')).splitlines() if l and not l.startswith('#')]
+        self.assertEqual(got, want)
+        self.assertTrue(any(l.endswith('FortCaesarScript') for l in got))     # Caesar's surgery polls the button in a MenuMode block
+
+    def test_consent_forks_resolve_and_carry_the_owner_decision_modes(self):
+        import gen_consent_messages as C
+        rows, problems = C.scan_forks(C.find_data())
+        self.assertEqual(problems, [])
+        by = {r[2]: r for r in rows}
+        self.assertEqual(by['FortCaesarComaMsg'][6], 'actor')                 # surgery: the activating player decides
+        self.assertEqual(by['NVDLC04TempleNukeAllConfirmMSG'][6], 'vote')      # nuke: party vote, the host breaks ties
+        self.assertEqual(by['INFO_010718'][6:8], ('vote', 'info'))             # Joshua or Daniel
+        self.assertEqual(by['INFO_011C68'][6:8], ('vote', 'info'))             # Elijah's offer
+        self.assertEqual(by['VMS42MicroclineMsg'][3], '*')
+        text = _read(os.path.join(DATA, 'consent_messages.txt'))
+        for r in rows:
+            self.assertIn('%s:%06X %s ' % (r[0], r[1], r[2]), text)
+        self.assertEqual(len([l for l in text.splitlines() if 'VEndGameWarningMsg' in l]), 5)   # the five end-game boxes are still unanimous rows
+
+    def test_twin_fork_with_a_missing_form_aborts(self):
+        import gen_consent_messages as C
+        orig = list(C.FORKS)
+        try:
+            C.FORKS.append(('FalloutNV.esm', 'mesg', 'NoSuchMessageEver', 'vote', 1, 0, 'x'))
+            _, problems = C.scan_forks(C.find_data())
+            self.assertTrue(problems)
+        finally:
+            C.FORKS[:] = orig
+
+    def test_response_layout_facts_match_the_game_exe(self):
+        exe = os.path.join(HERE, '..', '..', '..', 'out', 'L5', 're', 'fnv_reference.exe')
+        if not os.path.exists(exe):
+            self.skipTest('no reference exe')
+        import struct
+        d = open(exe, 'rb').read()
+        e = struct.unpack_from('<I', d, 0x3C)[0]
+        nsec = struct.unpack_from('<H', d, e + 6)[0]
+        opt = struct.unpack_from('<H', d, e + 20)[0]
+        secs = []
+        for i in range(nsec):
+            o = e + 24 + opt + i * 40
+            vs, va, rs, rp = struct.unpack_from('<IIII', d, o + 8)
+            secs.append((va + 0x400000, max(vs, rs), rp))
+
+        def rd(a, n):
+            for va, sz, rp in secs:
+                if va <= a < va + sz:
+                    return d[rp + a - va: rp + a - va + n]
+        # TESTopicInfo::GetResponses 0x61E780 (SEH frame, ret 4) and MarkSaid 0x61F220 (thiscall, plain ret)
+        self.assertEqual(rd(0x61E780, 6).hex(), '558bec6aff68')
+        self.assertEqual(rd(0x61F220, 4).hex(), '558bec51')
+        # the INFO constructor clears +0x48 (mov dword ptr [eax+48h], 0) and never stores a response chain there: the chain is lazy
+        ctor = rd(0x61CF40, 0x60)
+        self.assertIn(bytes.fromhex('c74048') + b'\x00\x00\x00\x00', ctor)
+        # a response node's constructor clears its `next` at +0x28 (mov dword ptr [edx+28h], 0): the chain is intrusive, headed by a cell
+        self.assertIn(bytes.fromhex('c74228') + b'\x00\x00\x00\x00', rd(0x616CE0, 0x70))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=1)

@@ -9,44 +9,31 @@ every quest, every ending - and **every claim of "works" is proven by automated 
 ## Architecture
 
 ```
- FalloutNV.exe (host)                         FalloutNV.exe (client)
- ├─ NV:MP client.dll  <── NV:MP transport ──> ├─ NV:MP client.dll      players, NPC motion, combat
- └─ nvcoop.dll (ours, xNVSE plugin)           └─ nvcoop.dll
-     ├─ hooks: SetStage, objectives, globals,     ├─ applies deltas (no script re-run)
-     │  rep/karma, topic result scripts,          ├─ suppresses local quest-script authority
-     │  script-exec tracer, effect capture        └─ nvbridge test API
-     ├─ sync core (game-free C++)  <── ENet side channel (ours) ──>
-     ├─ NV:MP patches (signature-scanned)
+ FalloutNV.exe (host)                               FalloutNV.exe (client)
+ └─ nvcoop.dll (ours, xNVSE plugin)                 └─ nvcoop.dll
+     ├─ hooks: SetStage, objectives, globals,           ├─ applies deltas (no script re-run)
+     │  rep/karma, topic result scripts,                ├─ suppresses local quest-script authority
+     │  script-exec tracer, effect capture              ├─ guest intents (dialogue, activate, triggers)
+     ├─ sync core (game-free C++)  <── own transport (ENet) ──>
+     ├─ actors, avatars, combat, VATS, loot, world/time (all ours)
+     ├─ plugin/nvmp: optional, only patches NV:MP when a player also runs it
      └─ nvbridge (test API, JSON over pipe)
 ```
 
-Phase 1 rides on NV:MP for players/NPC motion; our own side channel carries story state.
-The sync core is engine- and transport-agnostic so Phase 2 can drop NV:MP if it becomes the limit (05-nvmp-intel).
+Update (2026-10-27): the mod no longer rides on NV:MP for anything. Players (avatars), NPC motion, combat, loot
+and the world sync through our own layers and our own transport, and every in-game test runs without NV:MP
+installed. NV:MP was a starting point only: we studied how it hooks the game. Its networking is closed source and
+none of its code is in this repo. `plugin/nvmp` stays as an optional compatibility module for players who run
+NV:MP at the same time.
 
-## The key design decision: effect capture, not script replay
-Prior art shows the two naive options both fail (01-prior-art):
-- **Replay SetStage on clients** (Skyrim Together) → result scripts run N times → duplicated items/rewards, double spawns.
-- **Write the stage number only** → result-script side effects (enable NPC, add item, set global, start quest) never happen on clients.
-
-**Our approach:** the host is the only machine that runs quest/topic result scripts. While a result script runs,
-nvcoop records every primitive world mutation it causes (stage set, objective change, global set, ref enable/disable,
-item add/remove, AV/rep/karma change, quest start/stop, moveto). That **effect list** is shipped as one atomic,
-ordered transaction. Clients apply the effects directly, without running scripts. Effects that target "the player" are
-routed by policy (to the triggering player, to everyone, or to party inventory).
-→ No duplication, no missing side effects, and every transaction is a perfect test fixture (record/replay for free).
-
-Supporting rules (from TES3MP / Skyrim Together):
-- Echo guard (ScopedQuestOverride-style) while applying remote deltas.
-- Canonical server-held story log → late join / reconnect / resync = replay log.
-- FormIDs on the wire as (plugin name, local id).
-- Merge rules by type: stage = max, flags = OR, kills = union, globals = host wins.
-- Per-category share flags (journal, topics, faction rank, reputation, karma, kills, globals) like TES3MP.
 - Script variables only via whitelist + effect capture.
 
 ## Architecture decision: hybrid (owner, 2026-10-15)
 Story layer (synccore, hooks, dialogue, coop runtime, our own transport) is 100% ours and must stay NV:MP-independent
 (only plugin/nvmp/ may reference NV:MP). Avatars / NPC motion / combat ride on NV:MP for now. Optimise for the best
 end product; revisit an own actor-sync layer once story co-op is playable.
+Superseded (2026-10-27): the own actor-sync layer was built (avatars, actors, combat, VATS, loot, world). Nothing
+depends on NV:MP now; only plugin/nvmp/ may reference it, as an optional compatibility module.
 
 ## Owner decisions (locked 2026-10-15)
 | Question | Decision |

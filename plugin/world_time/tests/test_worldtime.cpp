@@ -1063,4 +1063,73 @@ TEST(storm, lossy_duplicating_links_still_converge_and_every_request_resolves_on
     }
 }
 
+
+// ---- G38 / owner decision D7: a scripted time skip happens once per party event ----
+TEST(clock, a_scripted_three_day_skip_repeated_by_a_second_player_is_taken_back) {
+    ClockAuthority a;
+    GameTime t = at(9.0);
+    a.tick(1000, t, 30);
+    // the first player walks through the Canyon door: the script adds 3 days
+    GameTime first = advanceBy(t, 3 * 1440.0);
+    auto b1 = a.tick(1200, first, 30);
+    REQUIRE(b1.has_value());
+    CHECK(b1->jump);
+    GameTime undo;
+    CHECK(!a.takeUndo(&undo));
+    // the second player does the same 20 s later: the host script adds 3 days again
+    GameTime second = advanceBy(first, 3 * 1440.0 + 20.0 * 30 / 60.0);
+    auto b2 = a.tick(21200, second, 30);
+    CHECK(!b2.has_value());                                    // twin 170: every use skips again and is announced as a jump
+    REQUIRE(a.takeUndo(&undo));
+    CHECK(approx(deltaMinutes(second, undo), 3 * 1440.0, 1.0));   // twin 171: moved the wrong way
+    CHECK(a.repeatsUndone() == 1);
+    // after the window the next use is a new event
+    GameTime third = advanceBy(undo, 3 * 1440.0 + 200.0 * 30 / 60.0);
+    auto b3 = a.tick(221200, third, 30);
+    REQUIRE(b3.has_value());
+    CHECK(b3->jump);
+    CHECK(!a.takeUndo(&undo));
+    // a skip of another size inside the window is another event (Honest Hearts: +14 days)
+    GameTime other = advanceBy(third, 14 * 1440.0);
+    auto b4 = a.tick(230000, other, 30);
+    REQUIRE(b4.has_value());
+    CHECK(!a.takeUndo(&undo));
+    // short script leaps (set GameHour) are not events and never undone
+    GameTime hop = advanceBy(other, 300.0);
+    CHECK(a.tick(231000, hop, 30).has_value());
+    GameTime hop2 = advanceBy(hop, 300.0);
+    CHECK(a.tick(232000, hop2, 30).has_value());
+    CHECK(!a.takeUndo(&undo));
+}
+
+TEST(clock, the_once_per_event_rule_can_be_switched_off_by_configuration) {
+    ClockAuthority::Config c;
+    c.onceEnabled = false;
+    ClockAuthority a(c);
+    GameTime t = at(9.0);
+    a.tick(1000, t, 30);
+    GameTime first = advanceBy(t, 3 * 1440.0);
+    a.tick(1200, first, 30);
+    auto b = a.tick(21200, advanceBy(first, 3 * 1440.0 + 10.0), 30);
+    REQUIRE(b.has_value());
+    GameTime undo;
+    CHECK(!a.takeUndo(&undo));
+}
+
+TEST(session, two_players_using_the_same_scripted_door_skip_the_party_clock_once) {
+    Rig r(3);
+    r.run(2000);
+    const double daysBefore = r.host().eng.t.daysPassed;
+    r.host().eng.t = advanceBy(r.host().eng.t, 3 * 1440.0);       // player one: the door script adds 3 days
+    r.run(5000);
+    r.host().eng.t = advanceBy(r.host().eng.t, 3 * 1440.0);       // player two, five seconds later: the same script again
+    r.run(15000);
+    const double gained = r.host().eng.t.daysPassed - daysBefore;
+    CHECK(gained > 2.9 && gained < 3.3);                          // once: 3 days (+ the minutes that really passed), not 6
+    CHECK(r.host().s->stats().scriptedRepeatsUndone == 1);
+    for (size_t i = 1; i < 3; ++i) CHECK(std::fabs(r.driftToHost(i)) < 6.0);   // the guests follow the one skip
+    const double c1 = r.at(1).eng.t.daysPassed - daysBefore;
+    CHECK(c1 > 2.9 && c1 < 3.3);
+}
+
 }  // namespace

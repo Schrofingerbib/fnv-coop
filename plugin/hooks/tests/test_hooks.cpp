@@ -1,19 +1,23 @@
 // Unit tests for the hook patcher (fake memory) and the capture hub. Exit code != 0 on any failure.
 // Built twice: against the real sources, and against NVHOOKS_MUTANT sources (the latter MUST fail).
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <map>
 #include <vector>
 
 #include "../capture_hub.h"
 #include "../effect_json.h"
 #include "../engine_addrs.h"
+#include "../extract_pad.h"
 #include "../hook_patch.h"
 #include "../apply_lines.h"
 #include "../change_tracker.h"
 #include "../inventory_diff.h"
 #include "../suppress_policy.h"
 #include "../guest_local_run.h"
+#include "../guest_objvars.h"
 #include "../party_cond.h"
 #include "../rules_reducer.h"
 #include "fnvcoop/session.h"
@@ -414,6 +418,184 @@ TEST(reload_tampered_hook_is_counted_so_the_loader_can_refuse_to_unload) {
     CHECK(tamperedCount() == t0 + 1);
 }
 
+// ---- hook_patch rule 4: chaining on top of another patcher's entry jump (xNVSE's EventManager hook at 0x5AC750) ----
+// FakeXnvse models EventManager's lazy hook: the first handler registration for a game event writes `jmp MarkEventHook` over the
+// first 5 bytes (WriteRelJump), then the installer pointer is cleared and it never writes there again. Its stub re-runs the prologue
+// and jumps to target+6, so it never calls whatever was at the entry before.
+struct FakeXnvse {
+    static constexpr Addr kStub = 0x0B6A1000;   // MarkEventHook inside nvse_1_4.dll (never executed by the tests)
+    FakeMemory& m;
+    Addr target;
+    bool installerUsed = false;
+    void setEventHandler() {
+        if (installerUsed) return;
+        installerUsed = true;
+        uint8_t j[5];
+        uint32_t rel = kStub - (target + 5);
+        j[0] = 0xE9;
+        std::memcpy(j + 1, &rel, 4);
+        std::memcpy(&m.image[target - FakeMemory::kImage], j, 5);   // WriteRelJump: no prologue check, no chaining
+    }
+};
+
+TEST(chain_over_foreign_entry_jump_relocates_it_and_release_puts_it_back) {
+    FakeMemory m;
+    HookSpec s = makeSpec();
+    m.place(s);
+    FakeXnvse x{m, s.target};
+    x.setEventHandler();
+    const auto theirs = m.image;
+    HookRegistry reg(m);
+    const Addr detour = 0x30000000;
+    CHECK(reg.acquire(s, detour, nullptr) == PatchStatus::AlreadyHooked);   // not opted in: refused, nothing written
+    CHECK(m.image == theirs);
+    Addr tramp = 0;
+    CHECK(reg.acquire(s, detour, &tramp, nullptr, true) == PatchStatus::Ok);
+    CHECK(reg.chainedOver(s.target) == FakeXnvse::kStub);
+    auto code = m.bytes(s.target, 16);
+    CHECK(code[0] == 0xE9 && s.target + 5 + rel32At(code, 1) == detour);   // game -> ours
+    CHECK(code[5] == s.expected[5]);                                          // only their 5 bytes were replaced
+    CHECK(std::memcmp(&code[6], &s.expected[6], 10) == 0);
+    auto t = m.bytes(tramp, 10);
+    CHECK(t[0] == 0xE9 && tramp + 5 + rel32At(t, 1) == FakeXnvse::kStub);   // ours -> theirs (relocated, not copied verbatim)
+    CHECK(t[5] == 0xE9 && tramp + 10 + rel32At(t, 6) == s.target + 5);
+    CHECK(reg.auditTampered() == 0);                                          // a hot reload may unhook
+    CHECK(reg.release(s) == PatchStatus::Restored);
+    CHECK(m.image == theirs);                                                 // their jump back, byte for byte
+}
+
+TEST(xnvse_primed_before_install_keeps_the_hook_and_the_swap_alive) {
+    HookSpec s = makeSpec();
+    {   // the old order: we hook first, the bots/loot OnDrop registration makes xNVSE write over us -> reload refused
+        FakeMemory m;
+        m.place(s);
+        FakeXnvse x{m, s.target};
+        HookRegistry reg(m);
+        CHECK(reg.acquire(s, 0x30000000, nullptr, nullptr, true) == PatchStatus::Ok);
+        x.setEventHandler();
+        CHECK(reg.auditTampered() == 1);
+        m.place(s);   // let the destructor restore cleanly
+    }
+    {   // the fixed order: prime xNVSE, then hook (chained), then the later registrations write nothing
+        FakeMemory m;
+        m.place(s);
+        FakeXnvse x{m, s.target};
+        x.setEventHandler();   // PrimeXnvseEventHook
+        const auto theirs = m.image;
+        for (int cycle = 0; cycle < 3; ++cycle) {   // core load, hot reload, hot reload
+            HookRegistry reg(m);
+            CHECK(reg.acquire(s, 0x30000000 + 0x40u * cycle, nullptr, nullptr, true) == PatchStatus::Ok);
+            x.setEventHandler();   // bots InstallDropHandler: installer already used
+            CHECK(reg.auditTampered() == 0);
+            CHECK(reg.restoreAllAndVerify() == 0);
+            CHECK(m.image == theirs);
+        }
+    }
+    {   // a process where an older core was overwritten by xNVSE: the entry is their jump plus our NOP padding byte
+        FakeMemory m;
+        m.place(s);
+        FakeXnvse x{m, s.target};
+        {
+            HookRegistry old(m);
+            CHECK(old.acquire(s, 0x30000000, nullptr) == PatchStatus::Ok);
+            x.setEventHandler();
+            CHECK(old.restoreAllAndVerify() == 1);   // tampered: left alone
+        }
+        CHECK(m.image[s.target - FakeMemory::kImage + 5] == 0x90);
+        HookRegistry reg(m);
+        CHECK(reg.acquire(s, 0x30000080, nullptr, nullptr, true) == PatchStatus::Ok);
+        CHECK(reg.chainedOver(s.target) == FakeXnvse::kStub);
+    }
+}
+
+TEST(chain_refuses_a_foreign_jump_over_a_different_function_or_into_ourselves) {
+    HookSpec s = makeSpec();
+    {   // the body after the stolen bytes changed: wrong exe or a patch we do not understand
+        FakeMemory m;
+        m.place(s);
+        FakeXnvse x{m, s.target};
+        x.setEventHandler();
+        m.image[s.target - FakeMemory::kImage + 9] ^= 0x01;
+        const auto before = m.image;
+        HookRegistry reg(m);
+        CHECK(reg.acquire(s, 0x30000000, nullptr, nullptr, true) == PatchStatus::AlreadyHooked);
+        CHECK(m.image == before && reg.installedCount() == 0);
+    }
+    {   // the jump already goes to this detour (bookkeeping lost): chaining would loop forever
+        FakeMemory m;
+        m.place(s);
+        const Addr detour = 0x30000000;
+        uint32_t rel = detour - (s.target + 5);
+        m.image[s.target - FakeMemory::kImage] = 0xE9;
+        std::memcpy(&m.image[s.target - FakeMemory::kImage + 1], &rel, 4);
+        HookRegistry reg(m);
+        CHECK(reg.acquire(s, detour, nullptr, nullptr, true) == PatchStatus::AlreadyHooked);
+    }
+}
+
+// ---- extract_pad.h: ExtractArgs with more parameters in the script line than the hook has out pointers ----
+// fakeExtract models xNVSE's v_ExtractArgsEx: one va_arg pointer per parameter PRESENT in the line; an int is written as 4 bytes, a
+// string is copied whole. A null pointer stands for "a stray stack word": in the game that write would land at a random address.
+struct FakeLine {
+    int n = 0;
+    char kind[8] = {};
+    int ival[8] = {};
+    const char* sval[8] = {};
+};
+static FakeLine g_fakeLine;
+static int g_strayWrites = 0;
+static bool __cdecl fakeExtract(void*, void*, uint32_t* off, void*, void*, void*, void* ev, ...) {
+    va_list ap;
+    va_start(ap, ev);
+    for (int i = 0; i < g_fakeLine.n; ++i) {
+        void* p = va_arg(ap, void*);
+        if (!p) { ++g_strayWrites; continue; }
+        if (g_fakeLine.kind[i] == 's') std::memcpy(p, g_fakeLine.sval[i], std::strlen(g_fakeLine.sval[i]) + 1);
+        else std::memcpy(p, &g_fakeLine.ival[i], 4);
+        ++*off;
+    }
+    va_end(ap);
+    return true;
+}
+
+TEST(extract_args_extra_parameters_land_in_spare_slots_not_on_the_stack) {
+    {   // AddItem <item> 300 1: the hook asks for item and count only (the old itemCmd)
+        g_fakeLine = FakeLine{};
+        g_fakeLine.n = 3;
+        g_fakeLine.kind[0] = g_fakeLine.kind[1] = g_fakeLine.kind[2] = 'i';
+        g_fakeLine.ival[0] = 0x1F276; g_fakeLine.ival[1] = 300; g_fakeLine.ival[2] = 1;
+        g_strayWrites = 0;
+        struct { uint32_t a = 0xA5A5A5A5; int item = 0; int count = 0; uint32_t b = 0x5A5A5A5A; } f;
+        uint32_t off = 0;
+        CHECK(extractPadded(&fakeExtract, nullptr, nullptr, &off, nullptr, nullptr, nullptr, nullptr, {&f.item, &f.count}));
+        CHECK(g_strayWrites == 0);
+        CHECK(f.item == 0x1F276 && f.count == 300 && off == 3);
+        CHECK(f.a == 0xA5A5A5A5 && f.b == 0x5A5A5A5A);
+        CHECK(std::memcmp(extractSpare(2), &g_fakeLine.ival[2], 4) == 0);   // the extra flag went to scratch
+    }
+    {   // a line whose extra parameter is text ("angl" in an EIP is what a stray string write leaves behind)
+        static const std::string longText = "player.setangle z " + std::string(0x1F0, 'x');
+        g_fakeLine = FakeLine{};
+        g_fakeLine.n = 2;
+        g_fakeLine.kind[0] = 'i'; g_fakeLine.kind[1] = 's';
+        g_fakeLine.ival[0] = 7;
+        g_fakeLine.sval[1] = longText.c_str();
+        g_strayWrites = 0;
+        int first = 0;
+        uint32_t off = 0;
+        CHECK(longText.size() + 1 <= kExtractSpareBytes);
+        CHECK(extractPadded(&fakeExtract, nullptr, nullptr, &off, nullptr, nullptr, nullptr, nullptr, {&first}));
+        CHECK(g_strayWrites == 0 && first == 7);
+        CHECK(std::string(extractSpare(1)) == longText);
+    }
+    {   // more outs than slots is refused before ExtractArgs runs
+        int x = 0;
+        uint32_t off = 0;
+        CHECK(!extractPadded(&fakeExtract, nullptr, nullptr, &off, nullptr, nullptr, nullptr, nullptr,
+                             {&x, &x, &x, &x, &x, &x, &x, &x, &x, &x, &x, &x, &x}));
+    }
+}
+
 TEST(engine_address_table_is_sane) {
     std::map<Addr, const char*> seen;
     for (const HookSpec* s : addr::kAll) {
@@ -744,6 +926,101 @@ TEST(change_tracker_reports_first_sight_and_changes_only) {
     CHECK(t.size() == 2);
     t.clear();
     CHECK(t.update(k, 2.0));
+}
+
+TEST(change_tracker_priming_takes_the_present_world_as_known) {
+    // A host without a world baseline: the first poll pass must only record what is already there (no flood of every quest var), later
+    // passes report changes. Before this the host did not poll at all without a baseline.
+    ChangeTracker t;
+    const uint64_t ganger = ChangeTracker::varKey(0x104EAE, 1), idle = ChangeTracker::varKey(0x104EAE, 2), g = ChangeTracker::globalKey(0x35);
+    t.beginPrime();
+    CHECK(t.priming());
+    CHECK(!t.update(ganger, 0));
+    CHECK(!t.update(idle, 5));
+    CHECK(!t.update(g, 12.0));
+    t.endPrime();
+    CHECK(!t.priming());
+    CHECK(!t.update(ganger, 0) && !t.update(idle, 5) && !t.update(g, 12.0));   // nothing changed since the priming pass
+    CHECK(t.update(ganger, 1));                                                   // a ganger died on the host
+    CHECK(!t.update(ganger, 1));
+    CHECK(t.update(ganger, 2));
+    CHECK(t.update(g, 13.0));
+    // a value that moved DURING the priming pass is also only recorded, and the next change is still seen
+    ChangeTracker u;
+    u.beginPrime();
+    CHECK(!u.update(ganger, 0));
+    CHECK(!u.update(ganger, 3));
+    u.endPrime();
+    CHECK(!u.update(ganger, 3) && u.update(ganger, 4));
+    // without priming the first pass reports everything (the baseline host: the replicator drops what the baseline already holds)
+    ChangeTracker v;
+    CHECK(v.update(ganger, 0) && v.update(idle, 5));
+}
+
+TEST(guest_objvars_table_lists_the_quest_vars_that_object_scripts_write) {
+    const ObjectVarWrites& t = ObjectVarWrites::builtin();
+    CHECK(t.scripts() > 500 && t.rows() > 1500);   // generated from the game's own scripts (tools/gen_guest_objvars.py)
+    // the VMS16 gangers' OnDeath scripts: `set VMS16.nGangerDeathCount to VMS16.nGangerDeathCount + 1`
+    int gangerWriters = 0;
+    for (uint32_t id : {0x104C69u, 0x105D4Du}) {
+        const std::vector<ObjVarWrite>* w = t.of(FormRef("falloutnv.esm", id));
+        CHECK(w != nullptr);
+        if (!w) continue;
+        for (const ObjVarWrite& x : *w)
+            if (x.quest == FormRef("falloutnv.esm", 0x104EAE) && x.var == "ngangerdeathcount") ++gangerWriters;
+    }
+    CHECK(gangerWriters == 2);
+    CHECK(t.of(FormRef("falloutnv.esm", 0x104EAE)) == nullptr);   // a quest is not an object script
+    CHECK(t.of(FormRef("nosuch.esm", 0x104C69)) == nullptr);
+    // every row is well formed: lower-case variable, real forms
+    ObjectVarWrites mini;
+    mini.add(FormRef("a.esm", 5), FormRef("a.esm", 9), "bflag");
+    mini.add(FormRef("a.esm", 5), FormRef("a.esm", 9), "bflag");   // duplicate rows collapse
+    mini.add(FormRef("a.esm", 5), FormRef("a.esm", 9), "ncount");
+    mini.add(FormRef("a.esm", 2), FormRef("b.esm", 1), "x");
+    CHECK(mini.scripts() == 2 && mini.rows() == 3);
+    CHECK(mini.of(FormRef("a.esm", 5)) && mini.of(FormRef("a.esm", 5))->size() == 2 && mini.of(FormRef("a.esm", 2))->size() == 1);
+    CHECK(mini.of(FormRef("a.esm", 3)) == nullptr);
+}
+
+TEST(var_rollback_puts_back_only_what_a_script_changed) {
+    double a = 2, b = 7, c = 0;
+    VarRollback rb;
+    rb.remember(&a);
+    rb.remember(&b);
+    rb.remember(nullptr);   // an unresolved slot is ignored
+    CHECK(rb.size() == 2);
+    a = 3;   // the script wrote one of them
+    CHECK(rb.restore() == 1);
+    CHECK(a == 2 && b == 7 && c == 0);
+    CHECK(rb.size() == 0 && rb.restore() == 0);   // spent
+    // nested scripts (an outer script calls an inner one that writes the same var): the outermost restore wins
+    VarRollback outer, inner;
+    outer.remember(&a);
+    inner.remember(&a);
+    a = 9;
+    CHECK(inner.restore() == 1 && a == 2);
+    a = 11;
+    CHECK(outer.restore() == 1 && a == 2);
+}
+
+TEST(guest_ganger_death_scripts_do_not_count_on_the_guest_the_host_value_wins) {
+    // The retest: three gangers die; their OnDeath scripts run on the host AND on the guest (object scripts still run on a guest). The host's
+    // count is polled and replicated; the guest's own increments must not stay (it ended at 1..2 / 0 while the host had 3).
+    double hostVar = 0, guestVar = 0;
+    int rolledBack = 0;
+    auto onDeath = [](double& v) { v = v + 1; };   // set VMS16.nGangerDeathCount to VMS16.nGangerDeathCount + 1
+    for (int death = 1; death <= 3; ++death) {
+        onDeath(hostVar);
+        VarRollback rb;                 // the guest brackets the same script (engine_hooks.cpp h_ScriptExec)
+        rb.remember(&guestVar);
+        onDeath(guestVar);
+        rolledBack += static_cast<int>(rb.restore());
+        CHECK(guestVar == double(death - 1));   // never ahead of the last replicated host value
+        guestVar = hostVar;                     // the replicated SetScriptVar arrives (RemoteApplier writes the slot directly)
+    }
+    CHECK(rolledBack == 3);
+    CHECK(hostVar == 3 && guestVar == 3);
 }
 
 TEST(apply_lines_pin_command_names_and_parameter_order) {
@@ -1282,6 +1559,10 @@ int main() {
     run("trampoline_lookup_names_the_original_code_of_installed_hooks_only", trampoline_lookup_names_the_original_code_of_installed_hooks_only);
     run("reload_suspend_leaves_chained_hooks_alone_and_process_wide_helpers_see_every_registry", reload_suspend_leaves_chained_hooks_alone_and_process_wide_helpers_see_every_registry);
     run("reload_tampered_hook_is_counted_so_the_loader_can_refuse_to_unload", reload_tampered_hook_is_counted_so_the_loader_can_refuse_to_unload);
+    run("chain_over_foreign_entry_jump_relocates_it_and_release_puts_it_back", chain_over_foreign_entry_jump_relocates_it_and_release_puts_it_back);
+    run("xnvse_primed_before_install_keeps_the_hook_and_the_swap_alive", xnvse_primed_before_install_keeps_the_hook_and_the_swap_alive);
+    run("chain_refuses_a_foreign_jump_over_a_different_function_or_into_ourselves", chain_refuses_a_foreign_jump_over_a_different_function_or_into_ourselves);
+    run("extract_args_extra_parameters_land_in_spare_slots_not_on_the_stack", extract_args_extra_parameters_land_in_spare_slots_not_on_the_stack);
     run("engine_address_table_is_sane", engine_address_table_is_sane);
     run("engine_table_signature_roundtrip_on_fake_image", engine_table_signature_roundtrip_on_fake_image);
     run("guest_local_run_script_may_mutate_on_guest_but_others_may_not", guest_local_run_script_may_mutate_on_guest_but_others_may_not);
@@ -1311,6 +1592,10 @@ int main() {
     run("engine_table_pins_stack_bytes_of_hooked_functions", engine_table_pins_stack_bytes_of_hooked_functions);
     run("apply_lines_pin_command_names_and_parameter_order", apply_lines_pin_command_names_and_parameter_order);
     run("change_tracker_reports_first_sight_and_changes_only", change_tracker_reports_first_sight_and_changes_only);
+    run("change_tracker_priming_takes_the_present_world_as_known", change_tracker_priming_takes_the_present_world_as_known);
+    run("guest_objvars_table_lists_the_quest_vars_that_object_scripts_write", guest_objvars_table_lists_the_quest_vars_that_object_scripts_write);
+    run("var_rollback_puts_back_only_what_a_script_changed", var_rollback_puts_back_only_what_a_script_changed);
+    run("guest_ganger_death_scripts_do_not_count_on_the_guest_the_host_value_wins", guest_ganger_death_scripts_do_not_count_on_the_guest_the_host_value_wins);
     run("suppress_host_never_blocks", suppress_host_never_blocks);
     run("suppress_guest_blocks_script_mutations_only_inside_scripts", suppress_guest_blocks_script_mutations_only_inside_scripts);
     run("suppress_guest_skips_quest_scripts_but_not_object_scripts", suppress_guest_skips_quest_scripts_but_not_object_scripts);

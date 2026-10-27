@@ -26,6 +26,7 @@
 #include "avatar_runtime.h"
 #include "local_sampler.h"
 #include "puppet_game_engine.h"
+#include "run_state.h"
 #include "testing/fake_backend.h"
 #include "../../avatar_groups.h"
 #include "../../loco.h"
@@ -733,6 +734,20 @@ void get_pose_reports_the_real_place() {
     CHECK(!r.eng.GetPose(kPlayerRef, c, p));
 }
 
+void get_local_pose_reads_the_player() {
+    ERig r;
+    r.be.Player().pos = Vec3{120, 340, 15};
+    CellId c = 0;
+    Vec3 p;
+    CHECK(r.eng.GetLocalPose(c, p));
+    CHECK(c == kExtA && p.x == 120 && p.y == 340 && p.z == 15);
+    r.be.Player().pos.x = NAN;
+    CHECK(!r.eng.GetLocalPose(c, p));      // an unreadable place is "unknown", never a place
+    r.be.Player().pos.x = 120;
+    r.be.Player().cell = 0;
+    CHECK(!r.eng.GetLocalPose(c, p));      // no cell (loading): unknown
+}
+
 void console_cost_accounting() {
     ERig r;
     r.be.lineCostUs = 40;
@@ -954,6 +969,22 @@ void stack_reused_ref_ids() {
     CHECK(r.F(2)->exists && !r.F(2)->deleted);
     r.Run(500);
     CHECK_NEAR(r.F(2)->pos.x, 420, 0.5);
+}
+
+// The remote player stands exactly where the local player does (two people on one spot): through the real engine the puppet is put one
+// metre beside the real player, never inside it, so the engine has nothing to push apart.
+void stack_makes_room_for_the_local_player() {
+    SRig r;
+    r.be.Player().pos = Vec3{400, 200, 0};
+    r.Add(1, MkPose(kExtA, 400, 200, 0, 0.0f));
+    CHECK(r.UntilDriving(1));
+    r.Run(500);
+    CHECK_NEAR(std::hypot(r.F(1)->pos.x - 400, r.F(1)->pos.y - 200), 70.0, 1.0);
+    CHECK(r.pm.stats().bodyYields > 0);
+    r.Pose(1, MkPose(kExtA, 900, 200, 0, 0.0f));   // the remote walks off: its true place again
+    r.Run(500);
+    CHECK_NEAR(r.F(1)->pos.x, 900, 0.5);
+    CHECK_NEAR(r.F(1)->pos.y, 200, 0.5);
 }
 
 // ======================================================================================================================
@@ -1421,7 +1452,7 @@ void runtime_loopback_follows_the_player() {
     RRig q;
     CHECK(q.rt->SetLoopback(true));
     CHECK(q.rt->loopback());
-    float maxStep = 0;
+    float maxStep = 0, firstStep = 0;
     Vec3 prev;
     bool havePrev = false;
     double lagSum = 0;
@@ -1437,7 +1468,11 @@ void runtime_loopback_follows_the_player() {
         auto* f = q.be.Get(ref);
         if (!ref || !f || q.rt->manager().PhaseOf(1) != Phase::Driving) continue;
         Vec3 want{pq.pos.x + 160, pq.pos.y, pq.pos.z};
-        if (havePrev) maxStep = std::max(maxStep, DistXY(prev, f->pos));
+        // the first frames: the new ref still stands where it was placed (on the player), and the driver moves it out of the player's body once
+        if (havePrev) {
+            if (t > 200) maxStep = std::max(maxStep, DistXY(prev, f->pos));
+            else firstStep = std::max(firstStep, DistXY(prev, f->pos));
+        }
         prev = f->pos;
         havePrev = true;
         if (t > 1800 && t < 3900) {
@@ -1454,6 +1489,7 @@ void runtime_loopback_follows_the_player() {
     CHECK(lagN > 50);
     CHECK(lagSum / std::max(1, lagN) < 80.0);        // behind by delay + render time at 280 u/s: a few tens of units
     CHECK(maxStep < 40.0f);                          // no teleports, no rubber band
+    CHECK(firstStep < 100.0f);                       // at most the one hop out of the player's body (70), never the 160 of an eased arrival
     CHECK(runFrames > 50 && runGroupFrames * 10 >= runFrames * 8);   // the run group is playing for most of the run
     CHECK_NEAR(f->pos.x, pq.pos.x + 160, 3.0);       // and it ends up beside the player when the player stops
     CHECK_NEAR(f->pos.y, pq.pos.y, 3.0);
@@ -1661,6 +1697,20 @@ void runtime_remote_look_update_and_local_look() {
     CHECK(r.be.badLines.empty());
 }
 
+// Twin 72 (live wiring 2026-10-22): the runtime waits for a player in a loaded cell and the status says so.
+void runtime_starts_only_with_a_player_and_says_why_not() {
+    using namespace nvcoop::avatar;
+    CHECK(!shouldCreateRuntime(true, true, false, 30, false));    // main menu: nothing to place a puppet in (twin 72: created anyway)
+    CHECK(shouldCreateRuntime(true, true, false, 30, true));      // a save is loaded
+    CHECK(!shouldCreateRuntime(true, true, false, 31, true));     // checked every 30th frame only
+    CHECK(!shouldCreateRuntime(true, true, true, 60, true));      // exists already
+    CHECK(!shouldCreateRuntime(false, true, false, 30, true));    // [avatar] enabled=0 and no live switch
+    CHECK(!shouldCreateRuntime(true, false, false, 30, true));    // no console interface
+    CHECK(std::string(notRunningBecause(true, true)).empty());
+    CHECK(std::string(notRunningBecause(true, false)).find("loaded game") != std::string::npos);
+    CHECK(std::string(notRunningBecause(false, false)).find("enabled=0") != std::string::npos);
+}
+
 struct TestCase {
     const char* name;
     void (*fn)();
@@ -1673,10 +1723,10 @@ const TestCase kTests[] = {
     T(setpos_needs_3d_and_finite), T(setyaw_degrees_wrapped_and_skipped), T(playgroup_text), T(currentgroup_reads_any_slot),
     T(restraint_readback_and_fallback), T(nonCombatant_lines), T(generation3d_tracking), T(stance_and_weapon), T(equipment_calls),
     T(itemcount_fallback_when_evaluator_unavailable), T(appearance_is_honest), T(find_tagged_scans_every_loaded_cell), T(world_state_mapping),
-    T(move_to_cell_uses_an_anchor), T(get_pose_reports_the_real_place), T(console_cost_accounting), T(console_exceptions_and_gone_refs),
+    T(move_to_cell_uses_an_anchor), T(get_pose_reports_the_real_place), T(get_local_pose_reads_the_player), T(console_cost_accounting), T(console_exceptions_and_gone_refs),
     T(stack_spawn_and_drive), T(stack_running_costs_one_line_per_step), T(stack_equipment_converges), T(stack_save_and_load_purge),
     T(stack_cell_change), T(stack_rebuilt_3d_is_reasserted), T(stack_menu_pauses_and_replays), T(stack_survives_all_evaluators_missing),
-    T(stack_reused_ref_ids), T(sampler_period_identity_and_sequence), T(sampler_velocity_and_locomotion),
+    T(stack_reused_ref_ids), T(stack_makes_room_for_the_local_player), T(sampler_period_identity_and_sequence), T(sampler_velocity_and_locomotion),
     T(sampler_teleport_and_cell_change_restart_the_speed), T(sampler_speed_is_clamped), T(sampler_flags_from_the_engine), T(sampler_mover_flags_only_when_informative),
     T(sampler_not_ready_publishes_nothing), T(equip_watcher_publishes_stable_changes_only), T(local_appearance_is_read_from_the_base),
     T(runtime_loopback_follows_the_player), T(runtime_loopback_off_removes_the_puppet), T(runtime_loopback_refuses_the_local_slot),
@@ -1684,7 +1734,7 @@ const TestCase kTests[] = {
     T(runtime_game_events), T(runtime_status_json_contract),
     T(appearance_height_is_matched_with_setscale), T(weapon_mod_lines_and_readback), T(hit_target_health_lines),
     T(stack_weapon_mods_converge_and_follow_changes), T(stack_hit_target_puppet_survives_and_is_replaced), T(stack_look_update_keeps_the_puppet),
-    T(equip_watcher_carries_weapon_mods), T(runtime_remote_look_update_and_local_look),
+    T(equip_watcher_carries_weapon_mods), T(runtime_remote_look_update_and_local_look), T(runtime_starts_only_with_a_player_and_says_why_not),
 };
 
 }  // namespace

@@ -93,6 +93,7 @@ void ActorFeed::onWorldChanged() {
     rebase_.clear();
     port_.forgetWorld();
     if (sync_ && !FNV_MUT(52)) sync_->purgeStandIns();   // twin 52: ActorSync keeps believing in clones that died with the old world
+    if (sync_ && !FNV_MUT(68)) sync_->onWorldReloaded(); // twin 68: an actor that died in the old world can never die again in the loaded one
     if (!FNV_MUT(55)) port_.undoStale();                 // twin 55: what a save / crash left in the world stays there
     dirty_ = true;
 }
@@ -245,9 +246,15 @@ void ActorFeed::pollDeaths(uint64_t nowMs) {
     for (auto& kv : fed_) {
         Fed& f = kv.second;
         const NetId id = kv.first;
-        if (f.dead) continue;
         const RefId r = port_.activeRef(id);
         ActorRaw raw;
+        if (f.dead) {
+            // A death on record is over when ActorSync forgot it (a scripted ResurrectActor, a world load) AND the engine shows the actor on its feet
+            // again: the next death must be polled and declared like the first (bench 2026-10-27: the harness resurrects its gangers before every
+            // fight, and the second death of the same ref was never published).
+            if (!FNV_MUT(74) && r && !s->isDead(id) && eng_.read(r, raw) && !raw.dead()) { f.dead = false; f.deadSinceMs = 0; ++st_.deathsRearmed; }
+            continue;
+        }
         if (!r || !eng_.read(r, raw)) continue;
         if (!raw.dead()) { f.deadSinceMs = 0; continue; }
         if (s->isDead(id)) { f.dead = true; continue; }   // the network already declared it (port.kill ran)

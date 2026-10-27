@@ -87,11 +87,12 @@ Controls 0..9, 12, 14, 16 are proven from call sites; 10, 11 and 13..27 follow t
 | bot.reload / bot.sneak / bot.jump / bot.activate / bot.input | taps and generic hold/release/tap by name or id |
 | bot.menu | {kind,id,vatsMode,dialogState?,dialogReady?} from the menu stack top (0x714F00) and the VATS camera mode. Id 1059 (0x423) is the tutorial box: kind `tutorial`, also while VATS is active. VATS itself is 1056 (0x420) |
 | bot.dialog / bot.say {info} | list the DialogMenu ListBox choices; pick one by replicating the plain-topic path of HandleClick (0x7624F0) with gates: state 2, click gate, special INFOs refused |
+| bot.menu.close {kind?="container"} | close the open menu the engine's own way: `CloseAllMenusCore` 0x7037E0 (what the CloseAllMenus command calls; pinned, `bots_addrs.h`). Only a menu of `kind` is closed (`container`, `terminal`, `barter`, ...; `any` = anything a player can cancel out of, never a message box, the loading screen, the pause menu, VATS or the tutorial box); another menu on top is refused and left open. Reply `{closed,menu,kind}`; the menu is gone from `bot.menu` a frame or two later. Python: `Bot.close_menu(kind)`, `Bot.close_container()` (idempotent) |
 | bot.menu.press {button} / bot.consent {answer} | answer the message box the UI layer shows (new `ui.answer`); consent: Ready=0, Not yet=1. When the UI layer shows no box and the engine's own MessageMenu (1001) is the top menu, `bot.menu.press` presses that box natively (see "Native message box press" below). The reply has `path` `ui` or `native`. `bot.consent` never uses the native path |
 | bot.inventory {ref?,items?} | totals via 0x4C8F30 (base + delta, equipped included); without items only ExtraContainerChanges entries, partial:true |
 | bot.vats {ref} / test.vats.hit | tick-driven job: tap Vats, close the tutorial box, wait for limb select, select the target with VATSMenu HandleClick(3), queue the attack through the attack-button detour, execute, wait for playback. See "bot.vats: queue and execute" below. Limb choice is refused (unsupported) |
 | bot.fasttravel {marker} | GENUINE fast travel, queued the way the map menu does it (see below); gated on busy menus/VATS, a pending travel, and the engine's own may-travel check 0x93D660. Reply `{genuine:true,queued:true}`; the player moves a few frames later |
-| test.fasttravel {marker} | fallback only: a `MoveTo` teleport that crosses cells; reply `genuine:false`. `Bot.fast_travel` uses it only when `bot.fasttravel` is missing, never after an engine refusal |
+| test.fasttravel {marker} | fallback only (needs the game started with env `NVCOOP_TEST_HELPERS=1`, twin 64): a `MoveTo` teleport that crosses cells; reply `genuine:false`. `Bot.fast_travel` uses it only when `bot.fasttravel` is missing, never after an engine refusal |
 | bot.drops {since?,base?,windowMs?} | what the xNVSE `OnDrop` event reported (native handler, params `[dropper, droppedRef]`): `{seq,drops:[{seq,ref,base,dropper}]}`. Correlated by base form plus a 5 s window. `unsupported` if the handler could not register |
 | dev.refsOf {base,cell?} | enabled refs of a base form in the cell; `Bot.drop` uses a before/after difference as the fallback when `bot.drops` is unavailable |
 | dev.terminal {ref,entry} / dev.terminalState {ref} | click entry N of the open terminal menu (0x757F70 on the ListBox tile); state = what this bot picked, the engine has no used flag; needs the terminal menu open (Bot.use_terminal activates it first) |
@@ -130,6 +131,10 @@ Its `--table` output is the source of the ~170 call sites of `GetControlState` g
 - **Verified in game** (second run, 2026-10-21): with always-run on, `run:true` held no Run key (`runControl:false`) and the player ran:
   forward +610, back -482, strafes +600 / -590 units in 2 s. Only unit-tested: gamepad mode (no pad connected), the unknown-state
   fallback and a toggle change during a move.
+- **Gamepad mode in game** (under Proton on a Steam Deck, 2026-10-25, where Steam Input always answers as a pad): `bot.move`
+  forward for 3 s held Forward (`held:["Forward"]`, no menu open) and moved the player 0 units. With `bDisable360Controller:Interface`
+  set to 1 in memory, the same move went 1008 units. In gamepad mode the game takes movement from the pad, so the keyboard
+  controls that `bot.move` holds do nothing. `instances.py provision --no-pad` writes that key for the test copies.
 - **`run` omitted** (review finding on PR #10): `bot.move` without `run` holds no Run key, so the game's toggle picks the speed, as
   before `run` meant the speed. Test `move_without_run_leaves_the_speed_to_the_game`; twin 47 (an omitted run counts as run:false).
 

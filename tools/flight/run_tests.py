@@ -33,6 +33,7 @@ FULL = "--full" in sys.argv
 slow = unittest.skipUnless(FULL, "slow: run with --full")
 TMP_ROOT = os.path.join(ROOT, "out", "T1b", "tmp")
 TOY = os.path.join(HERE, "toy_replay.py")
+REGRESS = os.environ.get("NVFLIGHT_REGRESS") or os.path.join(HERE, "regress")   # the twin runs a copy of this file elsewhere
 REPLAY = [sys.executable, "-I", TOY, "{fixture}"]
 
 
@@ -896,6 +897,26 @@ class TraceReplayTests(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class ShippedFixtureTests(unittest.TestCase):
+    """The recorded in-game failures in tools/flight/regress/ (from_failure.py output, trace-1, no game needed to replay):
+    each one must still be found, with the bug signature written in it. An analyzer change that stops seeing a real failure fails here."""
+    def test_every_shipped_fixture_still_reproduces_its_signature(self):
+        names = sorted(n for n in os.listdir(REGRESS) if n.endswith(".json"))
+        self.assertTrue(names, "no fixtures in %s" % REGRESS)
+        for n in names:
+            with open(os.path.join(REGRESS, n), encoding="utf-8") as f:
+                fx = json.load(f)
+            want = fx.get("expect") or {}
+            r = TR.oracle(fx)
+            self.assertEqual(not r["diverged"], want.get("converges", True), n)
+            if "bug_signature" in want:
+                self.assertEqual(S.signature(r), want["bug_signature"], n)
+
+    def test_the_regress_runner_agrees(self):
+        n, bad = RG.run_dir(REGRESS, None)
+        self.assertEqual((n, bad), (len([x for x in os.listdir(REGRESS) if x.endswith(".json")]), 0))
+
+
 class FromFailureTests(unittest.TestCase):
     def setUp(self):
         os.makedirs(TMP_ROOT, exist_ok=True)
@@ -1198,6 +1219,8 @@ MUTATIONS = [
     ("regress", "ok = got == want", "ok = got", "expected-divergence fixtures fail"),
     ("trace_replay", 'if c["kind"] == "txn-missing" and later:', "if False:", "gap healed by a snapshot counted as a failure"),
     ("trace_replay", 'any(t >= c["aligned_us"] for s', 'any(t <= c["aligned_us"] for s', "snapshot before the gap heals it"),
+    ("trace_replay", 'FAILURE_CLASSES = ("digest-mismatch", "divergence", "stuck-sync", "desync-marker")',
+     'FAILURE_CLASSES = ("digest-mismatch", "divergence", "desync-marker")', "a recorded in-game stuck sync is no longer a failure"),
     ("trace_replay", 'own = [i for i in real if i["class"] != "desync-marker"]', "own = []", "own desync marker leads over a real finding"),
     ("trace_replay", "real = ([p] + [i for i in real if i is not p]) if p else real", "real = real", "failure signature taken from the marker"),
     ("trace_replay", "if len(data) - pos - N.RECORD_HEADER < plen:\n            break\n        end", "if False:\n            break\n        end", "half-written record kept"),
@@ -1245,7 +1268,7 @@ def _one_mutation(i, mod, old, new, why):
             return "TWIN BROKEN: %s: %s matches %d times" % (mod, why, text.count(old)), False
         with open(p, "w", encoding="utf-8") as f:
             f.write(text.replace(old, new))
-        env = dict(os.environ, NVFLIGHT_SRC=d)
+        env = dict(os.environ, NVFLIGHT_SRC=d, NVFLIGHT_REGRESS=REGRESS)
         only = ["--only", ONLY_NEW] if mod in ("trace_replay", "from_failure") else []   # their tests are all in these classes: no need to run the rest per mutation
         r = subprocess.run([sys.executable, "-I", os.path.join(d, "run_tests.py"), "--full", "--no-twin"] + only, capture_output=True, text=True, env=env, errors="replace")
         if r.returncode == 0:
@@ -1255,7 +1278,7 @@ def _one_mutation(i, mod, old, new, why):
         shutil.rmtree(d, ignore_errors=True)
 
 
-ONLY_NEW = "TraceReplayTests,FromFailureTests"
+ONLY_NEW = "TraceReplayTests,FromFailureTests,ShippedFixtureTests"
 TWIN_MODS = ["nvfr", "analyze", "shrink", "gentest", "report", "regress", "flight", "toy_replay", "trace_replay", "from_failure", "run_tests"]
 
 

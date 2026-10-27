@@ -30,6 +30,7 @@
 #include "hook_patch.h"
 #include "intents/container_redirect.h"
 #include "intents/intent_service.h"
+#include "intents/storage_book.h"
 #include "reload/reload_state.h"
 #ifdef NVCOOP_WITH_COMPANIONS
 #include "companions/companions_glue.h"   // glueAllowActivation / glueGuestInteraction
@@ -101,7 +102,27 @@ std::string ReadWholeFile(const std::string& path) {
     CloseHandle(h);
     return s;
 }
+bool WriteWholeFile(const std::string& path, const std::string& text) {
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD n = 0;
+    bool ok = WriteFile(h, text.data(), static_cast<DWORD>(text.size()), &n, nullptr) && n == text.size();
+    CloseHandle(h);
+    return ok;
+}
 uint64_t NowMs() { return GetTickCount64(); }
+constexpr const char* kStashStateFile = "nvcoop_intents_state.json";   // the host's gear ledger (storage_book.h), next to the dll
+uint64_t g_lastStateWriteMs = 0;
+void SaveStashState(bool force) {
+    if (!g_svc) return;
+    StorageBook& b = g_svc->stash();
+    if (!b.dirty()) return;
+    const uint64_t t = NowMs();
+    if (!force && t - g_lastStateWriteMs < 2000) return;
+    g_lastStateWriteMs = t;
+    if (WriteWholeFile(DllDir() + kStashStateFile, b.stateJson())) b.markClean();
+    else nvcoop::Log("intents: could not write %s (gear stashes are kept in memory only)", kStashStateFile);
+}
 
 // ---- ini -----------------------------------------------------------------------------------------------------------------------------
 
@@ -122,6 +143,15 @@ RefId PuppetOf(PlayerId slot) {
 #else
     (void)slot;
     return 0;
+#endif
+}
+// Why a guest has no puppet, for the stand-in log line.
+const char* AvatarsNote() {
+#ifdef NVCOOP_WITH_LIVE
+    return nvcoop::livewire::glueSwitches().avatars ? "[live] avatars=1 but this slot's puppet does not exist yet (not spawned, other cell or session not synced)"
+                                                     : "[live] avatars=0, so there are no puppets";
+#else
+    return "this build has no avatar layer";
 #endif
 }
 RefId GhostOf(PlayerId slot) {
@@ -179,6 +209,8 @@ void InstallObservers() {
     nvhooks::setEventObserver([](uint32_t mask, const fnvcoop::FormRef& t) {
         return g_svc && g_svc->onEvent(mask, t) == Obs::Suppress ? nvhooks::EventAction::Suppress : nvhooks::EventAction::Proceed;
     });
+    // A script / console SetStage the guest suppression dropped becomes a request the host judges (Kind::SetStage). Without it the stage would just vanish.
+    nvhooks::setStageRequestObserver([](const fnvcoop::FormRef& quest, uint32_t stage) { return g_svc && g_svc->onStageBlocked(quest, stage); });
     g_observersOn = true;
     nvcoop::Log("intents: guest observers installed (this replaces coop's forward_activate observer)");
 }
@@ -197,6 +229,12 @@ bool MStatus(const std::string&, std::string& out) {
     return true;
 }
 
+Kind KindOfName(const std::string& k) {
+    return k == "pickup" ? Kind::PickUp : k == "trigger" ? Kind::TriggerEnter : k == "triggerleave" ? Kind::TriggerLeave : k == "stay" ? Kind::TriggerStay
+         : k == "combat" ? Kind::StartCombat : k == "hit" ? Kind::Hit : k == "terminal" ? Kind::TerminalUse : k == "container" ? Kind::ContainerOpen
+         : k == "close" ? Kind::ContainerClose : k == "dialogue" ? Kind::DialogueStart : k == "stage" ? Kind::SetStage : Kind::Activate;
+}
+
 bool MSubmit(const std::string& params, std::string& out) {
     if (!g_svc || !g_svc->client()) { out = "intents client not running (not a joined guest, or [intents] enable=0)"; return false; }
     nvcoop::json::Value p;
@@ -205,9 +243,7 @@ bool MSubmit(const std::string& params, std::string& out) {
     fnvcoop::FormRef ref;
     if (!nvhooks::strToRef(p.get("ref").asString(""), &ref)) { out = "ref must be '<plugin>:<hex>'"; return false; }
     std::string k = p.get("kind").asString("activate");
-    Kind kind = k == "pickup" ? Kind::PickUp : k == "trigger" ? Kind::TriggerEnter : k == "triggerleave" ? Kind::TriggerLeave : k == "hit" ? Kind::Hit
-              : k == "terminal" ? Kind::TerminalUse : k == "container" ? Kind::ContainerOpen : k == "close" ? Kind::ContainerClose
-              : k == "dialogue" ? Kind::DialogueStart : Kind::Activate;
+    Kind kind = KindOfName(k);
     std::vector<uint8_t> path;
     for (const auto& v : p.get("path").items()) path.push_back(static_cast<uint8_t>(v.asInt(0)));
     uint32_t id = g_svc->submit(kind, ref, nullptr, static_cast<int32_t>(p.get("value").asInt(0)), std::move(path));
@@ -227,11 +263,10 @@ bool MHostRun(const std::string& params, std::string& out) {
     static uint32_t counter = 0;
     in.id = ++counter;
     std::string k = p.get("kind").asString("activate");
-    in.kind = k == "pickup" ? Kind::PickUp : k == "trigger" ? Kind::TriggerEnter : k == "triggerleave" ? Kind::TriggerLeave : k == "hit" ? Kind::Hit
-            : k == "terminal" ? Kind::TerminalUse : k == "container" ? Kind::ContainerOpen : k == "close" ? Kind::ContainerClose
-            : k == "dialogue" ? Kind::DialogueStart : Kind::Activate;
+    in.kind = KindOfName(k);
     if (!nvhooks::strToRef(p.get("ref").asString(""), &in.target)) { out = "ref must be '<plugin>:<hex>'"; return false; }
     for (const auto& v : p.get("path").items()) in.path.push_back(static_cast<uint8_t>(v.asInt(0)));
+    in.value = static_cast<int32_t>(p.get("value").asInt(0));
     Verdict v = g_svc->host()->handle(static_cast<PlayerId>(p.get("slot").asInt(1)), in);
     nvcoop::json::Value o = nvcoop::json::Value::object();
     o.set("result", resultName(v.result)).set("holder", (int64_t)v.holder).set("redirect", v.hasRedirect ? nvhooks::refToStr(v.redirect) : std::string());
@@ -278,17 +313,44 @@ void Init() {
     g_inited = true;
     nvcoop::intents::game::pinsOk();
     ContainerRedirect redirect;
+    StorageBook stash;
     if (!g_cfg.redirectFile.empty()) {
         std::string text = ReadWholeFile(DllDir() + g_cfg.redirectFile);
-        if (text.empty()) nvcoop::Log("intents: redirect file %s not found: shared storage containers stay shared", g_cfg.redirectFile.c_str());
-        else if (!redirect.load(text, &err)) nvcoop::Log("intents: redirect file %s: %s", g_cfg.redirectFile.c_str(), err.c_str());
-        else nvcoop::Log("intents: %u shared storage containers are redirected per player", (unsigned)redirect.size());
+        if (text.empty()) nvcoop::Log("intents: data file %s not found: shared storage containers stay shared", g_cfg.redirectFile.c_str());
+        else {
+            if (!redirect.load(text, &err)) nvcoop::Log("intents: data file %s (redirects): %s", g_cfg.redirectFile.c_str(), err.c_str());
+            else nvcoop::Log("intents: %u shared storage containers are redirected per player", (unsigned)redirect.size());
+            if (!stash.load(text, &err)) nvcoop::Log("intents: data file %s (stashes): %s", g_cfg.redirectFile.c_str(), err.c_str());
+            else if (g_cfg.storage) {
+                nvcoop::Log("intents: %u shared gear containers keep a stash per player", (unsigned)stash.entries().size());
+                std::string state = ReadWholeFile(DllDir() + kStashStateFile);
+                if (!state.empty() && !stash.loadState(state, &err)) nvcoop::Log("intents: %s: %s (starting with empty stashes)", kStashStateFile, err.c_str());
+            }
+        }
     }
     ServiceDeps d;
     d.eng = &nvcoop::intents::game::engine();
     d.puppetOf = PuppetOf;
     d.ghostOf = GhostOf;
+    d.actorMode = [](fnvcoop::PlayerId slot, nvcoop::intents::ActorMode mode, nvcoop::intents::RefId actor) {
+        // Logged once per slot and mode change. A stand-in is the HOST'S OWN player acting for the guest (rewards and karma still go to the guest by
+        // origin, but `player` inside the scripts is the host): it is only expected with [live] avatars=0 and no NV:MP ghost.
+        switch (mode) {
+            case nvcoop::intents::ActorMode::Puppet: nvcoop::Log("intents: acting player for slot %d = avatar puppet %08X", (int)slot, (unsigned)actor); break;
+            case nvcoop::intents::ActorMode::Ghost: nvcoop::Log("intents: acting player for slot %d = NV:MP ghost %08X", (int)slot, (unsigned)actor); break;
+            case nvcoop::intents::ActorMode::StandIn: nvcoop::Log("intents: ACTING-STANDIN slot %d: %s; host player 14 acts", (int)slot, AvatarsNote()); break;
+        }
+    };
     d.nowMs = NowMs;
+    // Kind::SetStage policy (the host keeps the say): an ExclusiveStages loser is refused before its result scripts run. The rules engine's barrier / tether
+    // answer through the engine's stage gate (verdict Deferred). Every refusal is a log line here and a counter in intents.status (service.detail.stage).
+    d.allowStage = [](fnvcoop::PlayerId, const fnvcoop::FormRef& quest, uint32_t stage) {
+        nvcoop::coop::Runtime* rt = nvcoop::coop::Runtime::active();
+        return !rt || !rt->stageExcluded(quest, stage);
+    };
+    d.stageRefused = [](fnvcoop::PlayerId slot, const fnvcoop::FormRef& quest, uint32_t stage, nvcoop::intents::Result why) {
+        nvcoop::Log("intents: guest stage %s=%u from slot %d not run: %s", nvhooks::refToStr(quest).c_str(), (unsigned)stage, (int)slot, resultName(why));
+    };
     d.containerMenuOpen = [] { return nvcoop::intents::game::containerMenuOpen(); };
     d.startDialogue = [](const fnvcoop::FormRef& npc) {
         nvcoop::coop::Runtime* rt = nvcoop::coop::Runtime::active();
@@ -299,7 +361,7 @@ void Init() {
     d.allowActivation = [](fnvcoop::PlayerId slot, const fnvcoop::FormRef& target) { return nvcoop::social::glueAllowActivation(slot, target); };
     d.interacted = [](fnvcoop::PlayerId slot, bool pickup, const fnvcoop::FormRef& target) { nvcoop::social::glueGuestInteraction(slot, pickup, target); };
 #endif
-    g_svc.reset(new IntentService(std::move(d), g_cfg, std::move(redirect)));
+    g_svc.reset(new IntentService(std::move(d), g_cfg, std::move(redirect), std::move(stash)));
     if (g_cfg.saveGate) {
         SaveGate::Deps gd;
         gd.suppressed = [] { return saveSuppressedBy(nvcoop::coop::Runtime::active()); };
@@ -313,8 +375,10 @@ void Init() {
 }
 
 void Uninit() {
+    SaveStashState(true);
     nvhooks::setActivateObserver(nullptr);
     nvhooks::setEventObserver(nullptr);
+    nvhooks::setStageRequestObserver(nullptr);
     g_observersOn = false;
     g_reg.reset();   // restores every patched entry
     g_canSaveHooked = g_termHooked = false;
@@ -327,6 +391,7 @@ void OnFrame() {
     if (!g_inited || !g_svc) return;
     nvcoop::coop::Runtime* rt = nvcoop::coop::Runtime::active();
     g_svc->frame(rt);
+    SaveStashState(false);
     if (g_svc->client() && g_svc->sessions() != g_observedSessions) {   // a guest session began: take the observers (after coop's own, which are set at start)
         g_observedSessions = g_svc->sessions();
         InstallObservers();

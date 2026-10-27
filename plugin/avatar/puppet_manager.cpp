@@ -95,6 +95,11 @@ void PuppetManager::RemovePlayer(Slot slot) {
     if (!avatarFaults().staleMapEntries) staleMap_.erase(slot);
 }
 
+void PuppetManager::SetLocalSlot(Slot slot) {
+    cfg_.localSlot = slot;
+    if (!avatarFaults().allowLocalSlot) RemovePlayer(slot);
+}
+
 void PuppetManager::SetEquipment(Slot slot, const std::vector<EquipEntry>& wanted) {
     if (Puppet* p = Find(slot)) p->equip.SetDesired(wanted);
 }
@@ -127,6 +132,7 @@ void PuppetManager::DeleteRef(Puppet& p, bool callEngine) {
     p.ref = 0;
     p.phase = (p.phase == Phase::Failed) ? Phase::Failed : Phase::Absent;
     p.haveApplied = false;
+    p.posConfirmed = false;
     p.lastGroup = -1;
     p.mismatchSince = 0;
     p.haveSneak = p.haveDrawn = false;
@@ -215,7 +221,17 @@ std::vector<std::pair<Slot, RefId>> PuppetManager::LivePuppets() const {
 bool PuppetManager::ActualPose(Slot slot, CellId& cell, Vec3& pos) const {
     const Puppet* p = Find(slot);
     if (!p || !p->ref || p->phase != Phase::Driving) return false;
-    return const_cast<IPuppetEngine&>(e_).GetPose(p->ref, cell, pos);
+    if (!const_cast<IPuppetEngine&>(e_).GetPose(p->ref, cell, pos)) return false;
+    // A puppet that is far from where this driver last put it, after it had been seen there, was pushed by the engine (the real
+    // player or another body standing in it). Tick undoes that with one SetPos, so the interpolation buffer must not take the
+    // pushed place as the start of an easing: it would ease the puppet back over hundreds of milliseconds, a visible teleport
+    // out and back. A puppet that was never seen at its place (just spawned or moved) is still reported where it is.
+    if (!avatarFaults().adoptPhysicsPush && p->haveApplied && p->posConfirmed && p->cell == cell &&
+        Dist(pos, p->appliedPos) > cfg_.driftUnits) {
+        pos = p->appliedPos;
+        ++stats_.pushesIgnored;
+    }
+    return true;
 }
 
 Phase PuppetManager::PhaseOf(Slot slot) const {
@@ -245,19 +261,51 @@ std::string PuppetManager::StatusJson() const {
         s += buf;
         first = false;
     }
-    char buf[800];
+    char buf[900];
     std::snprintf(buf, sizeof buf,
                   "],\"stats\":{\"spawned\":%llu,\"spawnFailures\":%llu,\"deleted\":%llu,\"refLost\":%llu,\"setPos\":%llu,\"setYaw\":%llu,"
                   "\"playGroup\":%llu,\"groupRefused\":%llu,\"animReasserts\":%llu,\"restrainReasserts\":%llu,\"parked\":%llu,\"purged\":%llu,"
-                  "\"saveDespawns\":%llu,\"equipOps\":%llu,\"equipGaveUp\":%llu,\"drift\":%llu,\"budgetDeferred\":%llu,\"load3DTimeouts\":%llu}}",
+                  "\"saveDespawns\":%llu,\"equipOps\":%llu,\"equipGaveUp\":%llu,\"drift\":%llu,\"budgetDeferred\":%llu,\"load3DTimeouts\":%llu,\"pushesIgnored\":%llu,\"bodyYields\":%llu}}",
                   (unsigned long long)stats_.spawned, (unsigned long long)stats_.spawnFailures, (unsigned long long)stats_.deleted,
                   (unsigned long long)stats_.refLost, (unsigned long long)stats_.setPos, (unsigned long long)stats_.setYaw,
                   (unsigned long long)stats_.playGroup, (unsigned long long)stats_.groupRefused, (unsigned long long)stats_.animReasserts,
                   (unsigned long long)stats_.restrainReasserts, (unsigned long long)stats_.parked, (unsigned long long)stats_.purged,
                   (unsigned long long)stats_.saveDespawns, (unsigned long long)stats_.equipOps, (unsigned long long)stats_.equipGaveUp,
-                  (unsigned long long)stats_.drift, (unsigned long long)stats_.budgetDeferred, (unsigned long long)stats_.load3DTimeouts);
+                  (unsigned long long)stats_.drift, (unsigned long long)stats_.budgetDeferred, (unsigned long long)stats_.load3DTimeouts,
+                  (unsigned long long)stats_.pushesIgnored, (unsigned long long)stats_.bodyYields);
     s += buf;
     return s;
+}
+
+// The place to give the engine for a puppet that should stand at `want`: `want` itself, unless that is inside the body of this machine's own
+// player (same cell, nearly the same height), in which case the nearest place at the edge of that body. `from` is where the puppet is now;
+// it decides the side when the remote stands exactly where the local player does.
+Vec3 PuppetManager::MakeRoom(CellId cell, const Vec3& want, const Vec3& from, bool haveFrom) {
+    if (avatarFaults().noBodyRoom || cfg_.bodyRoomUnits <= 0) return want;
+    if (!localRead_) {
+        localRead_ = true;
+        haveLocal_ = e_.GetLocalPose(localCell_, localPos_);
+    }
+    if (!haveLocal_ || localCell_ != cell) return want;
+    if (std::fabs(want.z - localPos_.z) > cfg_.bodyRoomHeightUnits) return want;
+    float dx = want.x - localPos_.x, dy = want.y - localPos_.y;
+    float d = std::sqrt(dx * dx + dy * dy);
+    if (d >= cfg_.bodyRoomUnits) return want;
+    if (d < 1.0f) {
+        dx = haveFrom ? from.x - localPos_.x : 0.0f;
+        dy = haveFrom ? from.y - localPos_.y : 0.0f;
+        d = std::sqrt(dx * dx + dy * dy);
+        if (d < 1.0f) {
+            dx = 1.0f;
+            dy = 0.0f;
+            d = 1.0f;
+        }
+    }
+    ++stats_.bodyYields;
+    Vec3 out = want;
+    out.x = localPos_.x + dx / d * cfg_.bodyRoomUnits;
+    out.y = localPos_.y + dy / d * cfg_.bodyRoomUnits;
+    return out;
 }
 
 // ---- spawn / configure ----------------------------------------------------------------------------------------------
@@ -273,7 +321,8 @@ void PuppetManager::TrySpawn(Puppet& p, uint32_t now) {
     }
     if (!Budget()) return;
     float yaw = F.usesPitchAsYaw ? p.pose.rot.x : WrapRad(p.pose.rot.y);
-    RefId r = e_.Spawn(tmpl, p.pose.cell, p.pose.pos, yaw);
+    const Vec3 at = MakeRoom(p.pose.cell, p.pose.pos, p.pose.pos, false);
+    RefId r = e_.Spawn(tmpl, p.pose.cell, at, yaw);
     if (!r) {
         ++stats_.spawnFailures;
         ++p.attempts;
@@ -291,7 +340,7 @@ void PuppetManager::TrySpawn(Puppet& p, uint32_t now) {
     p.phase = Phase::Loading3D;
     p.spawnedAt = now;
     p.cell = p.pose.cell;
-    p.appliedPos = p.pose.pos;
+    p.appliedPos = at;
     p.appliedYaw = yaw;
     p.haveApplied = true;
     p.appliedAt = now;
@@ -337,6 +386,7 @@ bool PuppetManager::Configure(Puppet& p, uint32_t now) {
 
 void PuppetManager::Tick(uint32_t now) {
     callsLeft_ = cfg_.maxEngineCalls;
+    localRead_ = false;
     if (loading_) return;
     if (!e_.WorldReady()) return;
     uint32_t ep = e_.WorldEpoch();
@@ -478,7 +528,7 @@ void PuppetManager::Drive(Puppet& p, uint32_t now, bool menuClosedNow) {
     }
 
     const PuppetPose& pose = p.pose;
-    const Vec3 target = pose.pos;
+    const Vec3 target = MakeRoom(pose.cell, pose.pos, p.appliedPos, p.haveApplied && p.cell == pose.cell);
     const float yaw = F.usesPitchAsYaw ? pose.rot.x : (F.noYawNormalize ? pose.rot.y : WrapRad(pose.rot.y));
     const bool stale = now - p.poseAt > cfg_.staleMs;
     const bool frozen = pose.frozen || stale;
@@ -498,6 +548,7 @@ void PuppetManager::Drive(Puppet& p, uint32_t now, bool menuClosedNow) {
                 p.appliedYaw = yaw;
                 p.appliedAt = now;
                 p.haveApplied = true;
+                p.posConfirmed = false;
                 p.phase = Phase::Loading3D;   // wait for the rebuilt 3D before anything else
                 p.spawnedAt = now;
                 p.forceAnim = true;
@@ -512,9 +563,13 @@ void PuppetManager::Drive(Puppet& p, uint32_t now, bool menuClosedNow) {
                    now - p.appliedAt >= cfg_.posHeartbeatMs;
     CellId ac = 0;
     Vec3 ap;
-    if (e_.GetPose(p.ref, ac, ap) && Dist(ap, p.appliedPos) > cfg_.driftUnits) {
-        ++stats_.drift;
-        needPos = true;
+    if (e_.GetPose(p.ref, ac, ap)) {
+        if (Dist(ap, p.appliedPos) > cfg_.driftUnits) {
+            ++stats_.drift;
+            needPos = true;
+        } else if (p.haveApplied && ac == p.cell) {
+            p.posConfirmed = true;
+        }
     }
     if (needPos && Budget()) {
         if (e_.SetPos(p.ref, target)) {

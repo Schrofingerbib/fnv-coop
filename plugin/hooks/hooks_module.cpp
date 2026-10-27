@@ -18,6 +18,7 @@
 #include "effect_json.h"
 #include "engine_hooks.h"
 #include "guest_local_run.h"
+#include "guest_objvars.h"
 #include "reload/reload_state.h"
 
 using nvcoop::json::Value;
@@ -70,6 +71,27 @@ void LoadGuestLocalRun() {
     nvhooks::setGuestLocalRun(list.scripts);
     g_localRunListed = list.scripts.size();
     nvcoop::Log("hooks: GuestLocalRun allow-list: %d scripts (%d malformed)", static_cast<int>(list.scripts.size()), list.skipped);
+    nvcoop::Log("hooks: guest quest-var rollback table: %d scripts, %d variables", static_cast<int>(nvhooks::ObjectVarWrites::builtin().scripts()),
+                static_cast<int>(nvhooks::ObjectVarWrites::builtin().rows()));
+}
+
+NVSEInterface* g_nvse = nullptr;
+
+// xNVSE's EventManager hooks MarkBaseExtraListScriptEvent (0x5AC750) lazily, once, the first time any game-event handler is set (our
+// bots/loot OnDrop handlers do that after Init), and its jump never calls a previous hook. Registering and removing a no-op handler for
+// one of those events before Init makes that one-shot install happen first, so our MarkScriptEvent hook chains on top of it
+// (hook_patch rule 4): the guest event observer keeps running, and a hot reload can unhook (the old order left our bytes overwritten,
+// so every client swap was refused). The handler is removed at once; the xNVSE jump stays for good, as it would anyway.
+void PrimeNoopHandler(TESObjectREFR*, void*) {}
+void PrimeXnvseEventHook() {
+    auto* ev = g_nvse ? static_cast<NVSEEventManagerInterface*>(g_nvse->QueryInterface(kInterface_EventManager)) : nullptr;
+    if (!ev || !ev->SetNativeEventHandler || !ev->RemoveNativeEventHandler) {
+        nvcoop::Log("hooks: xNVSE event manager unavailable, MarkScriptEvent hook not primed");
+        return;
+    }
+    const bool set = ev->SetNativeEventHandler("OnDrop", &PrimeNoopHandler);
+    if (set) ev->RemoveNativeEventHandler("OnDrop", &PrimeNoopHandler);
+    nvcoop::Log("hooks: xNVSE event hook primed (%s)", set ? "handler set and removed" : "set refused");
 }
 
 const char* RoleName(nvhooks::Role r) {
@@ -86,7 +108,9 @@ void InitHooks() {
     g_hub.addSink([](fnvcoop::EffectTxn&& t) { g_txns.push_back(nvhooks::txnToJson(t)); });
     // story-capture (docs/tools/story-capture.md): ~75 more script commands become RefCommand effects. OFF unless [hooks] story_capture=1.
     nvhooks::setStoryCapture(GetPrivateProfileIntA("hooks", "story_capture", 0, IniPath().c_str()) != 0);
+    if (g_role == nvhooks::Role::Guest) PrimeXnvseEventHook();   // before Init: MarkScriptEvent is a guest-only hook
     g_report = nvhooks::Init(g_hub, g_role);
+    if (const std::string ch = nvhooks::chainedHookTargets(); !ch.empty()) nvcoop::Log("hooks: chained on top of another patcher: %s", ch.c_str());
     LoadGuestLocalRun();
     g_applier.reset(new nvhooks::RemoteApplier(g_hub, nvhooks::resolver()));
     auto exec = [](const std::string& line, uint32_t refID) {
@@ -114,7 +138,9 @@ void InitHooks() {
 Value ScriptsJson() {
     const auto& s = nvhooks::scriptStats();
     Value o = Value::object();
-    o.set("gated", (int64_t)s.gated).set("ran", (int64_t)s.ran).set("ranWhileApplying", (int64_t)s.ranWhileApplying);
+    o.set("gated", (int64_t)s.gated).set("ran", (int64_t)s.ran).set("ranWhileApplying", (int64_t)s.ranWhileApplying)
+        .set("questVarGuarded", (int64_t)s.questVarGuarded).set("questVarRollbacks", (int64_t)s.questVarRollbacks)
+        .set("stagesBlocked", (int64_t)s.stagesBlocked).set("stagesForwarded", (int64_t)s.stagesForwarded);
     return o;
 }
 
@@ -414,7 +440,10 @@ bool MGuestStats(const std::string&, std::string& out) {
     }
     o.set("role", RoleName(g_role)).set("allowListed", (int64_t)g_localRunListed).set("localRan", (int64_t)s.localRan).set("ran", (int64_t)s.ran)
         .set("questScriptsSkipped", (int64_t)sp.questScripts).set("mutationsBlocked", (int64_t)sp.mutations)
-        .set("resultScriptsBlocked", (int64_t)sp.resultScripts).set("perScript", per);
+        .set("resultScriptsBlocked", (int64_t)sp.resultScripts).set("perScript", per)
+        .set("questVarGuarded", (int64_t)s.questVarGuarded).set("questVarRollbacks", (int64_t)s.questVarRollbacks)
+        .set("stagesBlocked", (int64_t)s.stagesBlocked).set("stagesForwarded", (int64_t)s.stagesForwarded)
+        .set("objVarScripts", (int64_t)nvhooks::ObjectVarWrites::builtin().scripts()).set("objVarRows", (int64_t)nvhooks::ObjectVarWrites::builtin().rows());
     out = o.dump();
     return true;
 }
@@ -514,6 +543,7 @@ bool MCondEval(const std::string& params, std::string& out) {
 }
 
 void OnLoad(void* nvse) {
+    g_nvse = static_cast<NVSEInterface*>(nvse);
     if (nvse) g_console = static_cast<NVSEConsoleInterface*>(static_cast<NVSEInterface*>(nvse)->QueryInterface(kInterface_Console));
     nvcoop::RegisterMethod("hooks.status", MStatus, true);
     nvcoop::RegisterMethod("capture.begin", MBegin, true);
@@ -556,7 +586,7 @@ NVCOOP_MODULE(l5_hooks, "l5_hooks", OnLoad, OnMessage, OnFrame);
 NVCOOP_RELOAD_STATE(l5_hooks, "l5_hooks", 1, 10,
     /*canUnload*/ [] {
         int n = nvhooks::auditTamperedHooks();
-        return n ? std::to_string(n) + " engine hook(s) were chained over by another mod" : std::string();
+        return n ? std::to_string(n) + " engine hook(s) were chained over by another mod (" + nvhooks::tamperedHookTargets() + ")" : std::string();
     },
     /*save*/ [](nvreload::Writer& w) {
         w.boolean(g_inited);

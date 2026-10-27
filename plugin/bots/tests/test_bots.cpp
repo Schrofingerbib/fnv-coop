@@ -264,6 +264,7 @@ using nvbots_test::FakeGame;
 
 struct GlueEngine : MockEngine {
     FakeGame* g = nullptr;
+    bool helpers = true;   // env NVCOOP_TEST_HELPERS=1
     int pressed = -1, uiTries = 0;
     bool uiBox = true;   // the UI layer (ui.answer) is showing a box
     std::string moved;
@@ -277,6 +278,7 @@ struct GlueEngine : MockEngine {
         return true;
     }
     bool moveTo(const std::string& r, std::string*) override { moved = r; return true; }
+    bool testHelpers() override { return helpers; }
 };
 struct GlueRig {
     FakeGame g;
@@ -540,6 +542,75 @@ TEST(vats_job_keeps_an_attack_queued_before_a_late_tutorial_box) {
     if (r.rpc.vats().phase() != VatsJob::kDone) std::printf("  reason: %s\n", r.rpc.vats().reason().c_str());
     CHECK(r.g.queuedTargets.size() == 1);   // one attack, not two
     CHECK(r.g.execCalls == 1 && r.g.closeCalls >= 1);
+}
+
+TEST(vats_job_waits_before_the_accept_and_repeats_an_accept_that_started_nothing) {
+    // measured 2026-10-27: the accept in the frame after the queue started no playback (it did later); the module's auto fire waits 350 ms for the same reason
+    {
+        GlueRig r;
+        r.g.forms["T:1"] = 0x60000001;
+        r.g.buildVats({0x60000001, 0x60000002});
+        CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+        uint64_t queuedAt = 0, execAt = 0;
+        for (int i = 0; i < 700 && r.rpc.vats().running(); ++i) {
+            r.e.now += 50;
+            r.rpc.tick();
+            const int ex = r.g.execCalls;
+            if (ex && !execAt) execAt = r.e.now;
+            r.g.vatsFrame(r.in.filter(kVats, kPressed, 0) != 0);
+            if (r.g.queue > 0 && !queuedAt) queuedAt = r.e.now;
+            (void)ex;
+        }
+        CHECK(r.rpc.vats().phase() == VatsJob::kDone && queuedAt && execAt);
+        CHECK(execAt >= queuedAt + VatsJob::kExecDelayMs);
+    }
+    {   // the first accept starts nothing: the job accepts again and plays the attack once
+        GlueRig r;
+        r.g.forms["T:1"] = 0x60000001;
+        r.g.buildVats({0x60000001, 0x60000002});
+        r.g.ignoreExecs = 1;
+        CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+        vatsDrive(r);
+        CHECK(r.rpc.vats().phase() == VatsJob::kDone);
+        CHECK(r.g.execCalls == 2 && r.g.queuedTargets.size() == 1);
+    }
+    {   // an accept that never works ends in an error after three tries, never in a wait for the 25 s limit
+        GlueRig r;
+        r.g.forms["T:1"] = 0x60000001;
+        r.g.buildVats({0x60000001, 0x60000002});
+        r.g.ignoreExecs = 99;
+        CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+        vatsDrive(r);
+        CHECK(r.rpc.vats().phase() == VatsJob::kFailed && reasonHas(r, "playback_never_started"));
+        CHECK(r.g.execCalls == 3);
+        CHECK(r.e.now < 25000 + 5000);
+    }
+}
+
+TEST(vats_job_closes_a_tutorial_box_that_swallowed_the_accept_and_accepts_again) {
+    // measured 2026-10-27: the VATS hint box opened after the attack was queued and the accept, the queue stayed at 1 and the job waited in "playback" for ever
+    GlueRig r;
+    r.g.forms["T:1"] = 0x60000001;
+    r.g.buildVats({0x60000001, 0x60000002});
+    r.g.boxOverAccept = true;
+    CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+    const std::vector<std::string> seen = vatsDrive(r);
+    CHECK(r.rpc.vats().phase() == VatsJob::kDone);
+    if (r.rpc.vats().phase() != VatsJob::kDone) std::printf("  reason: %s\n", r.rpc.vats().reason().c_str());
+    CHECK(r.g.closeCalls >= 1 && !r.g.tutorialOpen);
+    CHECK(r.g.execCalls == 2 && r.g.queuedTargets.size() == 1);   // one attack, accepted twice (the first was swallowed)
+    CHECK(hasPhase(seen, "tutorial"));
+}
+
+TEST(vats_accept_gate_answers_pressed_a_limited_number_of_times) {
+    // a loop in the engine that asks the press-edge question until it is answered false froze the main thread for more than 50 s (first lab run)
+    VatsAcceptGate g;
+    g.arm(0);
+    int yes = 0;
+    for (int i = 0; i < 100000; ++i) yes += g.force(1, 0, 0) ? 1 : 0;
+    CHECK(yes == VatsAcceptGate::kMaxForced && !g.armed());
+    g.arm(0);
+    CHECK(g.force(1, 0, 0));   // armed again, a new allowance
 }
 
 TEST(vats_job_refuses_zero_hit_chance_and_zero_ap) {
@@ -919,6 +990,132 @@ TEST(terminal_pick_clicks_the_requested_entry_and_records_it) {
     CHECK(r.g.calls.back() == "termclick " + FakeGame::hex(FakeGame::kTerm + 0x10 + 0x20));
 }
 
+TEST(terminal_pick_reads_the_texts_and_clicks_the_tile_of_the_embedded_list) {
+    // the lab terminal (DefaultUnlockTermWALL) has ONE entry, "Disengage Lock": its text and tile come from the list head embedded in the ListBox
+    GlueRig r;
+    r.g.forms["FalloutNV.esm:EAC00"] = 0x70000000;
+    r.g.buildMenus();
+    r.g.buildTerminal({"Disengage Lock"}, 0x70000000);
+    r.g.topId = 0x421;
+    CHECK(r.call("dev.terminal", "{\"ref\":\"FalloutNV.esm:EAC00\",\"entry\":0}"));
+    CHECK(r.out.find("\"entries\":[\"Disengage Lock\"]") != std::string::npos && r.out.find("\"used\":\"Disengage Lock\"") != std::string::npos);
+    CHECK(!r.g.calls.empty() && r.g.calls.back() == "termclick " + FakeGame::hex(FakeGame::kTerm + 0x10));
+    CHECK(!r.call("dev.terminal", "{\"ref\":\"FalloutNV.esm:EAC00\",\"entry\":1}") && r.out.find("1 entries shown") != std::string::npos);
+}
+
+TEST(terminal_pick_closes_a_tutorial_box_over_the_menu_first) {
+    GlueRig r;
+    r.g.forms["FalloutNV.esm:EAC00"] = 0x70000000;
+    r.g.buildMenus();
+    r.g.buildTerminal({"Disengage Lock"}, 0x70000000);
+    r.g.tutorialOpen = true;
+    r.g.topId = 0x421;   // the fake keeps the terminal as its top menu id; the open tutorial box is found by its own lookup
+    r.g.calls.clear();
+    CHECK(r.call("dev.terminal", "{\"ref\":\"FalloutNV.esm:EAC00\",\"entry\":0}"));
+    CHECK(r.out.find("\"tutorialClosed\":true") != std::string::npos && !r.g.tutorialOpen);
+    CHECK(r.g.calls.size() >= 2 && r.g.calls[0] == "closetutorial" && r.g.calls.back().rfind("termclick", 0) == 0);
+}
+
+TEST(test_fasttravel_needs_the_test_helper_env) {
+    GlueRig r;
+    r.e.helpers = false;
+    CHECK(!r.call("test.fasttravel", "{\"marker\":\"FalloutNV.esm:ABC\"}"));
+    CHECK(r.out.find("NVCOOP_TEST_HELPERS=1") != std::string::npos && r.e.moved.empty());
+    r.e.helpers = true;
+    CHECK(r.call("test.fasttravel", "{\"marker\":\"FalloutNV.esm:ABC\"}") && r.e.moved == "FalloutNV.esm:ABC");
+    // the genuine path is not a test helper: it is open on a normal game
+    r.e.helpers = false;
+    r.g.buildMenus();
+    r.g.forms["FalloutNV.esm:ABC"] = 0x3C000000;
+    CHECK(r.call("bot.fasttravel", "{\"marker\":\"FalloutNV.esm:ABC\"}"));
+}
+
+// ---- bot.menu.close ----
+static int closeCalls(const FakeGame& g) { int n = 0; for (const std::string& c : g.calls) n += c == "closeallmenus"; return n; }
+
+TEST(menu_close_leaves_the_container_menu_the_engine_way) {
+    GlueRig r;
+    r.g.buildMenus();
+    r.g.topId = 0x3F0;
+    CHECK(r.call("bot.menu.close", "{}"));   // the default kind is the container menu
+    CHECK(r.out.find("\"closed\":true") != std::string::npos && r.out.find("\"kind\":\"container\"") != std::string::npos && r.out.find("\"menu\":1008") != std::string::npos);
+    CHECK(closeCalls(r.g) == 1);
+    CHECK(r.g.topId == 0);                                                       // the menu stack is empty afterwards
+    CHECK(r.call("bot.menu") && r.out.find("\"kind\":\"none\"") != std::string::npos);
+    // an explicit kind, and the terminal menu
+    r.g.topId = 0x421;
+    CHECK(r.call("bot.menu.close", "{\"kind\":\"terminal\"}") && r.out.find("\"kind\":\"terminal\"") != std::string::npos && closeCalls(r.g) == 2);
+    // "any" closes what a player could cancel out of
+    for (uint32_t id : {0x41D, 0x3F6, 0x41F, 0x3EA}) {
+        r.g.topId = id;
+        const int before = closeCalls(r.g);
+        CHECK(r.call("bot.menu.close", "{\"kind\":\"any\"}") && closeCalls(r.g) == before + 1);
+    }
+}
+
+TEST(menu_close_closes_the_tutorial_box_with_the_tutorial_close_not_closeallmenus) {
+    // measured on the second PC (2026-10-27): the first-use hint over a terminal stayed open and bot.menu.close refused it, so every later input was eaten
+    for (const char* kind : {"tutorial", "any"}) {
+        GlueRig r;
+        r.g.buildMenus();
+        r.g.tutorialOpen = true;
+        r.g.topId = 0x423;
+        r.g.calls.clear();
+        CHECK(r.call("bot.menu.close", (std::string("{\"kind\":\"") + kind + "\"}").c_str()));
+        CHECK(r.out.find("\"closed\":true") != std::string::npos && r.out.find("\"kind\":\"tutorial\"") != std::string::npos);
+        CHECK(r.g.closeCalls == 1 && !r.g.tutorialOpen);
+        CHECK(closeCalls(r.g) == 0);   // CloseAllMenusCore is not what closes it
+    }
+    GlueRig r;   // the default kind (container) still leaves a tutorial box alone, and says so
+    r.g.buildMenus();
+    r.g.tutorialOpen = true;
+    r.g.topId = 0x423;
+    CHECK(!r.call("bot.menu.close", "{}") && r.out.find("is tutorial") != std::string::npos && r.g.closeCalls == 0);
+}
+
+TEST(menu_close_refuses_with_a_reason_and_touches_nothing) {
+    GlueRig r;
+    r.g.buildMenus();
+    // nothing open
+    r.g.topId = 0;
+    CHECK(!r.call("bot.menu.close", "{}") && r.out == "no menu is open");
+    CHECK(!r.call("bot.menu.close", "{\"kind\":\"any\"}") && r.out == "no menu is open");
+    // another kind is on top: the container request leaves it open
+    r.g.topId = 0x421;
+    CHECK(!r.call("bot.menu.close", "{}") && r.out.find("is terminal") != std::string::npos && r.out.find("not container") != std::string::npos);
+    r.g.topId = 0x3F1;   // a conversation is never closed as a container
+    CHECK(!r.call("bot.menu.close", "{\"kind\":\"container\"}") && r.out.find("is dialogue") != std::string::npos);
+    // "any" never closes the message box, the loading screen, the pause menu, VATS or the HUD (the tutorial box has its own close, below)
+    for (uint32_t id : {0x3E9, 0x3EF, 0x3F5, 0x420, 0x3EC}) {
+        r.g.topId = id;
+        CHECK(!r.call("bot.menu.close", "{\"kind\":\"any\"}") && r.out.find("not closed from code") != std::string::npos);
+    }
+    CHECK(closeCalls(r.g) == 0);
+    // wrong thread
+    r.g.topId = 0x3F0;
+    r.g.mainThread = false;
+    CHECK(!r.call("bot.menu.close", "{}") && r.out.find("main thread") != std::string::npos && closeCalls(r.g) == 0);
+    r.g.mainThread = true;
+    // the live glue refuses (pins, fault): reported, not claimed
+    r.g.closeOk = false;
+    CHECK(!r.call("bot.menu.close", "{}") && r.out.find("refused the CloseAllMenusCore call") != std::string::npos);
+    CHECK(r.g.topId == 0x3F0);
+    // no interface manager yet
+    r.g.closeOk = true;
+    r.g.mem.erase(nvbots::eng::kInterfaceMgrPtr);
+    CHECK(!r.call("bot.menu.close", "{}") && r.out.find("interface manager not ready") != std::string::npos);
+    // without engine glue
+    Rig plain;
+    CHECK(!plain.call("bot.menu.close", "{}") && plain.out.find("unsupported") != std::string::npos);
+}
+
+TEST(menu_close_pin_is_the_closeallmenus_core) {
+    CHECK(addr::CloseAllMenusCore.addr == 0x7037E0U && addr::CloseAllMenusCore.ret == 0);
+    bool listed = false;
+    for (const addr::CallPin* c : addr::kAllCalls) listed = listed || c == &addr::CloseAllMenusCore;
+    CHECK(listed);
+}
+
 TEST(glue_methods_need_the_engine) {
     Rig r;
     for (const char* m : {"bot.menu", "bot.dialog", "bot.inventory", "bot.vats", "test.vats.hit", "dev.countRefs", "dev.refsOf", "bot.fasttravel", "dev.terminal"})
@@ -1173,6 +1370,29 @@ TEST(pins_match_real_exe_if_available) {
     std::printf("  always-run pins matched in the reference exe: %d of %d\n", runPins, (int)(sizeof addr::kRunPins / sizeof addr::kRunPins[0]));
 }
 
+// A pinned entry that world_time has detoured (jmp rel32 at the entry, trampoline = the stolen prologue) still counts as the pinned function.
+// Before: bots read "engine pin PendingTravelSet @0093BE30 does not match this exe" after a core reload and switched off bot.menu & co.
+static void pins_accept_an_entry_our_own_hook_detoured() {
+    const addr::CallPin& p = addr::PendingTravelSet;
+    unsigned char hooked[16];
+    std::memcpy(hooked, p.bytes, 16);
+    hooked[0] = 0xE9; hooked[1] = 0x10; hooked[2] = 0x20; hooked[3] = 0x30; hooked[4] = 0x40;       // jmp detour
+    unsigned char tramp[16] = {};
+    std::memcpy(tramp, p.bytes, 6);                                                                    // stolen 55 8B EC 83 EC 08, then jmp back
+    tramp[6] = 0xE9;
+    CHECK(pinBytesOk(p.bytes, p.bytes, nullptr));                       // untouched entry
+    CHECK(pinBytesOk(hooked, p.bytes, tramp));                          // our detour, original prologue in the trampoline
+    CHECK(!pinBytesOk(hooked, p.bytes, nullptr));                       // a jmp nobody of ours owns (no trampoline): another mod's patch, refused
+    unsigned char other[16];
+    std::memcpy(other, tramp, 16);
+    other[2] ^= 0xFF;
+    CHECK(!pinBytesOk(hooked, p.bytes, other));                         // our detour over a DIFFERENT exe's function: the pin still fails
+    unsigned char wrong[16];
+    std::memcpy(wrong, p.bytes, 16);
+    wrong[3] ^= 0xFF;
+    CHECK(!pinBytesOk(wrong, p.bytes, tramp));                          // changed bytes without a jmp: refused whatever the trampoline holds
+}
+
 int main() {
     run("held_overrides_real_input_until_released", held_overrides_real_input_until_released);
     run("press_edge_reaches_the_game_exactly_once", press_edge_reaches_the_game_exactly_once);
@@ -1200,6 +1420,9 @@ int main() {
     run("vats_job_without_tutorial_on_the_default_target", vats_job_without_tutorial_on_the_default_target);
     run("vats_job_closes_a_tutorial_box_that_opens_late", vats_job_closes_a_tutorial_box_that_opens_late);
     run("vats_job_keeps_an_attack_queued_before_a_late_tutorial_box", vats_job_keeps_an_attack_queued_before_a_late_tutorial_box);
+    run("vats_job_waits_before_the_accept_and_repeats_an_accept_that_started_nothing", vats_job_waits_before_the_accept_and_repeats_an_accept_that_started_nothing);
+    run("vats_job_closes_a_tutorial_box_that_swallowed_the_accept_and_accepts_again", vats_job_closes_a_tutorial_box_that_swallowed_the_accept_and_accepts_again);
+    run("vats_accept_gate_answers_pressed_a_limited_number_of_times", vats_accept_gate_answers_pressed_a_limited_number_of_times);
     run("vats_job_refuses_zero_hit_chance_and_zero_ap", vats_job_refuses_zero_hit_chance_and_zero_ap);
     run("vats_job_never_executes_an_empty_queue", vats_job_never_executes_an_empty_queue);
     run("vats_job_fails_clearly", vats_job_fails_clearly);
@@ -1218,6 +1441,13 @@ int main() {
     run("refs_of_lists_enabled_refs_of_a_base", refs_of_lists_enabled_refs_of_a_base);
     run("count_refs_by_base_in_a_cell", count_refs_by_base_in_a_cell);
     run("terminal_pick_clicks_the_requested_entry_and_records_it", terminal_pick_clicks_the_requested_entry_and_records_it);
+    run("terminal_pick_reads_the_texts_and_clicks_the_tile_of_the_embedded_list", terminal_pick_reads_the_texts_and_clicks_the_tile_of_the_embedded_list);
+    run("terminal_pick_closes_a_tutorial_box_over_the_menu_first", terminal_pick_closes_a_tutorial_box_over_the_menu_first);
+    run("test_fasttravel_needs_the_test_helper_env", test_fasttravel_needs_the_test_helper_env);
+    run("menu_close_leaves_the_container_menu_the_engine_way", menu_close_leaves_the_container_menu_the_engine_way);
+    run("menu_close_closes_the_tutorial_box_with_the_tutorial_close_not_closeallmenus", menu_close_closes_the_tutorial_box_with_the_tutorial_close_not_closeallmenus);
+    run("menu_close_refuses_with_a_reason_and_touches_nothing", menu_close_refuses_with_a_reason_and_touches_nothing);
+    run("menu_close_pin_is_the_closeallmenus_core", menu_close_pin_is_the_closeallmenus_core);
     run("glue_methods_need_the_engine", glue_methods_need_the_engine);
     run("always_run_state_reads_the_engine_bytes", always_run_state_reads_the_engine_bytes);
     run("move_run_is_the_speed_whatever_the_always_run_toggle", move_run_is_the_speed_whatever_the_always_run_toggle);
@@ -1226,6 +1456,7 @@ int main() {
     run("move_with_unknown_always_run_keeps_the_key_meaning", move_with_unknown_always_run_keeps_the_key_meaning);
     run("always_run_pins_hold_the_addresses_the_reader_uses", always_run_pins_hold_the_addresses_the_reader_uses);
     run("spec_is_valid_and_installs_and_restores_on_a_fake_image", spec_is_valid_and_installs_and_restores_on_a_fake_image);
+    run("pins_accept_an_entry_our_own_hook_detoured", pins_accept_an_entry_our_own_hook_detoured);
     run("pins_match_real_exe_if_available", pins_match_real_exe_if_available);
     std::printf("%d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

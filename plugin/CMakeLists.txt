@@ -71,7 +71,7 @@ else()
   target_link_libraries(nvcoop PRIVATE nvcoop_core)
 endif()
 target_include_directories(nvcoop PUBLIC
-  "${CMAKE_CURRENT_LIST_DIR}"
+  "${CMAKE_CURRENT_LIST_DIR}" "${CMAKE_CURRENT_LIST_DIR}/../tools/mut"
   "${FNVCOOP_NVSE_DIR}" "${FNVCOOP_NVSE_DIR}/nvse" "${FNVCOOP_NVSE_DIR}/nvse/nvse")
 target_compile_definitions(nvcoop PRIVATE RUNTIME=1 RUNTIME_VERSION=0x040020D0 WIN32 _WINDOWS _CRT_SECURE_NO_WARNINGS)
 if(MSVC)

@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "engine_hooks.h"  // nvhooks::FormResolver (declaration only; game-free)
@@ -150,18 +151,32 @@ private:
 class RefVarTracker {
 public:
     // First sight of (ref,index) records the baseline and returns false (a ref's initial values come from the baseline
-    // transfer, not from the change stream). Later calls return true when the value differs from the last REPORTED one
-    // and the poll budget is not exhausted; a deferred change is reported by a later poll.
-    bool observe(uint32_t refID, uint16_t index, double value);
-    void beginPoll(size_t budget) { budget_ = budget; reported_ = 0; }
+    // transfer, not from the change stream) -- unless `reportFirst` (a WATCHED ref: its cell may have loaded after the variable
+    // was written, nothing ever saw the write) and the value is not the script default 0: then the value is reported once.
+    // Later calls return true when the value differs from the last REPORTED one and the poll budget is not exhausted; a deferred
+    // change is reported by a later poll. A variable that changed on kHotStreak polls in a row is a timer (Time = GetCurrentTime):
+    // it is held back for kHotQuiet polls so it cannot eat the budget of the flags that matter (the newest value is reported then).
+    bool observe(uint32_t refID, uint16_t index, double value, bool reportFirst = false);
+    void beginPoll(size_t budget) { budget_ = budget; reported_ = 0; ++round_; }
     size_t reportedThisPoll() const { return reported_; }
+    size_t budget() const { return budget_; }
     void forgetRef(uint32_t refID);  // cell unloaded: the next sighting re-baselines
+    // The player changed cell: refs that are not in `keep` (the watched ones are polled wherever the player is) re-baseline.
+    void forgetAllExcept(const std::unordered_set<uint32_t>& keep);
     size_t size() const { return last_.size(); }
     void clear() { last_.clear(); }
+    static constexpr uint8_t kHotStreak = 8;
+    static constexpr uint32_t kHotQuiet = 32;
 
 private:
-    std::unordered_map<uint64_t, double> last_;
+    struct Entry {
+        double last = 0;
+        uint8_t streak = 0;
+        uint32_t quietUntil = 0;
+    };
+    std::unordered_map<uint64_t, Entry> last_;
     size_t budget_ = 0, reported_ = 0;
+    uint32_t round_ = 0;
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -197,7 +212,7 @@ const char* avName(uint32_t av);
 std::string markForDeleteLine();                                     // on the ref
 std::string setEssentialLine(const SetEssential& e, uint32_t baseOrRefID);  // refOnly: on the ref; else SetEssential <base> n
 std::string setRestrainedLine(bool on);                              // on the ref
-std::string setRelationLine(Relation kind, uint32_t factionA, uint32_t factionB);
+std::string setRelationLine(Relation kind, uint32_t factionA, uint32_t factionB, uint8_t flags1 = 0, uint8_t flags2 = 0);
 std::string scriptPackageLine(bool add, uint32_t packageID);         // on the actor
 std::string ignoreCrimeLine(bool on);                                // on the actor
 std::string setPCEnemyOfFactionLine(uint32_t factionID, bool on);
@@ -207,6 +222,7 @@ std::string setCellOwnershipLine(uint32_t cellID, uint32_t ownerID);
 std::string setCellPublicFlagLine(uint32_t cellID, bool on);
 std::string avLine(const SetActorValueRef& e);                       // on the actor; empty if the AV has no console name
 std::string placeAtMeLine(uint32_t baseID, int count);               // on a reference in the target cell
+std::string presentLine(const Present& p, uint32_t formID);          // no calling reference
 std::string setPosLine(char axis, float v);
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -247,6 +263,12 @@ private:
     std::map<std::pair<fnvcoop::FormRef, uint16_t>, double> vars_;
     std::vector<WorldEffect> world_;
 };
+
+// cause.aux of the txns the world-time object poll records: the poll's ObjectState is not repeated as a world effect.
+constexpr int32_t kObjectPollAux = 0x0B1E;
+// The world-channel copy of an ObjectState the host captured (a script command or a guest intent changed a lock / open state / destroyed flag). nullopt: nothing to send
+// (the world-time poll's own effect, or no tracked bit).
+std::optional<SetObjectState> worldCopyOfObjectState(const fnvcoop::ObjectState& os, int32_t causeAux);
 
 // JSON for WorldEffect: {"type":"SetEssential","actor":"falloutnv.esm:104C79","essential":true,"refOnly":false}
 std::string worldEffectToJson(const WorldEffect& e);

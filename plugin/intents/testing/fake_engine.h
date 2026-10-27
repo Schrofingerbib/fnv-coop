@@ -3,6 +3,7 @@
 #pragma once
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -110,6 +111,58 @@ public:
         bool ok = log("disable", ctxActor, target, 0, disableOk);
         if (ok && disableMarksWorld) { auto it = world.find(target); if (it != world.end()) it->second.disabled = true; }
         return ok;
+    }
+    // quests: the stage per quest (a quest not in the table is "not loaded"). setStage mirrors the engine detour: the stage is recorded on ENTRY into the
+    // open scope (CaptureHub, like h_SetStage), the quest moves, and onStage can add the stage's own consequences. stageDefer holds it like the rules engine's gate.
+    std::map<FormRef, int32_t> quests;
+    std::set<FormRef> stageDefer;
+    bool stageFails = false;
+    std::function<void(const FormRef&, uint32_t)> onStage;
+    bool questStage(const FormRef& q, int32_t* stage) override {
+        auto it = quests.find(q);
+        if (it == quests.end()) return false;
+        *stage = it->second;
+        return true;
+    }
+    StageOutcome setStage(const FormRef& q, uint32_t stage) override {
+        log("setStage", ctxActor, q, stage, true);
+        if (stageFails) return StageOutcome::Failed;
+        if (stageDefer.count(q)) return StageOutcome::Deferred;
+        std::unique_ptr<nvhooks::ScopedCapture> cap;
+        if (hub) cap.reset(new nvhooks::ScopedCapture(*hub, Cause{CauseKind::QuestResult, q, static_cast<int32_t>(stage)}));
+        if (hub) hub->record(fnvcoop::SetStage{q, stage});
+        quests[q] = static_cast<int32_t>(stage);
+        if (onStage) onStage(q, stage);
+        return StageOutcome::Applied;
+    }
+    // G10: the journal. Like the engine's AddNote hook, the call records the shared AddNote effect into the open scope.
+    bool noteOk = true;
+    std::set<FormRef> journal;
+    bool addNote(const FormRef& n) override {
+        bool ok = log("addNote", ctxActor, n, 0, noteOk);
+        if (ok) {
+            journal.insert(n);
+            if (hub) hub->record(fnvcoop::AddNote{n});
+        }
+        return ok;
+    }
+    // G35: container contents. Not logged as engine calls on a target (they are plumbing); replaceInScope counts the calls made with an acting scope open (must stay 0).
+    std::map<FormRef, std::vector<StoredItem>> containers;
+    bool readFails = false, replaceFails = false;
+    int readCalls = 0, replaceCalls = 0, replaceInScope = 0;
+    bool readItems(const FormRef& c, std::vector<StoredItem>* out) override {
+        ++readCalls;
+        auto it = containers.find(c);
+        if (readFails || it == containers.end()) return false;
+        *out = it->second;
+        return true;
+    }
+    bool replaceItems(const FormRef& c, const std::vector<StoredItem>& items) override {
+        ++replaceCalls;
+        if (depth > 0) ++replaceInScope;
+        if (replaceFails || !containers.count(c)) return false;
+        containers[c] = items;
+        return true;
     }
     void closeMenus() override { ui.push_back("closeMenus"); }
     void notify(const std::string& t) override { ui.push_back("notify:" + t); }

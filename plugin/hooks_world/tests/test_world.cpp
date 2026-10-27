@@ -14,6 +14,7 @@
 #include "world_core.h"
 #include "world_plan.h"
 #include "world_query.h"
+#include "world_refvars.h"
 #include "engine_addrs.h"
 
 using namespace nvworld;
@@ -580,6 +581,10 @@ TEST(route_and_retriable) {
     CHECK(!retriable(fnvcoop::RefScriptVar{}, Outcome::Ok));
     CHECK(retriable(WorldEffect(SetRestrained{}), Outcome::Missing));
     CHECK(!retriable(WorldEffect(SetRestrained{}), Outcome::Rejected));
+    // a door that refuses its lock change while the cell attaches is asked again (the lab door: the client stayed locked)
+    CHECK(retriable(fnvcoop::ObjectState{}, Outcome::Rejected));    // twin 65
+    CHECK(retriable(WorldEffect(SetObjectState{}), Outcome::Rejected));
+    CHECK(!retriable(fnvcoop::ObjectState{}, Outcome::Other));
 }
 
 static HeldEffect heldCreated(uint32_t id, double v) {
@@ -1219,6 +1224,22 @@ TEST(query_foreign_or_broken_entries_are_refused) {
     }
 }
 
+TEST(world_actors_type_filter_reads_creatures_from_the_reference) {
+    // spawn_proof 2026-10-22: `world.actors {type: 60}` (creatures) listed nothing, so "every instance has exactly one more actor" saw [0, 0, 0].
+    const uint32_t kChar = 0x3B, kCreature = 0x3C, kNpcBase = 0x2A, kCreatureBase = 0x2B, kContainer = 0x1B, kDoor = 0x1C, kRefr = 0x3A;
+    CHECK(actorTypeMatches(kChar, kChar, kNpcBase));                    // an NPC reference, as before
+    CHECK(!actorTypeMatches(kChar, kCreature, kCreatureBase));          // a creature is not a character
+    CHECK(actorTypeMatches(kCreature, kCreature, kCreatureBase));       // a radroach reference is a creature
+    CHECK(!actorTypeMatches(kCreature, kChar, kNpcBase));
+    CHECK(actorTypeMatches(kContainer, kRefr, kContainer));             // placed objects: the BASE form has the type
+    CHECK(actorTypeMatches(kDoor, kRefr, kDoor));
+    CHECK(!actorTypeMatches(kContainer, kRefr, kDoor));
+    CHECK(actorTypeMatches(kRefr, kRefr, 0x28));                        // 0x3A asks for plain references
+}
+
+#include "refvars_tests.h"
+#include "presentation_tests.h"
+
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     run("query_table", query_table);
@@ -1270,6 +1291,9 @@ int main() {
     run("world_baseline_spawns_and_vars", world_baseline_spawns_and_vars);
     run("world_baseline_folds_net_state", world_baseline_folds_net_state);
     run("baseline_replay_on_client_is_idempotent", baseline_replay_on_client_is_idempotent);
+    run("world_actors_type_filter_reads_creatures_from_the_reference", world_actors_type_filter_reads_creatures_from_the_reference);
+    runRefVarTests();
+    runPresentationTests();
     std::printf("%d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

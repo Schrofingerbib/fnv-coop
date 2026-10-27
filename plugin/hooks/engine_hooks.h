@@ -5,6 +5,7 @@
 // Threading: Init/Shutdown/hooks all run on the game main thread (script execution is single-threaded).
 #pragma once
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,8 @@ InitReport Init(CaptureHub& hub, Role role, FormResolver* resolver = nullptr);
 void Shutdown();  // restores every patched byte (only if still ours)
 // Hot reload preflight: how many of our installed hooks another patcher has chained over (0 = safe to unload).
 int auditTamperedHooks();
+std::string tamperedHookTargets();   // "0x0058A3B0 0x...": the hook targets whose bytes someone overwrote (hot-reload refusals name them)
+std::string chainedHookTargets();    // "0x005AC750->0x0B6A1234 ...": hooks installed on top of another patcher's entry jump (hook_patch rule 4)
 
 CaptureHub* hub();
 FormResolver& resolver();
@@ -91,6 +94,10 @@ struct ScriptStats {
     uint64_t ranWhileApplying = 0;  // subset of `ran` during a RemoteApplier::apply (must be 0 with the gate on)
     uint64_t localRan = 0;          // GuestLocalRun allow-listed scripts that executed (subset of `ran`)
     uint64_t applierLines = 0;      // console lines the applier itself executed (kill/resurrect/move); not counted above
+    uint64_t questVarRollbacks = 0; // guest: shared quest vars an object / NPC / effect script wrote and that were put back (host is authoritative)
+    uint64_t questVarGuarded = 0;   // guest: executions of scripts known to write a shared quest var
+    uint64_t stagesBlocked = 0;     // guest: SetStage calls a running script / console line made and the suppression dropped
+    uint64_t stagesForwarded = 0;   // ... of which the stage request observer sent to the host (the host decides; docs/protocol.md section 19, Kind SetStage)
 };
 const ScriptStats& scriptStats();
 // Distinct GuestLocalRun script refIDs that ran, with run counts (diagnostic; at most 64 entries).
@@ -118,13 +125,15 @@ public:
 // frame, so these are NOT put into capture txns: the host polls each tick and feeds the replicator.
 //   nvhooks::enableStatePolling(true);            // turns the per-scope var/global diff off (no duplicates in txns)
 //   nvhooks::pollHostState(sink);                 // once per host tick: sink.scriptVar()/global() for every CHANGED value
-// The first poll reports every value (baseline); later polls only changes. Cost is one pass over all quests/globals.
+// The first poll reports every value (baseline) and later polls only changes, unless the poll was enabled with prime=true (a host WITHOUT a
+// world baseline): then the first pass only records what is already there and nothing is reported until it changes.
+// Cost is one pass over all quests/globals.
 struct StateSink {
     virtual ~StateSink() = default;
     virtual void scriptVar(const fnvcoop::FormRef& quest, uint16_t index, double value) = 0;
     virtual void global(const fnvcoop::FormRef& global, float value) = 0;
 };
-void enableStatePolling(bool on);
+void enableStatePolling(bool on, bool prime = false);
 size_t pollHostState(StateSink& sink);
 
 // Guest-originated activation (TESObjectREFR::Activate 0x573170, thiscall(ref, activator, u8, u32, u32), ret 0x10).
@@ -146,6 +155,13 @@ bool playerControlsLocked();
 // Host: let the rules engine defer a SetStage that the engine is about to perform (not ours, not while applying, not inside a
 // StageGateBypass). `quest` is the engine refID (resolver().toRef() converts). Return false = the engine SetStage is skipped and
 // the detour returns false. The owner re-issues the stage later under a StageGateBypass.
+// Guest: a script or console line called SetStage and the suppression dropped it (SuppressPolicy::blockMutation). The observer gets the quest and the stage
+// so the intents layer can ask the host to advance it. Return true when the request went out. Unset = the drop stays silent (counted in stagesBlocked).
+using StageRequestObserver = std::function<bool(const fnvcoop::FormRef& quest, uint32_t stage)>;
+void setStageRequestObserver(StageRequestObserver obs);
+// Host: how many SetStage calls the stage gate has held back so far (engine counter; a guest's SetStage intent compares it before / after).
+uint64_t stageGateDeferred();
+
 using StageGateFn = std::function<bool(const fnvcoop::FormRef& quest, uint32_t stage)>;
 void setStageGate(StageGateFn f);
 class StageGateBypass {
@@ -157,6 +173,12 @@ public:
 };
 // Local read of a quest's current stage (TESQuest+0x60) for scene-pass detection (e.g. VCG01 chargen finished). -1 if unknown.
 int localQuestStage(const fnvcoop::FormRef& quest);
+// Local read of a quest's TESQuest::flags byte (bit0 running, bit1 completed, bit6 failed; a failed quest also has bit1). -1 if unknown.
+int localQuestFlags(const fnvcoop::FormRef& quest);
+// Local read of every objective of a quest: objective id -> status bits (bit0 displayed, bit1 completed). False if the quest is unknown.
+bool localQuestObjectives(const fnvcoop::FormRef& quest, std::map<uint32_t, uint8_t>& out);
+// Local read of one global's value (TESGlobal::data). False if the form is unknown or not a global.
+bool localGlobalValue(const fnvcoop::FormRef& global, double& out);
 // Execute a console line through the injected executor (for the owner of a deferred stage: "setstage <hex> <n>").
 bool execConsoleLine(const std::string& line);
 // Same, with `refID` as the console's calling reference (so `KillActor`, `MoveTo ...`, `GetDead` act on that reference).

@@ -56,6 +56,10 @@ struct Cfg {
     bool objects = true;
     uint32_t objectsPerTick = 40;
     bool saves = true;
+    bool onceEvent = true;           // D7: a scripted time skip happens once per party event
+    double onceMinHours = 12.0;
+    uint32_t onceWindowS = 120;
+    double onceToleranceMin = 60.0;
 };
 Cfg g_cfg;
 
@@ -85,6 +89,10 @@ void LoadCfg() {
     g_cfg.objectsPerTick = static_cast<uint32_t>(GetPrivateProfileIntA("worldtime", "objectsPerTick", 40, ini.c_str()));
     if (g_cfg.objectsPerTick == 0) g_cfg.objectsPerTick = 40;
     g_cfg.saves = GetPrivateProfileIntA("worldtime", "saves", 1, ini.c_str()) != 0;
+    g_cfg.onceEvent = GetPrivateProfileIntA("worldtime", "once_event", 1, ini.c_str()) != 0;
+    g_cfg.onceMinHours = static_cast<double>(GetPrivateProfileIntA("worldtime", "once_min_hours", 12, ini.c_str()));
+    g_cfg.onceWindowS = static_cast<uint32_t>(GetPrivateProfileIntA("worldtime", "once_window_s", 120, ini.c_str()));
+    g_cfg.onceToleranceMin = static_cast<double>(GetPrivateProfileIntA("worldtime", "once_tolerance_min", 60, ini.c_str()));
 }
 
 uint64_t NowMs() { return GetTickCount64(); }
@@ -279,6 +287,7 @@ void RecordEffects(const std::vector<fnvcoop::Effect>& fx) {
     if (!hub || !hub->enabled() || fx.empty() || hub->depth() != 0) return;
     fnvcoop::Cause c;
     c.kind = fnvcoop::CauseKind::Script;
+    c.aux = nvworld::kObjectPollAux;   // hooks_world sends a script's ObjectState a second time as a world effect; the poll's own is not repeated
     nvhooks::ScopedCapture sc(*hub, c);
     for (const auto& e : fx) hub->record(e);
 }
@@ -329,6 +338,10 @@ void Build(Runtime* rt) {
     g_st.self = g_st.role == nvwt::Role::Host ? nvwt::kHostPlayer : (rt->client() && rt->client()->joined() ? rt->client()->slot() : nvwt::kNoPlayer);
     nvwt::SessionConfig cfg;
     cfg.broker.travel = g_cfg.partyTravel ? nvwt::TravelMode::Party : nvwt::TravelMode::Free;
+    cfg.authority.onceEnabled = g_cfg.onceEvent;
+    cfg.authority.onceMinMinutes = g_cfg.onceMinHours * 60.0;
+    cfg.authority.onceWindowMs = g_cfg.onceWindowS * 1000u;
+    cfg.authority.onceToleranceMinutes = g_cfg.onceToleranceMin;
     nvwt::SessionEnv env;
     env.engine = &g_engine;
     fnvcoop::MuxTransport* mux = rt->mux();
@@ -530,7 +543,8 @@ void OnMessage(uint32_t type, void*, uint32_t) {
 
 bool MStatus(const std::string&, std::string& out) {
     Value o = Value::object();
-    o.set("enabled", g_cfg.enabled).set("hooked", g_hooked).set("pins", Pins()).set("partyTravel", g_cfg.partyTravel)
+    o.set("enabled", g_cfg.enabled).set("hooked", g_hooked).set("pins", Pins())
+        .set("partyTravel", g_st.session ? g_st.session->partyTravel() : g_cfg.partyTravel)   /* a client: the host's last beacon */
         .set("session", g_st.session != nullptr).set("role", g_st.role == nvwt::Role::Host ? "host" : "client");
     if (g_st.session) {
         const auto& s = g_st.session->stats();

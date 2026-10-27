@@ -499,6 +499,20 @@ int main(int argc, char** argv) {
         RemoveFile(g_run + "nvcoop_stub.json");
     }
 
+    // ---- cosave callbacks: NVSE keeps calling the loader's forwarders for the whole process, so the core's callbacks must be gone
+    // the moment that core is unloaded (in game 2026-10-21 the core registered them with NVSE itself, which crashed a hot reload) ----
+    {
+        HostEnv env;
+        env.corePath = g_core;
+        env.cacheDir = g_cache;
+        CoreHost host(env);
+        std::string err;
+        CHECK(host.Load(err), ("load (cosave): " + err).c_str());
+        CHECK(nvcoop::HasCosaveCallbacks(), "the core's cosave callbacks reach the loader through set_cosave");
+        CHECK(host.Unload(err), ("unload (cosave): " + err).c_str());
+        CHECK(!nvcoop::HasCosaveCallbacks(), "the unloaded core's cosave callbacks are cleared (they would point into a freed image)");
+    }
+
     std::printf("loader tests: %d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

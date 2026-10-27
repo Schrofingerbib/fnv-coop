@@ -40,16 +40,33 @@ inline Bridge makeDialogueBridge(const DialogueBridgeConfig& c) {
         o.confirmButton = rule.confirmButton;
         o.declineChoice = rule.declineChoice;
         o.timeoutMs = rule.timeoutMs;
+        o.mode = static_cast<fnvcoop_dlg::HostDialogue::ConsentMode>(rule.mode);
+        o.anyButton = rule.anyButton;
         return node->raiseModal(origin, text, std::move(buttons), def, o, now());
     };
     b.consentFor = [consentMap](const FormRef& msg) -> std::optional<ConsentRule> {
         auto it = consentMap->find(msg);
-        if (it == consentMap->end() || mut(15)) return std::nullopt;  // MUTANT 15: the consent table is ignored
+        if (it == consentMap->end() || it->second.isInfo || mut(15)) return std::nullopt;  // MUTANT 15: the consent table is ignored
         ConsentRule r;
         r.confirmButton = it->second.confirmButton;
         r.declineChoice = it->second.declineChoice;
+        r.timeoutMs = it->second.timeoutMs;
+        r.mode = it->second.mode;
+        r.anyButton = it->second.anyButton;
         return r;
     };
+    // fork INFOs (Joshua or Daniel, Elijah's offer): the dialogue host holds the pick until the party answered
+    if (node && node->host() && !mut(25)) {   // MUTANT 25: the fork INFOs of the consent table are never handed to the dialogue host
+        std::map<FormRef, fnvcoop_dlg::HostDialogue::ChoiceRule> rules;
+        for (const auto& kv : c.consent) {
+            if (!kv.second.isInfo) continue;
+            fnvcoop_dlg::HostDialogue::ChoiceRule r;
+            r.mode = static_cast<fnvcoop_dlg::HostDialogue::ConsentMode>(kv.second.mode);
+            r.timeoutMs = kv.second.timeoutMs;
+            rules[kv.first] = r;
+        }
+        if (!rules.empty()) node->host()->setChoiceRules(std::move(rules));
+    }
 
     b.watchesQuest = c.watchesQuest ? c.watchesQuest : [node](uint32_t) { return node->companions().ruleCount() != 0; };
     b.viewVar = [node](const FormRef& quest, uint32_t idx, PlayerId slot, int32_t real) { return node->viewQuestVarFor(quest, idx, slot, real); };

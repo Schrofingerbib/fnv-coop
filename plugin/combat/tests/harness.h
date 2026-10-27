@@ -24,6 +24,8 @@ struct Rec {
     cc::Vec3 pos;
     float radius = 40;
     int32_t health = 100, maxHealth = 100;
+    bool lifeLag = false;             // health <= 0 (alive == false in the view) but the engine's life state still reads alive: a lethal VATS hit that was never finished
+    float sliver = 0;                 // the engine's float health beyond the integer the model shows (12.4 reads 12: sliver 0.4)
     uint8_t limbMask = 0;
     PlayerId recruiter = kNoPlayer;
     FormRef faction;
@@ -95,6 +97,9 @@ struct FakeEngine : ICombatEngine {
     int32_t xpValue = 50;
     bool vats = false;
     bool refuseDamage = false;
+    bool refuseLethal = false;            // the engine takes at most the integer health off: a sliver of float health survives every blow
+    bool refuseKill = false;
+    std::vector<uint32_t> kills;          // refs the owner killed explicitly (killActor)
 
     Rec* find(uint32_t ref) {
         cc::Entity e;
@@ -109,10 +114,19 @@ struct FakeEngine : ICombatEngine {
         // "owned": the machine that applies a hit simulates its victim right now (an actor it owns, not mid-handoff, or its own player)
         const bool owned = victim.isPlayer() ? victim.id == w->me : (r->owner == w->me && !r->pending && !r->standIn);
         damage.push_back({victim, ref, amount, attackerRef, h.hitId, h.vats, h.limb, h.attacker, owned});
-        r->health -= amount;
-        if (r->health <= 0 && r->alive) { r->health = 0; r->alive = false; deaths.push_back(ref); }
+        const float real = static_cast<float>(r->health) + r->sliver - static_cast<float>(refuseLethal ? std::min(amount, r->health) : amount);
+        if (real <= 0 && r->alive) { r->health = 0; r->sliver = 0; r->alive = false; deaths.push_back(ref); }
+        else if (r->alive) { r->health = static_cast<int32_t>(real); r->sliver = real - static_cast<float>(r->health); }
         return true;
     }
+    bool killActor(uint32_t ref) override {
+        Rec* r = find(ref);
+        if (!r || refuseKill) return false;
+        kills.push_back(ref);
+        if (r->alive || r->lifeLag) { r->alive = false; r->lifeLag = false; r->health = 0; r->sliver = 0; deaths.push_back(ref); }
+        return true;
+    }
+    bool lifeDead(uint32_t ref) override { Rec* r = find(ref); return r && !r->alive && !r->lifeLag; }
     bool setLimbCrippled(const cc::Entity& v, uint32_t ref, cc::Limb l) override {
         Rec* r = find(ref);
         if (!r) return false;

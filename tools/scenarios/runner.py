@@ -284,9 +284,21 @@ class Runner:
         else:
             raise ScenarioError("bad action %r" % (act,))
 
+    def _targets(self, sc, st):
+        """Indices (into self.nvs) a step runs on: the scenario's players that exist. A scenario written for 2 players
+        run on ONE copy (a single-copy proof test that only needs the start state) moves/enables/checks only the copy
+        that exists; asking for a player with no bridge used to raise IndexError."""
+        idx = scenlib.step_target(st, sc)
+        if MUTANT == "allplayers":
+            return idx
+        return [i for i in idx if i < len(self.nvs)]
+
     # ---- checks
     def _check(self, sc, st, res):
-        idx = scenlib.step_target(st, sc)
+        idx = self._targets(sc, st)
+        if not idx:
+            raise ScenarioError("check %s needs player(s) %s but only %d copy(ies) are connected" % (
+                st["id"], scenlib.step_target(st, sc), len(self.nvs)))
         expr, cmp_, value, agg, tol, timeout, ref = scenlib.check_expr(st, res)
         if expr is None and st["kind"] not in ("owner", "spawn_count"):
             raise ScenarioError("check kind %s has no expression" % st["kind"])
@@ -322,7 +334,7 @@ class Runner:
                 rec.update(self._check(sc, st, res))
             else:
                 acts = scenlib.step_actions(st, res)
-                idx = scenlib.step_target(st, sc)
+                idx = self._targets(sc, st)
                 if MUTANT == "firsthost":
                     idx = [0]
                 def one(i):
@@ -400,6 +412,14 @@ class Runner:
             out.append(rec)
             if rec["status"] in ("error", "blocked"):
                 break
+        # The first digest round after all of the above. The sync wait ran BEFORE the message boxes were pressed away (about 50 s of DLC
+        # setup on every machine), the quest reset and the setup steps, so the first round that finds those differences (the guest that
+        # rejoined, 256 effects repaired once in the two-copy fight test 2026-10-21) came in the middle of the playbook's first step,
+        # and its strict counters failed it. A repair that this jump caused belongs to the jump: wait for a digest that is ok AFTER the
+        # last mismatch, and report it (coopSync.settledAfterSetup). Nothing changed since the last settle (an in-place jump with no
+        # reset and no setup step) needs no wait.
+        if (plan["reload"] or ids or out) and MUTANT != "nofinalsettle" and self._in_coop():
+            coop_sync = dict(coop_sync or {}, settledAfterSetup=self._wait_digest_ok(60.0, 0.5, 20.0))
         new = {"loaded": True, "save": save, "dirty": sorted(fp["dirty"]), "failed": False, "quest_hex": ids, "scenario": sc["name"]}
         self.store.put_many({k: new for k in self.keys})
         return {"reload": plan["reload"], "reasons": plan["reasons"], "seconds": round(self.now() - t0, 2), "setup": out,
@@ -554,7 +574,9 @@ class Runner:
           * the same mismatch comes back repeat_limit times (the same keys with the same host and client values: the repair is not working),
           * stale_limit digests were stale (the host cannot judge them),
           * no digest arrived for stall_s (the client does not send, or the link is down).
-        Rate-limited digests are normal and count as arrived. timeout_s is the outer limit."""
+        Rate-limited digests are normal and count as arrived. timeout_s is the outer limit.
+        "One more ok" means one more AFTER the newest mismatch seen during the wait: an ok that came before a mismatch (a round that
+        judged the world before the guest's late load-time scripts ran) does not end it, or the repair would land in the next test."""
         host = None
         for nv in self.nvs:
             try:
@@ -580,6 +602,7 @@ class Runner:
         t0 = self.now()
         rx, rx_at = d0.get("received", 0), t0
         mismatch, repeats, prev_sig = d0.get("mismatch", 0), 0, None
+        ok_floor = d0.get("ok", 0)   # the ok count to beat: d0's, raised to the count at the newest mismatch
         limit = 1 if MUTANT == "hairtrigger" else repeat_limit
 
         def failed(reason, ds):
@@ -596,7 +619,9 @@ class Runner:
             ds = status()
             d = ds.get("digests") or {}
             now = self.now()
-            if d.get("ok", 0) > d0.get("ok", 0):
+            if MUTANT != "anyok" and d.get("mismatch", 0) > mismatch:   # a mismatch since the last poll: only an ok after it counts
+                ok_floor = max(ok_floor, d.get("ok", 0))
+            if d.get("ok", 0) > (d0.get("ok", 0) if MUTANT == "anyok" else ok_floor):
                 if MUTANT == "latesuccess":   # test-only: notice the success only when the whole timeout has passed
                     self.sleep(max(0.0, timeout_s - (self.now() - t0)))
                 return {"digestOk": True, "settleReason": "ok", "settleRepairs": d.get("repairs", 0) - d0.get("repairs", 0),

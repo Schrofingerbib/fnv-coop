@@ -24,6 +24,7 @@
 // 28 ItemCount of a non-owned item uses fallback  29 spawn of an untagged base allowed    30 MoveToCell without anchor check
 // 31 no spawn circuit breaker                     32 a new ref that fails the guard is kept   33 a placed (non 0xFF) ref with a tagged base counts as ours
 // 34 puppets are ghosts (enemy shots pass through them)
+// 86 the local player's place is never answered (no room is made for it)
 
 namespace nvcoop::avatar::engine {
 
@@ -443,6 +444,15 @@ bool GamePuppetEngine::GetPose(RefId ref, CellId& cell, Vec3& pos) {
     cell = ri.cell;
     pos = ri.pos;
     return ri.cell != 0;
+}
+
+bool GamePuppetEngine::GetLocalPose(CellId& cell, Vec3& pos) {
+    if (FNV_MUT(86)) return false;
+    RefInfo pl;
+    if (!be_.ReadRef(kPlayerRef, pl) || !pl.exists || !pl.isPlayer || pl.cell == 0 || !Finite(pl.pos)) return false;
+    cell = pl.cell;
+    pos = pl.pos;
+    return true;
 }
 
 bool GamePuppetEngine::PlayGroup(RefId ref, int baseGroup, int flags) {

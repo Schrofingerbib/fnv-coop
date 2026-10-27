@@ -1,0 +1,109 @@
+{
+ "config": {
+  "clients": 1
+ },
+ "evidence": {
+  "desync_keys": [
+   "StartQuest 4ADEE@falloutnv.esm: host (absent) / client StartQuest 4ADEE@falloutnv.esm",
+   "StopQuest 152E8A@falloutnv.esm: host (absent) / client StopQuest 152E8A@falloutnv.esm",
+   "StartQuest 14ADAE@falloutnv.esm: host (absent) / client StartQuest 14ADAE@falloutnv.esm",
+   "StopQuest 10A214@falloutnv.esm: host (absent) / client StopQuest 10A214@falloutnv.esm",
+   "StartQuest 11F460@falloutnv.esm: host (absent) / client StartQuest 11F460@falloutnv.esm",
+   "StartQuest 131E7C@falloutnv.esm: host (absent) / client StartQuest 131E7C@falloutnv.esm",
+   "StartQuest 140E14@falloutnv.esm: host (absent) / client StartQuest 140E14@falloutnv.esm",
+   "StartQuest 139B8D@falloutnv.esm: host (absent) / client StartQuest 139B8D@falloutnv.esm"
+  ],
+  "found": {
+   "at_ms": 21549.486,
+   "class": "divergence",
+   "detail": "effect 0 of txn seq 2 differs between machines: slot(s) [1] hash 0f0bf6da13952235; slot(s) [1] hash 6b5695aea31f470d; slot(s) [1] hash 7e72fc6fa4a285ad; slot(s) [1] hash e6daa1c5ee8053f5",
+   "healed": true,
+   "key": "txn:2[0]",
+   "kind": "txn-hash",
+   "suspects": [
+    1
+   ]
+  },
+  "symptoms": [
+   "digest mismatch x112",
+   "49 repair(s), 4195 effect(s) repaired",
+   "sync lag: slot 2 acked 0 of 1260; slot 1 acked 1258 of 1260"
+  ]
+ },
+ "expect": {
+  "bug_signature": "divergence txn:#[#]",
+  "converges": false,
+  "meaning": "recorded evidence of the failure"
+ },
+ "format": "trace-1",
+ "headers": {
+  "0": "4e564652010040000000000006000000b8a1d668a1010000d6ffc716000000000000000000000000821c01000000000000000000000000000000000000000000",
+  "1": "4e56465201004000010100000600000058b1d668a1010000f038ef390000000000000000000000008fef01000000000000000000000000000000000000000000"
+ },
+ "shrunk": {
+  "complete": true,
+  "first": {
+   "category": "divergence",
+   "key": "txn:57[1]"
+  },
+  "oracle_runs": 108,
+  "original_steps": 199697,
+  "reduced_steps": 2,
+  "seconds": 11.37,
+  "signature": "divergence txn:#[#]",
+  "stages": [
+   "dropped all NetIn (14289 records)",
+   "dropped all NetOut (16242 records)",
+   "dropped all Marker (157516 records)",
+   "dropped all Digest (454 records)",
+   "dropped all Meta (2 records)"
+  ],
+  "violations": [
+   "divergence txn:57[1]",
+   "divergence txn:57[1]"
+  ]
+ },
+ "source": {
+  "failure": "FAIL-1-01-the_fight_starts_both_players_at_the_enemies_the_host_owns_them",
+  "kind": "settle",
+  "playbook": "enemy_handoff",
+  "reason": "machines did not converge within 73.7813s: lastSeq per machine {'host': 1203, 'client1': 1205}, host allSynced=False",
+  "recordings": [
+   {
+    "dropped": 0,
+    "file": "nvcoop-manual-1792760639035-13.nvfr",
+    "name": "host",
+    "records": 72834,
+    "role": "host",
+    "slot": 0
+   },
+   {
+    "dropped": 0,
+    "file": "nvcoop-manual-1792761232989-17.nvfr",
+    "name": "client1",
+    "records": 126863,
+    "role": "client",
+    "slot": 1
+   }
+  ],
+  "run": "fight",
+  "step": "01-the fight starts: both players at the enemies, the host owns them"
+ },
+ "steps": [
+  {
+   "at_ms": 152453.544,
+   "hex": "05001c00360b00004120d508000000003900000000000000010000000001000000000602208d986b11902a7c",
+   "op": "rec",
+   "slot": 1,
+   "ty": "TxnApplied"
+  },
+  {
+   "at_ms": 167232.908,
+   "hex": "05001c006d0b000025a4b6090000000039000000000000000200000000010000000006027e66cefbaa56acc1",
+   "op": "rec",
+   "slot": 1,
+   "ty": "TxnApplied"
+  }
+ ],
+ "version": 1
+}

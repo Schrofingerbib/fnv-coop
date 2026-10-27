@@ -495,6 +495,43 @@ TEST(client, an_item_somebody_else_took_is_removed_here_and_a_late_creation_is_i
     CHECK(!hasAction(r.acts(), Action::RemoveItem));
 }
 
+TEST(client, a_placed_item_somebody_else_took_is_removed_by_its_world_ref) {
+    ClientRig r;
+    const FormRef ref = F(0x842, "nvcooplab.esp");
+    r.feed(MItemGone{0x4000, 0, 3, ref});                        // the host took a Stimpak off the floor; this machine never touched it
+    auto a = r.acts();
+    REQUIRE(countActions(a, Action::RemoveItem) == 1);
+    const Action* rm = findAction(a, Action::RemoveItem);
+    CHECK(rm->id == 0x4000);
+    CHECK(rm->placed == ref);                                    // twin 173: the engine can only find a placed item from this
+    CHECK(r.c.stats().removedPlaced == 1);
+    // a dropped item has no ref and is found by its id
+    r.feed(MItemGone{kItemIdBase + 9, 0, 4});
+    auto b = r.acts();
+    REQUIRE(findAction(b, Action::RemoveItem));
+    CHECK(findAction(b, Action::RemoveItem)->placed.plugin.empty());
+}
+
+TEST(client, one_pickup_is_one_claim_even_when_the_engine_reports_it_twice) {
+    ClientRig r;
+    const FormRef ref = F(0x842, "nvcooplab.esp");
+    r.c.pickedUp(0x11, 0x4000, F(9), 1, 0, 7, V(), r.now, ref);
+    r.c.pickedUp(0x11, 0x4000, F(9), 1, 0, 7, V(), r.now, ref);   // twin 172: a second claim loses at the host and takes the item back from the winner
+    CHECK(r.countSent<ReqClaim>() == 1);
+    CHECK(r.c.stats().claimsDuplicate == 1);
+    CHECK(r.last<ReqClaim>()->ref == ref);
+    CHECK(r.last<ReqClaim>()->hasAdopt);
+    Result win;
+    win.txn = r.last<ReqClaim>()->txn; win.op = OpKind::Claim; win.id = 0x4000; win.count = 1; win.base = F(9);
+    r.feed(win);
+    CHECK(r.acts().empty());                                      // nothing taken back
+    // an issued id (a dropped item) is guarded the same way
+    r.sent.clear();
+    r.c.pickedUp(0x12, kItemIdBase + 3, F(9), 1, 0, 7, V(), r.now);
+    r.c.pickedUp(0x12, kItemIdBase + 3, F(9), 1, 0, 7, V(), r.now);
+    CHECK(r.countSent<ReqClaim>() == 1);
+}
+
 TEST(client, a_pickup_of_an_own_drop_that_has_no_id_yet_waits_for_the_id) {
     ClientRig r;
     r.c.dropped(0xAA, F(5), 3, 0, 7, V(1, 2, 3), V(), r.now);
@@ -627,4 +664,40 @@ TEST(client, touching_a_physics_object_asks_once_for_ownership) {
     r.now += 1000;
     r.c.touch(net, V(), V(), r.now);
     CHECK(r.sent.empty());                                        // already ours
+}
+
+TEST(client, a_menu_less_transfer_may_start_only_when_nothing_of_that_container_is_in_flight) {
+    ClientRig r;
+    CHECK(r.c.transferIdle(0x100));                 // unknown container: nothing in flight
+    r.open(0x100, I({{1, 2}}));
+    CHECK(!r.c.transferIdle(0x100));                // opened, the answer is pending
+    CHECK(r.c.transferIdle(0x101));                 // other containers are not affected
+    const ReqOpen* o = r.last<ReqOpen>();
+    REQUIRE(o);
+    r.feed(r.grant(o->txn, 0x100, I({{1, 2}})));
+    CHECK(!r.c.transferIdle(0x100));                // open and held
+    r.c.closed(0x100, I({{1, 2}}), r.now);
+    CHECK(!r.c.transferIdle(0x100));                // closing: the close request is not answered yet
+}
+
+TEST(client, a_tombstone_in_a_join_table_removes_the_placed_item_once_however_often_the_table_comes) {
+    ClientRig r;
+    const FormRef ref = F(0x842, "nvcooplab.esp");
+    r.feed(MTableBegin{1});
+    r.feed(MItemGone{0x4000, 2, 0, ref});
+    r.feed(MTableEnd{1, 0, 0});
+    auto a = r.acts();
+    REQUIRE(countActions(a, Action::RemoveItem) == 1);
+    CHECK(findAction(a, Action::RemoveItem)->placed == ref);
+    // a heal / resync pushes the table again: the engine is not asked a second time
+    r.feed(MTableBegin{2});
+    r.feed(MItemGone{0x4000, 2, 0, ref});                        // twin 183
+    r.feed(MTableEnd{2, 0, 0});
+    CHECK(countActions(r.acts(), Action::RemoveItem) == 0);
+    // our own old pickup in the table: nothing to remove
+    ClientRig self;
+    self.feed(MTableBegin{1});
+    self.feed(MItemGone{0x4001, 1, 0, ref});
+    self.feed(MTableEnd{1, 0, 0});
+    CHECK(countActions(self.acts(), Action::RemoveItem) == 0);
 }

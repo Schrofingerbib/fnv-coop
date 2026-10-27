@@ -45,6 +45,13 @@ public:
         uint32_t intervalMs = 5000;       // periodic beacon
         double jumpMinutes = 4.0;         // clock deviates from its own extrapolation by more than this => jump
         uint32_t minGapMs = 200;          // never two beacons closer than this (except a forced one)
+        // Owner decision D7: a scripted time skip happens once per PARTY event (the Canyon door's +3 days, Honest Hearts' +14 days), not once per player
+        // who triggers the script. A forward leap of the host clock that no granted wait / sleep explains, of at least onceMinMinutes, that has the
+        // size of one already seen onceWindowMs ago (within onceToleranceMinutes) is the same event again: the host takes it back.
+        bool onceEnabled = true;
+        double onceMinMinutes = 720.0;    // 12 game hours; shorter leaps (a script that sets the hour) are not "events"
+        uint32_t onceWindowMs = 120000;   // the party-consent timeout: everybody who walks through the door in that time is the same event
+        double onceToleranceMinutes = 60.0;
     };
     explicit ClockAuthority(Config c = Config()) : cfg_(c) {}
 
@@ -57,6 +64,14 @@ public:
     // The host loaded a save (clock is arbitrary now): next tick sends a jump beacon and the rate estimate restarts.
     void noteLoaded() { haveLast_ = false; force_ = true; forceJump_ = true; }
 
+    // The last tick took a repeated scripted skip back: write `*to` into the game clock (no beacon is due, clients never saw the leap).
+    bool takeUndo(GameTime* to) {
+        if (!undoPending_) return false;
+        undoPending_ = false;
+        if (to) *to = undoTo_;
+        return true;
+    }
+    uint32_t repeatsUndone() const { return repeatsUndone_; }
     void setPartyTravel(bool on) { partyTravel_ = on; }
     uint32_t skipEpoch() const { return epoch_; }
     uint32_t beaconsSent() const { return seq_; }
@@ -71,6 +86,12 @@ private:
     bool haveBeacon_ = false;
     bool partyTravel_ = false;
     uint32_t seq_ = 0, epoch_ = 0;
+    // scripted skip events (D7)
+    bool haveEvent_ = false, undoPending_ = false;
+    uint64_t eventMs_ = 0;
+    double eventSize_ = 0;
+    GameTime undoTo_;
+    uint32_t repeatsUndone_ = 0;
 };
 
 // ---- client ---------------------------------------------------------------------------------------------------------------------

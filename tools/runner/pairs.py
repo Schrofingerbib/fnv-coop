@@ -17,7 +17,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 PORT_BASE = 27960          # the plugin's default [coop] port: pair 0 keeps working with the old single-pair setup
 LOOPBACK = ("127.0.0.1", "localhost", "::1")
 COPY_GB = 0.7              # resident memory of one game copy (measured by the lead)
-RESERVE_GB = 2.0           # left for Windows, the lead's tools and the test processes
+RESERVE_GB = 1.2           # left for Windows, the lead's tools and the test processes (16 GB PC; 2.0 stalled the sweep while agents built)
 GIB = 2 ** 30
 TRUE_WORDS = ("1", "true", "yes", "on")
 

@@ -39,6 +39,7 @@ namespace {
 
 constexpr uint32_t kGetContainerData = 0x4BF220, kItemTotal = 0x4C8F30, kBaseContainer = 0x4BFFB0, kTopMenuId = 0x714F00;
 constexpr uint32_t kInterfaceMgrPtr = 0x11D8A80;
+constexpr uint32_t kFormDeleted = 0x20, kFormDisabled = 0x800;   // TESForm::flags (+8): a picked-up world item shows kFormDeleted (ref.info 0x408 -> 0x4032A)
 constexpr uint32_t kMenuContainer = 0x3F0;
 const uint8_t kPinGetContainerData[16] = {0x55, 0x8b, 0xec, 0x6a, 0xff, 0x68, 0x13, 0x12, 0xef, 0x00, 0x64, 0xa1, 0x00, 0x00, 0x00, 0x00};
 const uint8_t kPinItemTotal[16] = {0x55, 0x8b, 0xec, 0x83, 0xec, 0x14, 0x89, 0x4d, 0xf0, 0xc7, 0x45, 0xf4, 0x00, 0x00, 0x00, 0x00};
@@ -301,6 +302,34 @@ bool RealLootEngine::adjustPlayer(const FormRef& base, int32_t delta) {
     return runOn(kPlayerRef, line);
 }
 
+bool RealLootEngine::playerCount(const FormRef& base, int32_t& out) {
+    out = 0;
+    if (!pinsOk_) return false;
+    const uint32_t id = nvhooks::resolver().fromRef(base);
+    const uint32_t form = id ? formAddr(id) : 0;   // the resolver answers any form, not only references
+    uint32_t data = 0;
+    int32_t total = 0;
+    if (!form || !CallGetContainerData(kPlayerRef, &data) || !data || !CallThis2(kItemTotal, data, form, &total)) return false;   // same totals call readContents() uses
+    out = total < 0 ? 0 : total;
+    return true;
+}
+
+bool RealLootEngine::testGrab(RefId container, uint32_t itemId, int32_t count, bool remove, bool add, std::string* why) {
+    auto fail = [&](const char* m) { if (why) *why = m; return false; };
+    if (count <= 0 || !itemId) return fail("bad item or count");
+    char line[96];
+    if (remove) {
+        if (!container || !formAddr(container)) return fail("the container ref is not loaded");
+        std::snprintf(line, sizeof line, "RemoveItem %08X %d 1", itemId, count);
+        if (!runOn(container, line)) return fail("RemoveItem on the container was refused");
+    }
+    if (add) {
+        std::snprintf(line, sizeof line, "AddItem %08X %d 1", itemId, count);
+        if (!runOn(kPlayerRef, line)) return fail("AddItem on the player was refused");
+    }
+    return true;
+}
+
 void RealLootEngine::notify(lc::Notice n, NetId id) {
     char b[96];
     std::snprintf(b, sizeof b, "{\"notice\":\"%s\",\"id\":%u}", lc::toString(n), id);
@@ -343,7 +372,10 @@ bool RealLootEngine::describeItem(RefId ref, ItemDesc& out) {
     } else {
         NetId net = 0;
         FormRef fr;
-        if ((ref >> 24) != 0xFF && nvhooks::resolver().toRef(ref, &fr) && !fr.plugin.empty()) net = nvcoop::actors::deriveNetId(fr);   // a placed item
+        if ((ref >> 24) != 0xFF && nvhooks::resolver().toRef(ref, &fr) && !fr.plugin.empty()) {   // a placed item
+            net = nvcoop::actors::deriveNetId(fr);
+            out.placedRef = fr;   // the net id is a hash: the others find this ref from plugin:localId, nothing maps the id back
+        }
         out.net = net;
     }
     out.item.id = out.net;
@@ -376,21 +408,47 @@ void RealLootEngine::bindItem(RefId ref, NetId net) {
     netRef_[net] = ref;
 }
 
-bool RealLootEngine::removeItem(NetId net) {
+bool RealLootEngine::removeItem(NetId net, const FormRef& placed) {
     auto it = netRef_.find(net);
     RefId ref = it != netRef_.end() ? it->second : 0;
     if (!ref) {
         for (const auto& kv : boundNet_) if (kv.second == net) { ref = kv.first; break; }
     }
-    if (!ref) {
-        // a placed item: its ref is the one whose derived id matches
-        const RefId r = nvcoop::actors::engine::refOf(net);
-        ref = r;
+    if (!ref && !placed.plugin.empty()) {
+        // A placed item (a persistent ref of a plugin): the net id is a hash of plugin:localId, so only the ref the sender named can be found. (The actor
+        // registry behind actors::engine::refOf knows actors only: asking it for a Stimpak on the floor answers 0, which is why a pickup never reached
+        // the other copies.)
+        const uint32_t id = nvhooks::resolver().fromRef(placed);
+        if (id && formAddr(id)) ref = id;
     }
-    if (!ref || !formAddr(ref)) return false;
+    const uint32_t obj = ref ? formAddr(ref) : 0;
     boundNet_.erase(ref);
     netRef_.erase(net);
+    if (!obj) return false;
+    uint32_t flags = 0;
+    if (Rd32(obj + 8, &flags) && (flags & (kFormDeleted | kFormDisabled))) return true;    // gone already (the machine that took it, or a repeat): done. (false means: no such ref HERE yet, the caller asks again)
     return runOn(ref, "Disable") && runOn(ref, "MarkForDelete");
+}
+
+bool RealLootEngine::isNoteBase(const FormRef& base) {
+    const uint32_t id = nvhooks::resolver().fromRef(base);
+    const uint32_t form = id ? formAddr(id) : 0;
+    uint8_t t = 0;
+    return form && Rd8(form + 4, &t) && t == 0x31;   // BGSNote
+}
+
+bool RealLootEngine::addNote(const FormRef& note) {
+    const uint32_t id = nvhooks::resolver().fromRef(note);
+    if (!id) return false;
+    nvhooks::CaptureHub* hub = nvhooks::hub();
+    char line[64];
+    std::snprintf(line, sizeof line, "AddNote %08X", id);   // the same line the remote applier uses; the engine's AddNote hook records the effect into the open scope
+    if (!hub) return nvhooks::execConsoleLine(line);
+    fnvcoop::Cause c;
+    c.kind = fnvcoop::CauseKind::Intent;
+    c.source = note;
+    nvhooks::ScopedCapture scope(*hub, c);
+    return nvhooks::execConsoleLine(line);
 }
 
 bool RealLootEngine::readPose(NetId net, lc::Vec3& pos, lc::Vec3& rot) {

@@ -22,6 +22,9 @@ public:
     virtual void setSnapshotSink(SnapshotSink s) = 0;        // 20 Hz, from tick(); null = drop
     virtual void setEquipSink(EquipSink s) = 0;              // once at the start and after every stable change
     virtual void setLocalIdentity(fnvcoop::live::NetId netId, fnvcoop::live::OwnerEpoch epoch) = 0;
+    // This machine's slot in the session. The avatar layer's own default (slot 0) is right for the host only; a client that is never told
+    // refuses the host's puppet as "the local slot". Called at every session start, before any addRemote.
+    virtual void setLocalSlot(nvcoop::avatar::Slot /*slot*/) {}
 
     // ---- network -> remote players ----
     virtual bool addRemote(nvcoop::avatar::Slot slot, const nvcoop::avatar::Appearance& a) = 0;   // replaces an existing puppet

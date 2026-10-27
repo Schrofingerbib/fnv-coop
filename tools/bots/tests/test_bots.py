@@ -330,6 +330,14 @@ class GlueActions(unittest.TestCase):
         self.assertEqual(r.reason, "vats_failed")
         self.assertIn("target_not_selectable", r.data["why"])
 
+    def test_a_frozen_main_thread_ends_the_vats_wait_with_its_own_reason(self):
+        nv, b = make("vats_freeze")
+        t0 = b.clock.monotonic()
+        r = b.vats_target(ref(RAIDER))
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "main_thread_stuck", r)
+        self.assertLess(b.clock.monotonic() - t0, 10.0, "three refusals end the wait, it does not poll the frozen game for the 30 s limit")
+
     def test_vats_noop_is_caught_by_health_check(self):
         nv, b = make("vats_noop")
         before = b.health(ref(RAIDER))
@@ -387,6 +395,22 @@ class GlueActions(unittest.TestCase):
         self.assertEqual(b2.terminal_used(ref(TERM)), [])      # a click the game ignored shows up as nothing used
         nv3, b3 = make(menu_method=False)
         self.assertEqual(b3.use_terminal(ref(TERM), 0).reason, "unsupported")
+
+    def test_a_tutorial_box_over_the_terminal_is_closed_before_the_click(self):
+        nv, b = make()
+        r = _terminal_under_tutorial(b)
+        self.assertTrue(r.ok, r)
+        self.assertEqual(b.terminal_used(ref(TERM)), [{"index": 0, "text": "Disengage Lock"}])
+        self.assertEqual(nv._menu, "terminal")
+        nv2, b2 = make("tutorial_stuck")
+        r2 = _terminal_under_tutorial(b2)
+        self.assertFalse(r2.ok)
+        self.assertEqual(b2.terminal_used(ref(TERM)), [], "no click went out under the box")
+
+    def test_close_tutorial_does_nothing_when_no_box_is_up(self):
+        nv, b = make()
+        self.assertTrue(b.close_tutorial())
+        self.assertFalse([c for c in nv.calls if c[0] == "call" and c[1] == "bot.menu.close"])
 
     def test_fast_travel_and_count_refs(self):
         nv, b = make()
@@ -826,6 +850,49 @@ class ConsoleRefLines(unittest.TestCase):
         self.assertEqual(nv2.world.things[DOOR].open_state, 3)
 
 
+class SecondPcBuild(unittest.TestCase):
+    """What the second PC's game does that the first fakes did not (in game 2026-10-27, the lab's first runs)."""
+
+    def test_take_and_put_work_on_a_build_without_removeitemtarget(self):
+        # the console answers ok:true with 'Script command "RemoveItemTarget" not found.' in the output and nothing moves
+        nv, b = make("no_removeitemtarget")
+        r = b.take(ref(CHEST), ITEM, 2)
+        self.assertTrue(r.ok, r)
+        self.assertEqual((b.inventory_count(ITEM, ref(CHEST)), b.inventory_count(ITEM)), (3, 2))
+        r = b.put(ref(CHEST), ITEM, 1)
+        self.assertTrue(r.ok, r)
+        self.assertEqual((b.inventory_count(ITEM, ref(CHEST)), b.inventory_count(ITEM)), (4, 1))
+        lines = [c for c in nv.calls if c[0] == "exec"]
+        self.assertIn(("exec", "RemoveItem 00000500 2 1", ref(CHEST)), lines)
+        self.assertIn(("exec", "player.AddItem 00000500 2 1"), lines)
+        self.assertIn(("exec", "player.RemoveItem 00000500 1 1"), lines)
+
+    def test_a_take_that_really_moves_nothing_still_fails_on_that_build(self):
+        nv, b = make("no_removeitemtarget")
+        nv.world.things[CHEST].items[ITEM] = 5
+        r = b.take(ref(CHEST), ITEM, 9)          # more than the chest holds
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "not_enough")
+
+    def test_a_picked_up_item_that_the_game_marks_deleted_counts_as_gone(self):
+        # in game ref.info flags went 0x408 -> 0x4032A after the pickup: deleted (0x20), never disabled (0x800)
+        nv, b = make("pickup_deletes")
+        self.assertTrue(b.ref_enabled(ref(GROUND)))
+        r = b.pickup(ref(GROUND), ITEM)
+        self.assertTrue(r.ok, r)
+        self.assertFalse(b.ref_enabled(ref(GROUND)))
+        self.assertEqual(nv.world.things[GROUND].disabled, False)
+
+    def test_the_walk_steers_with_the_console_when_bot_look_does_nothing_on_a_client_copy(self):
+        nv, b = make("look_ignored")
+        self.assertFalse(b.goto((800, 0, 0), timeout_s=8).ok, "the stock walk needs bot.look")
+        nv, b = make("look_ignored")
+        b.look_via_console = True
+        r = b.goto((800, 0, 0), timeout_s=8)
+        self.assertTrue(r.ok, r)
+        self.assertFalse([c for c in nv.calls if c[0] == "call" and c[1] == "bot.look"], "no bot.look call: the console line set the angle")
+
+
 # ---- mutation twins: a defective game must make the matching action FAIL, never report success ----
 def _scenario(name):
     """-> callable(bot) returning the ActionResult that must be a failure under mutant `name`."""
@@ -851,8 +918,25 @@ def _scenario(name):
         "exec_ref_ignored": lambda b: b.take(ref(CHEST), ITEM, 1),
         "msgbox_stuck": lambda b: _dismiss_two_boxes(b),
         "msgbox_ui_only": lambda b: _dismiss_two_boxes(b),
+        "menu_close_ignored": lambda b: _open_then_close_container(b),
         "drops_base_text": lambda b: _drop_ref_check(b),
+        "tutorial_stuck": lambda b: _terminal_under_tutorial(b),
     }[name]
+
+
+def _terminal_under_tutorial(b):
+    """The first terminal opens under the first-use hint box: use_terminal must close the box, then click. The twin where the box stays must fail."""
+    b.nv.tutorial_on_terminal = True
+    b.nv.world.things[TERM].topics_text = ["Disengage Lock"]
+    return b.use_terminal(ref(TERM), 0)
+
+
+def _open_then_close_container(b):
+    """Open the chest (its menu is up), then close it from code: the twin where the plugin's close does nothing must fail the postcondition."""
+    r = b.open(ref(CHEST))
+    if not r.ok:
+        return r
+    return b.close_container(ref(CHEST), timeout_s=1.0)
 
 
 def _dismiss_two_boxes(b):
@@ -872,7 +956,7 @@ def _drop_ref_check(b):
 
 MUTANTS = ["move_ignored", "look_ignored", "stop_ignored", "jump_noop", "fire_noop", "setpos_ignored", "angle_ignored", "activate_noop", "transfer_noop", "transfer_dup", "equip_noop",
            "drop_noop", "fire_miss", "health_stuck", "dialog_never", "drop_wrong_ref", "travel_ignored", "exec_ref_ignored", "msgbox_stuck", "msgbox_ui_only",
-           "drops_base_text"]
+           "drops_base_text", "menu_close_ignored", "tutorial_stuck"]
 
 
 class MutationTwins(unittest.TestCase):
@@ -900,6 +984,29 @@ class MutationTwins(unittest.TestCase):
                 nv, b = make(m, query_av=False)
                 r = b.fire(ref(RAIDER), expect_hit=True)
                 self.assertFalse(r.ok, f"mutant {m} slipped through the health fallback: {r}")
+
+    def test_close_menu_closes_only_the_asked_kind_and_says_why_not(self):
+        nv, b = make(None)
+        self.assertEqual(b.close_menu().reason, "rpc_error:no menu is open")                     # nothing open
+        self.assertTrue(b.open(ref(CHEST)).ok)
+        self.assertEqual(nv._menu, "container")
+        r = b.close_menu("terminal")                                                              # a terminal request leaves the container up
+        self.assertFalse(r.ok)
+        self.assertIn("left open", r.reason)
+        self.assertEqual(nv._menu, "container")
+        r = b.close_container(ref(CHEST))
+        self.assertTrue(r.ok, r)
+        self.assertEqual((nv._menu, r.data["closed"]), ("none", "container"))
+        self.assertEqual(b.menu_info()["kind"], "none")
+        again = b.close_container(ref(CHEST))                                                     # idempotent: a menu the module already closed
+        self.assertTrue(again.ok and again.data.get("already"), again)
+        nv.native_boxes = [2]                                                                     # "any" never closes a message box
+        self.assertFalse(b.close_menu("any").ok)
+        self.assertEqual(nv.native_boxes, [2])
+
+    def test_close_menu_without_the_bridge_method_is_unsupported(self):
+        nv, b = make(None, menu_method=False)
+        self.assertEqual(b.close_menu().reason, "unsupported")
 
     def test_ref_info_error_reports_rpc_failure(self):
         nv, b = make("ref_info_error")

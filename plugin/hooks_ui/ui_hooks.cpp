@@ -13,7 +13,10 @@
 
 #include "common/nvcoop_api.h"
 #include "engine_hooks.h"
+#include "extract_pad.h"   // plugin/hooks: every ExtractArgs call gets spare out slots (issue #33)
 #include "ui_addrs.h"
+
+using nvhooks::extractPadded;
 
 namespace nvui {
 namespace {
@@ -120,6 +123,8 @@ struct GameEngine : IUiEngine {
     }
     bool refOf(uint32_t refID, FormRef& out) override { return toRef(refID, out); }
     void log(const std::string& s) override { nvcoop::Log("[ui] %s", s.c_str()); }
+    void openMirror(uint32_t menu, const std::string& text, uint8_t origin) override { ops::openMirror(menu, text, origin); }
+    void closeMirror(uint32_t menu) override { ops::closeMirror(menu); }
 };
 GameEngine g_engine;
 
@@ -133,6 +138,7 @@ Cmd o_ShowMessage;
 int g_inShowMessage = 0;
 void* g_showThisObj = nullptr;
 FormRef g_showMessageForm;
+FormRef g_showScript;   // the running script of the ShowMessage in flight (G07: does it have a MenuMode block?)
 
 bool __cdecl h_ShowMessage(CMD_ARGS) {
     ++g_cnt.seenShowMessage;
@@ -143,9 +149,12 @@ bool __cdecl h_ShowMessage(CMD_ARGS) {
         void* msg = nullptr;
         uint32_t dummy = 0;
         uint32_t off = opcodeOff ? *opcodeOff : 0;
-        if (extractArgs()(paramInfo, scriptData, &off, thisObj, contObj, script, eventList, &msg, &dummy)) toRef(refIdOf(msg), g_showMessageForm);
+        // ShowMessage takes up to nine more variables and a duration: all of them land in the padding, never through stray stack words
+        if (extractPadded(extractArgs(), paramInfo, scriptData, &off, thisObj, contObj, script, eventList, {&msg, &dummy})) toRef(refIdOf(msg), g_showMessageForm);
     }
     g_showThisObj = thisObj;
+    g_showScript = FormRef();
+    toRef(refIdOf(script), g_showScript);
     ++g_inShowMessage;
     struct Leave {
         ~Leave() { --g_inShowMessage; }
@@ -175,6 +184,7 @@ bool __cdecl h_ShowMessageBox(const char* msg, uint32_t u1, uint32_t u2, void* c
         c.scriptRefID = rd32(addr::MessageBoxScriptRefID);
         c.thisObj = refIdOf(g_showThisObj);
         c.message = g_showMessageForm;
+        c.script = g_showScript;
         c.text = safeStr(msg);
         const char* bs[10] = {b0, b1, b2, b3, b4, b5, b6, b7, b8, b9};
         for (int i = 0; i < 10 && bs[i]; ++i) c.buttons.push_back(safeStr(bs[i]));
@@ -256,7 +266,7 @@ bool __cdecl h_Say(CMD_ARGS) {
     int32_t a = 0, b = 0, d = 0;
     void* base = nullptr;
     uint32_t off = opcodeOff ? *opcodeOff : 0;
-    const bool got = extractArgs()(paramInfo, scriptData, &off, thisObj, contObj, script, eventList, &topic, &a, &base, &b, &d);
+    const bool got = extractPadded(extractArgs(), paramInfo, scriptData, &off, thisObj, contObj, script, eventList, {&topic, &a, &base, &b, &d});
     g_lastInfo = 0;
     ++g_forcedDepth;
     const bool r = o_Say(CMD_PASS);
@@ -282,7 +292,7 @@ bool __cdecl h_SayTo(CMD_ARGS) {
     void* topic = nullptr;
     int32_t a = 0, b = 0;
     uint32_t off = opcodeOff ? *opcodeOff : 0;
-    const bool got = extractArgs()(paramInfo, scriptData, &off, thisObj, contObj, script, eventList, &actor, &topic, &a, &b);
+    const bool got = extractPadded(extractArgs(), paramInfo, scriptData, &off, thisObj, contObj, script, eventList, {&actor, &topic, &a, &b});
     g_lastInfo = 0;
     ++g_forcedDepth;
     const bool r = o_SayTo(CMD_PASS);
@@ -311,7 +321,7 @@ bool __cdecl h_StartConversation(CMD_ARGS) {
     void* r2 = nullptr;
     int32_t a = 0, b = 0;
     uint32_t off = opcodeOff ? *opcodeOff : 0;
-    if (extractArgs()(paramInfo, scriptData, &off, thisObj, contObj, script, eventList, &target, &topic, &r1, &r2, &a, &b) && topic) {
+    if (extractPadded(extractArgs(), paramInfo, scriptData, &off, thisObj, contObj, script, eventList, {&target, &topic, &r1, &r2, &a, &b}) && topic) {
         ForcedCall c;
         c.kind = ForcedCall::Kind::StartConversation;
         c.speaker = refIdOf(thisObj);
@@ -332,7 +342,7 @@ bool __cdecl h_SwapTexture(CMD_ARGS) {
         void* ref = nullptr;
         char oldTex[512] = {}, newTex[512] = {};
         uint32_t off = opcodeOff ? *opcodeOff : 0;
-        if (extractArgs()(paramInfo, scriptData, &off, thisObj, contObj, script, eventList, &ref, oldTex, newTex))
+        if (extractPadded(extractArgs(), paramInfo, scriptData, &off, thisObj, contObj, script, eventList, {&ref, oldTex, newTex}))
             g_router->onSwapTexture(refIdOf(ref), oldTex, newTex);
     }
     return o_Swap(CMD_PASS);
@@ -441,11 +451,18 @@ struct QueuedBox {
 std::deque<QueuedBox> g_queue;
 uint32_t g_showing = 0;
 Answer g_answer;
+QueuedBox g_mirrorBox{};          // the read-only copy of a box a remote player is answering (G07)
+uint32_t g_mirrorId = 0;
+bool g_mirrorRepeat = false;
 
 void __cdecl boxCallback() {
     const int b = reinterpret_cast<int(__cdecl*)()>(addr::MessageBoxLastButton.addr)();
     const uint32_t id = g_showing;
     g_showing = 0;
+    if (id && id == g_mirrorId) {   // the host pressed the mirror's dummy button: not an answer, the box comes back next frame
+        g_mirrorRepeat = true;
+        return;
+    }
     if (id && g_answer) g_answer(id, b);
 }
 
@@ -486,7 +503,35 @@ bool openMenu(const fnvcoop_dlg::MenuRequest& rq) {
     return ok;
 }
 
+bool openMirror(uint32_t menu, const std::string& text, uint8_t origin) {
+    g_mirrorId = menu;
+    g_mirrorRepeat = false;
+    g_mirrorBox = QueuedBox{menu, "Player " + std::to_string(int(origin)) + " is deciding:\n" + text, {"Waiting..."}};
+    g_queue.push_back(g_mirrorBox);
+    pump();
+    return true;
+}
+
+void closeMirror(uint32_t menu) {
+    if (menu != g_mirrorId) return;
+    g_mirrorId = 0;
+    g_mirrorRepeat = false;
+    for (auto it = g_queue.begin(); it != g_queue.end(); ++it)
+        if (it->id == menu) {
+            g_queue.erase(it);
+            break;
+        }
+    if (g_showing == menu) {
+        g_showing = 0;   // never answers: the origin already did
+        reinterpret_cast<void(__cdecl*)()>(addr::CloseAllMenusCore.addr)();
+    }
+}
+
 void pump() {
+    if (g_mirrorRepeat && g_mirrorId && !g_showing) {   // re-show a mirror the host dismissed
+        g_mirrorRepeat = false;
+        g_queue.push_front(g_mirrorBox);
+    }
     if (g_showing || g_queue.empty()) return;
     QueuedBox q = std::move(g_queue.front());
     g_queue.pop_front();
@@ -590,11 +635,15 @@ bool nearPlayer(uint32_t refID, float maxDist) {
 }  // namespace ops
 
 // ------------------------------------------------------------------ ending slideshow (both roles)
+ShowSequencer& showSequencer() {
+    static ShowSequencer s;
+    return s;
+}
 SlideClient& slideClient() {
     static SlideClient c(SlideClient::Callbacks{
         [](const FormRef& r, const std::string& o, const std::string& n) { return ops::swapTexture(r, o, n); },
         [](bool locked) { nvhooks::SetPlayerControlsLocked(locked); },
-        [](const std::string& s) { nvcoop::Log("[ui] slideshow: %s", s.c_str()); }});
+        [](const std::string& s) { nvcoop::Log("[ui] slideshow: %s", s.c_str()); }}, &showSequencer());
     return c;
 }
 SlideHost& slideHost(SlideHost::Send send) {

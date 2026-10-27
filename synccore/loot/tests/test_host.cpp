@@ -360,6 +360,59 @@ TEST(host, a_placed_item_is_learned_at_its_first_claim_and_stays_taken) {
     CHECK(h2.placedTaken(0x4000));
 }
 
+static const MItemGone* goneTo(const HostRig& r, PlayerId to) {
+    for (const auto& o : r.last) if (o.to == to) if (auto* g = std::get_if<MItemGone>(&o.body)) return g;
+    return nullptr;
+}
+
+TEST(host, a_placed_items_gone_message_names_its_world_ref_so_the_other_copies_can_find_it) {
+    // The net id of a placed item is a hash: a machine that never touched the item cannot turn it back into a ref. The message carries the ref.
+    HostRig r = rig3();
+    r.req(1, claimPlaced(1, 0x4000, 0x77, 1));
+    REQUIRE(goneTo(r, 2));
+    CHECK(goneTo(r, 2)->ref == F(0x842, "nvcooplab.esp"));   // twin 170
+    CHECK(goneTo(r, 2)->item == 0x4000);
+    REQUIRE(goneTo(r, 0));
+    CHECK(goneTo(r, 0)->ref == F(0x842, "nvcooplab.esp"));
+    CHECK(goneTo(r, 1) == nullptr);                          // the claimant's engine removed its own copy
+}
+
+TEST(host, a_race_for_a_placed_item_gives_it_to_exactly_one_player_whoever_arrives_first) {
+    for (int order = 0; order < 2; ++order) {
+        HostRig r = rig3();
+        const PlayerId first = order == 0 ? 1 : 2, second = order == 0 ? 2 : 1;
+        r.req(first, claimPlaced(1, 0x4000, 0x77, 1));
+        CHECK(r.resultFor(first)->status == Status::Ok);
+        r.req(second, claimPlaced(1, 0x4000, 0x77, 1));
+        CHECK(r.resultFor(second)->status == Status::AlreadyTaken);
+        CHECK(r.resultFor(second)->other == first);
+        CHECK(r.host.stats().claimsWon == 1);
+        CHECK(r.host.stats().claimsLost == 1);
+        CHECK(r.countAll<MItemGone>() == 0);                 // told once, at the win; the loser removed its own copy and is not asked again
+    }
+}
+
+TEST(host, the_winners_own_second_claim_of_the_same_item_is_not_a_loss) {
+    // One pickup that reaches the host twice (two event paths, a resend under a new txn) must not take the item back from the player who won it.
+    HostRig r = rig3();
+    r.req(1, claimPlaced(1, 0x4000, 0x77, 2));
+    CHECK(r.resultFor(1)->status == Status::Ok);
+    r.req(1, claimPlaced(2, 0x4000, 0x77, 2));
+    CHECK(r.resultFor(1)->status == Status::Ok);             // twin 171
+    CHECK(r.host.stats().claimsRepeated == 1);
+    CHECK(r.host.stats().claimsWon == 1);
+    CHECK(r.countAll<MItemGone>() == 0);
+    // a dropped item as well
+    r.req(1, dropReq(3, 0x33, 5));
+    const NetId id = r.resultFor(1)->newId;
+    r.req(2, claimReq(1, id));
+    CHECK(r.resultFor(2)->status == Status::Ok);
+    r.req(2, claimReq(2, id));
+    CHECK(r.resultFor(2)->status == Status::Ok);             // twin 171
+    r.req(1, claimReq(4, id));
+    CHECK(r.resultFor(1)->status == Status::AlreadyTaken);   // somebody else still loses
+}
+
 TEST(host, save_and_load_keep_contents_items_tombstones_and_never_reuse_an_issued_id) {
     HostRig r = rig3();
     r.req(1, openAdopt(1, rec(0x100, I({{1, 5}, {2, 7}}), ContainerKind::Corpse)));
@@ -569,4 +622,71 @@ TEST(host, a_second_mover_cannot_take_clutter_from_a_moving_owner_but_can_from_a
     bool told = false;
     for (auto& x : o) if (x.to == 2 && std::holds_alternative<MClutterOwn>(x.body)) told = true;
     CHECK(told);
+}
+
+static int goneInTable(const HostRig& r, PlayerId to, NetId item, FormRef* ref = nullptr) {
+    int n = 0;
+    for (const auto& o : r.last)
+        if (o.to == to)
+            if (auto* g = std::get_if<MItemGone>(&o.body))
+                if (g->item == item) { ++n; if (ref) *ref = g->ref; }
+    return n;
+}
+
+TEST(host, a_client_that_joins_after_a_pickup_is_told_the_placed_item_is_gone) {
+    // The pickup was told to the players who were there. A player who joins afterwards gets the table: the tombstone (with the ref) must be in it.
+    HostRig r = rig3();
+    r.req(1, claimPlaced(1, 0x4000, 0x77, 2));
+    r.join(3);
+    FormRef ref;
+    CHECK(goneInTable(r, 3, 0x4000, &ref) == 1);                 // twin 181
+    CHECK(ref == F(0x842, "nvcooplab.esp"));                     // twin 180: the ref came along
+    // it sits between TableBegin and TableEnd of that table
+    int begin = -1, gone = -1, end = -1, i = 0;
+    for (const auto& o : r.last) {
+        if (o.to == 3) {
+            if (std::holds_alternative<MTableBegin>(o.body)) begin = i;
+            if (std::holds_alternative<MItemGone>(o.body)) gone = i;
+            if (std::holds_alternative<MTableEnd>(o.body)) end = i;
+        }
+        ++i;
+    }
+    CHECK(begin >= 0 && gone > begin && end > gone);
+    // the counts the client checks the table against are not about tombstones
+    for (const auto& o : r.last)
+        if (o.to == 3)
+            if (auto* e = std::get_if<MTableEnd>(&o.body)) CHECK(e->items == 0);
+}
+
+TEST(host, the_join_table_tombstones_survive_a_host_save_and_are_bounded) {
+    HostConfig cfg;
+    cfg.maxTableTombstones = 2;
+    HostRig r(cfg);
+    r.join(1);
+    r.join(2);
+    for (uint32_t i = 0; i < 4; ++i) {
+        ReqClaim c = claimPlaced(i + 1, 0x4000 + i, 0x77, 1);
+        c.ref = F(0x900 + i, "nvcooplab.esp");
+        r.req(1, c);
+    }
+    r.join(3);
+    int n = 0;
+    for (const auto& o : r.last) if (o.to == 3 && std::holds_alternative<MItemGone>(o.body)) ++n;
+    CHECK(n == 2);                                               // twin 182: unbounded
+    // a restarted host knows the refs again
+    auto bytes = r.host.save();
+    HostRig r2(cfg);
+    REQUIRE(r2.host.load(bytes));
+    r2.join(2);
+    r2.join(1);
+    FormRef ref;
+    CHECK(goneInTable(r2, 1, 0x4000, &ref) == 1);
+    CHECK(ref == F(0x900, "nvcooplab.esp"));
+    // a tombstone without a ref (an old save) cannot be told to anybody, but still blocks a second pickup
+    ReqClaim bare = claimPlaced(9, 0x5000, 0x77, 1);
+    bare.ref = FormRef();
+    r2.req(2, bare);
+    r2.join(3);
+    CHECK(goneInTable(r2, 3, 0x5000) == 0);
+    CHECK(r2.host.placedTaken(0x5000));
 }

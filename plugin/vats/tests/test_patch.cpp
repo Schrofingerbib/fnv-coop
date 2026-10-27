@@ -48,6 +48,7 @@ std::vector<Group> groups() {
         {ad::kTargetMultSites, ad::kTargetMultSiteCount, ad::kGetTargetTimeMult, ad::kGetTimeMultPrologue},
         {ad::kPauseSitesMain, ad::kPauseSiteMainCount, ad::kMenuMode, ad::kMenuModePrologue},
         {ad::kPauseSitesExtended, ad::kPauseSiteExtendedCount, ad::kMenuMode, ad::kMenuModePrologue},
+        {ad::kThreadWaitSites, ad::kThreadWaitSiteCount, ad::kThreadsActive, ad::kThreadsActivePrologue},
     };
 }
 
@@ -67,6 +68,7 @@ TEST(vats_patch, the_tables_have_the_sizes_the_re_notes_state_and_no_site_twice)
     CHECK(ad::kTargetMultSiteCount == 9);
     CHECK(ad::kPauseSiteMainCount == 2);
     CHECK(ad::kPauseSiteExtendedCount == 9);
+    CHECK(ad::kThreadWaitSiteCount == 1 && ad::kThreadWaitSites[0].site == 0x00713C8D);   // the menu update's worker wait (docs: vats_addrs.h)
     std::set<uint32_t> seen;
     for (const Group& g : groups())
         for (size_t i = 0; i < g.n; ++i) CHECK_MSG(seen.insert(g.sites[i].site).second, g.sites[i].name);

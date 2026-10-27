@@ -126,6 +126,23 @@ public:
 
     // How the host receives outermost-scope txns. Default hub->addSink (slot 0 stays with L5's capture.end bridge).
     void setDumper(IWorldDumper* d) { dumper_ = d; }
+    // Host: reads one quest's stage / completed / failed from the engine (false = unknown). Feeds HostSession::hostQuestState; before start().
+    using QuestStateReader = std::function<bool(const fnvcoop::FormRef& quest, int32_t& stage, bool& completed, bool& failed)>;
+    void setQuestStateReader(QuestStateReader f) { questState_ = std::move(f); }
+    // Host: reads every objective of one quest (objective id -> status bits 0..3) from the engine (false = unknown quest). Feeds HostSession::hostObjectives; before start().
+    using ObjectiveStateReader = std::function<bool(const fnvcoop::FormRef& quest, std::map<uint32_t, uint8_t>& objectives)>;
+    void setObjectiveStateReader(ObjectiveStateReader f) { objectiveState_ = std::move(f); }
+    // Host: reads every script var (index -> value) of one owner (a quest) from the engine; false = unknown owner / no script variables.
+    // Feeds HostSession::hostScriptVars (client-only SetScriptVar keys the baseline-less host never recorded); before start().
+    using ScriptVarReader = std::function<bool(const fnvcoop::FormRef& owner, std::map<uint16_t, double>& vars)>;
+    void setScriptVarReader(ScriptVarReader f) { scriptVars_ = std::move(f); }
+    // Host: reads one quest's running flag from the engine (false = unknown quest). Feeds HostSession::hostQuestRunning when there is no world
+    // baseline dump to read it from (a baseline-less host committed "not running" for every quest the client was running, and the client stopped them); before start().
+    using QuestRunningReader = std::function<bool(const fnvcoop::FormRef& quest, bool& running)>;
+    void setQuestRunningReader(QuestRunningReader f) { questRunning_ = std::move(f); }
+    // Host: reads one global's value from the engine (false = unknown). Feeds HostSession::hostGlobals (client-only SetGlobal keys); before start().
+    using GlobalReader = std::function<bool(const fnvcoop::FormRef& global, double& value)>;
+    void setGlobalReader(GlobalReader f) { globals_ = std::move(f); }
     void setActionExecutor(ActionExecutor f) { executor_ = std::move(f); }
     // "Acting player" context (docs/protocol.md section 12): while the host runs a guest's interaction, the engine layer must resolve
     // `player` inside the target's script block to that guest. The hook is called (slot, true) before and (slot, false) after the executor.
@@ -173,9 +190,18 @@ public:
     fnvcoop::RulesEngine* rules() { return rules_.get(); }
     // Host: coalescing channel for quest script vars / globals polled from the engine (L5 pollHostState). null on clients.
     fnvcoop::StateReplicator* replicator() { return replicator_.get(); }
+    // Host: the engine poll that feeds the replicator (L5 pollHostState), run once per frame right before the replicator flushes. It runs
+    // WITH OR WITHOUT a world baseline: quest vars that object / NPC scripts write inline (`set VMS16.nGangerDeathCount to ... + 1` in a
+    // ganger's OnDeath) are inside no capture scope, so the poll is the only way they reach the shared state. `first` = the replicator is
+    // new (a new session): the poll resets its change tracker. `prime` = first AND no baseline: the machine's current values are taken as the
+    // known state (a baseline would have transferred them) and only later changes are reported, instead of flooding every quest var.
+    using StatePollFn = std::function<void(fnvcoop::StateReplicator& to, bool first, bool prime)>;
+    void setStatePoll(StatePollFn f) { statePoll_ = std::move(f); polledRep_ = nullptr; }
     // Host: the engine wants to advance `quest` to `stage`. false => DEFERRED (skip the engine call; stageApplier fires on release).
     // Calls made by the stage applier itself, and everything while no rules engine is loaded, proceed.
     bool stageRequested(const fnvcoop::FormRef& quest, uint32_t stage, fnvcoop::PlayerId initiator = 0);
+    // Host: the quest rules refuse `stage` outright (ExclusiveStages: another outcome of the set was committed first). False without a rules engine.
+    bool stageExcluded(const fnvcoop::FormRef& quest, uint32_t stage) const;
     // Local player is now in `cell` (host: tells the rules engine; client: ReportCell action). No-op while syncing.
     void reportCell(const fnvcoop::FormRef& cell);
     // Local player finished their per-player step of `quest` (chargen...): host -> rules engine, client -> ScenePass action.
@@ -272,6 +298,8 @@ private:
     bool haveRules_ = false;
     std::unique_ptr<fnvcoop::RulesEngine> rules_;
     std::unique_ptr<fnvcoop::StateReplicator> replicator_;
+    StatePollFn statePoll_;
+    const fnvcoop::StateReplicator* polledRep_ = nullptr;   // the replicator the poll last ran for (a new one = a new session)
     EdidResolver edid_;
     std::function<bool(fnvcoop::PlayerId, fnvcoop::FormRef&)> playerRef_;
     std::function<uint32_t(fnvcoop::PlayerId)> ghostOf_;
@@ -282,6 +310,11 @@ private:
     bool applyingDeferred_ = false;
     std::unique_ptr<fnvcoop::MuxTransport> mux_;
     IWorldDumper* dumper_ = nullptr;
+    QuestStateReader questState_;
+    ObjectiveStateReader objectiveState_;
+    ScriptVarReader scriptVars_;
+    QuestRunningReader questRunning_;
+    GlobalReader globals_;
     std::unique_ptr<fnvcoop::ShadowState> usedBaseline_;
     uint64_t usedHash_ = 0;
     ActionExecutor executor_;

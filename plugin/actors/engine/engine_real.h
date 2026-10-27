@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "actors/engine/engine_iface.h"
+#include "actors/engine/pin_check.h"
 
 namespace nvcoop::actors::engine {
 
@@ -50,8 +51,9 @@ private:
     bool loading_ = false;
     Pins pins_;
     uint64_t sehFaults_ = 0;
-    bool pinsChecked_ = false;
+    PinPolicy pinPolicy_;
     void checkPins();
+    void ensurePins();   // first use, and again while a pin is refused (pin_check.h)
 };
 
 }  // namespace nvcoop::actors::engine

@@ -148,8 +148,10 @@ METHOD_NOT_FOUND = -32601
 class Bridge:
     def __init__(self, game: FakeCopy):
         self.game, self.closed = game, False
+        self.methods: List[str] = []
 
     def call(self, method, params=None, timeout_s=0):
+        self.methods.append(method)
         return self.game.call(method, params, timeout_s)
 
     def close(self):
@@ -166,6 +168,7 @@ class World:
         self.dll.write_bytes(core_bytes("new"))
         self.new_id = hotswap.build_id_of(self.dll)
         self.connects: List[int] = []
+        self.bridges: List[Bridge] = []
         self.clock = Clock()
         self.logs: List[str] = []
 
@@ -177,7 +180,9 @@ class World:
         if g.connect_failures:
             g.connect_failures -= 1
             raise ConnectionLost("pipe busy")
-        return Bridge(g)
+        b = Bridge(g)
+        self.bridges.append(b)
+        return b
 
     def swap(self, ids=(0, 1), **kw):
         kw.setdefault("sleep", self.clock.sleep)
@@ -200,6 +205,18 @@ def leftovers(w: World) -> List[str]:
 
 
 # ------------------------------------------------------------------------------ the checks (each one is also run against twins)
+def check_reload_goes_out_on_a_fresh_connection(t: unittest.TestCase):
+    # in game 2026-10-21 the drain refused every reload: the waiting bridge thread had run core methods before and kept an old core
+    # return address in its stack buffers. The connection that sends dev.reload must send nothing else.
+    with world() as w:
+        code, rep = w.swap()
+        t.assertEqual(code, 0, rep)
+        senders = [b for b in w.bridges if "dev.reload" in b.methods]
+        t.assertEqual(len(senders), 2, "one dev.reload per copy")
+        for b in senders:
+            t.assertEqual(b.methods, ["dev.reload"], f"the reload connection ran other methods first: {b.methods}")
+
+
 def check_swaps_every_copy(t: unittest.TestCase, w_muts=None):
     with world(w_muts) as w:
         code, rep = w.swap()
@@ -486,6 +503,12 @@ class HotswapTests(unittest.TestCase):
         self.fail(f"twin {[p[0] for p in patches]} was not caught by {check.__name__}")
 
     # ---- the real code ----
+    def test_reload_goes_out_on_a_fresh_connection(self):
+        check_reload_goes_out_on_a_fresh_connection(self)
+
+    def test_twin_reload_on_the_status_connection_is_caught(self):
+        self.assertCaught(check_reload_goes_out_on_a_fresh_connection, [("reload_connection", lambda connect, i, wait_s, nv: nv)])
+
     def test_build_id_matches_the_loader_format(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "x.bin"

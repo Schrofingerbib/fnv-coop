@@ -908,6 +908,116 @@ static void t_snap_and_drift() {
     CHECK(r.pm.ActualPose(1, ac, ap) && ac == kCellA && std::fabs(ap.x - 100) < 0.01f);
 }
 
+// A body in the way (the real player standing in the puppet) pushes it hundreds of units. The place reported to the
+// interpolation buffer must stay the one the driver put it at, or the buffer eases the puppet back from the pushed place.
+// A small deviation is still reported as it is (the buffer corrects those at once).
+static void t_physics_push_not_adopted() {
+    g_test = "physics_push_not_adopted";
+    Rig r;
+    r.eng.reportsCurrentGroup = false;
+    r.Add(1, MkPose(kCellA, 100, 200, 0, 0, kLocoWalkFwd, Vec3{0, 120, 0}));
+    r.Run(1500);
+    CellId ac = 0;
+    Vec3 ap;
+    r.F(1)->pos.x += 60;
+    CHECK(r.pm.ActualPose(1, ac, ap) && std::fabs(ap.x - 160) < 0.01f);
+    CHECK(r.pm.stats().pushesIgnored == 0);
+    r.Step();
+    r.F(1)->pos.x += 300;
+    CHECK(r.pm.ActualPose(1, ac, ap) && std::fabs(ap.x - 100) < 0.01f && ac == kCellA);
+    CHECK(r.pm.stats().pushesIgnored == 1);
+    uint64_t d0 = r.pm.stats().drift;
+    r.Step();
+    CHECK(r.pm.stats().drift == d0 + 1);
+    CHECK(std::fabs(r.F(1)->pos.x - 100) < 0.01f);
+    CHECK(r.pm.StatusJson().find("\"pushesIgnored\":1") != std::string::npos);
+}
+
+// Two bodies in one place: the remote player's puppet is driven by SetPos every frame, and a real player standing in (or walking through) that
+// place is shoved by the engine, hundreds of units in a second, because the driver puts the puppet back into the same spot again and again.
+// The driver must leave room: the place it sends is moved out to bodyRoomUnits around the local player, and the true place is used again as
+// soon as the two bodies are apart. The fake engine shoves the real player by the overlap on every write that lands inside it.
+static float Flat(const Vec3& a, const Vec3& b) { return std::hypot(a.x - b.x, a.y - b.y); }
+
+static void t_body_room() {
+    g_test = "body_room";
+    // (a) the remote runs straight through the local player
+    {
+        Rig r;
+        r.eng.haveLocal = true;
+        r.eng.localCell = kCellA;
+        r.eng.localPos = Vec3{500, 500, 0};
+        r.Add(1, MkPose(kCellA, 500, 100, 0, 0, kLocoRunFwd, Vec3{0, 300, 0}));
+        r.Run(1500);
+        CHECK(r.pm.PhaseOf(1) == Phase::Driving);
+        float minD = 1e9f;
+        for (int i = 0; i <= 60; ++i) {
+            r.Pose(1, MkPose(kCellA, 500, 100.0f + 15.0f * i, 0, 0, kLocoRunFwd, Vec3{0, 300, 0}));
+            r.Step();
+            minD = std::min(minD, Flat(r.F(1)->pos, r.eng.localPos));
+        }
+        r.Run(500);
+        CHECK(r.eng.localShoves == 0 && r.eng.localTravel == 0);
+        CHECK(std::fabs(r.eng.localPos.x - 500) < 0.01f && std::fabs(r.eng.localPos.y - 500) < 0.01f);
+        CHECK(minD >= 69.9f);
+        CHECK(r.pm.stats().bodyYields > 0);
+        CHECK(Flat(r.F(1)->pos, Vec3{500, 1000, 0}) < 0.6f);           // apart again: the true place is used
+        CHECK(r.pm.StatusJson().find("\"bodyYields\":") != std::string::npos);
+    }
+    // (b) the remote stands exactly where the local player stands (also at spawn): it waits at the edge, the player is not moved
+    {
+        Rig r;
+        r.eng.haveLocal = true;
+        r.eng.localCell = kCellA;
+        r.eng.localPos = Vec3{500, 500, 0};
+        r.Add(1, MkPose(kCellA, 500, 500, 0));
+        r.Run(2000);
+        CHECK(r.eng.localShoves == 0);
+        CHECK(std::fabs(Flat(r.F(1)->pos, r.eng.localPos) - 70.0f) < 0.6f);
+    }
+    // (c) the local player walks into a standing remote and through its place: it is the puppet that yields, the player is not shoved
+    {
+        Rig r;
+        r.eng.haveLocal = true;
+        r.eng.localCell = kCellA;
+        r.eng.localPos = Vec3{500, 100, 0};
+        r.Add(1, MkPose(kCellA, 500, 300, 0));
+        r.Run(1500);
+        float minD = 1e9f;
+        for (int i = 0; i <= 40; ++i) {
+            r.eng.localPos.y = 100.0f + 15.0f * i;
+            r.Step();
+            minD = std::min(minD, Flat(r.F(1)->pos, r.eng.localPos));
+        }
+        CHECK(r.eng.localShoves == 0);
+        CHECK(minD >= 69.9f);
+        r.eng.localPos = Vec3{500, 900, 0};
+        r.Run(500);
+        CHECK(Flat(r.F(1)->pos, Vec3{500, 300, 0}) < 0.6f);            // the player is past: the puppet is back at the true place
+    }
+    // (d) no room is made where there is no body: another cell, another floor, a local place the engine cannot read
+    {
+        Rig r;
+        r.eng.haveLocal = true;
+        r.eng.localCell = kCellB;
+        r.eng.localPos = Vec3{500, 500, 0};
+        r.Add(1, MkPose(kCellA, 500, 500, 0));
+        r.Run(1500);
+        CHECK(Flat(r.F(1)->pos, Vec3{500, 500, 0}) < 0.6f && r.pm.stats().bodyYields == 0);
+        Rig r2;
+        r2.eng.haveLocal = true;
+        r2.eng.localCell = kCellA;
+        r2.eng.localPos = Vec3{500, 500, 0};
+        r2.Add(1, MkPose(kCellA, 500, 500, 300));
+        r2.Run(1500);
+        CHECK(Flat(r2.F(1)->pos, Vec3{500, 500, 0}) < 0.6f && r2.pm.stats().bodyYields == 0);
+        Rig r3;
+        r3.Add(1, MkPose(kCellA, 500, 500, 0));
+        r3.Run(1500);
+        CHECK(Flat(r3.F(1)->pos, Vec3{500, 500, 0}) < 0.6f && r3.pm.stats().bodyYields == 0);
+    }
+}
+
 static void t_group_refused_retries() {
     g_test = "group_refused_retries";
     Rig r;
@@ -1404,6 +1514,8 @@ static void RunSuite() {
     RUN(t_yaw_handling);
     RUN(t_position_rate);
     RUN(t_snap_and_drift);
+    RUN(t_physics_push_not_adopted);
+    RUN(t_body_room);
     RUN(t_group_refused_retries);
     RUN(t_call_budget);
     RUN(t_ref_map);
@@ -1432,7 +1544,7 @@ static const Twin kTwins[] = {
     TWIN(noJumpLand), TWIN(ignoreBudget), TWIN(staleMapEntries), TWIN(noPostMenuSnap), TWIN(noSaveWait),
     TWIN(noWeaponMods), TWIN(modsIgnoredInSet), TWIN(modsRetryForever), TWIN(appearanceUpdateRespawns), TWIN(noPuppetHeal),
     TWIN(noPuppetDeathRespawn), TWIN(apiLocalGetsPuppet), TWIN(apiPlayerIsPuppet), TWIN(apiActingNeedsPuppet), TWIN(hitsForwardEmpty),
-    TWIN(puppetHitProceeds),
+    TWIN(puppetHitProceeds), TWIN(adoptPhysicsPush), TWIN(noBodyRoom),
 };
 
 int main(int argc, char** argv) {

@@ -231,8 +231,46 @@ bool SehWrap(const std::string& path, ShotInfo& info, std::string& err, void*& b
 
 }  // namespace
 
+// The device the game itself renders with: EndScene (vtable slot 42) is patched once in the shared D3D9 device
+// vtable and records its `this`. The heap scan above can pick a stale or foreign object (seen with DXVK); this cannot.
+constexpr int kEndScene = 42;
+using EndScene_t = HRESULT(__stdcall*)(void*);
+EndScene_t g_origEndScene = nullptr;
+void* volatile g_seenDevice = nullptr;
+bool g_hookTried = false;
+
+HRESULT __stdcall EndSceneHook(void* dev) {
+    g_seenDevice = dev;
+    return g_origEndScene(dev);
+}
+
+bool InstallEndSceneHook(std::string& err) {
+    if (g_hookTried) return g_origEndScene != nullptr;
+    g_hookTried = true;
+    void* probeDev = nullptr;
+    void* probeD3d = nullptr;
+    HWND probeWnd = nullptr;
+    auto** vt = static_cast<void**>(ProbeDeviceVtable(probeDev, probeD3d, probeWnd));
+    if (probeDev) V<Rel_t>(probeDev, kRelease)(probeDev);
+    if (probeD3d) V<Rel_t>(probeD3d, kRelease)(probeD3d);
+    if (probeWnd) DestroyWindow(probeWnd);
+    if (!vt) { err = "D3D9 probe device could not be created"; return false; }
+    DWORD old = 0;
+    if (!VirtualProtect(&vt[kEndScene], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) { err = "VirtualProtect on the D3D9 vtable failed"; return false; }
+    g_origEndScene = reinterpret_cast<EndScene_t>(vt[kEndScene]);
+    vt[kEndScene] = reinterpret_cast<void*>(&EndSceneHook);
+    VirtualProtect(&vt[kEndScene], sizeof(void*), old, &old);
+    return true;
+}
+
 bool CaptureBackbufferPng(const std::string& path, ShotInfo& info, std::string& err) {
-    if (!g_device) g_device = FindDevice();
+    if (!InstallEndSceneHook(err) && !err.empty()) return false;
+    if (g_origEndScene) {
+        g_device = g_seenDevice;
+        if (!g_device) { err = "no frame rendered since the EndScene hook went in: retry in a moment"; return false; }
+    } else if (!g_device) {
+        g_device = FindDevice();
+    }
     if (!g_device) { err = "D3D9 device not found (regions=" + std::to_string(g_regions) + " vtableHits=" + std::to_string(g_hits) + ")"; return false; }
     void* bb = nullptr;
     void* sys = nullptr;

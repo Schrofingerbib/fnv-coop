@@ -1,7 +1,7 @@
 # synccore/loot: loot, containers, dropped items and physics clutter (FULL-SYNC-PLAN 3.5), game-free. Included from synccore/CMakeLists.txt.
 #   fnvcoop_loot     production library (twins compiled out): what plugin/loot links
 #   fnvcoop_loot_rt  the same sources with FNVCOOP_RUNTIME_MUT: the test exe picks a mutation twin with FNVCOOP_MUT=<n> at run time
-#   loot_tests       unit tests + model tests + fuzz; twins 101..137 must each fail it (synccore\loot\run_tests.cmd runs them all)
+#   loot_tests       unit tests + model tests + fuzz; twins 101..137 and 170..173 must each fail it (synccore\loot\run_tests.cmd runs them all)
 set(LOOT_MUT_INC ${CMAKE_CURRENT_LIST_DIR}/../../tools/mut)
 foreach(sfx "" "_rt")
   add_library(fnvcoop_loot${sfx} STATIC ${CMAKE_CURRENT_LIST_DIR}/loot.cpp ${CMAKE_CURRENT_LIST_DIR}/loot_wire.cpp)
@@ -33,6 +33,10 @@ endif()
 
 add_test(NAME loot_core_unit COMMAND loot_tests)
 foreach(v RANGE 101 137)
+  add_test(NAME loot_core_mut${v} COMMAND loot_tests)
+  set_tests_properties(loot_core_mut${v} PROPERTIES WILL_FAIL TRUE ENVIRONMENT "FNVCOOP_MUT=${v}")
+endforeach()
+foreach(v 170 171 172 173)
   add_test(NAME loot_core_mut${v} COMMAND loot_tests)
   set_tests_properties(loot_core_mut${v} PROPERTIES WILL_FAIL TRUE ENVIRONMENT "FNVCOOP_MUT=${v}")
 endforeach()

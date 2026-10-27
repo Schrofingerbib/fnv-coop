@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include "voice_token.h"
+
 #include "fnvcoop_mut.h"  // FNV_MUT(n): runtime mutation twins (env FNVCOOP_MUT=n); constant false in production builds
 
 namespace nvui {
@@ -56,16 +58,21 @@ Route UiRouter::onMessageBox(const MessageBoxCall& c) {
         return Route::Local;
     }
     const uint64_t now = eng_.nowMs();
-    const PlayerId origin = origin_.resolve(c.thisObj, c.scriptRefID, now);
-    if (origin == kHost || origin == kNoSlot) {
+    PlayerId origin = origin_.resolve(c.thisObj, c.scriptRefID, now);
+    std::optional<ConsentRule> consent;
+    if (br_.consentFor && br_.raiseModal && !c.message.plugin.empty()) consent = br_.consentFor(c.message);
+    // A box that asks the PARTY is raised through the dialogue host even when the host player is the one deciding: the host's own native box
+    // would have skipped the vote (the consent rules only ever reached the box a guest answered). Personal decisions (mode 2) stay local.
+    const bool partyBox = consent && consent->mode != 2 && !mut(23);   // MUTANT 23: a host-origin box never asks the party
+    if ((origin == kHost || origin == kNoSlot) && !partyBox) {
         ++stats_.boxesLocal;
         return Route::Local;
     }
+    if (origin == kNoSlot) origin = kHost;
+    if (origin == kHost) ++stats_.hostConsent;
     FormRef subject;
     if (c.thisObj) eng_.refOf(c.thisObj, subject);
     const int32_t def = defaultChoiceFor(c.buttons.size());
-    std::optional<ConsentRule> consent;
-    if (br_.consentFor && br_.raiseModal && !c.message.plugin.empty()) consent = br_.consentFor(c.message);
 
     raising_ = true;
     early_.reset();
@@ -86,6 +93,19 @@ Route UiRouter::onMessageBox(const MessageBoxCall& c) {
         early_.reset();
     } else {
         pending_[id] = p;
+    // G07: the script has a `begin MenuMode 1001` block (it polls GetButtonPressed there). With no menu open on this machine that block
+    // never runs (inferred from the code, not seen in game): either mirror the box here until the origin answers, or say so.
+    if (origin != kHost && mmHasBlock_ && !c.script.plugin.empty() && mmHasBlock_(c.script)) {
+        if (mmMode_ == MenuModeMode::Mirror && !mut(22)) {   // MUTANT 22: the mirror is never opened (the MenuMode block stays dead)
+            mirrors_.insert(id);
+            ++stats_.mirrorsOpened;
+            eng_.openMirror(id, c.text, origin);
+        } else if (mmWarned_.insert(c.script).second) {
+            ++stats_.menuModeSkipped;
+            eng_.log("box for script " + c.script.plugin + ":" + std::to_string(c.script.localId) +
+                     " was raised to a remote player and the script has a MenuMode block: it will not run on this machine (menumode=off; needs in-game proof)");
+        }
+    }
     }
     return Route::Suppressed;
 }
@@ -93,6 +113,7 @@ Route UiRouter::onMessageBox(const MessageBoxCall& c) {
 void UiRouter::onMenuResume(uint32_t menu, int32_t choice, bool) {
     auto it = pending_.find(menu);
     if (it == pending_.end()) {
+        closeMirror(menu);
         if (raising_) early_ = std::make_pair(menu, choice);
         else ++stats_.dupResumes;
         return;
@@ -100,6 +121,14 @@ void UiRouter::onMenuResume(uint32_t menu, int32_t choice, bool) {
     Pending p = it->second;
     if (!mut(2)) pending_.erase(it);  // MUTANT 2: resume is not one-shot
     finishBox(p, choice);
+    closeMirror(menu);
+}
+
+void UiRouter::closeMirror(uint32_t menu) {
+    if (mirrors_.erase(menu) && !mut(24)) {   // MUTANT 24: the mirror stays up after the answer (the host stays paused in a dead box)
+        ++stats_.mirrorsClosed;
+        eng_.closeMirror(menu);
+    }
 }
 
 // ------------------------------------------------------------------ service menus
@@ -184,6 +213,10 @@ ForcedOutcome UiRouter::onForced(const ForcedCall& c) {
     a.topic = c.topic;
     a.info = c.info;
     a.lines = c.lines;
+    // Receivers play the line with `<npc>.Say <topic>`: name the topic + INFO in each line's voice token (the same token a conversation uses).
+    if (!mut(21) && !a.topic.plugin.empty() && !a.info.plugin.empty())   // MUTANT 21: forced lines carry no voice token (subtitle only, no voice)
+        for (size_t i = 0; i < a.lines.size(); ++i)
+            if (a.lines[i].voice.empty()) a.lines[i].voice = makeVoiceToken(a.topic, a.info, uint32_t(i + 1));
     a.target = o.target;
     a.scene = c.scene || t.party || (c.kind == ForcedCall::Kind::Say && !origin_.scoped());
     if (a.scene && br_.nextStamp)  // party scene (narrator, cutscene): everybody gets these, so they can be ordered against the slides

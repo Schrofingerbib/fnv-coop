@@ -112,6 +112,22 @@ std::optional<Beacon> ClockAuthority::tick(uint64_t nowMs, const GameTime& cur, 
         const double expect = std::max(0.0, static_cast<double>(timeScale)) / 60.0 * dt;
         if (got < -cfg_.jumpMinutes) jump = true;                        // the clock went backwards: a load or a script
         if (!FNV_MUT(103) && got > expect + cfg_.jumpMinutes) jump = true;  // MUTANT 103: forward leaps (a script, a sleep) are not noticed
+        const double leap = got - expect;
+        if (cfg_.onceEnabled && !forceJump_ && !force_ && leap >= cfg_.onceMinMinutes && leap > cfg_.jumpMinutes) {
+            if (haveEvent_ && nowMs - eventMs_ <= cfg_.onceWindowMs && std::fabs(leap - eventSize_) <= cfg_.onceToleranceMinutes && !FNV_MUT(170)) {
+                // the same party event again (a second player used the door): take it back, nobody was told about it
+                // (MUTANT 170: every player's use skips the time again)
+                undoTo_ = advanceBy(cur, FNV_MUT(171) ? leap : -leap);   // MUTANT 171: the clock is moved the wrong way
+                undoPending_ = true;
+                ++repeatsUndone_;
+                last_ = undoTo_;
+                lastMs_ = nowMs;
+                return std::nullopt;
+            }
+            haveEvent_ = true;
+            eventMs_ = nowMs;
+            eventSize_ = leap;
+        }
     }
     last_ = cur;
     lastMs_ = nowMs;

@@ -106,3 +106,18 @@ base weapon damage left 0 in the native hit. Also caught through these tests (co
 - The player's own death/respawn is polled once per frame (health / life state); the corpse and the death screen are the engine's.
 - Limb crippling follows combat-core's accumulated-damage model (head 30, limbs 25 hp of hit damage), not the engine's per-creature limb health; natural hits on
   an actor the machine owns use the engine's own limb logic and publish the resulting crippled mask.
+
+## A natural lethal hit and the life state (2026-10-27, vats lab room)
+The owner's engine applies a hit on its own actor natively (`gate PROCEED ... victim is resolved here`; VATS shots go through the same funnel, the gate
+logged shots 1, 3 and 4 of the lab run). In the lab's VATS room shot 4 took the health to -14 on the host while the client showed 1 (the actor port's
+floor for a mirrored health: it never writes 0, the death is its own message). The death is declared only by the actor port's poll of the LIFE STATE
+(Actor+0x108 = 1 or 2); the combat view's `alive` is also false for health <= 0, so a victim with health <= 0 and a life state that never flipped (a VATS
+kill: slow motion, kill cam) looked dead to everything that decides and nothing declared it. `CombatSync` now follows up every natural hit whose
+published vitals show a victim at health <= 0: after `lethalSettleMs` (1500) the owner kills it (`ICombatEngine::killActor`) unless
+`ICombatEngine::lifeDead` says the engine did, a named or essential victim is left to the engine, and the same `lifeDead` test replaces `isDead` in the
+accepted-hit follow-up (`killConfirmMs`). Counters in `combat.status`: `naturalLethal` (victims seen at health <= 0 after a natural hit whose own death had not
+already declared them) and `naturalLethalStuck` (the ones the owner had to kill; 0 after a VATS kill means the engine did finish them and the missing death is elsewhere).
+Twins 792 (never followed up), 793 (isDead instead of lifeDead), 794 (a protected victim is killed), 795 (a healed victim is killed): tests/test_flow.cpp `combat_death`.
+A dead copy legitimately differs from the owner's corpse in health (-14 against the port's floor 1), so a lab check that compares the health of a target the
+shot has just killed cannot tell a delivered death from a lost one; the check after it ("dead on both copies") can.
+

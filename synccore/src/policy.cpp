@@ -53,6 +53,9 @@ bool parseForm(const std::vector<std::string>& t, size_t& pos, FormRef& out) {
 bool VolatileKeys::isVolatile(const Effect& e) const {
     if (mutations().ignoreVolatile) return false;
     if (auto* v = std::get_if<SetScriptVar>(&e)) return isVolatileVar(v->owner, v->index);
+    // an object / NPC script var is per-machine on the same terms as a quest var (`var <ref> <index>` or `owner <ref>`): before this a
+    // timer on a ref (RefScriptVar 171CDC var 1) was baselined and replicated although each machine counts its own
+    if (auto* r = std::get_if<RefScriptVar>(&e)) return isVolatileVar(r->ref, r->index);
     if (auto* g = std::get_if<SetGlobal>(&e)) return isVolatileGlobal(g->global);
     if (auto* x = std::get_if<StartQuest>(&e)) return fields_.count({x->quest, kFieldRunning}) > 0;
     if (auto* x = std::get_if<StopQuest>(&e)) return fields_.count({x->quest, kFieldRunning}) > 0;
@@ -169,6 +172,8 @@ size_t normalizeTxn(EffectTxn& txn, const SharePolicy& p) {
                 keep = p.journal && !volatileKeys().isVolatile(Effect(x));
             } else if constexpr (std::is_same_v<T, SetScriptVar>) {
                 keep = p.journal && !volatileKeys().isVolatileVar(x.owner, x.index);
+            } else if constexpr (std::is_same_v<T, RefScriptVar>) {
+                keep = !volatileKeys().isVolatileVar(x.ref, x.index);
             } else if constexpr (std::is_same_v<T, CompleteQuest> || std::is_same_v<T, FailQuest> || std::is_same_v<T, CompleteAllObjectives>) {
                 keep = p.journal;
             } else if constexpr (std::is_same_v<T, SetPlayerControls>) {

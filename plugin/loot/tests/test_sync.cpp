@@ -63,7 +63,9 @@ TEST(sync, a_second_player_is_refused_the_menu_is_closed_and_nothing_is_closed_o
 }
 
 TEST(sync, a_move_the_host_refuses_is_taken_back_from_the_players_inventory) {
-    Cluster c(3);
+    SyncConfig cfg = Cluster::defaultCfg();
+    cfg.menuless = false;                           // the menu watcher on its own (the menu-less screening would also catch a move the watcher missed: twin 141)
+    Cluster c(3, cfg);
     share(c, 0x100, I({{1, 10}}));
     Machine& a = c.machine(1);
     Machine& b = c.machine(2);
@@ -84,7 +86,7 @@ TEST(sync, a_move_the_host_refuses_is_taken_back_from_the_players_inventory) {
 TEST(sync, the_container_is_read_before_a_message_that_replaces_its_contents_is_handled) {
     // the grant carries different contents (this engine rolled another list) and arrives after the player already took something
     SyncConfig cfg = Cluster::defaultCfg();
-    cfg.pollMs = 500;                               // the periodic poll must not be what saves the day
+    cfg.pollMs = 500;
     Cluster c(1, cfg);
     c.host().eng.add(0x100, I({{1, 10}}));
     c.host().eng.openMenuOn(0x100);
@@ -219,6 +221,197 @@ TEST(sync, a_pickup_is_a_claim_the_other_machines_lose_the_ref_and_an_npc_pickup
     CHECK(a.eng.worldByNet(net) == nullptr);          // the dropper's ref went away
     CHECK(c.host().eng.worldByNet(net) == nullptr);
     CHECK(count(b.eng.player, 5) == 3);
+}
+
+// ---- placed items: persistent refs of a plugin, the same ref on every copy (the lab's loot room: a Stimpak on the floor) ----
+namespace {
+const FormRef kPlacedRef("nvcooplab.esp", 0x842);
+// a placed item on every machine; returns the ref of machine i in refs[i]
+std::vector<RefId> placeEverywhere(Cluster& c, uint32_t base = 5, int32_t n = 1) {
+    std::vector<RefId> refs;
+    for (auto& mc : c.m) refs.push_back(mc->eng.addPlaced(F(base), n, kPlacedRef));
+    return refs;
+}
+// what the engine does when the player activates a world item: the item goes into the inventory, the ref is gone (the claim is made at the same instant)
+void takeAsPlayer(Machine& m, RefId ref) {
+    ItemDesc d;
+    REQUIRE(m.eng.describeItem(ref, d));
+    m.sync->onPickup(kPlayerRef, ref);
+    m.eng.player[d.item.base] += d.item.count;
+    m.eng.world[ref].alive = false;
+}
+}  // namespace
+
+TEST(sync, a_placed_item_the_host_picks_up_is_gone_on_every_copy_exactly_once) {
+    // The lab failure: "loose item 1 is gone on both copies: host False, client True". The host's engine removed its ref; the guest's copy stayed
+    // because it could not find a placed ref from its hashed net id.
+    Cluster c(3);
+    auto refs = placeEverywhere(c);
+    takeAsPlayer(c.host(), refs[0]);
+    c.run(600);
+    CHECK(c.machine(1).eng.world[refs[1]].alive == false);   // twins 170 173 174 175
+    CHECK(c.machine(2).eng.world[refs[2]].alive == false);
+    CHECK(count(c.host().eng.player, 5) == 1);
+    CHECK(count(c.machine(1).eng.player, 5) == 0);
+    CHECK(count(c.machine(2).eng.player, 5) == 0);
+    CHECK(c.machine(1).sync->stats().removesDone == 1);      // exactly once
+    CHECK(c.machine(2).sync->stats().removesDone == 1);
+    CHECK(c.machine(1).sync->stats().removesPlaced == 1);
+    CHECK(c.host().sync->stats().removesRun == 0);           // the taker's own engine did it
+    CHECK(c.host().sync->host()->stats().claimsWon == 1);
+    CHECK(c.host().sync->host()->stats().placedClaims == 1);
+    c.settle(4000);                                          // nothing more happens: no repeat removal, no rollback
+    CHECK(c.machine(1).sync->stats().removesRun == 1);
+    CHECK(c.machine(2).sync->stats().removesRun == 1);
+    CHECK(c.host().sync->stats().rollbacksApplied == 0);
+}
+
+TEST(sync, a_placed_item_a_guest_picks_up_is_gone_on_the_host_and_the_other_guest) {
+    Cluster c(3);
+    auto refs = placeEverywhere(c, 5, 2);
+    takeAsPlayer(c.machine(2), refs[2]);
+    c.run(600);
+    CHECK(c.host().eng.world[refs[0]].alive == false);
+    CHECK(c.machine(1).eng.world[refs[1]].alive == false);
+    CHECK(count(c.machine(2).eng.player, 5) == 2);           // the winner keeps its stack
+    CHECK(c.machine(2).sync->stats().removesRun == 0);
+    CHECK(c.host().sync->stats().removesDone == 1);
+    CHECK(c.machine(1).sync->stats().removesDone == 1);
+}
+
+TEST(sync, two_players_picking_up_the_same_placed_item_at_once_leave_it_with_exactly_one) {
+    for (int order = 0; order < 2; ++order) {
+        Cluster c(2);
+        auto refs = placeEverywhere(c);
+        if (order == 0) { takeAsPlayer(c.host(), refs[0]); takeAsPlayer(c.machine(1), refs[1]); }
+        else { takeAsPlayer(c.machine(1), refs[1]); takeAsPlayer(c.host(), refs[0]); }
+        c.settle(3000);
+        const int got = count(c.host().eng.player, 5) + count(c.machine(1).eng.player, 5);
+        CHECK(got == 1);                                     // one winner, the loser's item was taken back
+        CHECK(c.host().eng.aliveWorld() == 0);
+        CHECK(c.machine(1).eng.aliveWorld() == 0);
+        bool told = false;
+        for (auto& m : c.m) for (auto& n : m->eng.notices) if (n.first == lc::Notice::AlreadyTaken) told = true;
+        CHECK(told);
+        CHECK(c.host().sync->host()->stats().claimsWon == 1);
+        CHECK(c.host().sync->host()->stats().claimsLost == 1);
+    }
+}
+
+TEST(sync, the_same_pickup_reported_twice_by_the_engine_is_one_claim_and_the_item_stays_with_the_player) {
+    Cluster c(2);
+    auto refs = placeEverywhere(c);
+    Machine& g = c.machine(1);
+    ItemDesc d;
+    REQUIRE(g.eng.describeItem(refs[1], d));
+    g.sync->onPickup(kPlayerRef, refs[1]);
+    g.sync->onPickup(kPlayerRef, refs[1]);                   // a second event for the same activation
+    g.eng.player[d.item.base] += 1;
+    g.eng.world[refs[1]].alive = false;
+    c.settle(3000);
+    CHECK(count(g.eng.player, 5) == 1);
+    CHECK(g.sync->client()->stats().claims == 1);
+    CHECK(g.sync->client()->stats().claimsDuplicate == 1);
+    CHECK(c.host().eng.aliveWorld() == 0);
+}
+
+TEST(sync, a_placed_item_that_is_not_loaded_here_is_a_counted_miss_not_a_crash_and_a_repeat_is_harmless) {
+    Cluster c(3);
+    auto refs = placeEverywhere(c);
+    c.machine(2).eng.world.clear();                          // its cell is not loaded on machine 2
+    takeAsPlayer(c.host(), refs[0]);
+    c.run(600);
+    CHECK(c.machine(2).sync->stats().removesGone == 1);
+    CHECK(c.machine(2).sync->stats().actionsFailed == 0);
+    CHECK(c.machine(1).eng.world[refs[1]].alive == false);
+}
+
+TEST(sync, a_client_that_joins_after_a_placed_item_was_picked_up_does_not_see_the_item) {
+    // The gap: the pickup was told to the players who were there; the table pushed to a late joiner left the tombstone out.
+    Cluster c(2);
+    auto refs = placeEverywhere(c);
+    takeAsPlayer(c.host(), refs[0]);
+    c.run(600);
+    Machine& late = c.addMachine();
+    const RefId lref = late.eng.addPlaced(F(5), 1, kPlacedRef);   // the joiner's own copy of the persistent ref: it is still on its floor
+    c.run(600);
+    CHECK(late.eng.world[lref].alive == false);                   // twins 180 181
+    CHECK(late.sync->stats().removesDone == 1);
+    CHECK(count(late.eng.player, 5) == 0);                        // nobody was given the item again
+    c.settle(3000);
+    CHECK(late.sync->stats().removesRun == 1);                    // the tombstone is not acted on a second time
+}
+
+TEST(sync, a_taken_placed_item_in_a_cell_that_loads_later_is_removed_when_the_cell_loads) {
+    Cluster c(2);
+    auto refs = placeEverywhere(c);
+    takeAsPlayer(c.host(), refs[0]);
+    c.run(600);
+    Machine& late = c.addMachine();                               // joins while its player is elsewhere: no ref of that cell is here
+    c.run(600);
+    CHECK(late.sync->stats().removesDeferred == 1);               // twin 176
+    const RefId lref = late.eng.addPlaced(F(5), 1, kPlacedRef);   // the cell loads
+    c.run(5000);
+    CHECK(late.eng.world[lref].alive == false);
+    CHECK(late.sync->stats().removesDone == 1);
+    CHECK(late.sync->stats().removesRetried >= 1);
+    const uint64_t calls = late.sync->stats().removesRetried;
+    c.run(5000);
+    CHECK(late.sync->stats().removesRetried == calls);            // done: nobody asks again
+}
+
+TEST(sync, a_placed_item_whose_ref_never_shows_up_is_given_up_after_a_bounded_number_of_tries) {
+    SyncConfig cfg = Cluster::defaultCfg();
+    cfg.removeRetryMs = 100;
+    cfg.maxRemoveTries = 4;
+    Cluster c(2, cfg);
+    auto refs = placeEverywhere(c);
+    takeAsPlayer(c.host(), refs[0]);
+    c.run(600);
+    Machine& late = c.addMachine();
+    c.run(3000);
+    CHECK(late.sync->stats().removesDeferred == 1);
+    CHECK(late.sync->stats().removesRetried == 4);                // twin 177
+    CHECK(late.sync->stats().removesDropped == 1);
+}
+
+// ---- G10 / P4 interface: a picked-up NOTE goes to the host's journal, not into an inventory ----
+TEST(sync, a_note_a_guest_picks_up_is_added_to_the_hosts_journal_once) {
+    Cluster c(3);
+    for (auto& m : c.m) m->eng.notes.insert(F(0x77));         // base 0x77 is a BGSNote everywhere
+    auto refs = placeEverywhere(c, 0x77, 1);
+    takeAsPlayer(c.machine(1), refs[1]);                       // the guest picks up the Jessup note: its own engine added it to its own journal
+    c.run(600);
+    REQUIRE(c.host().eng.notesAdded.size() == 1);              // twin 178
+    CHECK(c.host().eng.notesAdded[0] == F(0x77));
+    CHECK(c.host().sync->stats().notesGranted == 1);
+    CHECK(c.machine(1).eng.notesAdded.empty());                // only the host's journal is written by this path; the AddNote effect carries it to the others
+    CHECK(c.machine(2).eng.notesAdded.empty());
+    CHECK(c.host().eng.aliveWorld() == 0 && c.machine(1).eng.aliveWorld() == 0 && c.machine(2).eng.aliveWorld() == 0);   // the note object is gone everywhere
+}
+
+TEST(sync, the_host_picking_up_a_note_records_it_and_a_repeated_claim_grants_nothing_more) {
+    Cluster c(2);
+    for (auto& m : c.m) m->eng.notes.insert(F(0x77));
+    auto refs = placeEverywhere(c, 0x77, 1);
+    takeAsPlayer(c.host(), refs[0]);
+    c.run(600);
+    CHECK(c.host().eng.notesAdded.size() == 1);                // the shared AddNote effect has to be recorded for the other copies
+    // the same pickup reaches the host again under a new transaction (a second event path): answered Ok, granted once
+    c.host().sync->client()->pickedUp(refs[0], NetId(0x20000000u + kPlacedRef.localId), F(0x77), 1, 0, 7, lc::Vec3(), c.now + 10, kPlacedRef);
+    c.settle(3000);
+    CHECK(c.host().eng.notesAdded.size() == 1);                // twin 179
+    CHECK(c.host().sync->stats().notesGranted == 1);
+}
+
+TEST(sync, a_picked_up_item_that_is_not_a_note_is_never_added_as_a_note) {
+    Cluster c(2);
+    c.host().eng.notes.insert(F(0x77));
+    auto refs = placeEverywhere(c, 5, 2);                      // a Stimpak
+    takeAsPlayer(c.machine(1), refs[1]);
+    c.run(600);
+    CHECK(c.host().eng.notesAdded.empty());                    // twin 180
+    CHECK(c.host().sync->stats().notesGranted == 0);
 }
 
 TEST(sync, a_pickup_that_loses_the_race_is_taken_back_from_the_loser) {

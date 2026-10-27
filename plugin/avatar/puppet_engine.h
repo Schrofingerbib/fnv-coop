@@ -47,6 +47,8 @@ public:
     virtual bool MoveToCell(RefId ref, CellId cell, const Vec3& pos, float yawRad) = 0;   // cell change; 3D is rebuilt
     // The ref's real place (physics or AI may have moved it). False when unknown.
     virtual bool GetPose(RefId ref, CellId& cell, Vec3& pos) = 0;
+    // Where THIS machine's own player stands (cell and place). False when unknown (default: the driver then makes no room for it).
+    virtual bool GetLocalPose(CellId& /*cell*/, Vec3& /*pos*/) { return false; }
     // flags bit 0: loop / hold the group (script PlayGroup flag 1).
     virtual bool PlayGroup(RefId ref, int baseGroup, int flags) = 0;
     virtual int CurrentGroup(RefId ref) = 0;       // -1 unknown (then only the heartbeat re-asserts)

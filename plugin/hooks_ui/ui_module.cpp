@@ -12,6 +12,9 @@
 #include <Windows.h>
 
 #include <map>
+#include <memory>
+#include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 
@@ -20,6 +23,8 @@
 #include "common/nvcoop_api.h"
 #include "effect_json.h"
 #include "engine_hooks.h"
+#include "dialogue_embedded.h"
+#include "fnvcoop_dlg/facts.h"
 #include "ui_hooks.h"
 #include "reload/reload_state.h"
 
@@ -102,6 +107,28 @@ void InitUi() {
     nvui::Bridge b;
     if (g_selftest) InstallSelftestBridge(b);
     g_router = nvui::MakeRouter(std::move(b));
+    {   // G07: [ui] menumode=off|mirror. off = log the scripts whose MenuMode block cannot run on the host; mirror = show the box here too.
+        char mm[16] = {};
+        GetPrivateProfileStringA("ui", "menumode", "off", mm, sizeof mm, IniPath().c_str());
+        auto scripts = std::make_shared<std::set<fnvcoop::FormRef>>();
+        for (size_t i = 0; i < fndlg::kEmbeddedDialogueDataCount; ++i) {
+            if (std::string(fndlg::kEmbeddedDialogueData[i].name) != "menumode_scripts.txt") continue;
+            std::istringstream in(std::string(reinterpret_cast<const char*>(fndlg::kEmbeddedDialogueData[i].data), fndlg::kEmbeddedDialogueData[i].size));
+            std::string line;
+            while (std::getline(in, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                std::istringstream ls(line);
+                std::string ref;
+                if (!(ls >> ref)) continue;
+                fnvcoop::FormRef f;
+                if (fnvcoop_dlg::parseFormRef(ref, f)) scripts->insert(f);
+            }
+        }
+        const bool mirror = std::string(mm) == "mirror";
+        g_router->setMenuMode(mirror ? nvui::UiRouter::MenuModeMode::Mirror : nvui::UiRouter::MenuModeMode::Off,
+                              [scripts](const fnvcoop::FormRef& s) { return scripts->count(s) != 0; });
+        nvcoop::Log("hooks_ui: menumode=%s, %u scripts with a MenuMode 1001 block", mirror ? "mirror" : "off", unsigned(scripts->size()));
+    }
     g_report = nvui::Init(*g_router, g_host);
     nvcoop::Log("hooks_ui: role=%s selftest=%d installed=%d failed=%d", g_host ? "host" : "guest", g_selftest ? 1 : 0, g_report.ok, g_report.failed);
     for (auto& h : g_report.hooks) nvcoop::Log("hooks_ui:   %-24s %s", h.name.c_str(), nvhooks::statusName(h.status));

@@ -51,12 +51,28 @@ inline constexpr CallSpec MessageBoxLastButton = {"MessageBoxLastButton", 0x703F
 inline constexpr CallSpec MessageBoxCallback = {"MessageBoxCallback", 0x5B4A70U, {0x55, 0x8b, 0xec, 0xe8, 0x28, 0xf5, 0x14, 0x00, 0xa2, 0x84, 0xc6, 0x18, 0x01, 0x5d, 0xc3, 0xcc}};
 // cdecl cmd handler
 inline constexpr CallSpec GetButtonPressed = {"GetButtonPressed", 0x5B4A80U, {0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x83, 0x7d, 0x10}};
+// thiscall(info, Cell* out) ret 4: loads the INFO response chain into out, or into the engine cache cell 0x11CC07C when out is null
+inline constexpr CallSpec DialogGetResponses = {"DialogGetResponses", 0x61E780U, {0x55, 0x8b, 0xec, 0x6a, 0xff, 0x68, 0xcb, 0xba, 0xef, 0x00, 0x64, 0xa1, 0x00, 0x00, 0x00, 0x00}};
+// thiscall(info) plain ret: [info+0x22] = 1 and the form-modified flag, unless flags1 & 0x10
+inline constexpr CallSpec InfoMarkSaid = {"InfoMarkSaid", 0x61F220U, {0x55, 0x8b, 0xec, 0x51, 0x89, 0x4d, 0xfc, 0x8b, 0x4d, 0xfc, 0xe8, 0x31, 0x00, 0x00, 0x00, 0x0f}};
+// cdecl condition function (thisObj, perk, 0, double*): not party-hooked
+inline constexpr CallSpec CondHasPerk = {"CondHasPerk", 0x5A4630U, {0x55, 0x8b, 0xec, 0x83, 0xec, 0x0c, 0x8b, 0x45, 0x14, 0xd9, 0xee, 0xdd, 0x18, 0x83, 0x7d, 0x08}};
+// cdecl condition function (thisObj, item, 0, double*): not party-hooked
+inline constexpr CallSpec CondGetEquipped = {"CondGetEquipped", 0x59DA90U, {0x55, 0x8b, 0xec, 0x83, 0xec, 0x18, 0x8b, 0x45, 0x14, 0xd9, 0xee, 0xdd, 0x18, 0xc7, 0x45, 0xf8}};
+// cdecl(ref) -> ExtraContainerChanges::Data*; creates the data when missing
+inline constexpr CallSpec ContainerChangesOf = {"ContainerChangesOf", 0x4BF220U, {0x55, 0x8b, 0xec, 0x6a, 0xff, 0x68, 0x13, 0x12, 0xef, 0x00, 0x64, 0xa1, 0x00, 0x00, 0x00, 0x00}};
+// thiscall(Data*, item) -> total count (base container + entry delta)
+inline constexpr CallSpec ContainerChangesCount = {"ContainerChangesCount", 0x4C8F30U, {0x55, 0x8b, 0xec, 0x83, 0xec, 0x14, 0x89, 0x4d, 0xf0, 0xc7, 0x45, 0xf4, 0x00, 0x00, 0x00, 0x00}};
+// cdecl(refID) -> TESForm*
+inline constexpr CallSpec LookupFormByID = {"LookupFormByID", 0x4839C0U, {0x55, 0x8b, 0xec, 0x51, 0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x83, 0x3d, 0xc0, 0x54, 0x1c}};
 
 inline constexpr unsigned MessageBoxScriptRefID = 0x11CAC64;
 inline constexpr unsigned MessageBoxButton = 0x118C684;
 inline constexpr unsigned DialogMenuPtr = 0x11D9510;
 inline constexpr unsigned DialogMenuInfoSpoken = 0x11D9518;
+inline constexpr unsigned DialogResponseCacheInfo = 0x11CBF3C;
+inline constexpr unsigned DialogResponseCacheCell = 0x11CC07C;
 
 inline constexpr const HookSpec* kAllHooks[] = {&ShowMessage, &ShowMessageBox, &CondEvalVar, &CmdSay, &CmdSayTo, &CmdStartConversation, &CmdSwapTexture, &GetTopicInfo, &CmdShowBarterMenu, &CmdShowRepairMenu, &CmdShowRecipeMenu, &CmdShowCaravanMenu, &CmdShowSlotMachine, &CmdShowBlackJack, &CmdShowRoulette};
-inline constexpr const CallSpec* kAllCalls[] = {&ExtractArgs, &CloseAllMenusCore, &DialogMenuClose, &DialogMenuCreate, &MessageBoxLastButton, &MessageBoxCallback, &GetButtonPressed};
+inline constexpr const CallSpec* kAllCalls[] = {&ExtractArgs, &CloseAllMenusCore, &DialogMenuClose, &DialogMenuCreate, &MessageBoxLastButton, &MessageBoxCallback, &GetButtonPressed, &DialogGetResponses, &InfoMarkSaid, &CondHasPerk, &CondGetEquipped, &ContainerChangesOf, &ContainerChangesCount, &LookupFormByID};
 }  // namespace nvui::addr

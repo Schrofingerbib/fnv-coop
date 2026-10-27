@@ -102,7 +102,7 @@ void ioBody(Archive& a, ReqHold& m) { a.varu32(m.cont); }
 void ioBody(Archive& a, ReqDrop& m) {
     a.varu32(m.txn); fnvcoop::io(a, m.base); a.vari32(m.count); a.varu32(m.meta); a.varu32(m.cell); io(a, m.pos); io(a, m.rot);
 }
-void ioBody(Archive& a, ReqClaim& m) { a.varu32(m.txn); a.varu32(m.item); a.boolean(m.hasAdopt); if (m.hasAdopt) io(a, m.adopt); }
+void ioBody(Archive& a, ReqClaim& m) { a.varu32(m.txn); a.varu32(m.item); a.boolean(m.hasAdopt); if (m.hasAdopt) { io(a, m.adopt); fnvcoop::io(a, m.ref); } }
 void ioBody(Archive& a, ReqResync& m) { a.varu32(m.cont); a.boolean(m.all); }
 void ioBody(Archive& a, ReqDigest& m) { a.u64(m.digest); a.varu32(m.containers); a.varu32(m.items); }
 void ioBody(Archive& a, ReqTouch& m) { a.varu32(m.net); io(a, m.pos); io(a, m.rot); }
@@ -111,7 +111,7 @@ void ioBody(Archive& a, MContainer& m) { io(a, m.rec); }
 void ioBody(Archive& a, MDelta& m) { a.varu32(m.cont); a.varu32(m.rev); fnvcoop::io(a, m.base); a.vari32(m.newCount); if (a.reading() && (m.newCount < 0 || m.newCount > kMaxCount)) a.fail(); }
 void ioBody(Archive& a, MLock& m) { a.varu32(m.cont); a.varu32(m.lockSeq); ioPlayer(a, m.holder); }
 void ioBody(Archive& a, MItemNew& m) { io(a, m.item); }
-void ioBody(Archive& a, MItemGone& m) { a.varu32(m.item); ioPlayer(a, m.by); a.varu32(m.txn); }
+void ioBody(Archive& a, MItemGone& m) { a.varu32(m.item); ioPlayer(a, m.by); a.varu32(m.txn); fnvcoop::io(a, m.ref); }
 void ioBody(Archive& a, MContainerGone& m) { a.varu32(m.cont); }
 void ioBody(Archive& a, MTableBegin& m) { a.varu32(m.seq); }
 void ioBody(Archive& a, MTableEnd& m) { a.varu32(m.seq); a.varu32(m.containers); a.varu32(m.items); }

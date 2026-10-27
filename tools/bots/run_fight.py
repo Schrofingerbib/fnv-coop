@@ -293,6 +293,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as e:  # noqa: BLE001
             print(f"cannot reach the game instances: {e}", file=sys.stderr)
             return 2
+        import nvready                              # noqa: WPS433
+        why = nvready.wait_ready(nvs)               # the preflight's coop.status gets no reply while a copy still boots or loads a save
+        if why:
+            print(f"cannot reach the game instances: {why}", file=sys.stderr)
+            return 2
         rows, missing = preflight(nvs)
         print_preflight(rows, missing)
         if a.preflight_only:

@@ -28,6 +28,10 @@ instances 2k (host) and 2k+1 (client) on co-op port <port-base>+k (default 27960
 Without --pairs the port is not written and every client joins the plugin's default port, as before. With --pairs,
 --ini coop.port / coop.host are an error (exit 2), and --n must match or be left out. show and destroy take --pairs too.
 
+--no-pad writes [Interface] bDisable360Controller=1 into each copy's FalloutPrefs.ini, so the copies ignore game
+controllers. Use it where a pad always answers (a Steam Deck: Steam Input shows its controls as one) and bots or the
+input probe have to walk: in gamepad mode the game ignores the keyboard movement controls that bot.move holds.
+
 Environment overrides: FNV_GAME_DIR, FNV_INSTANCES_ROOT.
 """
 from __future__ import annotations
@@ -46,6 +50,7 @@ from typing import Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mygames  # noqa: E402
 import pairs  # noqa: E402
+import steamlib  # noqa: E402
 
 DEFAULT_GAME = r"C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas"
 DEFAULT_ROOT = str(Path(__file__).resolve().parents[3] / "fnv-instances")
@@ -60,7 +65,14 @@ LINK_MODES = ("hardlink", "symlink", "copy")
 
 
 def game_dir() -> Path:
-    return Path(os.environ.get("FNV_GAME_DIR", DEFAULT_GAME))
+    """FNV_GAME_DIR, else (off Windows) the install in a Steam library under the home folder (steamlib.py), else the Steam
+    default in Program Files. Off Windows the owner's INIs then come from the game's Proton prefix (mygames.py), so a
+    Steam Deck needs neither FNV_GAME_DIR nor FNV_DOCUMENTS_DIR."""
+    env = os.environ.get("FNV_GAME_DIR")
+    if env:
+        return Path(env)
+    found = steamlib.find_game() if steamlib.OFF_WINDOWS else None
+    return found or Path(DEFAULT_GAME)
 
 
 def instances_root() -> Path:
@@ -141,10 +153,17 @@ FALLOUT_INI_EDITS = [
 ]
 PREFS_EDITS = [
     ("Display", "bFull Screen", "0"),
-    ("Display", "iSize W", "640"),
-    ("Display", "iSize H", "480"),
+    ("Display", "iSize W", "1280"),   # not 640x480: measured 125 ms/frame (8 fps, GPU allocation churn in the AMD driver) vs 15 ms at 1280x720 in a window
+    ("Display", "iSize H", "720"),
     ("Display", "iPresentInterval", "0"),
     ("Display", "iMultiSample", "0"),
+]
+# --no-pad. Gamepad mode = an XInput pad answered and bDisable360Controller:Interface is 0 (docs/tools/T6a-actions.md); in it
+# the game takes movement from the pad and ignores the keyboard controls bot.move holds (plugin/bots). Under Proton on a Steam
+# Deck (2026-10-25), where Steam Input always answers as a pad, a 3 s bot.move forward moved the player 0 units; with this
+# key set to 1 the same move went 1008 units. The key is in FalloutPrefs.ini, which the game reads after Fallout.ini.
+NO_PAD_EDITS = [
+    ("Interface", "bDisable360Controller", "1"),
 ]
 
 
@@ -154,6 +173,8 @@ class PrefsUnavailable(RuntimeError):
 
 def display_adapter_name() -> Optional[str]:
     """The primary display adapter's name (EnumDisplayDevicesW), which is what the game's launcher writes as sD3DDevice."""
+    if os.environ.get("NVCOOP_ADAPTER"):   # a remote (ssh) session cannot enumerate displays: the name is given instead
+        return os.environ["NVCOOP_ADAPTER"]
     if os.name != "nt":
         return None
     import ctypes
@@ -216,14 +237,35 @@ def _base_ini(name: str) -> str:
     return ""
 
 
-def render_inis() -> Dict[str, str]:
+def render_inis(no_pad: bool = False) -> Dict[str, str]:
     fo = _base_ini("Fallout.ini")
+    play = os.environ.get("NVCOOP_PLAY") == "1"   # a person plays: only the focused copy may read the keyboard and mouse
     for s, k, v in FALLOUT_INI_EDITS:
+        if play and k in ("bBackground Mouse", "bBackground Keyboard"):
+            v = "0"
         fo = ini_set(fo, s, k, v)
     pr = _base_ini("FalloutPrefs.ini")
-    for s, k, v in PREFS_EDITS:
+    for s, k, v in PREFS_EDITS + (NO_PAD_EDITS if no_pad else []):
         pr = ini_set(pr, s, k, v)
+    if os.environ.get("NVCOOP_LEAN") == "1":
+        fo, pr = _apply_lean(fo, pr)
     return {"Fallout.ini": fo, "FalloutPrefs.ini": pr}
+
+
+# NVCOOP_LEAN=1: the pool's low-cost profile (shadows, grass, water, effects off, no sound) for a machine short of RAM. Not applied: the window
+# size and the frame cap (a smaller window measured slower here, and a cap would distort fps scores) and keys whose effect is only a guess.
+LEAN_SKIP = {"iSize W", "iSize H", "iFPSClamp", "iPresentInterval", "iMultiSample", "bAllow30Shaders", "iTexMipMapMinimum", "bUseRefractionShader",
+             "bFXAA", "iMaxAnisotropy", "bTransparencyMultisampling"}
+
+
+def _apply_lean(fo: str, pr: str):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pool"))
+    import lowcost
+    texts = {lowcost.FO: fo, lowcost.PR: pr}
+    for r in lowcost.rows(audio_off=True):
+        if r.key not in LEAN_SKIP:
+            texts[r.file] = ini_set(texts[r.file], r.section, r.key, r.value)
+    return texts[lowcost.FO], texts[lowcost.PR]
 
 
 # ---------------------------------------------------------------- linking
@@ -335,12 +377,34 @@ def stale_plugin_dlls(plugins: Path, keep: List[Path]) -> List[Path]:
     return [f for f in sorted(plugins.glob("*.dll")) if f.name.lower().startswith("nvcoop") and f.name.lower() not in names]
 
 
+DXVK_CONF = "d3d9.maxFrameRate = 60\n"   # the game's speed follows its frame rate: uncapped DXVK runs it at 100+ fps, i.e. too fast
+
+
+def deps_dir() -> Path:
+    """Cached third-party runtime files (tools/runner/fetch_deps.py fills it): out/cache/deps/{dxvk,nvse}."""
+    return Path(os.environ.get("NVCOOP_DEPS_DIR") or Path(__file__).resolve().parents[2] / "out" / "cache" / "deps")
+
+
+def install_dxvk(d: Path) -> bool:
+    """DXVK's 32-bit d3d9.dll next to FalloutNV.exe, plus a 60 fps cap. Measured on an AMD RX 6600: under NVSE the game's own D3D9 path
+    ran exteriors at about 6 fps with props and foliage jumping (the main thread sat in the driver creating and destroying GPU
+    allocations); with DXVK the same copy runs at 60+ fps. Returns False when the cached dll is missing or NVCOOP_NO_DXVK=1."""
+    if os.environ.get("NVCOOP_NO_DXVK") == "1":
+        return False
+    src = deps_dir() / "dxvk" / "d3d9.dll"
+    if not src.is_file():
+        return False
+    _replace(src, d / "d3d9.dll")
+    (d / "dxvk.conf").write_text(DXVK_CONF, encoding="ascii", newline="")
+    return True
+
+
 def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
               plugin_dll: Optional[Path] = None, plugin_files: Optional[List[Path]] = None,
               autoload: str = "", autoload_delay_frames: int = 600, modes=LINK_MODES,
               root: Optional[Path] = None, appid: Optional[str] = STEAM_APPID,
               extra_ini: Optional[Dict[str, Dict[str, str]]] = None, core_dll: Optional[Path] = None,
-              port_base: Optional[int] = None) -> Dict:
+              port_base: Optional[int] = None, dxvk: bool = False, no_pad: bool = False) -> Dict:
     # Check every input before the first write: a missing dll or a bad ini entry must not leave a half instance.
     sources, plan_ini = plugin_plan(plugin_dll, core_dll, plugin_files)
     ini_extra = provision_ini(plan_ini, extra_ini)
@@ -360,7 +424,7 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
     (d / "Saves").mkdir(exist_ok=True)
     plugins.mkdir(parents=True, exist_ok=True)
     check_plugins_inside(d)  # and again before anything is deleted from or written into Plugins
-    for name, text in render_inis().items():
+    for name, text in render_inis(no_pad).items():
         (d / name).write_text(text, encoding="latin-1", newline="")
     if appid:
         (d / "steam_appid.txt").write_text(appid, encoding="ascii")
@@ -370,6 +434,8 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
             if f.is_file() and f.suffix.lower() in (".exe", ".dll") and f.name.lower().startswith(("nvse", "xnvse")):
                 _replace(f, d / f.name)
                 installed.append(f.name)
+    if dxvk and install_dxvk(d):
+        installed += ["d3d9.dll", "dxvk.conf"]
     removed: List[str] = []
     for f in stale_plugin_dlls(plugins, sources):
         f.unlink()
@@ -401,7 +467,7 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
     meta = {
         "instance": i, "role": role, "dir": str(d), "pipe": rf"\\.\pipe\nvcoop-{i}",
         "exe": str(d / "FalloutNV.exe"), "link_counts": counts, "installed": installed, "removed": removed,
-        "ini": cfg, "game_dir": str(g),
+        "ini": cfg, "game_dir": str(g), "no_pad": no_pad,
         **({"pair": pairs.pair_of(i), "port": int(cfg["coop"].get("port") or 0)} if port_base is not None else {}),
         "pinned": {p: sha256_file(d / p) for p in PINNED_FILES if (d / p).exists()},
     }
@@ -412,8 +478,10 @@ def provision(i: int, *, role: str = "host", nvse_dir: Optional[Path] = None,
 def write_plugin_ini(d: Path, i: int, role: str, autoload: str = "", delay: int = 600,
                      extra: Optional[Dict[str, Dict[str, str]]] = None) -> Dict:
     """nvcoop.ini read by plugin/main.cpp ([bridge] instance/autoload/autoloadDelayFrames); [coop] is ours."""
+    visible = os.environ.get("NVCOOP_VISIBLE") == "1"
     cfg = {
-        "bridge": {"instance": str(i), "autoload": autoload, "autoloadDelayFrames": str(delay), "minimized": "1", "multiInstance": "1"},
+        "bridge": {"instance": str(i), "autoload": autoload, "autoloadDelayFrames": str(delay), "minimized": "0" if visible else "1",
+                   "focusGuard": "1", "multiInstance": "1"},
         "coop": {"instanceId": str(i), "role": role, "pipe": rf"\\.\pipe\nvcoop-{i}"},
     }
     merge_ini(cfg, extra)
@@ -615,6 +683,10 @@ def main(argv=None) -> int:
                         "and coop.role are an error")
     p.add_argument("--autoload", default="")
     p.add_argument("--no-appid", action="store_true")
+    p.add_argument("--no-dxvk", action="store_true", help="do not install the cached DXVK d3d9.dll + 60 fps cap (python tools/runner/fetch_deps.py fills the cache)")
+    p.add_argument("--no-pad", action="store_true",
+                   help="the copies ignore game controllers (FalloutPrefs.ini bDisable360Controller=1), so bot.move can walk "
+                        "where a pad always answers, as on a Steam Deck")
     p.add_argument("--modes", default=",".join(LINK_MODES))
     for c in ("show", "destroy"):
         q = sub.add_parser(c)
@@ -659,7 +731,8 @@ def main(argv=None) -> int:
                               plugin_dll=dll, core_dll=core, extra_ini=extra_ini,
                               autoload=a.autoload, modes=tuple(a.modes.split(",")),
                               appid=None if a.no_appid else STEAM_APPID,
-                              port_base=a.port_base if a.pairs else None)
+                              port_base=a.port_base if a.pairs else None,
+                              dxvk=not a.no_dxvk, no_pad=a.no_pad)
             except UnsafeInstance as e:
                 print(f"error: instance {i}: {e}", file=sys.stderr)
                 return 2

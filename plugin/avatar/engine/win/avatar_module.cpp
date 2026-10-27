@@ -35,6 +35,7 @@
 #include "avatar_api.h"
 #include "avatar_glue.h"
 #include "avatar_runtime.h"
+#include "run_state.h"
 #include "common/minijson.h"
 #include "common/nvcoop_api.h"
 #include "../../puppet_hits.h"
@@ -474,7 +475,7 @@ void OnFrame() {
     if (!g.enabled || !g.backend) return;
     ++g.frames;
     if (!g.rt) {
-        if ((g.frames % 30) == 0 && PlayerReady()) CreateRuntime();
+        if (nvcoop::avatar::shouldCreateRuntime(g.enabled, g.backend != nullptr, false, g.frames, (g.frames % nvcoop::avatar::kRuntimeCheckEveryFrames) == 0 && PlayerReady())) CreateRuntime();
         if (!g.rt) return;
     }
     g.rt->Tick(NowMs());
@@ -490,6 +491,9 @@ namespace glue {
 
 bool Enabled() { return g.enabled; }
 bool Running() { return g.rt != nullptr; }
+const char* NotRunningBecause() {
+    return nvcoop::avatar::notRunningBecause(g.enabled, g.rt != nullptr);
+}
 
 void SetSnapshotSink(std::function<void(const live::ActorSnapshot&)> sink) {
     g.snapSink = sink;
@@ -498,6 +502,14 @@ void SetSnapshotSink(std::function<void(const live::ActorSnapshot&)> sink) {
 void SetEquipSink(std::function<void(const std::vector<EquipEntry>&)> sink) {
     g.equipSink = sink;
     if (g.rt) g.rt->SetEquipSink(std::move(sink));
+}
+void SetLocalSlot(Slot slot) {
+    g.cfg.puppet.localSlot = slot;      // a runtime that does not exist yet is created with it
+    g.cfg.loopbackSlot = static_cast<Slot>(slot == 1 ? 2 : 1);
+    if (g.rt) {
+        g.rt->SetLocalSlot(slot);
+        if (g.dir) g.dir->SetLocalSlot(slot);
+    }
 }
 void SetLocalIdentity(live::NetId netId, live::OwnerEpoch epoch) {
     g.netId = netId;

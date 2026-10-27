@@ -66,7 +66,7 @@ public:
     struct Stats {
         uint32_t beaconsSent = 0, beaconsRecv = 0, badPackets = 0, unexpected = 0, snaps = 0, advances = 0, skipsExecuted = 0,
                  requestsHandled = 0, duplicateRequests = 0, verdictsSent = 0, verdictsRecv = 0, travelsStarted = 0, helloSent = 0,
-                 requestsTimedOut = 0, statusSent = 0, statusRecv = 0;
+                 requestsTimedOut = 0, statusSent = 0, statusRecv = 0, scriptedRepeatsUndone = 0;
     };
     const Stats& stats() const { return stats_; }
 

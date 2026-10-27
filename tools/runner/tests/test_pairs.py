@@ -330,20 +330,20 @@ class Pairs(unittest.TestCase):
     # ---------------------------------------------------------------- RAM guard
     def check_ram(self, mut):
         with mutant(mut):
-            # 10 GiB free, 2 GiB reserve, 0.7 GB a copy: 11 copies = 5 pairs. Copies that run count on top: (2 + 11) // 2 = 6.
-            self.assertEqual(pairs.max_pairs_by_ram(10 * GIB), 5)
-            self.assertEqual(pairs.max_pairs_by_ram(10 * GIB, up_copies=2), 6)
-            self.assertEqual(pairs.max_pairs_by_ram(1 * GIB), 0, "below the reserve nothing fits")
-            self.assertIsNone(pairs.ram_problem(5, 0, 10 * GIB))
-            why = pairs.ram_problem(6, 0, 10 * GIB)
+            # reserve pinned to 2 GiB here (the default is tuned per PC). 10 GiB free, 2 GiB reserve, 0.7 GB a copy: 11 copies = 5 pairs. Copies that run count on top: (2 + 11) // 2 = 6.
+            self.assertEqual(pairs.max_pairs_by_ram(10 * GIB, reserve_gb=2.0), 5)
+            self.assertEqual(pairs.max_pairs_by_ram(10 * GIB, up_copies=2, reserve_gb=2.0), 6)
+            self.assertEqual(pairs.max_pairs_by_ram(1 * GIB, reserve_gb=2.0), 0, "below the reserve nothing fits")
+            self.assertIsNone(pairs.ram_problem(5, 0, 10 * GIB, reserve_gb=2.0))
+            why = pairs.ram_problem(6, 0, 10 * GIB, reserve_gb=2.0)
             self.assertIsNotNone(why, "6 pairs need 12 copies and only 11 fit")
             self.assertIn("at most 5", why)
             self.assertIn("8.4 GB", why)
-            self.assertIsNotNone(pairs.ram_problem(3, 0, int(5.5 * GIB)), "6 copies need 4.2 GB beyond the 2 GB reserve")
+            self.assertIsNotNone(pairs.ram_problem(3, 0, int(5.5 * GIB), reserve_gb=2.0), "6 copies need 4.2 GB beyond the 2 GB reserve")
             # the lead's pair is already running: its memory is taken out of the free RAM, so it needs no more
-            self.assertIsNone(pairs.ram_problem(1, 2, int(0.5 * GIB)), "both copies of the pair already run")
-            self.assertIsNone(pairs.ram_problem(2, 2, int(4.6 * GIB)), "two more copies need 1.4 GB beyond the reserve")
-            self.assertIsNotNone(pairs.ram_problem(3, 2, int(4.6 * GIB)), "four more copies need 2.8 GB")
+            self.assertIsNone(pairs.ram_problem(1, 2, int(0.5 * GIB), reserve_gb=2.0), "both copies of the pair already run")
+            self.assertIsNone(pairs.ram_problem(2, 2, int(4.6 * GIB), reserve_gb=2.0), "two more copies need 1.4 GB beyond the reserve")
+            self.assertIsNotNone(pairs.ram_problem(3, 2, int(4.6 * GIB), reserve_gb=2.0), "four more copies need 2.8 GB")
 
     def test_ram(self):
         self.check_ram(None)

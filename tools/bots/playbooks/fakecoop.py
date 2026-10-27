@@ -40,6 +40,7 @@ BUGS = {
     "ready_veto_ignored": "a No vote does not stop the one-way step",
     "tether_off": "tether radius is not enforced",
     "consent_ignored": "fast travel proceeds without party consent",
+    "travel_mode_free": "the world-time module runs fast travel as free (the shipped default) although the test needs party consent",
     "travel_in_combat": "fast travel is allowed in combat",
     "owner_split": "ownership transfer is not delivered to clients",
     "flap_owner": "no hysteresis: ownership flips back and forth near the border",
@@ -109,6 +110,8 @@ class FakeNv:
             return self.bot.anim_probe()
         if method == "coop.owner":
             return self.bot.owner_info(params["ref"])
+        if method == "worldtime.status":
+            return {"enabled": True, "session": True, "partyTravel": "travel_mode_free" not in self.bot.world.bugs}
         if method == "events":
             return {"events": [], "next": 0}
         if method == "flight.dump":
@@ -173,6 +176,8 @@ class FakeCoop:
         self.walk_speed = walk_speed            # units/s; None: movement is instant and the animation checks have nothing to see
         self.walk_blocked = False               # True: every walk (mode "walk") fails "stuck", as on rough terrain; a teleport works
         self.walk_times_out = False             # True: every walk fails "timeout: N units left", as on a long way; a teleport works
+        self.stand_on_target = False            # True: goto_ref stops 4 units from the ref, as after a scenario's setup MoveTo
+        self.aim_min_dist = 0.0                 # > 0: aim_at refuses a nearer target with "too_close", as the real Bot.aim_at (100)
         self.vt = 0.0                           # virtual seconds, 0.05 per tick
         self.tick_hooks: List[Any] = []
         self._lock = threading.RLock()
@@ -698,6 +703,8 @@ class FakeBot:
         if mode == "walk" and self.world.walk_times_out:
             return Result(False, "timeout: 4774 units left (wanted within 300), no menu is open")
         off = dist * (0.5 + 0.1 * self.idx)     # players stop short of the ref, each a bit differently
+        if self.world.stand_on_target:
+            off = 4.0
         pos = self._ref_pos(ref)
         return self._move((pos[0] + off, pos[1], pos[2]), r["cell"], mode)
 
@@ -749,6 +756,9 @@ class FakeBot:
             return Result(False, f"{ref} is not loaded on {self.name}")
         if r["cell"] != self.me["cell"] or self.world.dist(self._ref_pos(ref), self.me["pos"]) > 4000:
             return Result(False, "target is out of range")
+        d = self.world.dist(self._ref_pos(ref), self.me["pos"])
+        if d < self.world.aim_min_dist:
+            return Result(False, f"too_close: the player is {d:.0f} units from the target (minimum {self.world.aim_min_dist:g})")
         self.me["aim"] = norm(ref)
         return Result(True)
 

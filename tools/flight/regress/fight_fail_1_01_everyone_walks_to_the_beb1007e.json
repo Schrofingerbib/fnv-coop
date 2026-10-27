@@ -1,0 +1,109 @@
+{
+ "config": {
+  "clients": 1
+ },
+ "evidence": {
+  "desync_keys": [
+   "StartQuest 4ADEE@falloutnv.esm: host (absent) / client StartQuest 4ADEE@falloutnv.esm",
+   "StopQuest 152E8A@falloutnv.esm: host (absent) / client StopQuest 152E8A@falloutnv.esm",
+   "StartQuest 14ADAE@falloutnv.esm: host (absent) / client StartQuest 14ADAE@falloutnv.esm",
+   "StopQuest 10A214@falloutnv.esm: host (absent) / client StopQuest 10A214@falloutnv.esm",
+   "StartQuest 11F460@falloutnv.esm: host (absent) / client StartQuest 11F460@falloutnv.esm",
+   "StartQuest 131E7C@falloutnv.esm: host (absent) / client StartQuest 131E7C@falloutnv.esm",
+   "StartQuest 140E14@falloutnv.esm: host (absent) / client StartQuest 140E14@falloutnv.esm",
+   "StartQuest 139B8D@falloutnv.esm: host (absent) / client StartQuest 139B8D@falloutnv.esm"
+  ],
+  "found": {
+   "at_ms": 18904.743,
+   "class": "divergence",
+   "detail": "effect 0 of txn seq 3 differs between machines: slot(s) [1] hash 48c4576dc096c9db; slot(s) [1] hash ba165f729ba961a1; slot(s) [1] hash f07a18e142c2ac35",
+   "healed": true,
+   "key": "txn:3[0]",
+   "kind": "txn-hash",
+   "suspects": [
+    1
+   ]
+  },
+  "symptoms": [
+   "digest mismatch x43",
+   "11 repair(s), 1436 effect(s) repaired"
+  ]
+ },
+ "expect": {
+  "bug_signature": "divergence txn:#[#]",
+  "converges": false,
+  "meaning": "recorded evidence of the failure"
+ },
+ "format": "trace-1",
+ "headers": {
+  "0": "4e5646520100400000000100060000008086dd69a10100007fd3ef0f0000000000000000000000005d0201000000000000000000000000000000000000000000",
+  "1": "4e5646520100400001010000060000002096dd69a10100007603401b000000000000000000000000074601000000000000000000000000000000000000000000"
+ },
+ "shrunk": {
+  "complete": true,
+  "first": {
+   "category": "divergence",
+   "key": "txn:183[1]"
+  },
+  "oracle_runs": 95,
+  "original_steps": 149604,
+  "reduced_steps": 2,
+  "seconds": 2.33,
+  "signature": "divergence txn:#[#]",
+  "stages": [
+   "window +-60000ms: 149604 -> 24860 records",
+   "dropped all NetIn (2401 records)",
+   "dropped all NetOut (2414 records)",
+   "dropped all Marker (17140 records)",
+   "dropped all Digest (44 records)",
+   "dropped all Meta (2 records)"
+  ],
+  "violations": [
+   "divergence txn:183[1]",
+   "divergence txn:183[1]"
+  ]
+ },
+ "source": {
+  "failure": "FAIL-1-01-everyone_walks_to_the_enemies",
+  "kind": "settle",
+  "playbook": "enemy_fight",
+  "reason": "machines did not converge within 40.9307s: lastSeq per machine {'host': 3433, 'client1': 3433}, host allSynced=False",
+  "recordings": [
+   {
+    "dropped": 0,
+    "file": "nvcoop-desync-1792777755438-11.nvfr",
+    "name": "host",
+    "records": 66141,
+    "role": "host",
+    "slot": 0
+   },
+   {
+    "dropped": 0,
+    "file": "nvcoop-manual-1792777949489-9.nvfr",
+    "name": "client1",
+    "records": 83463,
+    "role": "client",
+    "slot": 1
+   }
+  ],
+  "run": "fight",
+  "step": "01-everyone walks to the enemies"
+ },
+ "steps": [
+  {
+   "at_ms": 67167.572,
+   "hex": "05001c00400a00007a10c00300000000b70000000000000001000000000100000000060212d8117fa6ed6792",
+   "op": "rec",
+   "slot": 1,
+   "ty": "TxnApplied"
+  },
+  {
+   "at_ms": 75333.441,
+   "hex": "05001c00050c000067aa3c0400000000b700000000000000020000000001000000000602927f1b7f82cf099d",
+   "op": "rec",
+   "slot": 1,
+   "ty": "TxnApplied"
+  }
+ ],
+ "version": 1
+}

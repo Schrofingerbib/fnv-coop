@@ -210,6 +210,28 @@ TEST(feed, an_owner_whose_actor_dies_in_the_engine_publishes_the_death) {
     CHECK(r.died.size() == 1);
 }
 
+// enemy_handoff, game 2026-10-22: the owner's copy of a ganger read dying (life 1) and half a second later restrained (5), which every reader
+// counts as ALIVE, while the other machine had it dead. Publishing the death turns the AI off; SetRestrained on a corpse overwrote its life
+// state. Twin 72 restrains the corpse like a living NPC.
+TEST(feed, the_owners_copy_of_a_dead_actor_stays_dead_it_is_not_restrained_back_to_life) {
+    FeedRig r;
+    crowd(r, 2);
+    r.startSession();
+    r.run(1500);
+    const NetId id = r.id(0x100);
+    CHECK(r.sync->ownerOf(id).mine);
+    const int restrainsBefore = r.eng.count("restrain", 0x100);
+    r.eng.a[0x100].life = 1;                       // the engine's own death starts (dying)
+    r.eng.a[0x100].av[kAvHealth] = 0;
+    r.run(300);
+    CHECK(r.sync->isDead(id) && r.feed.stats().deathsReported == 1);
+    r.eng.a[0x100].life = 2;                       // the dying animation ends
+    r.run(1500);
+    CHECK(r.eng.a[0x100].life == 2);               // still dead: not 5
+    CHECK(r.eng.count("restrain", 0x100) == restrainsBefore);
+    CHECK(r.port.aiOff(id));                       // the port knows its AI is off
+}
+
 TEST(feed, a_story_npc_killed_by_the_engine_without_authority_is_revived) {
     FeedRig r;
     r.eng.addNpc(0x100, 0x500, {1000, 1000, 0}).baseUnique = true;
@@ -277,6 +299,55 @@ TEST(feed, nothing_is_scanned_without_a_session) {
     crowd(r, 2);
     r.run(2000);
     CHECK(r.feed.stats().scans == 0 && r.feed.fedCount() == 0);
+}
+
+TEST(feed, an_actor_that_died_before_a_load_can_die_again_after_it) {
+    // in game 2026-10-21: a gecko killed in one run was alive again after the reload, died again on the host, and stayed alive on the guest
+    FeedRig r;
+    crowd(r, 1);
+    r.startSession();
+    r.run(1500);
+    NetId id = r.id(0x100);
+    r.eng.a[0x100].life = 2;
+    r.eng.a[0x100].av[kAvHealth] = 0;
+    r.run(300);
+    CHECK(r.sync->isDead(id) && r.feed.stats().deathsReported == 1);
+    // the owner loads a save from before the death: the actor stands there alive
+    r.eng.a[0x100].life = 0;
+    r.eng.a[0x100].av[kAvHealth] = 100;
+    r.eng.epoch = 2;
+    r.frame();
+    r.run(1500);
+    id = r.id(0x100);
+    CHECK_MSG(!r.sync->isDead(id), "the old world's death is still on record after the load");
+    r.eng.a[0x100].life = 2;
+    r.eng.a[0x100].av[kAvHealth] = 0;
+    r.run(300);
+    CHECK_MSG(r.feed.stats().deathsReported == 2, "the second death was not published: " + std::to_string(r.feed.stats().deathsReported));
+    CHECK(r.sync->isDead(id));
+}
+
+TEST(feed, an_actor_a_script_resurrected_can_die_again_and_the_second_death_is_published) {
+    // bench 2026-10-27 (real_fight): the harness resurrects the gangers with a console `Resurrect` before every fight; the feed kept "dead" on the
+    // actor for the rest of the session, so the second death was never polled, never declared, and the other machines never heard of it
+    FeedRig r;
+    crowd(r, 1);
+    r.startSession();
+    r.run(1500);
+    NetId id = r.id(0x100);
+    r.eng.a[0x100].life = 2;
+    r.eng.a[0x100].av[kAvHealth] = 0;
+    r.run(300);
+    CHECK(r.sync->isDead(id) && r.feed.stats().deathsReported == 1);
+    // the story host resurrects it (ResurrectActor effect): ActorSync forgets the death, the port stands it up again
+    r.sync->onEffect(fnvcoop::ResurrectActor{r.eng.refForm(0x100)});
+    r.run(800);
+    CHECK_MSG(r.eng.a[0x100].life == 0 && !r.sync->isDead(id), "the resurrect did not take");
+    r.eng.a[0x100].life = 2;
+    r.eng.a[0x100].av[kAvHealth] = 0;
+    r.run(600);
+    CHECK_MSG(r.feed.stats().deathsReported == 2, "the second death was not published: " + std::to_string(r.feed.stats().deathsReported));
+    CHECK(r.sync->isDead(id));
 }
 
 TEST(feed, a_loaded_game_forgets_the_old_world_and_undoes_what_a_save_left_behind) {

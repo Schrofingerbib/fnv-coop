@@ -18,6 +18,7 @@
 //   FNVCOOP_MUT=2 : host capture hook not wired (captured txns are never committed)
 //   FNVCOOP_MUT=3 : host ignores guest actions (onAction never executes)
 //   FNVCOOP_MUT=4 : client skips setBaselineWorld (joins without a baseline transfer)
+//   FNVCOOP_MUT=8 : host polls the engine's quest vars only with a world baseline (baseline=0: story vars written by object scripts never leave the host)
 //   FNVCOOP_MUT=5 : L11 wiring twin; env COOP_UI_MUTANT=n drops one wiring call (1 bridge config, 2 menu resume, 3 mux 0xE5 channel,
 //                   4 SlideshowEnd calls (host + guest), 5 INFO reader install); COOP_LEAVE_MUTANT=n breaks leave()/join()
 #ifdef FNVCOOP_RUNTIME_MUT
@@ -259,6 +260,82 @@ bool Runtime::start(std::string* err) {
             host_->setWorldBaseline(b, hash);
             usedBaseline_.reset(new ShadowState(b));
             usedHash_ = hash;
+            // Desync repair (issue #25): quests a client reports a running state for that the host's shared world lacks are settled with
+            // the host engine's own running state, read through a fresh dump (rare: once committed the keys are part of the shared world).
+            IWorldDumper* qd = dumper_;
+            host_->hostQuestRunning = [qd](const std::vector<FormRef>& qs, std::map<FormRef, bool>& out) {
+                ShadowState now;
+                uint64_t nowHash = 0;
+                std::string why;
+                if (!qd->dump(&now, &nowHash, &why)) return false;
+                for (auto& q : qs) { auto it = now.questRunning.find(q); if (it != now.questRunning.end()) out[q] = it->second; }
+                return true;
+            };
+        }
+        if (!host_->hostQuestRunning && questRunning_) {
+            // No world baseline to dump from: read the running flag of just the quests a client reported, straight from this engine. Without a
+            // reader the session falls back to the completeness default (not running) and stops every quest the client is running.
+            QuestRunningReader rd = questRunning_;
+            host_->hostQuestRunning = [rd](const std::vector<FormRef>& qs, std::map<FormRef, bool>& out) {
+                for (auto& q : qs) {
+                    bool on = false;
+                    if (rd(q, on)) out[q] = on;
+                }
+                return true;
+            };
+        }
+        if (globals_) {
+            GlobalReader rd = globals_;
+            host_->hostGlobals = [rd](const std::vector<FormRef>& gs, std::map<FormRef, double>& out) {
+                for (auto& g : gs) {
+                    double v = 0;
+                    if (rd(g, v)) out[g] = v;
+                }
+                return true;
+            };
+        }
+        if (questState_) {
+            // Desync repair: client-only quest state (non-zero stage, completed, failed) is settled only where THIS engine confirms it.
+            // Works with or without a world baseline (a baseline-less host never recorded what both copies loaded from the same save).
+            QuestStateReader rd = questState_;
+            host_->hostQuestState = [rd](const std::vector<FormRef>& qs, std::map<FormRef, HostSession::HostQuestState>& out) {
+                for (auto& q : qs) {
+                    HostSession::HostQuestState s;
+                    int32_t stage = -1;
+                    if (!rd(q, stage, s.completed, s.failed)) continue;
+                    s.stage = stage;
+                    out[q] = s;
+                }
+                return true;
+            };
+        }
+        if (objectiveState_) {
+            // Same for client-only objective state (non-zero flags, all objectives completed): settled only where THIS engine shows the same.
+            ObjectiveStateReader rd = objectiveState_;
+            host_->hostObjectives = [rd](const std::vector<FormRef>& qs, std::map<FormRef, std::map<uint32_t, uint8_t>>& out) {
+                for (auto& q : qs) {
+                    std::map<uint32_t, uint8_t> objs;
+                    if (rd(q, objs)) out[q] = std::move(objs);
+                }
+                return true;
+            };
+        }
+        if (scriptVars_) {
+            // Same for client-only script vars: 0 is adopted as the default unless this engine shows another value, non-zero only where it shows the same.
+            ScriptVarReader rd = scriptVars_;
+            host_->hostScriptVars = [rd](const std::vector<std::pair<FormRef, uint16_t>>& vars, std::map<std::pair<FormRef, uint16_t>, double>& out) {
+                std::map<FormRef, std::map<uint16_t, double>> byOwner;
+                for (auto& v : vars) {
+                    auto o = byOwner.find(v.first);
+                    if (o == byOwner.end()) {
+                        std::map<uint16_t, double> got;
+                        o = byOwner.emplace(v.first, rd(v.first, got) ? std::move(got) : std::map<uint16_t, double>()).first;
+                    }
+                    auto it = o->second.find(v.second);
+                    if (it != o->second.end()) out[v] = it->second;
+                }
+                return true;
+            };
         }
         {
             HostSession::DesyncOptions dopt;
@@ -568,6 +645,10 @@ bool Runtime::stageRequested(const FormRef& quest, uint32_t stage, PlayerId init
     return rules_->onStageRequested(quest, stage, initiator) == StageDecision::Proceed;
 }
 
+bool Runtime::stageExcluded(const FormRef& quest, uint32_t stage) const {
+    return rules_ && rules_->stageExcluded(quest, stage);
+}
+
 void Runtime::reportCell(const FormRef& cell) {
     if (rules_) rules_->onCellReported(kHostPlayer, cell);
     else if (client_ && client_->joined() && !client_->baselineActive()) client_->submitAction(IntentKind::ReportCell, cell);
@@ -646,7 +727,14 @@ void Runtime::frame() {
             }
         }
         if (rules_) rules_->tick(t);
-        if (replicator_) replicator_->flush(t);
+        if (replicator_) {
+            if (statePoll_ && (cfg_.baseline || !FNV_MUT(8))) {   // twin 8: the old gate, polling only with a world baseline
+                const bool first = polledRep_ != replicator_.get();
+                polledRep_ = replicator_.get();
+                statePoll_(*replicator_, first, first && !cfg_.baseline);
+            }
+            replicator_->flush(t);
+        }
     }
     if (client_) {
         if (enet_) {
@@ -1026,7 +1114,11 @@ std::string Runtime::statusJson() const {
         h.set("lastSeq", (int64_t)host_->log().head()).set("peers", peers).set("connected", joined).set("allSynced", host_->allSynced())
             .set("commits", (int64_t)s.commits).set("droppedByPolicy", (int64_t)s.droppedByPolicy)
             .set("epoch", (int64_t)host_->epoch()).set("welcomes", (int64_t)s.welcomes).set("snapshots", (int64_t)s.snapshots).set("replays", (int64_t)s.replays)
-            .set("retransmitBatches", (int64_t)s.retransmitBatches).set("badMessages", (int64_t)s.badMessages);
+            .set("retransmitBatches", (int64_t)s.retransmitBatches).set("badMessages", (int64_t)s.badMessages)
+            .set("questRunningAdopted", (int64_t)s.questRunningAdopted).set("questStateAdopted", (int64_t)s.questStateAdopted)
+            .set("questStateDisagreed", (int64_t)s.questStateDisagreed).set("resumesRefused", (int64_t)s.resumesRefused)
+            .set("objectiveZeroAdopted", (int64_t)s.objectiveZeroAdopted).set("objectiveStateAdopted", (int64_t)s.objectiveStateAdopted)
+            .set("objectiveStateDisagreed", (int64_t)s.objectiveStateDisagreed);
         if (replicator_) {
             const auto& rp = replicator_->stats();
             Value r = Value::object();
@@ -1055,7 +1147,8 @@ std::string Runtime::statusJson() const {
             .set("rejectReason", (int64_t)client_->rejectReason())
             .set("baselineEffects", (int64_t)client_->baselineResult().effectsApplied)
             .set("baselineKept", (int64_t)client_->baselineResult().entriesKept).set("baselineReverted", (int64_t)client_->baselineResult().reverted)
-            .set("baselineUnrevertable", (int64_t)client_->baselineResult().unrevertable).set("baselineChunks", (int64_t)client_->baselineResult().chunks);
+            .set("baselineUnrevertable", (int64_t)client_->baselineResult().unrevertable).set("baselineChunks", (int64_t)client_->baselineResult().chunks)
+            .set("repairUnrevertable", (int64_t)client_->syncStats().repairRevertsUnrevertable);
         o.set("client", c2);
         o.set("lastSeq", (int64_t)client_->applied()).set("connected", client_->joined() ? 1 : 0);
     }

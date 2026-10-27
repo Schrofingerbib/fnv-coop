@@ -27,7 +27,7 @@ std::vector<Body> allBodies() {
     v.push_back(ReqClose{6, 9, 0xDEADBEEFCAFEull});
     v.push_back(ReqHold{9});
     ReqDrop d = dropReq(7, 0x33, 5); d.meta = 9; d.rot = V(1, 2, 3); v.push_back(d);
-    ReqClaim c; c.txn = 8; c.item = 0x55; c.hasAdopt = true; c.adopt = richItem(); c.adopt.id = 0x55; v.push_back(c);
+    ReqClaim c; c.txn = 8; c.item = 0x55; c.hasAdopt = true; c.adopt = richItem(); c.adopt.id = 0x55; c.ref = F(0x842, "nvcooplab.esp"); v.push_back(c);
     v.push_back(ReqResync{9, true});
     v.push_back(ReqDigest{0x1122334455667788ull, 5, 6});
     v.push_back(ReqTouch{kItemIdBase + 1, V(1, 2, 3), V(0.5f, 0, 0)});
@@ -38,7 +38,7 @@ std::vector<Body> allBodies() {
     v.push_back(MDelta{9, 12, F(0x10), 0});
     v.push_back(MLock{9, 3, kNoPlayer});
     v.push_back(MItemNew{richItem()});
-    v.push_back(MItemGone{kItemIdBase + 5, 2, 8});
+    v.push_back(MItemGone{kItemIdBase + 5, 2, 8, F(0x842, "nvcooplab.esp")});
     v.push_back(MContainerGone{9});
     v.push_back(MTableBegin{4});
     v.push_back(MTableEnd{4, 10, 20});
@@ -68,6 +68,31 @@ TEST(wire, every_message_kind_round_trips_byte_for_byte) {
         CHECK(encodeEnvelope(back) == bytes);
     }
     CHECK(seen.size() == std::variant_size_v<Body>);
+}
+
+TEST(wire, a_placed_items_own_ref_travels_with_the_claim_and_the_gone_message) {
+    ReqClaim c = claimPlaced(3, 0x4000, 0x77, 2);
+    Envelope e; e.src = 1; e.body = c;
+    auto bytes = encodeEnvelope(e);
+    Envelope back;
+    REQUIRE(decodeEnvelope(bytes.data(), bytes.size(), back));
+    const ReqClaim* q = std::get_if<ReqClaim>(&back.body);
+    REQUIRE(q);
+    CHECK(q->ref == F(0x842, "nvcooplab.esp"));
+    MItemGone g; g.item = 0x4000; g.by = 1; g.txn = 3; g.ref = F(0x842, "nvcooplab.esp");
+    e.body = g;
+    bytes = encodeEnvelope(e);
+    REQUIRE(decodeEnvelope(bytes.data(), bytes.size(), back));
+    const MItemGone* m = std::get_if<MItemGone>(&back.body);
+    REQUIRE(m);
+    CHECK(m->ref == F(0x842, "nvcooplab.esp"));
+    CHECK(m->item == 0x4000);
+    // a dropped item's message carries no ref
+    g.ref = FormRef();
+    e.body = g;
+    bytes = encodeEnvelope(e);
+    REQUIRE(decodeEnvelope(bytes.data(), bytes.size(), back));
+    CHECK(std::get_if<MItemGone>(&back.body)->ref.plugin.empty());
 }
 
 TEST(wire, request_and_unreliable_classification) {

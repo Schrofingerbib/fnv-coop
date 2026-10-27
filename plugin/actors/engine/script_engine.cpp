@@ -49,8 +49,11 @@ std::string startCombat(RefId target) { char b[48]; std::snprintf(b, sizeof b, "
 std::string evaluatePackage() { return "EvaluatePackage"; }
 std::string setEssential(bool on) { return on ? "SetActorRefEssential 1" : "SetActorRefEssential 0"; }
 std::string forceAv(const char* avName, float value) {
+    // The Amount parameter is an integer: "ForceActorValue Health 85.00" does not compile ("Unknown variable '85.00' for parameter Amount")
+    // yet the console answers ok, so the old "%.2f" line changed nothing in game (found 2026-10-22).
     char b[96];
-    std::snprintf(b, sizeof b, "ForceActorValue %s %.2f", avName, static_cast<double>(value));
+    if (FNV_MUT(40)) std::snprintf(b, sizeof b, "ForceActorValue %s %.2f", avName, static_cast<double>(value));   // twin 40: the decimal form
+    else std::snprintf(b, sizeof b, "ForceActorValue %s %ld", avName, std::lround(static_cast<double>(value)));
     return b;
 }
 std::string kill() { return FNV_MUT(5) ? "Kill" : nvhooks::killCmd(); }

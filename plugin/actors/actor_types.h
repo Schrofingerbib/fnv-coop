@@ -43,6 +43,15 @@ struct ActorMeta {
 // with a taken id (Stats::idCollisions).
 NetId deriveNetId(const FormRef& ref);
 
+// One entry of an actor's inventory (totals: base container + changes). A list is sorted by (plugin, localId); count > 0.
+struct InvItem {
+    FormRef form;
+    int32_t count = 0;
+    friend bool operator==(const InvItem& a, const InvItem& b) { return a.form == b.form && a.count == b.count; }
+    friend bool operator!=(const InvItem& a, const InvItem& b) { return !(a == b); }
+};
+using InvList = std::vector<InvItem>;
+
 // One player as the ownership service needs to see them (fed by the avatar layer).
 struct PlayerPose {
     bool present = false;
@@ -74,6 +83,9 @@ public:
     virtual void setBase(NetId id, const FormRef& pick) = 0;              // leveled pick: swap the base form to match
     virtual void kill(NetId id) = 0;                                      // apply death (called only when authorised)
     virtual void revive(NetId id) = 0;                                    // scripted resurrect (host ResurrectActor effect)
+    // Inventory (the owner's AI drinks a Stimpak, the other copies must lose it too). Defaults: not available, nothing is synced.
+    virtual bool sampleInventory(NetId id, InvList& out) { (void)id; (void)out; return false; }   // false = cannot read it exactly now
+    virtual bool applyInventory(NetId id, const InvList& want) { (void)id; (void)want; return false; }   // make the engine copy hold exactly `want`
 };
 
 // ---- the network side --------------------------------------------------------------------------------------------------------
@@ -94,6 +106,8 @@ struct SyncConfig {
     uint32_t ownEvalMs = 250;      // host: re-decide every tracked actor this often
     uint32_t settleMs = 300;       // owner: an idle actor sends one reliable settle snapshot after this long
     uint32_t resyncMinMs = 500;    // client: at most one MResync per actor per this long
+    uint32_t invPollMs = 500;      // owner: read an owned actor's inventory this often (a few actors per tick)
+    uint32_t invSettleMs = 1000;   // owner: publish a changed inventory once it has stayed the same this long (a replicated AddItem has landed everywhere by then)
     uint32_t holdAiMaxMs = 4000;   // safety net: a new owner that committed without the old owner's final state waits at most this long before it drives the AI
     std::function<bool(CellId, CellId)> adjacent;   // neighbouring exterior cells (default: same cell only)
 };
@@ -124,6 +138,7 @@ struct Stats {
     uint64_t resyncsSent = 0, resyncsAnswered = 0, idCollisions = 0, undecodable = 0, spoofed = 0;
     uint64_t ownershipApplied = 0, ownershipDuplicates = 0, ownershipStale = 0;
     uint64_t recruiterChanges = 0;
+    uint64_t invPublished = 0, invApplied = 0, invRejected = 0, invDuplicate = 0, invApplyFailed = 0;   // MInventory
     uint64_t animEventsSent = 0, animEventsApplied = 0, animEventsRejected = 0, animEventsDuplicate = 0;   // enemy-anim MAnimEvent
     uint64_t aiHolds = 0, aiHoldsReleased = 0, staleFinalsForwarded = 0;   // forced-commit hold of the new owner's AI (see ActorSync::onOwnApplied)
 };

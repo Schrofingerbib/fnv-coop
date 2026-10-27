@@ -19,8 +19,8 @@ constexpr size_t kRecentVerdicts = 32;
 
 }  // namespace
 
-IntentHost::IntentHost(HostDeps deps, Config cfg, ContainerRedirect redirect)
-    : deps_(std::move(deps)), cfg_(std::move(cfg)), redirect_(std::move(redirect)) {}
+IntentHost::IntentHost(HostDeps deps, Config cfg, ContainerRedirect redirect, StorageBook* stash)
+    : deps_(std::move(deps)), cfg_(std::move(cfg)), redirect_(std::move(redirect)), stash_(stash) {}
 
 Verdict IntentHost::verdictOf(const Intent& in, Result r) const {
     Verdict v;
@@ -106,15 +106,24 @@ Result IntentHost::runLegacy(PlayerId slot, fnvcoop::IntentKind kind, const Form
     return r;
 }
 
-bool IntentHost::pickActor(PlayerId slot, Kind k, TargetClass cls, Actor* out) const {
+void IntentHost::noteActor(PlayerId slot, ActorMode mode, RefId actor) {
+    auto it = lastMode_.find(slot);
+    if (it != lastMode_.end() && it->second == mode && !FNV_MUT(330)) return;   // MUTANT 330: reported on every action, not on a change
+    lastMode_[slot] = mode;
+    if (mode == ActorMode::StandIn && FNV_MUT(331)) return;   // MUTANT 331: a stand-in is never reported (the silent host-player run)
+    if (deps_.actorMode) deps_.actorMode(slot, mode, actor);
+}
+
+bool IntentHost::pickActor(PlayerId slot, Kind k, TargetClass cls, Actor* out) {
     RefId p = deps_.puppetOf ? deps_.puppetOf(slot) : 0;
     if (FNV_MUT(311)) p = 0;   // MUTANT 311: the puppet is never used (everything runs as the host's player)
-    if (p) { out->ref = p; out->puppet = true; return true; }
+    if (p) { out->ref = p; out->puppet = true; noteActor(slot, ActorMode::Puppet, p); return true; }
     RefId g = deps_.ghostOf ? deps_.ghostOf(slot) : 0;
-    if (g && !FNV_MUT(311)) { out->ref = g; out->ghost = true; return true; }
+    if (g && !FNV_MUT(311)) { out->ref = g; out->ghost = true; noteActor(slot, ActorMode::Ghost, g); return true; }
     if (!standInAllowed(cfg_, k, cls)) return false;
     out->ref = kHostPlayerRef;
     out->standIn = true;
+    noteActor(slot, ActorMode::StandIn, kHostPlayerRef);
     return true;
 }
 
@@ -129,17 +138,22 @@ Result IntentHost::checkReach(const Actor& a, const TargetInfo& t, Kind k) {
     return distance(p, t.pos) > reach ? Result::OutOfRange : Result::Executed;
 }
 
-Result IntentHost::runScoped(PlayerId slot, const Actor& a, Kind k, const FormRef& target, const std::function<Result(IActingScope&)>& fn) {
+Result IntentHost::runScoped(PlayerId slot, const Actor& a, Kind k, const FormRef& target, const std::function<Result(IActingScope&)>& fn, bool stash) {
     Result r = Result::Failed;
     Cause c;
     c.kind = CauseKind::Intent;
     c.source = target;
     c.aux = static_cast<int32_t>(k);
     bool ran = deps_.runAsGuest && deps_.runAsGuest(slot, [&] {
-        std::unique_ptr<IActingScope> scope = FNV_MUT(312) ? std::unique_ptr<IActingScope>(new NoScope()) : deps_.eng->beginActing(a.ref, slot, c);
-        if (!scope) { r = Result::Failed; return; }
-        r = fn(*scope);
-    });   // the scope is closed (its txn emitted) before runAsGuest returns, while the origin is still the guest
+        StashHold hold;
+        if (stash) hold = stashEnter(slot);   // the shared gear containers hold this player's stash while the interaction runs (outside the capture scope: nothing is recorded)
+        {
+            std::unique_ptr<IActingScope> scope = FNV_MUT(312) ? std::unique_ptr<IActingScope>(new NoScope()) : deps_.eng->beginActing(a.ref, slot, c);
+            if (!scope) r = Result::Failed;
+            else r = fn(*scope);
+        }   // the scope is closed here (its txn emitted) while the origin is still the guest
+        if (stash) stashExit(hold);
+    });
     if (!ran) return Result::Failed;
     if (r == Result::Executed) {
         if (a.puppet) ++stats_.actedAsPuppet;
@@ -149,9 +163,62 @@ Result IntentHost::runScoped(PlayerId slot, const Actor& a, Kind k, const FormRe
     return r;
 }
 
+// ---- gear stashes (storage_book.h) -------------------------------------------------------------------------------------------------------------
+
+IntentHost::StashHold IntentHost::stashEnter(PlayerId slot) {
+    StashHold hold;
+    hold.slot = slot;
+    if (!stash_ || stash_->empty() || !cfg_.storage || !deps_.eng) return hold;
+    if (slot == kHostPlayer && !FNV_MUT(410)) return hold;   // MUTANT 410: the host's own player is swapped too (its container goes empty, its gear is "parked")
+    if (stashDepth_ > 0) return hold;                        // nested: the outer window already holds the right contents
+    ++stashDepth_;
+    hold.active = true;
+    for (const StorageBook::Entry& e : stash_->entries()) {
+        StashHold::One one;
+        one.container = e.container;
+        std::vector<StoredItem> now;
+        if (!deps_.eng->readItems(e.container, &now)) continue;   // not loaded / not readable here: this container is not part of the interaction
+        now = normalizeItems(std::move(now));
+        const std::vector<StoredItem>* mine = stash_->peek(e.container, slot);
+        if (now.empty() && !mine) { hold.held.push_back(one); ++stats_.stashKept; continue; }   // nothing parked, nothing to load: only the way back is checked
+        std::vector<StoredItem> load = mine ? *mine : std::vector<StoredItem>();
+        if (FNV_MUT(405)) load = now;   // MUTANT 405: nothing is swapped in (the guest's script sees whatever is in the container, the host's gear included)
+        if (!deps_.eng->replaceItems(e.container, load)) { ++stats_.stashFailed; continue; }   // untouched: leave it out of the way back too
+        stash_->take(e.container, slot);   // the contents now live in the container
+        one.parked = std::move(now);
+        one.loaded = std::move(load);
+        one.swapped = true;
+        ++stats_.stashSwaps;
+        hold.held.push_back(std::move(one));
+    }
+    return hold;
+}
+
+void IntentHost::stashExit(StashHold& hold) {
+    if (!hold.active) return;
+    hold.active = false;
+    --stashDepth_;
+    for (StashHold::One& one : hold.held) {
+        std::vector<StoredItem> mine;
+        if (!deps_.eng->readItems(one.container, &mine)) {
+            ++stats_.stashFailed;
+            mine = FNV_MUT(414) ? std::vector<StoredItem>() : one.loaded;   // MUTANT 414: a failed read is taken as "empty" (the guest's gear is wiped). Real: assume nothing changed, still give the parked contents back
+        }
+        mine = normalizeItems(std::move(mine));
+        if (!one.swapped && mine.empty()) continue;   // nothing was parked and the interaction left it empty
+        if (!FNV_MUT(411)) stash_->put(one.container, hold.slot, mine);   // MUTANT 411: what the guest left in the container is not filed (it is lost to the parked contents)
+        if (FNV_MUT(404)) continue;   // MUTANT 404: the parked contents are not put back (the host's own gear stays gone / the guest's stays in the shared container)
+        if (!deps_.eng->replaceItems(one.container, one.parked)) {
+            ++stats_.stashFailed;
+            stash_->put(one.container, hold.slot, mine);   // could not clean up: the guest's stash is still filed, the container keeps a copy
+        }
+    }
+}
+
 Verdict IntentHost::decide(PlayerId slot, const Intent& in, bool /*legacy*/) {
     if (!kindEnabled(cfg_, in.kind) && !FNV_MUT(315)) return verdictOf(in, Result::Disabled);   // MUTANT 315: a switched-off kind still runs
     if (in.kind == Kind::ContainerClose) return doContainerClose(slot, in);
+    if (in.kind == Kind::SetStage) return doSetStage(slot, in);   // the target is a quest form, not a reference: no describe()
     TargetInfo t;
     if (!deps_.eng->describe(in.target, t) || !t.loaded) return verdictOf(in, Result::NotLoaded);
     // plugin/companions: somebody else's companion is not for this guest to use (its wheel opens on its owner's machine only)
@@ -177,6 +244,8 @@ Verdict IntentHost::dispatch(PlayerId slot, const Intent& in, const TargetInfo& 
         case Kind::ContainerOpen: return doContainerOpen(slot, in, t);
         case Kind::TriggerEnter: return doEvent(slot, in, t, ev::OnTriggerEnter);
         case Kind::TriggerLeave: return doEvent(slot, in, t, ev::OnTriggerLeave);
+        case Kind::TriggerStay: return doStay(slot, in, t);
+        case Kind::StartCombat: return doEvent(slot, in, t, ev::OnStartCombat);
         case Kind::Hit: return doEvent(slot, in, t, ev::OnHit);
         case Kind::TerminalUse: return doTerminal(slot, in, t);
         case Kind::DialogueStart: {
@@ -216,13 +285,23 @@ Verdict IntentHost::doPickUp(PlayerId slot, const Intent& in, const TargetInfo& 
     claims_[in.target] = Claim{slot, now()};
     claimOrder_.push_back(in.target);
     while (claimOrder_.size() > cfg_.claimMemory) { claims_.erase(claimOrder_.front()); claimOrder_.pop_front(); }
+    const bool note = t.note && !FNV_MUT(403);   // MUTANT 403: a note is granted as an inventory item (the pipboy never gets it, GetHasNote stays false)
     Result r = runScoped(slot, a, Kind::PickUp, in.target, [&](IActingScope& sc) {
-        if (!deps_.eng->disableRef(in.target)) return Result::Failed;   // it stays in the world for everybody
-        fnvcoop::AddItem grant;
-        grant.item = t.base;
-        grant.count = t.count;
-        grant.to = fnvcoop::Recipient::origin();   // the guest's inventory only, never the host's
-        sc.record(grant);
+        if (note) {
+            // A note is a journal entry, not an inventory item (G10): the host's journal gains it (so GetHasNote on the host, which quest scripts poll, is true) and the
+            // engine's AddNote hook records the shared AddNote effect into this scope, which reaches the guest and every other copy. First, so that a refusal leaves the
+            // note lying in the world for the next try.
+            if (!deps_.eng->addNote(t.base)) return Result::Failed;
+            if (!deps_.eng->disableRef(in.target)) return Result::Failed;   // already in the journal; the AddNote is idempotent, the ref stays for a retry
+            ++stats_.noteGrants;
+        } else {
+            if (!deps_.eng->disableRef(in.target)) return Result::Failed;   // it stays in the world for everybody
+            fnvcoop::AddItem grant;
+            grant.item = t.base;
+            grant.count = t.count;
+            grant.to = fnvcoop::Recipient::origin();   // the guest's inventory only, never the host's
+            sc.record(grant);
+        }
         deps_.eng->raiseEvent(a.ref, in.target, ev::OnAdd);   // OnAdd blocks of the item (quest items) run with the guest's puppet as `player`
         return Result::Executed;
     });
@@ -277,9 +356,13 @@ Verdict IntentHost::doContainerClose(PlayerId slot, const Intent& in) {
 }
 
 Verdict IntentHost::doEvent(PlayerId slot, const Intent& in, const TargetInfo& t, uint32_t mask) {
+    if (mask == ev::OnStartCombat) {
+        if (t.cls != TargetClass::Npc && t.cls != TargetClass::Creature) return verdictOf(in, Result::BadTarget);
+        if (t.dead && !FNV_MUT(408)) return verdictOf(in, Result::Denied);   // MUTANT 408: a dead actor "starts combat" (its blocks run on a corpse)
+    }
     if (mask == ev::OnHit && (t.cls == TargetClass::Npc || t.cls == TargetClass::Creature) && !FNV_MUT(316))   // MUTANT 316: actor hits run as well (double OnHit)
         return verdictOf(in, Result::Denied);
-    if (mask == ev::OnTriggerEnter) {
+    if (mask == ev::OnTriggerEnter || mask == ev::OnStartCombat) {
         auto key = std::make_pair(slot, in.target);
         auto it = lastTrigger_.find(key);
         if (it != lastTrigger_.end() && now() - it->second < cfg_.triggerCooldownMs && !FNV_MUT(317))   // MUTANT 317: no cooldown (standing in a volume re-fires)
@@ -289,11 +372,62 @@ Verdict IntentHost::doEvent(PlayerId slot, const Intent& in, const TargetInfo& t
     if (!pickActor(slot, in.kind, t.cls, &a)) return verdictOf(in, Result::NoPuppet);
     if (Result r = checkReach(a, t, in.kind); r != Result::Executed) return verdictOf(in, r);
     Result r = runScoped(slot, a, in.kind, in.target, [&](IActingScope&) { return deps_.eng->raiseEvent(a.ref, in.target, mask) ? Result::Executed : Result::Failed; });
-    if (r == Result::Executed && mask == ev::OnTriggerEnter) {
+    if (r == Result::Executed && (mask == ev::OnTriggerEnter || mask == ev::OnStartCombat)) {
         if (lastTrigger_.size() > 2048) lastTrigger_.clear();
         lastTrigger_[std::make_pair(slot, in.target)] = now();
     }
+    if (r == Result::Executed && mask == ev::OnTriggerEnter && cfg_.triggerStay) {   // from now on the host re-raises OnTrigger for this puppet every frame, like the engine does
+        auto key = std::make_pair(slot, in.target);
+        if (presence_.count(key) || presence_.size() < cfg_.stayMax) {
+            if (!presence_.count(key)) ++stats_.stayStarted;
+            presence_[key] = Presence{now(), 0};
+        }
+    }
+    if (mask == ev::OnTriggerLeave && !FNV_MUT(407)) presence_.erase(std::make_pair(slot, in.target));   // MUTANT 407: a player who left keeps getting OnTrigger
     return verdictOf(in, r);
+}
+
+// The guest's per-frame OnTrigger events arrive as one TriggerStay per `stay_keepalive_ms`. The host does not run the block once per message: it keeps the
+// (player, trigger) presence and raises OnTrigger for the puppet itself, every host frame (tick), until the guest says it left, stops refreshing (lease) or
+// leaves the session. Nothing runs here but the bookkeeping.
+Verdict IntentHost::doStay(PlayerId slot, const Intent& in, const TargetInfo& t) {
+    auto key = std::make_pair(slot, in.target);
+    auto it = presence_.find(key);
+    if (it == presence_.end()) {
+        if (presence_.size() >= cfg_.stayMax && !FNV_MUT(412)) {   // MUTANT 412: the table is unbounded (a flood makes the host raise thousands of events a frame)
+            ++stats_.stayDropped;
+            return verdictOf(in, Result::RateLimited);
+        }
+        Actor a;
+        if (!pickActor(slot, Kind::TriggerStay, t.cls, &a)) return verdictOf(in, Result::NoPuppet);
+        if (Result r = checkReach(a, t, Kind::TriggerStay); r != Result::Executed) return verdictOf(in, r);
+        presence_[key] = Presence{now(), 0};
+        ++stats_.stayStarted;
+    } else {
+        it->second.lastSeenMs = now();
+    }
+    return verdictOf(in, Result::Executed);
+}
+
+void IntentHost::raisePresence() {
+    if (presence_.empty()) return;
+    const uint64_t t = now();
+    std::vector<std::pair<PlayerId, FormRef>> gone;
+    for (auto& kv : presence_) {
+        Presence& p = kv.second;
+        if (t - p.lastSeenMs > cfg_.stayLeaseMs && !FNV_MUT(406)) { gone.push_back(kv.first); ++stats_.stayExpired; continue; }   // MUTANT 406: no lease (a guest whose Leave was lost is "inside" for ever)
+        if (cfg_.stayRaiseMs && p.lastRaiseMs && t - p.lastRaiseMs < cfg_.stayRaiseMs && !FNV_MUT(409)) continue;   // MUTANT 409: the interval is ignored
+        const PlayerId slot = kv.first.first;
+        const FormRef target = kv.first.second;
+        TargetInfo ti;
+        if (!deps_.eng->describe(target, ti) || !ti.loaded || ti.disabled) { gone.push_back(kv.first); ++stats_.stayDropped; continue; }
+        Actor a;
+        if (!pickActor(slot, Kind::TriggerStay, ti.cls, &a)) { gone.push_back(kv.first); ++stats_.stayDropped; continue; }
+        runScoped(slot, a, Kind::TriggerStay, target, [&](IActingScope&) { return deps_.eng->raiseEvent(a.ref, target, ev::OnTrigger) ? Result::Executed : Result::Failed; }, false);   // no stash swap: this runs every frame
+        p.lastRaiseMs = t;
+        ++stats_.stayRaises;
+    }
+    for (const auto& k : gone) presence_.erase(k);
 }
 
 Verdict IntentHost::doTerminal(PlayerId slot, const Intent& in, const TargetInfo& t) {
@@ -309,12 +443,53 @@ Verdict IntentHost::doTerminal(PlayerId slot, const Intent& in, const TargetInfo
     return verdictOf(in, r);
 }
 
+// A guest's script or console tried to advance a quest. The guest applied nothing. The host judges it like the engine would judge its own script:
+//   - the stage must be a real advance (the shadow merge is max and the engine's SetStage only raises); a request for a stage the quest already
+//     reached is the host's own copy of the same script having got there first, and it must not run the stage's result scripts a second time;
+//   - the host's rules get their say through the engine's stage gate (barrier / tether: Deferred, released by the host later) and through allowStage
+//     (ExclusiveStages: a losing outcome is refused up front, Denied);
+//   - the stage runs as the guest (acting player = their puppet), so rewards and journal entries route by origin like any other intent.
+// Every refusal is counted and reported through HostDeps::stageRefused (the module writes a log line), never silent.
+Verdict IntentHost::doSetStage(PlayerId slot, const Intent& in) {
+    if (in.value <= 0 || in.value > 255) { ++stats_.stagesBad; return verdictOf(in, Result::BadTarget); }
+    const uint32_t stage = static_cast<uint32_t>(in.value);
+    int32_t cur = 0;
+    if (!deps_.eng->questStage(in.target, &cur)) return verdictOf(in, Result::NotLoaded);
+    auto refuse = [&](Result r) {
+        if (deps_.stageRefused && !FNV_MUT(336)) deps_.stageRefused(slot, in.target, stage, r);   // MUTANT 336: a refused guest stage is dropped without a word
+        return verdictOf(in, r);
+    };
+    if (cur >= static_cast<int32_t>(stage) && !FNV_MUT(333)) {   // MUTANT 333: a stage the quest already reached runs its result scripts again (double rewards)
+        ++stats_.stagesNoAdvance;
+        return refuse(Result::NoAdvance);
+    }
+    if (deps_.allowStage && !FNV_MUT(334) && !deps_.allowStage(slot, in.target, stage)) {   // MUTANT 334: the policy question is never asked
+        ++stats_.stagesRefused;
+        return refuse(Result::Denied);
+    }
+    Actor a;
+    if (!pickActor(slot, Kind::SetStage, TargetClass::Unknown, &a)) return verdictOf(in, Result::NoPuppet);
+    IIntentEngine::StageOutcome out = IIntentEngine::StageOutcome::Failed;
+    Result r = runScoped(slot, a, Kind::SetStage, in.target, [&](IActingScope&) {
+        out = deps_.eng->setStage(in.target, stage);
+        return out == IIntentEngine::StageOutcome::Failed ? Result::Failed : Result::Executed;
+    });
+    if (r == Result::Executed && out == IIntentEngine::StageOutcome::Deferred && !FNV_MUT(335)) {   // MUTANT 335: a held stage is reported as done
+        ++stats_.stagesDeferred;
+        return refuse(Result::Deferred);
+    }
+    if (r == Result::Executed) { ++stats_.stagesApplied; return verdictOf(in, Result::Executed); }
+    ++stats_.stagesFailed;
+    return refuse(r);
+}
+
 void IntentHost::tick() {
     const uint64_t t = now();
     for (auto it = locks_.begin(); it != locks_.end();) {
         if (t - it->second.refreshedMs > cfg_.lockLeaseMs) { it = locks_.erase(it); ++stats_.lockExpired; }
         else ++it;
     }
+    raisePresence();
 }
 
 void IntentHost::playerLeft(PlayerId slot) {
@@ -325,6 +500,11 @@ void IntentHost::playerLeft(PlayerId slot) {
         }
     }
     slots_.erase(slot);
+    lastMode_.erase(slot);
+    for (auto it = presence_.begin(); it != presence_.end();) {
+        if (it->first.first == slot) it = presence_.erase(it);
+        else ++it;
+    }
     for (auto it = lastTrigger_.begin(); it != lastTrigger_.end();) {
         if (it->first.first == slot) it = lastTrigger_.erase(it);
         else ++it;
@@ -336,6 +516,7 @@ void IntentHost::worldReset() {
     claimOrder_.clear();
     locks_.clear();
     lastTrigger_.clear();
+    presence_.clear();
 }
 
 std::vector<IntentHost::LockInfo> IntentHost::locks() const {
@@ -350,6 +531,11 @@ std::string IntentHost::statusJson() const {
       << ",\"duplicates\":" << stats_.duplicates << ",\"badDatagrams\":" << stats_.badDatagrams << ",\"verdictsSent\":" << stats_.verdictsSent
       << ",\"verdictsFailed\":" << stats_.verdictsFailed << ",\"actedAs\":{\"puppet\":" << stats_.actedAsPuppet << ",\"ghost\":" << stats_.actedAsGhost
       << ",\"standIn\":" << stats_.actedAsStandIn << "},\"reach\":{\"checked\":" << stats_.reachChecked << ",\"unchecked\":" << stats_.reachUnchecked
+      << "},\"stage\":{\"applied\":" << stats_.stagesApplied << ",\"noAdvance\":" << stats_.stagesNoAdvance << ",\"refused\":" << stats_.stagesRefused
+      << ",\"deferred\":" << stats_.stagesDeferred << ",\"failed\":" << stats_.stagesFailed << ",\"bad\":" << stats_.stagesBad
+      << "},\"stay\":{\"present\":" << presence_.size() << ",\"started\":" << stats_.stayStarted << ",\"raises\":" << stats_.stayRaises << ",\"expired\":" << stats_.stayExpired
+      << ",\"dropped\":" << stats_.stayDropped << "},\"notes\":" << stats_.noteGrants << ",\"stash\":{\"containers\":" << (stash_ ? stash_->entries().size() : 0u)
+      << ",\"filed\":" << (stash_ ? stash_->stashes() : 0u) << ",\"swaps\":" << stats_.stashSwaps << ",\"kept\":" << stats_.stashKept << ",\"failed\":" << stats_.stashFailed
       << "},\"scriptsSkipped\":" << stats_.scriptsSkipped << ",\"claims\":{\"won\":" << stats_.claimsWon << ",\"lost\":" << stats_.claimsLost
       << ",\"held\":" << claims_.size() << "},\"locks\":{\"granted\":" << stats_.lockGrants << ",\"busy\":" << stats_.lockBusy << ",\"expired\":"
       << stats_.lockExpired << ",\"released\":" << stats_.lockReleased << ",\"held\":" << locks_.size() << "},\"redirects\":" << stats_.redirects

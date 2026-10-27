@@ -33,6 +33,26 @@ struct Mutations {
     bool forcedNoDedupe = false;      // a re-delivered ForcedLines is shown again
     bool skipConsent = false;         // party-consent prompts resume the script on the origin's answer alone
     bool menuToSpectators = false;    // spectators receive the interactive MenuRequest (can answer it)           // a rejoining client keeps its stale Initiator/Spectator role
+    // --- round 5 (campaign fix wave 1, P3: guest dialogue end to end)
+    bool dlgReadWrongInfo = false;    // the response reader trusts the engine cache even when it holds another INFO's chain
+    bool sayOnceNeverShared = false;  // watching a line never marks the INFO said (player B can repeat player A's Speech success)
+    bool sayOnceAllShared = false;    // trainer / Speech-XP lines are shared too (only the first player gets them)
+    bool sayOnceKeepHostMark = false; // the host keeps the said-mark its RunResultScript made for a guest's per-player line
+    bool pollNoPick = false;          // the menu poller never reports the chosen INFO (the host never learns the pick)
+    bool pollPickEveryFrame = false;  // the menu poller re-reports the spoken INFO every frame (duplicate picks)
+    bool pollNoLineDone = false;      // the menu poller never reports the end of a line (the gate waits for the timeout)
+    bool pollLeaveAfterGoodbye = false; // closing the menu after a finished goodbye line is also reported as the player leaving
+    bool nonOwnerPicksCommand = false;// the glue lets a non-owner send an owner-only companion command
+    bool noCompanionCanon = false;    // a companion known under several forms (base, placed refs) is tracked per form: ownership is lost
+    bool forcedHostReplays = false;   // the host replays a scripted line its own engine already played (double subtitles and voice)
+    // --- G08 choice consent (D3: party vote, the host breaks ties; points of no return need everybody)
+    bool voteIsUnanimous = false;     // a party vote needs every player to agree (one "not yet" kills a story fork)
+    bool voteNoHostTieBreak = false;  // a tied vote is declined instead of the host deciding
+    bool voteTimeoutApproves = false; // the consent window running out approves the choice
+    bool noChoiceConsent = false;     // a fork INFO runs its scripts at the pick, before the party was asked
+    bool denyKeepsSaid = false;       // a denied fork leaves the INFO marked as said for the initiator (the choice is gone for good)
+    bool actorAsksParty = false;      // a personal decision (Caesar's surgery, a trooper's treatment) is put to a vote too
+    bool hostTalkSilent = false;      // the host player's own conversation is not shown to the other players
 };
 inline Mutations& mutations() {
     static Mutations m;

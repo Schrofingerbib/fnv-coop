@@ -577,6 +577,7 @@ bool exclusiveStagesHold() {
     ok &= r.host.commit(0, quest("Fork"), {SetStage{q, 110}}) != 0;
     ok &= r.host.commit(1, quest("Fork"), {SetStage{q, 120}}) == 0;              // a racing outcome loses
     ok &= r.host.state().stages.at(q) == 110;
+    ok &= eng.stageExcluded(q, 120) && !eng.stageExcluded(q, 110) && !eng.stageExcluded(q, 200);   // the guest-stage policy question (plugin/intents SetStage)
     ok &= r.host.commit(0, quest("Fork"), {SetStage{q, 110}}) == 0 || r.host.state().stages.at(q) == 110;   // the same outcome again is harmless
     ok &= r.host.commit(0, quest("Fork"), {SetStage{q, 200}}) != 0;              // progress beyond the fork is fine
     ok &= r.host.commit(1, quest("Fork"), {SetStage{q, 130}}) == 0;              // and the fork stays decided

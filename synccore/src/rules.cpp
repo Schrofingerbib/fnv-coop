@@ -782,6 +782,17 @@ double RulesEngine::reduceCondition(const FormRef& quest, const std::string& fun
     return initiatorValue();
 }
 
+bool RulesEngine::stageExcluded(const FormRef& quest, uint32_t stage) const {
+    if (mutations().rulesDisabled || mutations().exclusiveLastWins) return false;
+    const QuestRules* sq = rulesFor(quest);
+    const Rule* ex = sq ? sq->findFor("ExclusiveStages", stage) : nullptr;
+    if (!ex) return false;
+    auto w = exclusiveWinner_.find(quest);
+    if (w != exclusiveWinner_.end()) return w->second != stage;
+    auto st = host_.state().stages.find(quest);   // an outcome committed before this engine started counts (same rule as filter)
+    return st != host_.state().stages.end() && ex->appliesToStage(st->second) && st->second != stage;
+}
+
 void RulesEngine::filter(EffectTxn& t) {
     if (mutations().rulesDisabled) return;
     // ExclusiveStages: alternative outcomes (rescued / failed, three endings) are not progress. The first one committed wins in host order;

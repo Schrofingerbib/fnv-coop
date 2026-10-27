@@ -84,6 +84,13 @@ public:
     // Corpse decoration from a death declaration (crippled limbs show on the body). Only called once the actor is dead here.
     virtual bool decorateCorpse(uint32_t ref, uint8_t limbMask) = 0;
     virtual bool isDead(uint32_t ref) = 0;
+    // The engine's LIFE STATE says dying / dead (Actor+0x108 = 1 or 2). isDead() also answers true for an actor whose health is <= 0 but whose life state
+    // never flipped (a lethal VATS hit: the engine takes the health off and runs the death later, or not at all); only a life state death is declared by
+    // the actor port's poll, so only this one lets the owner skip the kill. Default: isDead (an engine without the distinction).
+    virtual bool lifeDead(uint32_t ref) { return isDead(ref); }
+    // The owner makes a victim dead that an accepted lethal hit left standing (the engine's float health kept a sliver the rounded health did not
+    // show, the replay was reduced by armour ...). The actor port then sees the death and declares it. false = could not (default: no engine).
+    virtual bool killActor(uint32_t /*victimRef*/) { return false; }
     // Kill XP. killXpOf returns the XP value of the victim, -1 = unknown (then no award; TODO-RE: the engine's per-victim XP).
     virtual int32_t killXpOf(uint32_t victimRef) = 0;
     virtual bool awardXp(int32_t xp) = 0;              // the LOCAL player only

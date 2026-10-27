@@ -26,7 +26,7 @@ def prefs_errors(rendered: str) -> list:
         errs.append("the game's low.ini preset was not applied")
     if "fdefaultfov=75" not in low:
         errs.append("Fallout_default.ini was not the base")
-    if "isize w=640" not in low:
+    if "isize w=1280" not in low:
         errs.append("the instance display edits were not applied")
     return errs
 

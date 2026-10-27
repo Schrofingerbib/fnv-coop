@@ -37,6 +37,10 @@ public:
     // the old puppet (reconnect): the old ref is deleted, never left behind.
     bool AddPlayer(Slot slot, const Appearance& a);
     void RemovePlayer(Slot slot);
+    // This machine's own slot, known once the session has assigned it (a client joins as slot 1, 2, ...; the ini default is 0). The local
+    // slot never gets a puppet: a puppet that already exists for it is removed.
+    void SetLocalSlot(Slot slot);
+    Slot LocalSlot() const { return cfg_.localSlot; }
     void SetEquipment(Slot slot, const std::vector<EquipEntry>& wanted);
     // A changed look of a known player: same template (race / sex) = applied to the live puppet without a respawn; another template = a new
     // puppet (AddPlayer, equipment kept). False when the slot has no puppet.
@@ -54,7 +58,8 @@ public:
     RefId RefOf(Slot slot) const;                     // 0 = no usable puppet right now
     std::optional<Slot> SlotOf(RefId ref) const;
     std::vector<std::pair<Slot, RefId>> LivePuppets() const;   // every slot with a usable puppet right now, ascending by slot
-    // Where the engine says the puppet really is (for live::InterpBuffer::sample's ActualPose). False when none.
+    // Where the engine says the puppet really is (for live::InterpBuffer::sample's ActualPose). False when none. A place farther
+    // than Config::driftUnits from the last applied one is a push, not a place to ease from: the applied place is reported.
     bool ActualPose(Slot slot, CellId& cell, Vec3& pos) const;
 
     // ---- introspection (tests, bridge) -----------------------------------------------------------------------------
@@ -86,6 +91,7 @@ private:
         Vec3 appliedPos;
         float appliedYaw = 0;
         bool haveApplied = false;
+        bool posConfirmed = false;         // the engine place was seen within driftUnits of appliedPos since the last (re)spawn / cell move
         uint32_t appliedAt = 0;
         bool forcePose = false;
         uint32_t unloadedSince = 0;
@@ -119,13 +125,14 @@ private:
     void Purge();
     FormId ChooseTemplate(const Appearance& a) const;
     bool Budget(unsigned n = 1);
+    Vec3 MakeRoom(CellId cell, const Vec3& want, const Vec3& from, bool haveFrom);
     void Log(const std::string& s) const { if (log_) log_(s); }
 
     IPuppetEngine& e_;
     Config cfg_;
     AnimConfig animCfg_;
     std::map<Slot, Puppet> puppets_;
-    Stats stats_;
+    mutable Stats stats_;   // mutable: ActualPose (const) counts the pushes it hides
     std::function<void(const std::string&)> log_;
     uint64_t nextGen_ = 1;
     uint32_t worldEpoch_ = 0;
@@ -134,6 +141,9 @@ private:
     bool prevMenu_ = false;
     unsigned callsLeft_ = 0;
     uint32_t tickNo_ = 0;
+    bool localRead_ = false, haveLocal_ = false;   // the local player's place, read at most once per Tick
+    CellId localCell_ = 0;
+    Vec3 localPos_;
     std::map<Slot, RefId> staleMap_;   // only used by the staleMapEntries fault
 };
 

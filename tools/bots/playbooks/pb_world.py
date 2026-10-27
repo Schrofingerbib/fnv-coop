@@ -68,6 +68,18 @@ class DoorTerminalLockPlaybook(Playbook):
             ctx.must(P.close_container(client.bot, box), "client closes the box")
 
 
+def travel_mode(m: Machine) -> object:
+    """True when the machine's world-time module runs fast travel as a party decision (worldtime.status partyTravel; a client reports the
+    host's last beacon), False when it is free, the error text when the module does not answer."""
+    try:
+        r = m.bot.nv.call("worldtime.status", {}, timeout_s=15.0)
+    except Exception as e:      # module off, or an old build
+        return f"worldtime.status: {e}"
+    if not isinstance(r, dict) or not r.get("enabled", True):
+        return "world-time module off"
+    return bool(r.get("partyTravel"))
+
+
 class FastTravelTetherPlaybook(Playbook):
     name = "fast_travel_tether"
     summary = "Fast travel needs party consent and no combat; a tethered player cannot wander off."
@@ -100,6 +112,20 @@ class FastTravelTetherPlaybook(Playbook):
                 ctx.settle()
                 ctx.same_everywhere("hostile alive", lambda m: m.bot.target_alive(hostile))
                 ctx.expect(not host.bot.target_alive(hostile), "hostile survived 12 volleys")
+        with ctx.step("fast travel is a party decision here", compare=False):
+            # The game ships with [worldtime] travel=free (a trip needs no consent), so "without consent is refused" below only holds when the
+            # test session runs travel=party (manifest ini worldtime.travel=party, plus coop.dialogue=1 for the question itself). Say that
+            # first instead of reporting a sync bug: in the 2026-10-22 in-game sweep the host simply travelled because the mode was free.
+            deadline = ctx.clock.now() + ctx.budget(10.0)         # a client learns the mode from the host's next beacon
+            modes: dict = {}
+            while True:
+                modes = {m.name: travel_mode(m) for m in ctx.machines}
+                if all(v is True for v in modes.values()) or ctx.clock.now() >= deadline:
+                    break
+                ctx.pause(0.5)
+            ctx.expect(all(v is True for v in modes.values()),
+                       f"fast travel is not set to party consent on every machine ({modes}); start the game with [worldtime] travel=party "
+                       "(and [coop] dialogue=1 for the question)")
         with ctx.step("fast travel without consent is refused", compare=False):
             r = host.bot.fast_travel(marker)
             ctx.expect(not r, "fast travel went ahead without the other players' consent")

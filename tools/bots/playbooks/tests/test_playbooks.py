@@ -198,8 +198,85 @@ class Twins(unittest.TestCase):
         self.assertIn("stage", r.reason)
         r, _ = run("fast_travel_tether", bugs={"tether_off"})
         self.assertIn("tether", r.reason)
+        r, _ = run("fast_travel_tether", bugs={"travel_mode_free"})
+        self.assertIn("not set to party consent", r.reason)       # a config problem is named, not reported as a consent bug
+        self.assertNotIn("without the other players' consent", r.reason)
         r, _ = run("ownership_handoff", bugs={"flap_owner"})
         self.assertIn("flapped", r.reason)
+
+
+class PlacementWalks(unittest.TestCase):
+    """In game 2026-10-22 the avatar of client1 stood still 857 units from the container (container_share) and 220 / 608 units from the
+    patrolling NPC (pnr_vote_guest_declines); walks stuck elsewhere too. Walking there is only placement for the checks that follow, so a
+    stuck or timed-out walk teleports and leaves a note (pb_combat.goto_or_teleport); the walk's own tolerance is unchanged."""
+
+    CASES = (("container_share", "pb_loot"), ("loot_race", "pb_loot"), ("pnr_vote", "pb_story"), ("pnr_vote_guest_declines", "pb_story"))
+
+    def go(self, name, mod, no_fallback=False, **flags):
+        import importlib
+        m = importlib.import_module("playbooks." + mod)
+        e = registry.REGISTRY[name]
+        w, refs = e.fake(e.players, set())
+        for k, v in flags.items():
+            setattr(w, k, v)
+        d = tempfile.mkdtemp(prefix="t6b-")
+        atexit.register(shutil.rmtree, d, True)
+        w.flight_dir = os.path.join(d, "flight")
+        lines = []
+        orig = m.goto_or_teleport
+        if no_fallback:        # twin: the old placement, a plain walk
+            m.goto_or_teleport = lambda ctx, mc, ref, dist: mc.bot.goto_ref(ref, dist)
+        try:
+            r = core.run_playbook(registry.make(name, REPO), fakecoop.make_machines(w), fakecoop.FakeComparer(), d, refs, dict(OPTS), log=lines.append)
+        finally:
+            m.goto_or_teleport = orig
+        return r, lines
+
+    def test_a_stuck_or_timed_out_walk_still_places_the_players(self):
+        for name, mod in self.CASES:
+            for flag in ("walk_blocked", "walk_times_out"):
+                with self.subTest(name=name, flag=flag):
+                    r, lines = self.go(name, mod, **{flag: True})
+                    self.assertTrue(r.ok, f"{name}: {r.reason}")
+                    self.assertTrue(any("did not arrive" in n and "teleported" in n for n in lines), lines)
+
+    def test_twin_the_plain_walk_fails_the_playbook_at_the_placement_step(self):
+        for name, mod in self.CASES:
+            with self.subTest(name):
+                r, _ = self.go(name, mod, no_fallback=True, walk_blocked=True)
+                self.assertFalse(r.ok, f"{name} passed with a blocked walk and no fallback")
+                self.assertIn("walks to", r.reason)
+
+
+class FightStandoff(unittest.TestCase):
+    """In game under Proton 2026-10-25 the fight stopped at "both kill raider 1": the scenario's setup MoveTo had put the host on the
+    raider, gather() left it there (within its 600 units) and Bot.aim_at refused, "too_close: the player is 4 units from the target
+    (minimum 100)". volley() now steps every shooter back first (pb_enemy.standoff), as enemy_fight already did."""
+
+    def go(self, no_standoff=False):
+        from playbooks import pb_enemy
+        e = registry.REGISTRY["fight"]
+        w, refs = e.fake(e.players, set())
+        w.stand_on_target, w.aim_min_dist = True, 100.0       # the in-game situation: players on the raider, the real aim limit
+        d = tempfile.mkdtemp(prefix="t6b-")
+        atexit.register(shutil.rmtree, d, True)
+        w.flight_dir = os.path.join(d, "flight")
+        orig = pb_enemy.standoff
+        if no_standoff:        # twin: the old volley, which shot from wherever the placement left the player
+            pb_enemy.standoff = lambda ctx, target, shooters: None
+        try:
+            return core.run_playbook(registry.make("fight", REPO), fakecoop.make_machines(w), fakecoop.FakeComparer(), d, refs, dict(OPTS))
+        finally:
+            pb_enemy.standoff = orig
+
+    def test_players_on_the_raider_step_back_and_the_fight_passes(self):
+        r = self.go()
+        self.assertTrue(r.ok, r.reason)
+
+    def test_twin_without_the_standoff_the_fight_fails_too_close(self):
+        r = self.go(no_standoff=True)
+        self.assertFalse(r.ok, "the fight passed with the players standing on the raider")
+        self.assertIn("too_close", r.reason)
 
 
 CHAOS = dict(chaos_adapter.relaxed_options("bad_wifi"), settle_s=0.3, ui_s=0.2, barrier_s=0.3, stage_s=0.3,

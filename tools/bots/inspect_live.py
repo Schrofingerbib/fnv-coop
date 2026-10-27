@@ -75,7 +75,7 @@ class ReadOnlyBridge:
         return self._nv.plugins()
 
     def eval(self, expr: str, ref: Optional[str] = None) -> float:
-        m = re.match(r"\s*(?:player\.)?(\w+)", expr)
+        m = re.match(r"\s*\(?\s*(?:player\.)?(\w+)", expr)      # "(player.GetEquippedObject 5) && 1" opens with a bracket
         if not m or m.group(1).lower() not in READ_ONLY_EVAL:
             raise ReadOnlyViolation(f"expression {expr!r} is not a known getter")
         self.calls.append("eval " + expr)

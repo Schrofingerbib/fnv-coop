@@ -30,9 +30,17 @@ SUITES = [
     ("lint split string literals", [sys.executable, "-I", "tools/lint/fix_newline_literals.py", "--check"], False, NO),
     ("lint tool tests (+ twin)", [sys.executable, "-I", "tools/lint/test_fix_newline_literals.py", "--twin"], False, NO),
     ("lint every Python file parses", [sys.executable, "-I", "tools/lint/check_py_compiles.py"], False, NO),
+    ("lint loot service is in the live hub (+ twins)", [sys.executable, "-I", "tools/lint/check_loot_wiring.py", "--self-test"], False, NO),
+    ("lint loot service wiring", [sys.executable, "-I", "tools/lint/check_loot_wiring.py"], False, NO),
+    ("lint host engine readers are wired (+ twins)", [sys.executable, "-I", "tools/lint/check_host_readers_wiring.py", "--self-test"], False, NO),
+    ("lint host engine readers wiring", [sys.executable, "-I", "tools/lint/check_host_readers_wiring.py"], False, NO),
+    ("lint workflow inputs stay out of run scripts, soak seed and count checked (+ twins)", [sys.executable, "-I", "tools/lint/check_workflow_inputs.py", "--self-test"], False, NO),
+    ("lint workflow inputs", [sys.executable, "-I", "tools/lint/check_workflow_inputs.py"], False, NO),
+    ("lint CI plugin artifact holds what provision installs, the Proton doc downloads it by name, only from the commit's own run (+ 13 twins)", [sys.executable, "-I", "tools/lint/check_plugin_artifact.py", "--self-test"], False, NO),
+    ("lint CI plugin artifact", [sys.executable, "-I", "tools/lint/check_plugin_artifact.py"], False, NO),
     ("test_all preflight", [sys.executable, "-I", "tools/test_all_selftest.py"], False, NO),
     ("canonical nvcoop.dll build", ["cmd", "/c", r"tools\runner\build_l1.cmd"], True, CM),
-    ("T5 chaos box", [sys.executable, "-I", "tools/chaos/run_tests.py"], False, NO),
+    ("T5 chaos box (+ chaos_pair: a pair joined through the relay)", [sys.executable, "-I", "tools/chaos/run_tests.py"], False, NO),
     ("L3 questdata", [sys.executable, "-I", "tools/questdata/run_tests.py"], False, NO),
     ("L7 snapshot", [sys.executable, "-I", "plugin/snapshot/tools/run_tests.py", "--no-engine"], False, MS_OPT),
     ("L9 coverage", [sys.executable, "-I", "tools/coverage/run_tests.py"], False, NO),
@@ -43,9 +51,13 @@ SUITES = [
     ("Enemy sync tests: fight, handoff, spawn, corpse loot (fake world + twins, load-robust clock)", [sys.executable, "-I", "tools/bots/playbooks/tests/run_enemy_tests.py"], False, NO),
     ("Questline sweeps: 17 plans, two-copy playthrough playbooks (fake world + twins), rules overlay", [sys.executable, "-I", "tools/questsweep/run_tests.py"], False, NO),
     ("T4a warm pool", [sys.executable, "-I", "tools/pool/run_tests.py"], False, NO),
+    ("Lab plugin generator NVCoopLab.esp: TES4 reader/writer, real-esm layout proofs, generated plugin + layout.json, installer (+ 22 twins; the game-file part skips without FalloutNV.esm)", [sys.executable, "-I", "tools/lab/esp/run_tests.py"], False, NO),
     ("Live wiring in-game proof (selftest + injected defects)", [sys.executable, "-I", "tools/runner/live_wiring_proof.py", "--selftest"], False, NO),
     ("Release: installer, uninstaller, packager (fake game folder + twins)", [sys.executable, "-I", "tools/installer/run_tests.py"], False, NO),
     ("Release: launcher (settings, nvcoop.ini, port checks, start; + twins)", [sys.executable, "-I", "tools/launcher/run_tests.py"], False, NO),
+    ("Proof harness: prove.py classifier, packet, ledger, owner-PC safety, --pairs scheduler, RAM guard (fake worlds, stub runners + 22 twins)", [sys.executable, "-I", "tools/proof/tests/run_tests.py"], False, NO),
+    ("Lab runner (rooms on a fake two-copy world, one test per fake bug, fail fast, time boxes, summary.md under 5 KB + 7 twins)", [sys.executable, "-I", "tools/lab/run_tests.py"], False, NO),
+    ("Proof drivers: release .cmd scripts, launcher loopback, public tree build, split-screen smoke (fake runners, damaged-release and launcher-fault twins + 5 twins)", [sys.executable, "-I", "tools/proof/drivers/tests/run_tests.py"], False, NO),
     ("T4b scenarios", [sys.executable, "-I", "-X", "utf8", "tools/scenarios/run_tests.py"], False, NO),
     ("T1b flight analyzer (fast)", [sys.executable, "-I", "tools/flight/run_tests.py"], False, NO),
     ("T1b flight analyzer (full + mutation twin)", [sys.executable, "-I", "tools/flight/run_tests.py", "--full"], True, NO),
@@ -88,6 +100,13 @@ SUITES = [
     ("social-core (companions, crime, kill rewards: rules + 66 runtime twins)", ["cmd", "/c", r"synccore\social\run_tests.cmd"], True, CM),
     ("companions-crime (SocialSync on 3 machines: companions, crime, kill rewards + 28 twins)", ["cmd", "/c", r"plugin\companions\run_tests.cmd"], True, CM),
     ("companions-crime in-game proof checker (selftest)", [sys.executable, "-I", "plugin/companions/proof/social_proof.py", "--selftest"], False, NO),
+    ("Readiness wait shared by prove.py and the proof scripts (+ twins, wiring of every script)", [sys.executable, "-I", "tools/runner/tests/test_nvready.py"], False, NO),
+    ("Steam libraries off Windows: the runner finds the game and its Proton prefix (fake Deck + 6 twins)", [sys.executable, "-I", "tools/runner/tests/test_steamlib.py"], False, NO),
+    ("NPC pick for the in-game NPC proofs: loaded NPC or the nearest one, runtime ids (+ 7 twins)", [sys.executable, "-I", "tools/runner/tests/test_npc_pick.py"], False, NO),
+    ("Proton launch scripts: Steam launch option and in-session runner (stubbed Steam client + 7 twins)", [sys.executable, "-I", "tools/runner/tests/test_proton_scripts.py"], False, NO),
+    ("provision --no-pad: copies ignore game controllers, the low-cost restore keeps it or stops (+ 6 twins)", [sys.executable, "-I", "tools/runner/tests/test_no_pad.py"], False, NO),
+    ("loot in-game proof checker (selftest + late-session twin)", [sys.executable, "-I", "plugin/loot/tools/loot_proof.py", "--selftest"], False, NO),
+    ("world-time in-game proof checker (selftest + press-blind twin)", [sys.executable, "-I", "plugin/world_time/tools/worldtime_proof.py", "--selftest"], False, NO),
     ("T1a flight recorder", ["cmd", "/c", r"plugin\flight\run_tests.cmd"], True, CM),
     ("T3b reload state", ["cmd", "/c", r"plugin\reload\run_tests.cmd"], True, CM),
     ("T3a loader", ["cmd", "/c", r"plugin\loader\run_tests.cmd"], True, CM),
@@ -103,19 +122,8 @@ SUITES = [
 
 import re
 
-# Public export: suites that need your own game install or generated game data skip with a reason instead of failing.
-def _data(*parts):
-    return (ROOT.joinpath(*parts)).exists()
-
-
-NEEDS = {
-    "L6 nvmp sigs (pinned 9.4)": (lambda: _data("third_party", "nvmp", "nvmp", "client.dll"),
-                                  "needs your own NV:MP 9.4 client.dll under third_party/nvmp/nvmp/"),
-    "L8 dialogue": (lambda: _data("out", "questdata", "risk.json"),
-                    "needs out/questdata (python -I tools/questdata/run_all.py) and an MSVC x86 toolchain"),
-}
-
 MUTANT = os.environ.get("TEST_ALL_MUTANT", "")
+WINDOWS = sys.platform == "win32"   # MSVC and the build scripts (vcvars, build_l1.cmd) exist on Windows only
 
 # Public export: suites that need your own game install or generated game data skip with a reason instead of failing.
 # Each list holds every file the suite opens (found by reading its loaders and by tracing a run). A partial
@@ -140,6 +148,12 @@ NEEDS = {
     "T4b scenarios": (tuple(QD + f for f in ("forms.json.gz", "quests.json", "dials.json.gz", "infos.jsonl.gz",
                                              "m1_goodsprings.json", "scenarios/VCG02.json")), QUESTDATA),
 }
+
+
+# Suites that drive Windows processes themselves (kernel32 through ctypes, taskkill, the mbcs codec, C:\ paths), not
+# through MSVC: off Windows they skip with this reason instead of failing on the missing API. Empty now: the proof harness
+# answers from /proc off Windows (tools/proof/pf_safety.py, pf_crash.py), so its fake-world tests run on Linux too.
+WINDOWS_ONLY = {}
 
 
 def missing_data(name: str) -> list:
@@ -194,6 +208,10 @@ def decide(name: str, slow: bool, tools: tuple, quick: bool, problems: dict):
     if missing:
         shown = ", ".join(missing[:3]) + (f" and {len(missing) - 3} more" if len(missing) > 3 else "")
         return "skip", f"{NEEDS[name][1]}. Missing: {shown}"
+    if not WINDOWS and MUTANT != "no_platform_skip" and any(t in ("cmake", "msvc") for t in required_tools(slow, tools)):
+        return "skip", f"needs the MSVC/CMake toolchain, which is Windows only (this is {sys.platform})"
+    if not WINDOWS and MUTANT != "no_platform_skip" and name in WINDOWS_ONLY:
+        return "skip", f"{WINDOWS_ONLY[name]}, which is Windows only (this is {sys.platform})"
     reasons = [problems[t] for t in required_tools(slow, tools) if problems.get(t)]
     if reasons:
         return "fail", ". ".join(reasons)
@@ -229,6 +247,7 @@ EXTRA_DEPS = {
     "L4 synccore": ("synccore/",),
     "repo hygiene (": ("synccore/", "plugin/", "tools/lint/"),
     "T2b simfuzz": ("synccore/", "tools/simfuzz/", "scenarios/simfuzz/"),
+    "NPC pick for": ("tools/actors/", "tools/animcheck/npc_proof.py"),   # the scripts that must use it (Wiring)
     "Enemy sync tests": ("tools/animcheck/", "tools/scenarios/", "scenarios/goodsprings_enemies.json"),   # thresholds, scenario validator, the scenario file
 }
 
@@ -295,6 +314,8 @@ def select_affected(files=None, base: str = "HEAD") -> list:
 def preflight(quick: bool, names=None) -> dict:
     """Checks only the tools that the suites of this run need (`names`: the suites picked by --affected / --only; default all).
     Prints one line per tool. Returns tool -> problem."""
+    if not WINDOWS and MUTANT != "no_platform_skip":
+        return {}   # decide() skips every suite that needs the toolchain, with the reason; nothing to check here
     users = {}
     for name, _, slow, tools in SUITES:
         if names is not None and name not in names:
@@ -351,10 +372,13 @@ def main() -> int:
             print(f"FAIL {name}: {reason}")
             failed.append(name)
             continue
-        need = NEEDS.get(name)
-        if need and not need[0]():
-            print(f"SKIP {name}: {need[1]}")
-            continue
+        # The data check is decide()'s (missing_data). A second check here called NEEDS[name][0]() from an older NEEDS of lambdas, and
+        # NEEDS now maps to file lists: with out/questdata present every data suite died on "'tuple' object is not callable".
+        if MUTANT == "stale_needs_check":  # twin: the old check
+            need = NEEDS.get(name)
+            if need and not need[0]():
+                print(f"SKIP {name}: {need[1]}")
+                continue
         t0 = time.time()
         p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, errors="replace")
         out = p.stdout + p.stderr
