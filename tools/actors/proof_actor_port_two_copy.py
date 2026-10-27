@@ -42,6 +42,7 @@ ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT / "tools" / "runner"))
 from proof_actor_port import NotReady, Result  # noqa: E402
+import npc_pick  # noqa: E402
 
 DEFAULT_AWAY_REF = "FalloutNV.esm:09289B"   # NovacMapMarker, the destination of scenarios/ownership_handoff.json (far from Goodsprings)
 JUMP_UNITS = 350.0          # largest NPC step between two samples that still counts as walking (same number as the ownership playbook)
@@ -49,6 +50,7 @@ CROSS_UNITS = 200.0         # the two copies of the NPC must end this close to e
 POLL_S = 0.25
 SETTLE_SAMPLES = 3          # samples that must agree after a handoff before it is judged
 WIRING_TIMEOUT_S = 30.0
+NPC_WAIT_S = 60.0           # a fresh jump registers the NPCs of its cell with coop.owner late; the hint --ref is only tried first
 FLIP_TIMEOUT_S = 60.0
 RETURN_WATCH_S = 8.0        # after the host is back next to the NPC the copies keep being sampled (a handoff back may happen) before the end state is judged
 KILL_TIMEOUT_S = 20.0
@@ -64,7 +66,10 @@ class Proof:
     """`host` and `client` are NvBridge-like: call(method, params), eval(expr, ref=...), exec(cmd, ref=...)."""
 
     def __init__(self, host: Any, client: Any, res: Result, npc: str, away_ref: str = DEFAULT_AWAY_REF, allow_restrained: Tuple[str, ...] = (),
-                 sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic) -> None:
+                 sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic, pick: bool = False,
+                 fallback: bool = True, wait_s: float = NPC_WAIT_S) -> None:
+        """pick=True: `npc` is only a hint; wiring() waits for an NPC that coop.owner knows on both copies and the host owns (choose())."""
+        self.pick, self.fallback, self.wait_s = pick, fallback, wait_s
         self.m = {"host": host, "client": client}
         self.r = res
         self.npc = npc
@@ -114,6 +119,52 @@ class Proof:
             return self.m[who].call("actors.port", {})
         except Exception as e:  # noqa: BLE001
             raise NotReady(f"actors.port is not registered on the {who} ({e}): nvcoop.dll without plugin/actors/engine") from e
+
+    def choose(self) -> None:
+        """Which NPC to prove on. The ref from the manifest is a hint: it is used when both copies know it and the host owns it, otherwise the first
+        character of the host's cell that qualifies is (readable and alive on the host, readable on the client, coop.owner known on both copies with
+        one (owner, epoch) pair, owner = the host). Waits up to wait_s; the NOT READY text says why each one was passed over."""
+        host, client = self.m["host"], self.m["client"]
+
+        def read(c: dict) -> dict:
+            return {"has3D": True,    # readable through the console on the host = loaded there (an unloaded ref raises)
+                    "dead": bool(int(host.eval("GetDead", ref=c["ref"]))), "disabled": bool(int(host.eval("GetDisabled", ref=c["ref"])))}
+
+        def accept(ref: str, _rd: dict) -> Optional[str]:
+            owners = {}
+            for who in ("host", "client"):
+                try:
+                    o = self.m[who].call("coop.owner", {"ref": ref})
+                except Exception:  # noqa: BLE001
+                    return f"coop.owner does not answer on the {who}"
+                if o.get("unsupported"):
+                    return f"coop.owner unsupported on the {who}"
+                if not o.get("known") or o.get("pending"):
+                    return f"coop.owner does not know it on the {who}"
+                owners[who] = o
+            ag = self.agreed({"owner": owners})
+            if ag is None:
+                return "the copies disagree on the owner"
+            if ag[0] != 0 or not owners["host"].get("mine", True):
+                return f"owned by slot {ag[0]}, not the host"
+            try:
+                client.eval("GetDead", ref=ref)
+            except Exception:  # noqa: BLE001
+                return "not loaded on the client"
+            return None
+
+        def cands() -> List[dict]:
+            return [{"ref": a.get("ref") or "", "id": a.get("id")} for a in host.call("world.actors", {"max": npc_pick.MAX_CANDS}).get("actors", [])]
+
+        try:
+            got = npc_pick.find(read, cands, {"ref": self.npc, "id": None}, accept=accept, wait_s=self.wait_s, allow_fallback=self.fallback,
+                                allow_restrained=True, sleep=self.sleep, now=self.now)
+        except npc_pick.NotFound as e:
+            raise NotReady(f"{e}: is [live] actors=1 on both, and are both copies near an NPC the host owns?") from e
+        if got.fallback:
+            print(f"proof_actor_port_two_copy: {got.note}")
+        self.r.info.update({"npc_requested": self.npc, "npc": got.ref, "npc_back": got.ref, "npc_note": got.note})
+        self.npc = got.ref
 
     def runtime_id(self, spec: str) -> str:
         """'Plugin.esm:HEX' -> 8 hex digits with the load-order index of the HOST's game (MoveTo needs a runtime id)."""
@@ -179,6 +230,8 @@ class Proof:
             if not st.get("enabled"):
                 raise NotReady(f"the actor port is disabled on the {w} ([actors] engine=0)")
         c("wiring.session_both", all(st.get("session") for st in ports.values()), f"session host {ports['host'].get('session')} client {ports['client'].get('session')}")
+        if self.pick:
+            self.choose()
         snap = self.sample_until(lambda s: self.agreed(s) is not None, WIRING_TIMEOUT_S)
         if snap is None:
             raise NotReady("coop.owner does not know the NPC on both copies (or they disagree): is [live] actors=1 on both, and are both near the NPC?")
@@ -351,6 +404,9 @@ class FakeSession:
         self.offset = {0: 0.0, 1: 0.0}
         self.left = {0: False, 1: False}
         self.machines = {"host": FakeMachine(self, 0), "client": FakeMachine(self, 1)}
+        self.npc = "FalloutNV.esm:104C70"                # the NPC that coop.owner knows
+        self.listed = [self.npc]                          # what world.actors lists on the host
+        self.client_blind = False                         # the client does not know the NPC yet
 
     # clock and state machine
     def sleep(self, s: float) -> None:
@@ -431,11 +487,13 @@ class FakeMachine:
             fed = 0 if (i == 1 and "not_fed" in s.f) else 3
             return {"enabled": True, "session": s.session[i], "fed": fed, "ledger": s.ledger(i), "stats": {"deathsRefused": s.refused[i]}}
         if method == "coop.owner":
+            if (params or {}).get("ref") != s.npc or (i == 1 and s.client_blind):
+                return {"known": False}
             return {"known": True, "owner": s.owner, "epoch": s.epoch, "mine": s.owner == i, "pending": s.pending}
         if method == "plugins":
             return {"plugins": [{"name": "FalloutNV.esm", "index": 0}]}
         if method == "world.actors":
-            return {"actors": [{"id": 1, "ref": "FalloutNV.esm:104C70"}]}
+            return {"actors": [{"id": a, "ref": r} for a, r in enumerate(s.listed, 1)]}
         if method == "coop.leave":
             if s.left[i]:
                 raise RuntimeError("already left the session")
@@ -456,6 +514,8 @@ class FakeMachine:
             raise RuntimeError("ref not loaded")
         if expr == "GetRestrained":
             return 1.0 if s.restr[i] else 0.0
+        if expr == "GetDisabled":
+            return 0.0
         if expr == "GetDead":
             return 1.0 if s.dead[i] else 0.0
         if expr.startswith("GetPos"):
@@ -515,6 +575,40 @@ def selftest() -> int:
         ok = False
     else:
         print("selftest: unreadable samples are skipped (reported, not failed)")
+    # the NPC is a hint: one that coop.owner does not know is replaced by one it knows; with none known the NOT READY says why
+    def hinted(listed: List[str], known: str, hint: str, **kw: Any) -> Tuple[Result, str]:
+        s = FakeSession()
+        s.npc, s.listed = known, listed
+        out = io.StringIO()
+        res = Result()
+        with contextlib.redirect_stdout(out):
+            Proof(s.machines["host"], s.machines["client"], res, hint, sleep=s.sleep, now=s.now, pick=True, **kw).run()
+        return res, out.getvalue()
+
+    res, out = hinted(["FalloutNV.esm:104C70", "FalloutNV.esm:104C77"], "FalloutNV.esm:104C77", "FalloutNV.esm:104C70")
+    if res.failures or "using FalloutNV.esm:104C77" not in out or res.info.get("npc") != "FalloutNV.esm:104C77":
+        print("selftest: a hint that coop.owner does not know was not replaced by the NPC it knows:", res.failures, out.strip()[:200])
+        ok = False
+    else:
+        print("selftest: a hint that coop.owner does not know is replaced by the NPC it knows")
+    res, out = hinted(["FalloutNV.esm:104C70"], "FalloutNV.esm:104C70", "FalloutNV.esm:104C70")
+    if res.failures or res.info.get("npc_note") != "using FalloutNV.esm:104C70":
+        print("selftest: a hint that qualifies was not used:", res.failures, res.info.get("npc_note"))
+        ok = False
+    else:
+        print("selftest: a hint that qualifies is used")
+    for what, kw in (("no listed NPC", dict(listed=[], known="FalloutNV.esm:104C77", hint="FalloutNV.esm:104C70")),
+                     ("none known", dict(listed=["FalloutNV.esm:104C77"], known="FalloutNV.esm:104C70", hint="FalloutNV.esm:104C77"))):
+        try:
+            hinted(**kw, wait_s=5.0)
+            print(f"selftest: {what} was not reported as not ready")
+            ok = False
+        except NotReady as e:
+            if "coop.owner does not know it on the host" in str(e) or "lists no character" in str(e):
+                print(f"selftest: {what} is reported as not ready, with the reason")
+            else:
+                print(f"selftest: the not-ready text for {what} does not say why:", e)
+                ok = False
     # not-ready paths: the host does not own the NPC; no actors.port at all
     s = FakeSession({"host_not_owner"})
     try:
@@ -547,7 +641,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--host", type=int, default=0, help="bridge instance id of the host")
     ap.add_argument("--client", type=int, default=1, help="bridge instance id of the client")
-    ap.add_argument("--ref", default=None, help="Plugin.esm:HEX of the NPC the host owns")
+    ap.add_argument("--ref", default=None, help="Plugin.esm:HEX of the NPC the host owns; a hint: when both copies do not know it, another NPC of the cell is used")
+    ap.add_argument("--no-fallback", action="store_true", help="NOT READY instead of another NPC when --ref does not qualify")
+    ap.add_argument("--npc-wait", type=float, default=NPC_WAIT_S, help="seconds to wait for an NPC that coop.owner knows on both copies")
     ap.add_argument("--away-ref", default=DEFAULT_AWAY_REF, help="Plugin.esm:HEX the host is moved to (another cell); default %(default)s, the Novac map marker")
     ap.add_argument("--allow-restrained", action="append", default=[], help="Plugin.esm:HEX of an actor that is legitimately restrained in the world (repeatable)")
     ap.add_argument("--outdir", default="out/actor-port/two-copy")
@@ -574,7 +670,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"cannot reach the game instances: {e}", file=sys.stderr)
         return 2
     try:
-        Proof(hb, cb, res, a.ref, a.away_ref, tuple(a.allow_restrained)).run()
+        Proof(hb, cb, res, a.ref, a.away_ref, tuple(a.allow_restrained), pick=True, fallback=not a.no_fallback, wait_s=a.npc_wait).run()
     except NotReady as e:
         print(f"proof_actor_port_two_copy: NOT READY: {e}")
         return 3

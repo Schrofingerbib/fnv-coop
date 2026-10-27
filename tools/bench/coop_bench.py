@@ -36,6 +36,8 @@ TARGETS = {
     "avatar.teleports_pm":      (0.0, 10.0),
     "play.fight_pass_pct":      (100.0, 0.0),     # share of the fight playbook's steps that passed (both screens agree on health, deaths, loot)
     "play.loot_pass_pct":       (100.0, 0.0),     # loot race playbook: exactly one winner, nothing duplicated
+    "play.kill_latency_s":      (1.0, 8.0),       # seconds from a kill on one copy until the other copy shows the actor dead (worst of the kills)
+    "play.npc_pos_err":         (50.0, 500.0),    # world units: worst distance between the two copies' view of a living NPC
     "area.recovery_s":          (3.0, 20.0),      # seconds until the client's puppet of the host is near the host again after the host leaves a building
     "net.bad_wifi_seq_lag_p95": (10.0, 100.0),    # messages behind on the bad_wifi profile (35 ms +- 25, 2 % loss with bursts)
     "net.bad_wifi_avatar_err_p95": (300.0, 2500.0),
@@ -44,7 +46,7 @@ TARGETS = {
 CATEGORIES = {"performance": ["perf.fps_p5", "perf.hitch_pct", "perf.bridge_rtt_p95"],
               "sync": ["sync.seq_lag_p95", "sync.digest_mismatch_pm", "sync.repair_effects_pm"],
               "avatars": ["avatar.err_p95", "avatar.teleports_pm"],
-              "gameplay": ["play.fight_pass_pct", "play.loot_pass_pct", "area.recovery_s"],
+              "gameplay": ["play.fight_pass_pct", "play.loot_pass_pct", "play.kill_latency_s", "play.npc_pos_err", "area.recovery_s"],
               "network": ["net.bad_wifi_seq_lag_p95", "net.bad_wifi_avatar_err_p95", "net.recover_seq_lag_p95"]}
 
 
@@ -104,7 +106,7 @@ class Sampler(threading.Thread):
                     dg = cs.get("desyncs", {}).get("digests", {})
                     tr = cs.get("transport", {})
                     c.update(frames=ctr.get("frames"), seq=cs.get("lastSeq"), dok=dg.get("ok"), dmis=dg.get("mismatch"), drep=dg.get("repairs"),
-                             deff=dg.get("effectsRepaired"), bin=tr.get("bytesIn"), bout=tr.get("bytesOut"))
+                             deff=dg.get("effectsRepaired"), dset=dg.get("effectsSettled"), dack=dg.get("divergenceAcked"), bin=tr.get("bytesIn"), bout=tr.get("bytesOut"))
                     c["pos"] = [nv.eval("Player.GetPos X"), nv.eval("Player.GetPos Y"), nv.eval("Player.GetPos Z")]
                     if n % 8 == 0:   # every ~2 s: which puppet does this copy have for the other player
                         av = nv.call("avatar.status", {}, timeout_s=5)
@@ -129,13 +131,59 @@ class Sampler(threading.Thread):
         self.out.close()
 
 
-def boot(save):
-    env = dict(os.environ, NVCOOP_VISIBLE="1", NVCOOP_TEST_HELPERS="1", PYTHONIOENCODING="utf-8")
+def lean_inis(log):
+    """A machine short of RAM: apply the pool's low-cost profile (shadows, grass, water, effects, sound off) to both instances' own INIs.
+    The window size and the frame cap stay as they are (see instances.LEAN_SKIP). Set NVCOOP_LEAN=0 to skip."""
+    if os.environ.get("NVCOOP_LEAN", "1") == "0":
+        return
+    try:
+        sys.path.insert(0, str(ROOT / "tools" / "pool"))
+        sys.path.insert(0, str(ROOT / "tools" / "runner"))
+        import instances
+        import lowcost
+        for i in (0, 1):
+            d = instances.instance_dir(i)
+            texts = {}
+            for name in (lowcost.FO, lowcost.PR):
+                lowcost.guard(d / name)
+                texts[name] = (d / name).read_text(encoding="latin-1")
+            texts[lowcost.FO], texts[lowcost.PR] = instances._apply_lean(texts[lowcost.FO], texts[lowcost.PR])
+            for name, t in texts.items():
+                (d / name).write_text(t, encoding="latin-1", newline="")
+        log("lean game settings applied to both copies (no sound, no shadows, no grass, no water effects)")
+    except Exception as e:   # noqa: BLE001
+        log(f"lean settings not applied: {str(e)[:120]}")
+
+
+def boot(save, attempts=3):
+    """Bring up two copies and load the save. A copy can hang while loading (its main thread stops answering the bridge): a hung boot is stopped
+    and tried again, up to `attempts` times, so a run never goes on against a dead game."""
+    last = None
+    for k in range(attempts):
+        try:
+            _boot_once(save)
+            return
+        except (Exception, SystemExit) as e:   # noqa: BLE001
+            last = e
+            print(f"   boot attempt {k + 1}/{attempts} failed: {str(e)[:140]}")
+    raise SystemExit(f"could not boot two responsive copies in {attempts} attempts: {str(last)[:200]}")
+
+
+REMOTE = [None]   # a remote.RemoteHost when the host copy runs on another machine (--remote)
+
+
+def _boot_once(save):
+    env = dict(os.environ, NVCOOP_VISIBLE="1", NVCOOP_TEST_HELPERS="1", NVCOOP_LEAN="1", PYTHONIOENCODING="utf-8")
     run_py = str(ROOT / "tools" / "runner" / "run.py")
     subprocess.run([sys.executable, "-I", run_py, "down"], cwd=str(ROOT), env=env, capture_output=True)
     time.sleep(8)
-    r = subprocess.run([sys.executable, "-I", run_py, "up", "--n", "2", "--wait-pipe", "180"], cwd=str(ROOT), env=env, capture_output=True, text=True)
-    if "pipes: {0: True, 1: True}" not in r.stdout:
+    lean_inis(print)
+    remote = REMOTE[0]
+    if remote is not None:   # the host copy (instance 0) runs on the other machine; only the client (instance 1) starts here
+        remote.up()
+    up = [sys.executable, "-I", run_py, "up", "--n", "2", "--wait-pipe", "180"] + (["--only", "1"] if remote is not None else [])
+    r = subprocess.run(up, cwd=str(ROOT), env=env, capture_output=True, text=True)
+    if ("pipes: {1: True}" if remote is not None else "pipes: {0: True, 1: True}") not in r.stdout:
         raise SystemExit("could not bring up two copies:\n" + r.stdout[-400:] + r.stderr[-400:])
     from nvbridge import NvBridge
     from bots.bot import Bot
@@ -144,6 +192,9 @@ def boot(save):
         nv.call("loadSave", {"name": save, "timeoutMs": 120000}, timeout_s=130)
     for i, nv in enumerate(conns):
         Bot(nv, name=f"b{i}", slot=i).dismiss_messages(quiet_s=25, max_s=150, max_n=20)
+    for i, nv in enumerate(conns):
+        if not phases.wait_serviced(nv, print, timeout_s=60):
+            raise RuntimeError(f"copy {i} is hung after loading the save (its main thread does not answer)")
 
 
 def pids_of():
@@ -298,6 +349,9 @@ def analyse(rows):
             m["sync.ever_converged"] = bool((h[-1][1].get("dok") or 0) > 0)
             m["sync.repairs_pm"] = round((h[-1][1]["drep"] - h[0][1]["drep"]) * 60.0 / (h[-1][0] - h[0][0]), 2)
             m["sync.repair_effects_pm"] = round((h[-1][1]["deff"] - h[0][1]["deff"]) * 60.0 / (h[-1][0] - h[0][0]), 1)
+            if h[-1][1].get("dset") is not None and h[0][1].get("dset") is not None:   # keys the host recorded once (bookkeeping, not repair): informational
+                m["sync.settled_effects_total"] = h[-1][1]["dset"] - h[0][1]["dset"]
+                m["sync.divergences_acked"] = h[-1][1].get("dack")
         bo = rate([(r["t"], r["0"].get("bout")) for r in sel if r["0"].get("bout") is not None])
         bi = rate([(r["t"], r["0"].get("bin")) for r in sel if r["0"].get("bin") is not None])
         if bo:
@@ -370,6 +424,9 @@ def derive(overall, phase_metrics, extras):
         pb = (extras or {}).get(f"playbook_{lab}")
         if pb is not None:
             m[f"play.{lab}_pass_pct"] = pb.get("pass_pct", 0.0)
+            for k in ("kill_latency_s", "npc_pos_err"):
+                if (pb.get("metrics") or {}).get(k) is not None:
+                    m[f"play.{k}"] = pb["metrics"][k]
     ar = (extras or {}).get("area") or {}
     if ar.get("recovery_s") is not None:
         m["area.recovery_s"] = ar["recovery_s"]
@@ -414,6 +471,13 @@ def report_extras(L, analysis, extras):
                 L += ["", "| Step | OK | s | Snapshot compare | Digest mismatches | Why not |", "|---|---|---|---|---|---|"]
                 for s in v["steps"]:
                     L.append(f"| {s['name']} | {s['ok']} | {s.get('seconds')} | {s.get('snapdiff')} | {s.get('digest_mismatch')} | {s.get('reason')} |")
+            ls = (v.get("metrics") or {}).get("loot_service")
+            if ls:
+                keys = ["containers", "known", "scans", "seen", "suspects", "arbitrated", "reverted", "revertedItems", "refused", "busy", "setsDeferred", "graceExpired", "countFails"]
+                L += ["Loot service counters during the step (coop.loot menuless block; `seen` = looks at a corpse whose engine copy differed, `arbitrated` = transfers sent through the lock, "
+                      "`reverted` = items taken back from the player):", "", "| Copy | " + " | ".join(keys) + " |", "|---|" + "---|" * len(keys)]
+                for who, d in ls.items():
+                    L.append(f"| {who} | " + " | ".join(str((d or {}).get(k)) for k in keys) + " |")
             L.append("")
     ar = extras.get("area")
     if ar:
@@ -482,6 +546,12 @@ def run_once(a, label, stamp):
     log = lambda s: print("   " + s, flush=True)   # noqa: E731
     relay, client_ini, ini_backup = None, None, None
     try:
+        if REMOTE[0] is not None:
+            phases.HOST_IP[0] = REMOTE[0].ip
+            if not a.net:   # the client joins the host on the other machine directly
+                import instances
+                client_ini = phases.client_ini_path(instances.instances_root())
+                ini_backup = phases.point_client_at_relay(client_ini, True, host=REMOTE[0].ip, port=phases.HOST_PORT)
         if a.net:   # the client joins through the chaos relay: start it and point the client's ini at it BEFORE the copies boot
             import instances
             client_ini = phases.client_ini_path(instances.instances_root())
@@ -506,7 +576,7 @@ def run_once(a, label, stamp):
         opts = {"probe": not a.no_probe, "area": not a.no_area, "playbooks": not a.no_playbooks}
         try:
             if a.scenario:   # a scenario file: tools/bench/scenarios/<name>.json (see scenario.py)
-                import scenario as scenario_mod
+                import bench_scenario as scenario_mod
                 import arena as arena_mod
                 ctx = scenario_mod.Ctx(samp, bots, arena_mod.Arena.load(a.arena or None), k=0.5 if a.quick else 1.0, relay=relay, outdir=out,
                                        log=log, walk_mode=a.walk_mode, phases_mod=phases)
@@ -537,6 +607,8 @@ def run_once(a, label, stamp):
             client_ini.write_text(ini_backup, encoding="latin-1", newline="")   # the client's own ini, exactly as it was
         if not a.keep_up and not a.no_boot:
             subprocess.run([sys.executable, "-I", str(ROOT / "tools" / "runner" / "run.py"), "down"], cwd=str(ROOT), capture_output=True)
+            if REMOTE[0] is not None:
+                REMOTE[0].stop()
 
 
 def aggregate(results, label):
@@ -577,7 +649,9 @@ def main():
     ap.add_argument("--baseline", default="")
     ap.add_argument("--runs", type=int, default=1, help="repeat the whole benchmark N times, each on a fresh boot; report the median and the spread")
     ap.add_argument("--keep-up", action="store_true", help="leave the copies running afterwards")
-    ap.add_argument("--walk-mode", default="step", choices=["step", "input", "walk"], help="how the bots move (default step: repeatable)")
+    ap.add_argument("--walk-mode", default=None, choices=["step", "input", "walk"],
+                    help="how the bots move: step (positions in small increments, repeatable) or input (real movement input, needs open ground: use the arena). "
+                         "Default: the scenario's own walk_mode, else step")
     ap.add_argument("--net", action="store_true", help="add the bad-network matrix: the client joins through the chaos relay and the profiles lan, good_wifi, "
                     "bad_wifi, mobile_tether, transatlantic, hell are stepped through (about 4 extra minutes)")
     ap.add_argument("--no-area", action="store_true", help="skip the area-change phase")
@@ -586,15 +660,27 @@ def main():
     ap.add_argument("--scenario", default="", help="run a scenario file instead of the built-in phases: a name in tools/bench/scenarios (standard, smoke) or a path")
     ap.add_argument("--arena", default="", help="arena layout file (default tools/bench/arena.json; without one the courses start where each player stands)")
     ap.add_argument("--full", action="store_true", help="everything: same as --net (the area, playbook and probe phases are on by default)")
+    ap.add_argument("--remote", default="", help="ssh name of a second PC that runs the HOST copy (this PC runs the client): see tools/bench/remote.py")
+    ap.add_argument("--remote-ip", default="192.168.0.10", help="that PC's address on the local network (the client joins it there)")
     a = ap.parse_args()
+    if a.remote:
+        if a.no_boot:
+            raise SystemExit("--remote needs a fresh boot: drop --no-boot")
+        import remote as remote_mod
+        REMOTE[0] = remote_mod.RemoteHost(ssh=a.remote, ip=a.remote_ip, log=lambda s: print("   " + s, flush=True))
     if a.full:
         a.net = True
     if a.scenario:
-        import scenario as _sc
+        import bench_scenario as _sc
         if any(s["phase"] == "net" for s in _sc.load(a.scenario)["steps"]):
             a.net = True   # the scenario steps through the bad-network profiles, so the client must join through the relay
     if a.net and a.no_boot:
         raise SystemExit("--net needs a fresh boot (the client must join through the relay): drop --no-boot")
+    if not a.walk_mode:
+        a.walk_mode = "step"
+        if a.scenario:
+            import bench_scenario as _sc2
+            a.walk_mode = _sc2.load(a.scenario).get("walk_mode", "step")
     WALK_MODE[0] = a.walk_mode
     if a.no_boot and a.runs > 1:
         raise SystemExit("--runs N needs a fresh boot per run: drop --no-boot")

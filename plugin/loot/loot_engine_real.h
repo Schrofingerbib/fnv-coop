@@ -26,12 +26,17 @@ public:
     RefId openMenuRef() override;
     bool closeMenu() override;
     bool adjustPlayer(const FormRef& base, int32_t delta) override;
+    bool playerCount(const FormRef& base, int32_t& out) override;
+    // Test helper (coop.loot {"grab":..}): the two halves of a quick-loot style take, with the guest gate lifted like every other call this engine makes.
+    bool testGrab(RefId container, uint32_t itemId, int32_t count, bool remove, bool add, std::string* why);
     void notify(lc::Notice n, NetId id) override;
     void loadedContainers(std::vector<NetId>& out, size_t max) override;
     bool describeItem(RefId ref, ItemDesc& out) override;
     RefId createItem(const lc::WorldItem& it) override;
     void bindItem(RefId ref, NetId net) override;
-    bool removeItem(NetId net) override;
+    bool removeItem(NetId net, const FormRef& placed) override;
+    bool isNoteBase(const FormRef& base) override;
+    bool addNote(const FormRef& note) override;
     bool readPose(NetId net, lc::Vec3& pos, lc::Vec3& rot) override;
     bool setPose(NetId net, const lc::Vec3& pos, const lc::Vec3& rot, bool moving) override;
 

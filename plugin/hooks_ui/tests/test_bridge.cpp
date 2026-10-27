@@ -61,7 +61,8 @@ struct FakeEngine : IUiEngine {
 
 static const char* kConsentFile =
     "# test table\n"
-    "FalloutNV.esm:161E8C VEndGameWarningMsg confirm=1 decline=0 buttons=I'm not ready yet.|Let's do this!\n";
+    "FalloutNV.esm:161E8C VEndGameWarningMsg confirm=1 decline=0 buttons=I'm not ready yet.|Let's do this!\n"
+    "FalloutNV.esm:002000 INFO_002000 confirm=0 decline=-1 mode=vote kind=info buttons=\n";   // a fork INFO: held until the party voted
 static const uint32_t kEndGameMsg = 0x161E8C;
 
 // Host (slot 0) + clients 1 and 2 over the in-memory network. Slideshow packets ride the same endpoints (first byte 0xE5).
@@ -84,6 +85,7 @@ struct World {
     ClientRig cr[3];
     uint64_t now = 0;
     uint32_t seqProvided = 0;
+    int scriptRuns = 0;                         // INFO result scripts the host ran
 
     explicit World(uint32_t latency = 20, double dup = 0, uint32_t jitter = 0, uint64_t seed = 5) : net(seed) {
         fnvcoop::LinkParams lp;
@@ -100,7 +102,7 @@ struct World {
             c.peerOfSlot = [](PlayerId p) { return fnvcoop::PeerId(p); };
             c.slotOfPeer = [](fnvcoop::PeerId p) { return PlayerId(p); };
             fnvcoop_dlg::ResultRunner runr;
-            if (i == 0) runr = [](const fnvcoop_dlg::ResultRequest&) { return uint64_t(1); };
+            if (i == 0) runr = [this](const fnvcoop_dlg::ResultRequest&) { ++scriptRuns; return uint64_t(1); };
             n.emplace_back(new DialogueNode(net.endpoint(i), c, runr, [this, i](const Event& e) { ev[i].push_back(e); }));
             cr[i].sc.reset(new SlideClient({[this, i](const FormRef&, const std::string&, const std::string& nw) {
                                                 cr[i].swaps.push_back(nw);
@@ -249,11 +251,35 @@ TEST(plain_box_has_no_consent_round) {
     CHECK(w.shown(0) == 0 && w.shown(1) == 0);
     CHECK(w.eng.lastButton() == 1);
 }
-TEST(consent_box_for_the_host_stays_local) {
+// The host player decides the Hoover Dam start: the guests are still asked (the box used to stay a native host box, with no consent round at all).
+TEST(consent_box_decided_by_the_host_asks_the_guests) {
     World w;
-    CHECK(w.router->onMessageBox(endgameBox(kEndGameMsg)) == Route::Local);
-    w.step(50);
-    CHECK(w.shown(1) == 0 && w.shown(2) == 0);
+    const Route routed = w.router->onMessageBox(endgameBox(kEndGameMsg));
+    REQUIRE(routed == Route::Suppressed);
+    w.step(100);
+    REQUIRE(w.shown(0) == 1);
+    const uint32_t id = w.lastMenuId(0);
+    CHECK(w.shown(1) == 0 && w.shown(2) == 0 && w.eng.lastButton() == kNoButton);
+    w.n[0]->menuReply(id, 1, uint32_t(w.now));                                    // the host presses "Let's do this!"
+    w.step(100);
+    CHECK(w.shown(1) == 1 && w.shown(2) == 1 && w.eng.lastButton() == kNoButton);   // the guests are asked, the script waits
+    w.n[1]->menuReply(id, 0, uint32_t(w.now));
+    w.n[2]->menuReply(id, 1, uint32_t(w.now));                                    // one "Not yet"
+    w.step(100);
+    CHECK(w.eng.lastButton() == 0);                                               // ... cancels it: the decline button
+}
+// Joshua or Daniel, Elijah's offer: a fork INFO from the consent table is held at the host until the party agreed
+TEST(fork_info_from_the_consent_table_waits_for_the_party) {
+    World w;
+    w.n[2]->requestStart(F(0x7000), uint32_t(w.now));
+    w.step(100);
+    w.n[2]->pick(F(0x1000), F(0x2000), 0, false, {fnvcoop_dlg::Line{"Lead the way.", "", 0, 50}}, {}, uint32_t(w.now));
+    w.step(100);
+    CHECK(w.scriptRuns == 0);                                                      // no result script before the vote
+    REQUIRE(w.shown(0) == 1 && w.shown(1) == 1 && w.shown(2) == 0);
+    w.n[1]->menuReply(w.lastMenuId(1), 0, uint32_t(w.now));                      // agree: initiator + player 1 = a majority of three
+    w.step(100);
+    CHECK(w.scriptRuns >= 1);
 }
 TEST(consent_origin_disconnect_takes_the_decline_default) {
     World w;
@@ -526,7 +552,8 @@ TEST(scene_narration_is_stamped_by_the_host_and_plays_in_order_with_the_slides) 
         REQUIRE(f.lines.size() == 1);
         std::string rest;
         const ShowStamp st = parseOrder(f.lines[0].voice, rest);
-        CHECK(st.valid() && rest.empty());
+        VoiceToken vt;
+        CHECK(st.valid() && parseVoiceToken(rest, vt) && vt.topic.localId == 0x6000 && vt.info.localId == 0x6001);   // stamp + the topic/INFO voice token
     }
     // narration and slides interleaved on a link that duplicates and reorders: both players see exactly the host's order
     for (uint64_t seed : {11u, 12u, 13u}) {
@@ -535,6 +562,7 @@ TEST(scene_narration_is_stamped_by_the_host_and_plays_in_order_with_the_slides) 
         for (int i = 1; i <= 6; ++i) {
             w.narrate("line" + std::to_string(i), 0x6000 + 2u * uint32_t(i));
             want.push_back("N:line" + std::to_string(i));
+            want.push_back("V:" + makeVoiceToken(F(0x6000 + 2u * uint32_t(i)), F(0x6001 + 2u * uint32_t(i)), 1));   // every line also names its topic for `Say`
             swapEnding(w, i);
             char b[64];
             want.push_back(std::string("S:") + kEnd(i, b));
@@ -566,7 +594,8 @@ int main() {
     run("consent_waits_for_the_party_then_resumes_with_confirm", consent_waits_for_the_party_then_resumes_with_confirm);
     run("consent_declined_gives_the_not_ready_button", consent_declined_gives_the_not_ready_button);
     run("plain_box_has_no_consent_round", plain_box_has_no_consent_round);
-    run("consent_box_for_the_host_stays_local", consent_box_for_the_host_stays_local);
+    run("consent_box_decided_by_the_host_asks_the_guests", consent_box_decided_by_the_host_asks_the_guests);
+    run("fork_info_from_the_consent_table_waits_for_the_party", fork_info_from_the_consent_table_waits_for_the_party);
     run("consent_origin_disconnect_takes_the_decline_default", consent_origin_disconnect_takes_the_decline_default);
     run("forced_say_in_a_scene_reaches_every_player", forced_say_in_a_scene_reaches_every_player);
     run("forced_say_to_one_player_is_aimed", forced_say_to_one_player_is_aimed);

@@ -8,6 +8,7 @@
 // Header-only; compiled into the test executable only.
 #pragma once
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <map>
 #include <set>
@@ -68,6 +69,14 @@ public:
     std::map<FormId, int> aiReequipLeft;       // the actor's AI puts this item back on, this many times
     std::function<CellId(const Vec3&)> cellOfPos;   // truth for "which cell is this position in"
     Vec3 menuDisplacement;                     // closing a menu leaves puppets this far from where they were (AI moved them)
+    // The real player of this machine as a body. A puppet written (Spawn / SetPos / MoveToCell) closer than bodyRadius to it, at nearly the same
+    // height, shoves the player away by the overlap: the engine pushing two capsules apart, counted in localShoves / localTravel.
+    bool haveLocal = false;
+    CellId localCell = 0;
+    Vec3 localPos;
+    float bodyRadius = 60.0f;
+    unsigned localShoves = 0;
+    float localTravel = 0;                     // total distance the real player was shoved
 
     // ---- observations ----------------------------------------------------------------------------------------------
     unsigned refusedNo3D = 0, commandsOnInvalid = 0, commandsOnForeign = 0, setPosCalls = 0, setYawCalls = 0, playGroupCalls = 0;
@@ -157,6 +166,23 @@ public:
         ++worldEpoch;
         for (size_t i = 0; i < image.size(); ++i) PlantOrphan(cell, Vec3{});
     }
+    // A body was put at `pos` in `cell`: push the real player out of it.
+    void BodyContact(CellId cell, const Vec3& pos) {
+        if (!haveLocal || cell != localCell || std::fabs(pos.z - localPos.z) > 110.0f) return;
+        float dx = localPos.x - pos.x, dy = localPos.y - pos.y;
+        float d = std::sqrt(dx * dx + dy * dy);
+        if (d >= bodyRadius) return;
+        if (d < 0.001f) {
+            dx = 1.0f;
+            dy = 0.0f;
+            d = 1.0f;
+        }
+        const float push = bodyRadius - d;
+        localPos.x += dx / d * push;
+        localPos.y += dy / d * push;
+        localTravel += push;
+        ++localShoves;
+    }
     void ClearTrace() {
         trace.clear();
         groupLog.clear();
@@ -196,6 +222,7 @@ public:
             r.worn.insert(f);
         }
         refs_[r.id] = r;
+        BodyContact(cell, pos);
         return r.id;
     }
     void Delete(RefId ref) override {
@@ -259,6 +286,7 @@ public:
                 violations.push_back("SetPos moved a ref from cell " + std::to_string(f->cell) + " to a position in cell " + std::to_string(truth));
         }
         f->pos = pos;
+        BodyContact(f->cell, pos);
         return true;
     }
     bool SetYaw(RefId ref, float yaw) override {
@@ -283,6 +311,13 @@ public:
         ++f->gen3d;
         f->group = 0;
         if (rebuild3DDropsRestraint) f->restrained = false;
+        BodyContact(cell, pos);
+        return true;
+    }
+    bool GetLocalPose(CellId& cell, Vec3& pos) override {
+        if (!haveLocal) return false;
+        cell = localCell;
+        pos = localPos;
         return true;
     }
     bool GetPose(RefId ref, CellId& cell, Vec3& pos) override {

@@ -75,6 +75,11 @@ const BaselineDumpStats& LastBaselineStats();
 
 // Exact signature requested by L10 (usable as a plain function pointer). Uses default options (watch refs from
 // env FNVCOOP_WATCHREFS if set). Never throws; engine faults (SEH) return false with *err set.
+// Loads the volatile-keys file into the shared list (fnvcoop::volatileKeys()) and resolves its variable names against the loaded game, WITHOUT
+// dumping the world. A host without a world baseline never dumps, so its list stayed empty: the poll committed per-machine vars (bFixedEDE,
+// iSpawnMonsters ...) that the client's dump leaves out, and the digest differed on them forever. Idempotent; call again until it returns true
+// (false = a name is still unresolved, or the file cannot be read; *summary says which). Main thread, after a save is loaded.
+bool PrepareVolatileKeys(const BaselineDumpOptions& opts, std::string* summary);
 bool DumpBaselineShadow(fnvcoop::ShadowState* out, uint64_t* contentHash, std::string* err);
 bool DumpBaselineShadowEx(fnvcoop::ShadowState* out, uint64_t* contentHash, std::string* err,
                           const BaselineDumpOptions& opts);

@@ -133,6 +133,9 @@ class NvBridge:
     @classmethod
     def connect(cls, instance: int = 0, wait_s: float = 0.0, path: Optional[str] = None) -> "NvBridge":
         """Open the pipe. With wait_s>0, retry until the game creates it (or time runs out)."""
+        remote = os.environ.get(f"NVCOOP_REMOTE_{int(instance)}")   # "host:port" of tools/runner/pipe_relay.py on the machine that runs this copy
+        if remote and path is None:
+            return NvBridgeTcp.connect_tcp(remote, wait_s)
         require_windows()
         p = path or pipe_path(instance)
         deadline = time.monotonic() + wait_s
@@ -380,6 +383,77 @@ class NvBridge:
 
 
 # ------------------------------------------------------------------------------------------------
+class NvBridgeTcp(NvBridge):
+    """The same bridge over TCP, for a copy on another machine (see pipe_relay.py). The game's pid is not tracked: a pid of the other machine
+    means nothing here, so a dead connection is reported as ConnectionLost, not GameCrashed."""
+
+    def __init__(self, sock, name: str = ""):
+        self._f = sock
+        self._sock = sock
+        self.name = name
+        self._ids = itertools.count(1)
+        self._buf = b""
+        self._lock = threading.Lock()
+        self._closed = False
+        self.game_pid = 0
+        self.lease = None
+
+    @classmethod
+    def connect_tcp(cls, addr: str, wait_s: float = 0.0) -> "NvBridgeTcp":
+        import socket
+        host, _, port = addr.rpartition(":")
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                s = socket.create_connection((host or "127.0.0.1", int(port)), timeout=5)
+                s.settimeout(None)
+                nv = cls(s, addr)
+                try:
+                    nv.ping()
+                except BridgeError:
+                    pass
+                return nv
+            except OSError as e:
+                if time.monotonic() >= deadline:
+                    raise ConnectionLost(f"cannot reach {addr}: {e}") from e
+                time.sleep(0.5)
+
+    def ping(self) -> Dict[str, Any]:
+        r = self.call("ping", timeout_s=5)
+        if r.get("pong") is not True:
+            raise ProtocolError(f"bad ping reply: {r!r}")
+        return r
+
+    def send_raw(self, line: str) -> None:
+        try:
+            self._sock.sendall(line.encode("utf-8") + b"\n")
+        except OSError as e:
+            raise ConnectionLost(f"write failed: {e}") from e
+
+    def recv_raw(self, timeout_s: float) -> Dict[str, Any]:
+        end = time.monotonic() + timeout_s
+        while b"\n" not in self._buf:
+            left = end - time.monotonic()
+            if left <= 0:
+                raise ConnectionLost(f"no reply within {timeout_s}s")
+            self._sock.settimeout(left)
+            try:
+                chunk = self._sock.recv(1 << 20)
+            except OSError as e:
+                raise ConnectionLost(f"no reply within {timeout_s}s ({e})") from e
+            if not chunk:
+                raise ConnectionLost("connection closed by the relay")
+            self._buf += chunk
+        line, self._buf = self._buf.split(b"\n", 1)
+        try:
+            msg = json.loads(line.decode("utf-8"))
+        except ValueError as e:
+            raise ProtocolError(f"invalid JSON from server: {line[:200]!r}") from e
+        if not isinstance(msg, dict):
+            raise ProtocolError(f"reply is not an object: {msg!r}")
+        return msg
+
+
 def _main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="nvbridge", description="Drive a running FNV instance via nvcoop.dll")
     ap.add_argument("--instance", type=int, default=0)

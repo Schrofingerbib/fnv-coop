@@ -149,6 +149,29 @@ TEST(intents_service, activate_runs_on_the_host_as_the_puppet_and_rewards_only_t
     CHECK(t.host.svc->host()->stats().executed == 1 && t.host.rt->actingSlot() == fnvcoop::kNoPlayer);
 }
 
+TEST(intents_service, guest_stage_request_goes_through_the_real_runtime_and_both_copies_agree) {
+    // the lab's quest room on the real Runtime: host at stage 10, guest A's console setstage 20 was dropped by the suppression and forwarded as Kind::SetStage
+    Trio t;
+    REQUIRE(t.joined());
+    const PlayerId sa = t.a.rt->client()->slot();
+    const FormRef q = R(0x1000);
+    t.host.eng.quests[q] = 10;
+    CHECK(t.a.svc->onStageBlocked(q, 20));
+    CHECK(pumpUntil(t.fr, [&] { return t.a.rt->client()->applied() >= 1 && t.b.rt->client()->applied() >= 1 && t.host.rt->host()->allSynced(); }));
+    CHECK(t.host.eng.quests[q] == 20 && t.host.eng.count("setStage") == 1 && t.host.eng.calls.back().contextActor == RefId(0x1000 + sa));
+    const auto* txn = t.host.rt->host()->log().get(1);
+    REQUIRE(txn != nullptr);
+    CHECK(txn->origin == sa && txn->cause.kind == fnvcoop::CauseKind::Intent);
+    CHECK(t.a.world.stages.at(S(q)) == 20 && t.b.world.stages.at(S(q)) == 20);                // every copy ends at the same stage, the requester's too
+    CHECK(pumpUntil(t.fr, [&] { return t.a.svc->client()->stats().verdicts == 1; }));
+    CHECK(t.host.svc->host()->stats().executed == 1 && t.host.svc->host()->stats().stagesApplied == 1);
+    // the same request again (the host's copy of the script is already there): refused, nothing runs, nothing new is announced
+    t.host.eng.calls.clear();
+    CHECK(t.b.svc->onStageBlocked(q, 20));
+    CHECK(pumpUntil(t.fr, [&] { return t.b.svc->client()->stats().verdicts == 1; }));
+    CHECK(t.host.eng.calls.empty() && t.host.svc->host()->stats().stagesNoAdvance == 1 && t.host.rt->host()->log().head() == 1);
+}
+
 TEST(intents_service, story_channel_intents_get_the_same_treatment) {
     Trio t;
     REQUIRE(t.joined());
@@ -310,4 +333,41 @@ TEST(intents_service, dialogue_runner_needs_a_puppet_or_a_stand_in_policy) {
     a.rt->dialogue()->pick(R(0x105560), R(0x105583), 0, false, {fnvcoop_dlg::Line{"House.", "", 0, 50}}, {}, (uint32_t)wallMs());
     CHECK(pumpUntil(fr, [&] { return host.svc->dialogueStats().refused >= 1; }));
     CHECK(host.eng.count("infoResult") == 0 && host.stubRuns == 0);                  // no puppet and no stand-in allowed: the script does not run for a stranger
+}
+
+TEST(intents_service, a_guest_conversations_result_scripts_see_that_guests_stash) {
+    // The Fort's "give me my gear back" lines are INFO result scripts: they run on the host as the guest and must read that guest's stash of the shared
+    // storage container, not the host's gear and not the other guest's.
+    const FormRef store = R(0x139B6B);
+    Trio t(true);
+    StorageBook b;
+    std::string err;
+    REQUIRE(b.load(R"({"stashes":[{"target":"falloutnv.esm:139B6B"}]})", &err));
+    ServiceDeps d;
+    d.eng = &t.host.eng;
+    d.nowMs = wallMs;
+    d.puppetOf = [](PlayerId s) { return s == 0 ? RefId(0) : RefId(0x1000 + s); };
+    t.host.svc.reset(new IntentService(std::move(d), icfg(), ContainerRedirect(), std::move(b)));   // rebuilt before anybody joined
+    REQUIRE(t.joined());
+    REQUIRE(pumpUntil(t.fr, [&] { return t.a.rt->dialogue() && t.b.rt->dialogue() && t.host.rt->host()->clients().size() == 2; }));
+    const PlayerId sa = t.a.rt->client()->slot(), sb = t.b.rt->client()->slot();
+    t.host.svc->stash().put(store, sa, {{R(0xB01), 2}});
+    t.host.svc->stash().put(store, sb, {{R(0xB02), 9}});
+    t.host.eng.containers[store] = {{R(0xAAA), 1}};
+    std::vector<std::vector<StoredItem>> seen;
+    auto prev = t.host.eng.onCall;
+    t.host.eng.onCall = [&, prev](const FakeEngine::Call& c) {
+        if (c.what == "infoResult") seen.push_back(t.host.eng.containers[store]);
+        prev(c);
+    };
+    t.a.rt->dialogue()->requestStart(R(0x104C0F), (uint32_t)wallMs());
+    CHECK(pumpUntil(t.fr, [&] { return !t.a.dlgEvents.empty(); }));
+    t.a.rt->dialogue()->pick(R(0x105560), R(0x105583), 0, false, {fnvcoop_dlg::Line{"House.", "", 0, 50}}, {}, (uint32_t)wallMs());
+    t.a.rt->dialogue()->lineDone((uint32_t)wallMs());
+    CHECK(pumpUntil(t.fr, [&] { return t.host.svc->dialogueStats().ran == 2; }));
+    REQUIRE(seen.size() == 2);
+    for (const auto& s : seen) CHECK(s == std::vector<StoredItem>({{R(0xB01), 2}}));   // Begin and End read guest A's gear: not the host's, not guest B's
+    CHECK(t.host.eng.containers[store] == std::vector<StoredItem>({{R(0xAAA), 1}}));  // the host's container is back as it was
+    REQUIRE(t.host.svc->stash().peek(store, sb) != nullptr);
+    CHECK(*t.host.svc->stash().peek(store, sb) == std::vector<StoredItem>({{R(0xB02), 9}}));
 }

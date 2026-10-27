@@ -273,7 +273,8 @@ def cmd_up(a) -> int:
     if foreign and not a.allow_foreign:
         print(f"FalloutNV.exe already running (pids {foreign}) and not ours; refusing (use --allow-foreign)", file=sys.stderr)
         return 2
-    for i in range(a.n):
+    ids = [a.only] if getattr(a, "only", None) is not None else list(range(a.n))   # --only I: start just that copy (its partner runs on another machine)
+    for i in ids:
         if not (instances.instance_dir(i) / "instance.json").exists():
             print(f"instance {i} not provisioned; run provision first", file=sys.stderr)
             return 2
@@ -294,10 +295,10 @@ def cmd_up(a) -> int:
     if a.wait_pipe:
         t0 = time.time()
         while time.time() - t0 < a.wait_pipe:
-            if all(_pipe_ready(i) for i in range(a.n)):
+            if all(_pipe_ready(i) for i in ids):
                 break
             time.sleep(1)
-        print("pipes:", {i: _pipe_ready(i) for i in range(a.n)})
+        print("pipes:", {i: _pipe_ready(i) for i in ids})
     return 0
 
 
@@ -363,6 +364,7 @@ def main(argv=None) -> int:
     p.add_argument("--n", type=int, default=2)
     p.add_argument("--pairs", type=int, default=0, help="N two-copy pairs: --n 2N, and refuse when the free RAM is too small")
     p.add_argument("--no-ram-check", action="store_true", help="--pairs: launch even if the free RAM looks too small")
+    p.add_argument("--only", type=int, default=None, help="start only this instance number (its partner runs on another machine)")
     p.add_argument("--wait-pipe", type=float, default=0)
     p.add_argument("--stagger", type=float, default=2.0)
     p.add_argument("--ttl", type=int, default=1800, help="game slot lease seconds (released by `down`)")

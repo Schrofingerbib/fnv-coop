@@ -26,7 +26,18 @@ Engine-facing code compiles into `nvcoop.dll` and is OFF by default.
 5. **Drops.** `OnDrop` (xNVSE native handler, wired in the module) -> `ReqDrop` -> a host-issued id in `[0xFFB00000, 0xFFBFFFFF]`, announced to everybody. The dropper binds its own local ref to the id
    (`BindDrop`), never creating it a second time; everybody else creates a ref (`CreateItem`, retried every second when the cell is not loaded there). Only the local player's drops count.
 6. **Pickups are claims.** `ReqClaim`: first claim wins; the others get `AlreadyTaken` and their optimistic pickup is taken back from the inventory with a message. Placed items are learned
-   at their first claim and stay taken (tombstones are saved with the host table). Everybody else's ref of a taken item is removed.
+   at their first claim and stay taken (tombstones are saved with the host table). Everybody else's ref of a taken item is removed: a dropped item by its issued id, a PLACED item (a persistent ref of a
+   plugin, e.g. a Stimpak on the floor of the lab's loot room) by the ref the claim carries (`ReqClaim.ref` -> `MItemGone.ref`, plugin:localId), because its net id is a hash nothing maps back (the actor
+   registry knows actors only). The claimant's own engine removed its own ref; the winner's repeated claim is `Ok`; the client sends one claim per item at a time. `coop.loot` -> `pickups`:
+   `activates`/`byPlayer` (OnActivate events seen), `seen`/`ignored`/`claimed` (pickups given to the rules), `claims`/`duplicate`/`won`/`lost` (this client), `removesRun`/`removesDone`/`removesGone`/`removesPlaced`
+   (refs removed because somebody else took the item; `removesGone` = no such ref here), `hostWon`/`hostLost`/`hostRepeated`. After a lab pickup `removesDone` is 1 on every other machine and `removesRun` 0 on the taker.
+   **Late joiners:** the join table (and every heal push) carries one `MItemGone` (with the ref) per placed tombstone, up to `HostConfig.maxTableTombstones` (4096, lowest id first), between `MTableBegin` and
+   `MTableEnd`; they are not counted in the table's totals. A client acts on a tombstone once (`gone_` memory). A machine whose cell is not loaded yet cannot find the ref: `RealLootEngine::removeItem` answers
+   false only for that case (true = removed or already gone) and `LootSync` asks again every `removeRetryMs` (2 s) up to `maxRemoveTries` (900), counted as `removesDeferred`/`removesRetried`/`removesDropped`.
+   The host save sidecar is version 2 (tombstones with their ref; version 1 still loads, its tombstones just cannot be told to a joiner). Needs in-game proof: a joiner in another cell, then walking to the item.
+   **Notes (G10):** a BGSNote (form type 0x31) is never an inventory item. When the host WINS a claim whose base is a note (`ILootEngine::isNoteBase`), `LootSync::grantNotes` runs `AddNote <id>` on the host
+   (`addNote`, inside a capture scope so the engine's AddNote hook records the one shared effect), once per note (`notesGranted`/`notesRefused`). A lost or repeated claim grants nothing. Twins plugin 178..180.
+
 7. **Every transfer is an idempotent transaction.** Per-sender txn ids; the host replays its answer for a repeat (container records inside replayed answers are refreshed to the present).
    The guest resends an unanswered request after 1.5 s with the same txn, gives up after 60 s.
 8. **The container digest is checked on close.** The close waits until every move of that container is answered; its digest is the engine copy's. A mismatch heals the closer's copy
@@ -38,6 +49,35 @@ Engine-facing code compiles into `nvcoop.dll` and is OFF by default.
 11. **Physics clutter.** The machine that moves a dropped item publishes its pose while it moves (at most ~15 per second), one final "at rest" pose, then nothing. The host judges owner,
     epoch and sequence and relays; a second mover takes over only from an owner that is resting. Other machines show the pose (`SetPose`).
 12. **Player inventories stay per player.** Nothing in the module sends or applies a player's inventory as such (a test pins that no message kind carries one).
+
+13. **Menu-less transfers go through the lock too.** A take or put the engine does on a CLOSED container without the container menu (console `RemoveItem` + `player.AddItem`, a quick-loot
+    style mod, a player's script; this is what the benchmark's "both grab at once" does) is invisible to the menu watcher. It used to bypass the lock: the host's sweep adopted it as a
+    script's change, a guest's audit threw the container back while the player kept the items, and two simultaneous grabbers both kept everything (3 duct tape became 6, bench
+    `dino-20261026-174728`). Now `LootSync::screenTransfer` (run by a dedicated scan every 50 ms, 8 closed containers per pass plus every container already seen to differ, and by the
+    sweep and the audit before they act) compares the engine copy with the shared contents. A difference is the local player's when the player's own count of that item moved the
+    other way by that much since the container last matched (`ILootEngine::playerCount`; each move explains one container only). It then runs exactly the menu path in one go:
+    open (lock), take / put, close, so the host's answer decides and a refusal (Busy, NotHolder, Insufficient) takes the items back from the player and puts the shared contents back.
+    A difference the player's inventory does not explain (a script) is left alone for `transferGraceMs` (400 ms: the AddItem may follow the RemoveItem) and then handled as before
+    (host sweep adopts it, guest audit corrects it). Limits: a put is attributed only for an item the container already held (that is when the player's count was sampled);
+    a player count of an item the engine cannot read means no attribution; the player's menu-path moves do not refresh the baselines of OTHER containers until those are scanned again.
+    `nvcoop.ini [loot] menuless=0` switches it off. Twins 158..162; tests `plugin/loot/tests/test_menuless.cpp`.
+    **Why bench `dino-20261027-144058` still showed 6** (the build above, verified loaded). Cause 1, the bench: its grab was the console pair `RemoveItem <tape> 1 1` (calling reference
+    = the corpse) + `player.AddItem`. On a GUEST the first line is a script mutation and the guest gate drops it (`plugin/hooks/suppress_policy.cpp`: only lines starting with `player.`
+    run), so the client's corpse never lost anything while the client's player still gained the item: there was no container difference for the scan to see (the corpse emptied on the
+    client only through the host's own takes). The bench now grabs through the test helper `coop.loot {"grab":{"container","item","count","phase":"both|remove|add"}}` (needs env
+    `NVCOOP_TEST_HELPERS=1`, which the bench sets; RemoveItem on the container + AddItem on the player with the gate lifted, the way a native quick-loot take behaves).
+    Cause 2, the scan (found by replaying the bench's timing game-free, `a_bench_style_grab_race_...`: 146 of 306 timings failed before): the scan compared the engine copy with the shared
+    contents AS THEY ARE NOW. When the other player's take reached this machine between this player's `RemoveItem` and its scan, the eager write of the new shared contents (or just the
+    delta itself) made the engine copy EQUAL the shared contents, the difference was gone, and the `AddItem` that followed had nothing to be matched with: the player kept the item and no
+    request was ever made. Fixes: (1) the engine copy is
+    compared with what it held when it last MATCHED a shared state (`engineBase_`), not with today's shared contents; (2) an eager `ContainerSet` is not written over an engine copy that
+    moved on its own (`setsDeferred`), the transfer's Open / Take answer writes the right contents; (3) the scan list is the engine's loaded containers PLUS every container of the shared
+    table that has a ref here (a corpse another machine registered was never in the real engine's list); (4) a menu the host refused (Busy / lock lost) that the engine cannot close
+    (`closeMenu()` has no verified call yet) keeps the player taking: those moves were never reported, now they are undone every poll (`blockedMenu_`, twin 167).
+    Counters (`coop.loot` -> `menuless`, the bench prints them under the loot playbook and in the failure reason): `known` containers in the last scan list, `scans` looks, `seen` looks at a
+    container whose copy differed, `suspects` differences the player's inventory did not (yet) explain, `arbitrated` transfers sent through the lock, `graceExpired` handed to the script
+    handling, `setsDeferred`, `countFails` (playerCount unreadable), `reverted` / `revertedItems` taken back from the player, `refused` / `busy` / `rollbackItems` (client side). A run where
+    `seen` is 0 on both machines means the detector never looked at the corpse. Limit: an `AddItem` BEFORE the `RemoveItem` across a scan is not attributed (the baseline is re-sampled when the container matches).
 
 ## Ordering rules the engine glue must keep (found by the fuzz, each has a test)
 - Read an open container BEFORE handling any message from the host (a correction replaces the engine copy and would swallow a change nobody has looked at). `LootSync` does it in `receive()` and in
@@ -96,10 +136,15 @@ synccore/loot (`loot_tests`, 101..137): 101 lock not enforced, 102 take/put with
 118 resting clutter keeps sending, 119 mover steals from a moving owner, 120 wire count unbounded, 121 wire trailing bytes, 122 refused take not rolled back, 123 refused put not rolled back,
 124 lost pickup keeps the item, 125 requests never resent, 126 item-gone not broadcast, 127 deltas not broadcast, 128 script change over a holder, 129 join table without containers,
 130 already-resolved without the record, 131 grant does not replace contents, 132 own drop created twice, 133 close keeps the lock, 134 close before moves are answered, 135 digest ignores
-contents, 136 replaced contents forget unconfirmed moves, 137 replayed answer carries a stale record.
-plugin/loot (`nvcoop_loot_tests`, 141..157): 141 no read before a host message, 142 rollback not executed, 143 no re-baseline after a correction, 144 own menu close reported, 145 inexact read
+contents, 136 replaced contents forget unconfirmed moves, 137 replayed answer carries a stale record, 180 tombstone forgets its ref, 181 join table without tombstones, 182 tombstones per table unbounded, 183 tombstones repeated on every table.
+plugin/loot additions: 176 a taken placed item that was not loaded is never retried, 177 retries never end.
+plugin/loot (`nvcoop_loot_tests`, 141..167): 141 no read before a host message, 142 rollback not executed, 143 no re-baseline after a correction, 144 own menu close reported, 145 inexact read
 offered, 146 claimed sender believed, 147 no host sweep, 148 no audit, 149 host answers not delivered locally, 150 NPC drop counted, 151 NPC pickup counted, 152 load keeps the view,
-153 session keeps scheduled work, 154 deferred creations forgotten, 155 clutter never sampled, 156 link loss keeps pending, 157 leaver not forwarded.
+153 session keeps scheduled work, 154 deferred creations forgotten, 155 clutter never sampled, 156 link loss keeps pending, 157 leaver not forwarded, 158 menu-less transfers never looked for, 159 any difference believed to be the player's, 160 no grace for the AddItem that follows a RemoveItem,
+161 one player move explains every container's difference, 162 a refused menu-less transfer closes a menu that is not ours, 163 only containers the engine already described are scanned,
+164 compared with today's shared contents instead of the last matched engine copy, 165 an eager write over a moved engine copy, 166 reverted items not counted, 167 a refused menu the engine cannot close keeps the player's takes.
+Placed-item pickups (2026-10-27, the lab's "loose item 1 is gone on both copies" failure): synccore/loot 170 the gone message does not name the placed ref, 171 the winner's own repeated claim is a loss,
+172 a pickup seen twice is claimed twice, 173 the remove action does not carry the placed ref; plugin/loot 174 the engine is asked by net id only, 175 the claim does not name the ref (171 is guarded by the core suite only).
 Each must make its suite fail; `run_tests.cmd` checks that.
 
 ## In-game proof (for the helper)

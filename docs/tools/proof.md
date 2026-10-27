@@ -62,7 +62,7 @@ the tests finish, one whole line each.
   touches only that test's copies; provisioning pair 1 uses `run.py provision --pairs 2 --first-pair 1`, so a running pair 0 stays untouched.
 - RAM guard: every copy that is not running yet needs 0.7 GB, and `--reserve-gb` (default 1.5) must stay free. Four copies are allowed when free RAM is at
   least 4 x 0.7 + reserve; the copies of the tests already running count. When two pairs do not fit, `--pairs 2` quietly runs one at a time.
-- `--pairs` is at most 2 (the owner's PC).
+- `--pairs` is at most 2 (the owner's PC). `PROOF_MAX_PAIRS=3` (at most 6) raises it for the second PC, which runs three pairs (`tools/bench/remote/proof_run.ps1`, started by `task.ps1`); `PROOF_NVSE_DIR` adds `--nvse-dir` to the provision command there, and `NVCOOP_ADAPTER` names the display adapter. The game slot needs `runs/gameslot_config.json` `{"slots": 3}`.
 
 ## What "proven" means
 

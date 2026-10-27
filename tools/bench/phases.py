@@ -13,6 +13,7 @@ INTERIOR = "GSDocMitchellHouse"        # a small interior next to the start of t
 EXTERIOR = ("WastelandNV", -18, 0)      # the exterior cell the save starts in (cow = center on world)
 NET_PROFILES = ["lan", "good_wifi", "bad_wifi", "mobile_tether", "transatlantic", "hell"]
 HOST_PORT, RELAY_PORT = 27960, 27961
+HOST_IP = ["127.0.0.1"]   # where the host copy listens: another machine's address in a two-PC run
 
 
 def dist(a, b):
@@ -49,7 +50,7 @@ def probe_cell(bot, cell, log, leg=250):
     """Teleport the bot to the exterior cell (cow) and take four short walks with REAL movement input (+x, -x, +y, -y). Returns what happened."""
     out = {"cell": list(cell), "legs_ok": 0, "legs": 4, "moved": [], "pos": None}
     try:
-        bot.nv.exec("cow WastelandNV %d %d" % cell)
+        exec_retry(bot, "cow WastelandNV %d %d" % cell, lambda s: None)
         bot.dismiss_messages(quiet_s=2, max_s=15, max_n=6)
         time.sleep(4)
         out["pos"] = [round(float(v)) for v in bot.pos()]
@@ -77,6 +78,32 @@ def find_origin(bots, log, cells=None, stop_at=4):
     return best, probes
 
 
+def wait_serviced(nv, log, timeout_s=90):
+    """Block until the game's main thread answers a request (it does not while a cell or save is loading). Returns True when it answers."""
+    end = time.time() + timeout_s
+    while time.time() < end:
+        try:
+            nv.eval("GetGameHour")
+            return True
+        except Exception:   # noqa: BLE001
+            time.sleep(1.5)
+    log("the game did not answer within %d s" % timeout_s)
+    return False
+
+
+def exec_retry(bot, line, log, tries=6):
+    """A console line on the bot's copy, retried while the game is busy loading ('main thread did not service the request')."""
+    last = None
+    for _ in range(tries):
+        try:
+            wait_serviced(bot.nv, log, 60)
+            return bot.nv.exec(line)
+        except Exception as e:   # noqa: BLE001
+            last = e
+            time.sleep(3)
+    raise last
+
+
 def goto_arena(ctx_arena, bots, log):
     """Move both copies into the arena cell, the client a little beside the host. No-op when the arena has no cell (they stay where they are)."""
     if not ctx_arena.cell or not ctx_arena.origin:
@@ -84,7 +111,7 @@ def goto_arena(ctx_arena, bots, log):
     ws, cx, cy = ctx_arena.cell
     x, y, z = ctx_arena.origin
     for i, b in enumerate(bots):
-        b.nv.exec("cow %s %d %d" % (ws, cx, cy))
+        exec_retry(b, "cow %s %d %d" % (ws, cx, cy), log)
         b.dismiss_messages(quiet_s=2, max_s=15, max_n=6)
     time.sleep(4)
     for i, b in enumerate(bots):
@@ -103,12 +130,12 @@ def area_change(samp, bots, k, log):
     info = {"ok": False}
     try:
         samp.phase[0] = "area_interior"
-        info["coc"] = str(host.nv.exec(f"coc {INTERIOR}").get("output"))[:60]
+        info["coc"] = str(exec_retry(host, f"coc {INTERIOR}", log).get("output"))[:60]
         host.dismiss_messages(quiet_s=3, max_s=20, max_n=6)
         sleep_until(time.time() + 12 * k)
         samp.phase[0] = "area_back"
         info["t_back"] = round(time.time() - samp.t0, 2)
-        info["cow"] = str(host.nv.exec("cow %s %d %d" % EXTERIOR).get("output"))[:60]
+        info["cow"] = str(exec_retry(host, "cow %s %d %d" % EXTERIOR, log).get("output"))[:60]
         host.dismiss_messages(quiet_s=3, max_s=20, max_n=6)
         sleep_until(time.time() + 18 * k)
         info["ok"] = True
@@ -170,7 +197,7 @@ class Relay:
         self.info.parent.mkdir(parents=True, exist_ok=True)
         if self.info.exists():
             self.info.unlink()
-        cmd = [sys.executable, "-I", str(ROOT / "tools" / "chaos" / "chaos.py"), "relay", "--target", f"127.0.0.1:{HOST_PORT}",
+        cmd = [sys.executable, "-I", str(ROOT / "tools" / "chaos" / "chaos.py"), "relay", "--target", f"{HOST_IP[0]}:{HOST_PORT}",
                "--listen", str(RELAY_PORT), "--profile", profile, "--seed", "7", "--info-file", str(self.info)]
         self.proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(80):
@@ -201,8 +228,9 @@ def client_ini_path(root_inst):
     return Path(root_inst) / "1" / "Data" / "NVSE" / "Plugins" / "nvcoop.ini"
 
 
-def point_client_at_relay(ini_path, on):
-    """Add (on) or remove (off) host / port keys under [coop] of the client's nvcoop.ini so it joins the relay port. Returns the original text."""
+def point_client_at_relay(ini_path, on, host="127.0.0.1", port=None):
+    """Add (on) or remove (off) host / port keys under [coop] of the client's nvcoop.ini so it joins the relay port (or, with host and port given, a
+    host copy on another machine). Returns the original text."""
     text = ini_path.read_text(encoding="latin-1")
     lines = text.splitlines()
     out, in_coop = [], False
@@ -214,8 +242,8 @@ def point_client_at_relay(ini_path, on):
             continue
         out.append(ln)
         if in_coop and s.lower() == "[coop]" and on:
-            out.append(f"host=127.0.0.1")
-            out.append(f"port={RELAY_PORT}")
+            out.append(f"host={host}")
+            out.append(f"port={port or RELAY_PORT}")
     new = "\r\n".join(out) + "\r\n"
     ini_path.write_text(new, encoding="latin-1", newline="")
     return text

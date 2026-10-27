@@ -139,7 +139,8 @@ Value ScriptsJson() {
     const auto& s = nvhooks::scriptStats();
     Value o = Value::object();
     o.set("gated", (int64_t)s.gated).set("ran", (int64_t)s.ran).set("ranWhileApplying", (int64_t)s.ranWhileApplying)
-        .set("questVarGuarded", (int64_t)s.questVarGuarded).set("questVarRollbacks", (int64_t)s.questVarRollbacks);
+        .set("questVarGuarded", (int64_t)s.questVarGuarded).set("questVarRollbacks", (int64_t)s.questVarRollbacks)
+        .set("stagesBlocked", (int64_t)s.stagesBlocked).set("stagesForwarded", (int64_t)s.stagesForwarded);
     return o;
 }
 
@@ -441,6 +442,7 @@ bool MGuestStats(const std::string&, std::string& out) {
         .set("questScriptsSkipped", (int64_t)sp.questScripts).set("mutationsBlocked", (int64_t)sp.mutations)
         .set("resultScriptsBlocked", (int64_t)sp.resultScripts).set("perScript", per)
         .set("questVarGuarded", (int64_t)s.questVarGuarded).set("questVarRollbacks", (int64_t)s.questVarRollbacks)
+        .set("stagesBlocked", (int64_t)s.stagesBlocked).set("stagesForwarded", (int64_t)s.stagesForwarded)
         .set("objVarScripts", (int64_t)nvhooks::ObjectVarWrites::builtin().scripts()).set("objVarRows", (int64_t)nvhooks::ObjectVarWrites::builtin().rows());
     out = o.dump();
     return true;

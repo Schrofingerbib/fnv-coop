@@ -213,6 +213,18 @@ void LootHost::sendTable(PlayerId to, Out& out) {
         for (const auto& kv : containers_) { out.push_back({to, Body(MContainer{kv.second})}); ++nc; }
     }
     for (const auto& kv : items_) { out.push_back({to, Body(MItemNew{kv.second})}); ++ni; }
+    if (!FNV_MUT(181)) {   // twin 181: the join table leaves the placed-item tombstones out (a client that joins after a pickup still sees the item)
+        uint32_t nt = 0;
+        for (const auto& kv : placedRef_) {
+            if (nt >= cfg_.maxTableTombstones && !FNV_MUT(182)) break;   // twin 182: the table size is unbounded
+            auto tomb = placedTaken_.find(kv.first);
+            if (tomb == placedTaken_.end()) continue;
+            MItemGone g;
+            g.item = kv.first; g.by = tomb->second; g.txn = 0; g.ref = kv.second;
+            out.push_back({to, Body(g)});
+            ++nt;
+        }
+    }
     for (const auto& kv : clutter_) {
         MClutterOwn o;
         o.net = kv.first; o.owner = kv.second.owner; o.epoch = kv.second.epoch; o.pos = kv.second.pos; o.rot = kv.second.rot;
@@ -519,6 +531,12 @@ void LootHost::doClaim(PlayerId from, const ReqClaim& r, uint64_t now, Out& out)
     if (!isIssuedItemId(r.item)) {   // a placed item: the host learns it at the first claim
         auto tomb = placedTaken_.find(r.item);
         if (tomb != placedTaken_.end()) {
+            if (tomb->second == from && !FNV_MUT(171)) {   // twin 171: the winner's own second claim of the same item is a loss (its pickup is taken back from it)
+                ++stats_.claimsRepeated;
+                if (r.hasAdopt) { res.base = r.adopt.base; res.count = r.adopt.count; }
+                finish();
+                return;
+            }
             res.status = Status::AlreadyTaken; res.other = tomb->second;
             ++stats_.claimsLost;
             finish();
@@ -526,10 +544,12 @@ void LootHost::doClaim(PlayerId from, const ReqClaim& r, uint64_t now, Out& out)
         }
         if (r.hasAdopt && validPlacedItem(r.adopt, r.item) && placedTaken_.size() < cfg_.maxPlacedTaken) {
             if (!FNV_MUT(115)) placedTaken_[r.item] = from;   // twin 115: no tombstone (the same placed item can be picked up again and again)
+            if (!r.ref.plugin.empty() && !FNV_MUT(180)) placedRef_[r.item] = r.ref;   // twin 180: the tombstone forgets its ref (a late joiner cannot be told which item is gone)
             res.base = r.adopt.base; res.count = r.adopt.count;
             ++stats_.claimsWon; ++stats_.placedClaims;
             MItemGone g;
             g.item = r.item; g.by = from; g.txn = r.txn;
+            if (!FNV_MUT(170)) g.ref = r.ref;   // twin 170: the others are told the id only: they cannot find a placed world item from it (the ref stays on their screen)
             sendAll(g, out, from);
             finish();
             return;
@@ -541,6 +561,11 @@ void LootHost::doClaim(PlayerId from, const ReqClaim& r, uint64_t now, Out& out)
     }
     auto rt = recentTaken_.find(r.item);
     if (rt != recentTaken_.end()) {
+        if (rt->second == from && !FNV_MUT(171)) {   // the winner claimed it twice: not a loss
+            ++stats_.claimsRepeated;
+            finish();
+            return;
+        }
         res.status = Status::AlreadyTaken; res.other = rt->second;
         ++stats_.claimsLost;
         finish();
@@ -697,7 +722,7 @@ uint64_t LootHost::digest() const { return tableDigest(containers_, items_); }
 
 std::vector<uint8_t> LootHost::save() const {
     Archive a = Archive::writer();
-    uint8_t ver = 1;
+    uint8_t ver = 2;   // 2: the placed tombstones carry their world ref
     a.u8(ver);
     uint32_t next = nextItemId_;
     a.varu32(next);
@@ -718,6 +743,14 @@ std::vector<uint8_t> LootHost::save() const {
         uint8_t by = kv.second;
         a.varu32(id); a.u8(by);
     }
+    n = placedRef_.size();
+    a.count(n, kMaxTableRecords);
+    for (const auto& kv : placedRef_) {
+        uint32_t id = kv.first;
+        FormRef f = kv.second;
+        a.varu32(id);
+        fnvcoop::io(a, f);
+    }
     return a.finish();
 }
 
@@ -725,7 +758,7 @@ bool LootHost::load(const std::vector<uint8_t>& bytes) {
     Archive a = Archive::reader(bytes.data(), bytes.size());
     uint8_t ver = 0;
     a.u8(ver);
-    if (!a.ok() || ver != 1) return false;
+    if (!a.ok() || (ver != 1 && ver != 2)) return false;
     uint32_t next = 0;
     a.varu32(next);
     std::map<NetId, ContainerRec> cs;
@@ -755,10 +788,23 @@ bool LootHost::load(const std::vector<uint8_t>& bytes) {
         if (!a.ok()) return false;
         pt[id] = by;
     }
+    std::map<NetId, FormRef> pr;
+    if (ver >= 2) {
+        if (!a.count(n, kMaxTableRecords)) return false;
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t id = 0;
+            FormRef f;
+            a.varu32(id);
+            fnvcoop::io(a, f);
+            if (!a.ok()) return false;
+            if (pt.count(id)) pr[id] = std::move(f);
+        }
+    }
     if (!a.ok() || !a.atEnd()) return false;
     containers_ = std::move(cs);
     items_ = std::move(is);
     placedTaken_ = std::move(pt);
+    placedRef_ = std::move(pr);
     held_.clear();
     clutter_.clear();
     recentTaken_.clear();
@@ -987,7 +1033,8 @@ uint32_t LootClient::dropped(uint32_t localRef, const FormRef& base, int32_t cou
     return d.txn;
 }
 
-void LootClient::pickedUp(uint32_t localRef, NetId item, const FormRef& base, int32_t count, uint32_t meta, CellId cell, const Vec3& pos, uint64_t now) {
+void LootClient::pickedUp(uint32_t localRef, NetId item, const FormRef& base, int32_t count, uint32_t meta, CellId cell, const Vec3& pos, uint64_t now,
+                          const FormRef& placedRef) {
     if (item == 0) {   // a dropped item of ours that has no issued id yet: ask once it has one
         for (const auto& kv : dropRef_) {
             if (kv.second == localRef) {
@@ -999,12 +1046,18 @@ void LootClient::pickedUp(uint32_t localRef, NetId item, const FormRef& base, in
         }
         return;
     }
+    if (!FNV_MUT(172)) {   // twin 172: one pickup seen twice (two event paths) is claimed twice: the second claim loses and the first pickup is taken back
+        for (const auto& kv : pending_) {
+            if (kv.second.op == OpKind::Claim && kv.second.id == item) { ++stats_.claimsDuplicate; return; }
+        }
+    }
     ReqClaim c;
     c.txn = nextTxn();
     c.item = item;
     if (!isIssuedItemId(item)) {
         c.hasAdopt = true;
         c.adopt.id = item; c.adopt.base = base; c.adopt.count = count; c.adopt.meta = meta; c.adopt.cell = cell; c.adopt.pos = pos;
+        c.ref = placedRef;
     }
     ++stats_.claims;
     Pending p;
@@ -1088,7 +1141,7 @@ void LootClient::onMessage(const Body& b, uint64_t now) {
         if (inTable_) tableItems_.insert(w.id);
         bindDrop(w);
     }
-    else if (auto* g = std::get_if<MItemGone>(&b)) forgetItem(g->item, g->by);
+    else if (auto* g = std::get_if<MItemGone>(&b)) forgetItem(g->item, g->by, g->ref);
     else if (auto* cg = std::get_if<MContainerGone>(&b)) {
         auto lc = local_.find(cg->cont);
         if (lc == local_.end() || !lc->second.open) containers_.erase(cg->cont);
@@ -1176,7 +1229,9 @@ void LootClient::bindDrop(const WorldItem& w) {
     ++stats_.created;
 }
 
-void LootClient::forgetItem(NetId id, PlayerId by) {
+void LootClient::forgetItem(NetId id, PlayerId by, const FormRef& placedRef) {
+    // A placed item's tombstone comes again with every table (join, heal): the engine was told the first time (the plugin keeps asking until the ref's cell is loaded).
+    if (!placedRef.plugin.empty() && gone_.count(id) && !FNV_MUT(183)) return;   // twin 183: every table repeats the removal of every placed item taken so far
     items_.erase(id);
     materialized_.erase(id);
     gone_.insert(id);
@@ -1185,6 +1240,8 @@ void LootClient::forgetItem(NetId id, PlayerId by) {
     if (by == cfg_.self) return;   // our own claim: the engine already removed the ref
     Action a;
     a.kind = Action::RemoveItem; a.id = id;
+    if (!FNV_MUT(173)) a.placed = placedRef;   // twin 173: the engine is told the id only (it cannot find a placed world item from that)
+    if (!placedRef.plugin.empty()) ++stats_.removedPlaced;
     push(std::move(a));
     ++stats_.removed;
 }
@@ -1568,6 +1625,12 @@ bool LootClient::isOpen(NetId cont) const {
     auto it = local_.find(cont);
     return it != local_.end() && it->second.open;
 }
+bool LootClient::transferIdle(NetId cont) const {
+    auto l = local_.find(cont);
+    if (l != local_.end() && (l->second.open || l->second.closeWanted || l->second.closeSent)) return false;
+    return pendingFor(cont) == 0;
+}
+
 bool LootClient::holdsLock(NetId cont) const {
     auto it = local_.find(cont);
     return it != local_.end() && it->second.granted;

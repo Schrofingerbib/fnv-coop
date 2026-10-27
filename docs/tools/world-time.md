@@ -92,3 +92,9 @@ python -I plugin/world_time/tools/worldtime_proof.py --instances 0 1 2 --door fa
 Steps: module/pins, clock follow and pull-back, wait by consent, refusal, native door (console `Activate`, no `SetOpenState`), autosave switches, party trip.
 Manual extras: lockpick a chest on the host and read `world.query GetLocked` on a client; open a door on a client and watch it follow the host's answer; load a
 save on the host and check `worldtime.clock` on the client.
+
+## Scripted time skips: once per party event (G38, owner decision D7)
+`ClockAuthority` (host): a forward leap of the host clock that no granted wait / sleep explains, of at least `once_min_hours` (12) game hours, with the size (within `once_tolerance_min`, 60 minutes) of one seen
+`once_window_s` (120) seconds ago, is the same party event again (the Canyon door's +3 days when a second player walks through, Honest Hearts' +14 days): the host takes it back with `takeUndo` and sends no beacon,
+so the clients never see it. Shorter leaps (a script that sets the hour) and skips of another size are never undone. ini `[worldtime] once_event=1|0 once_min_hours once_window_s once_tolerance_min`.
+Twins 170, 171 (`wt_clock.cpp`). Unproven in game: that the engine's own scripts leave the clock where the host wrote it, and that a script's other effects of the repeat (items, quest stages) are idempotent.

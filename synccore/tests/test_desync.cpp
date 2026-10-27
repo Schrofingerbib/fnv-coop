@@ -195,7 +195,7 @@ TEST(desync, ref_script_vars_are_not_digest_state_the_client_dump_cannot_carry_t
 }
 
 TEST(desync, twin_a_digest_that_compares_ref_script_vars_never_converges) {   // twin: the pre-fix digest
-    MutationScope m([] { Mutations x; x.digestKeepsRefVars = true; return x; }());
+    MutationScope m([] { Mutations x; x.digestKeepsRefVars = true; x.repairForever = true; return x; }());   // the pre-fix digest, and no give-up
     RefVarRun o = refVarsRun();
     CHECK(o.mismatch > 5);
     CHECK(o.repairs > 5);

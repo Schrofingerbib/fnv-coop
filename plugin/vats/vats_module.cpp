@@ -133,7 +133,7 @@ volatile DWORD g_mainThread = 0;
 
 struct Pins { bool setScale = false, getMult = false, menuMode = false, menuModeOf = false, accept = false, unclick = false, limb = false, handleClick = false, getForm = false; };
 Pins g_pins;
-uint64_t g_thunkScale = 0, g_thunkScaleChanged = 0, g_thunkMult = 0, g_thunkMultChanged = 0, g_thunkPause = 0, g_thunkPauseChanged = 0, g_thunkOffThread = 0, g_thunkErrors = 0;
+uint64_t g_thunkScale = 0, g_thunkScaleChanged = 0, g_thunkMult = 0, g_thunkMultChanged = 0, g_thunkPause = 0, g_thunkPauseChanged = 0, g_thunkOffThread = 0, g_thunkErrors = 0, g_thunkThreadSkips = 0;
 uint64_t g_calls = 0, g_callsFailed = 0, g_pinRefusals = 0;
 
 std::unique_ptr<vt::VatsRuntime> g_rt;
@@ -447,7 +447,7 @@ struct HookGroup {
     uint32_t thunk = 0;
     std::unique_ptr<vt::SitePatcher> patcher;
 };
-HookGroup g_groups[5];
+HookGroup g_groups[6];
 bool g_hooksTried = false;
 
 bool OnMainThread() { return g_mainThread == 0 || GetCurrentThreadId() == g_mainThread; }
@@ -519,6 +519,24 @@ bool __cdecl MenuModeThunk() {
     return r;
 }
 
+// 0x713D90 (cdecl bool): "the worker threads are started". The one call in the menu update (0x713C8D) is redirected here. While the world runs under an open VATS
+// menu the answer is false, so the menu update does not wait for a worker event that nobody signals (the main thread then waited for ever, vats_addrs.h).
+bool __cdecl ThreadsActiveThunk() {
+    bool r = reinterpret_cast<bool(__cdecl*)()>(static_cast<uintptr_t>(ad::kThreadsActive))();
+    vt::VatsSync* s = Sync();
+    if (r && s && OnMainThread()) {
+        try {
+            if (!vt::menuModeForWorld(s->policyInput(), true)) {   // false = the world keeps running although a menu (VATS) is open
+                ++g_thunkThreadSkips;
+                return false;
+            }
+        } catch (...) {
+            ++g_thunkErrors;
+        }
+    }
+    return r;
+}
+
 uint32_t ThunkAddr(void* fn) { return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(fn)); }
 
 void InstallHooks() {
@@ -529,9 +547,10 @@ void InstallHooks() {
     g_groups[2] = {"target_mult", ad::kTargetMultSites, ad::kTargetMultSiteCount, ad::kGetTargetTimeMult, ad::kGetTimeMultPrologue, ThunkAddr(reinterpret_cast<void*>(&TargetMultThunk)), nullptr};
     g_groups[3] = {"pause_main", ad::kPauseSitesMain, ad::kPauseSiteMainCount, ad::kMenuMode, ad::kMenuModePrologue, ThunkAddr(reinterpret_cast<void*>(&MenuModeThunk)), nullptr};
     g_groups[4] = {"pause_ext", ad::kPauseSitesExtended, ad::kPauseSiteExtendedCount, ad::kMenuMode, ad::kMenuModePrologue, ThunkAddr(reinterpret_cast<void*>(&MenuModeThunk)), nullptr};
-    for (int i = 0; i < 5; ++i) {
+    g_groups[5] = {"thread_wait", ad::kThreadWaitSites, ad::kThreadWaitSiteCount, ad::kThreadsActive, ad::kThreadsActivePrologue, ThunkAddr(reinterpret_cast<void*>(&ThreadsActiveThunk)), nullptr};
+    for (int i = 0; i < 6; ++i) {
         HookGroup& g = g_groups[i];
-        if (i == 3 && g_set.pauseSites < 1) continue;
+        if ((i == 3 || i == 5) && g_set.pauseSites < 1) continue;
         if (i == 4 && g_set.pauseSites < 2) continue;
         g.patcher.reset(new vt::SitePatcher(g_mem));
         const int n = g.patcher->install(g.sites, g.count, g.target, g.prologue, 16, g.thunk);

@@ -29,12 +29,16 @@ step gets its own row of metrics.
 | `playbook` | `name` (fight, loot_race, any playbook in tools/bots) | Runs the repo's playbook and scores its steps |
 | `net` | `profiles`, `secs`, `recover_secs` | Steps the client through the chaos relay profiles, then back to lan (starts the relay automatically) |
 
-Add a phase type with `@register("name")` in `scenario.py`. A phase that fails is recorded under `phase_errors` and the run carries on.
+Add a phase type with `@register("name")` in `bench_scenario.py`. A phase that fails is recorded under `phase_errors` and the run carries on.
 Courses and spawn rings come from `arena.py`: offsets from an origin, so a scenario never needs coordinates. `tools/bench/arena.json` can pin the
 origin (and the `cow` cell) of a flat, open area; without it each course starts where the player stands.
 `tools/bench/find_arena.py` looks for a flat, open exterior cell where real movement input works and writes `arena.json`; the `arena` phase then moves both
 copies there at the start of a scenario. Both are written and parse-checked but have NOT been run in the game yet.
 The scenario runner and the arena layout are tested without the game: `python -I -m unittest discover -s tools/bench/tests -p test_scenario.py`.
+
+`real_fight` kills the way each side can: the host with the console `Kill` (it owns the world), the client by standing off and shooting (`bot.fire`): a
+guest's console `Kill` on an actor it does not own is refused on purpose (guest gate), so a client console kill proves nothing. The shot goes to the
+actor's owner, which applies it; `play.kill_latency_s` is the time from the killing volley until the host shows the actor dead.
 
 ## What a run does
 

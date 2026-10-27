@@ -33,6 +33,21 @@ class ProofTests(unittest.TestCase):
         self.assertTrue(any(r[0] == "SKIP" and r[1].startswith("9") for r in res))
         self.assertFalse(g.dead)
 
+    def test_the_selftest_catches_a_proof_that_insists_on_one_npc(self):   # twin: npc_pick without the fallback / without the runtime id
+        import npc_pick
+        for mutant in ("no_fallback", "load_order_dropped", "no_wait"):
+            npc_pick.MUTANT = mutant
+            try:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = npc_proof.selftest()
+            except npc_proof.NotReady:
+                rc = 1          # gave up on the NPC the manifest named: caught
+            finally:
+                npc_pick.MUTANT = ""
+            if mutant != "load_order_dropped":      # the fake's plugins are index 0 / 2; the hint in the selftest is index 0, so that twin lives in test_npc_pick
+                self.assertNotEqual(rc, 0, mutant)
+
     def test_a_missing_anim_npc_is_not_ready_not_a_failure(self):
         class Dead:
             def call(self, *a, **k):

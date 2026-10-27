@@ -15,6 +15,7 @@
 #include "apply_remote.h"
 #include "engine_hooks.h"
 #include "world_core.h"
+#include "world_refvars.h"
 #include "world_plan.h"
 
 namespace nvworld {
@@ -58,6 +59,16 @@ void hostTick();
 // Refs whose script variables are polled in addition to the player's current cell (quest-critical NPCs/objects).
 void watchRef(const fnvcoop::FormRef& r);
 void clearWatched();
+// Poll schedule (ini [world] refvar_fast_every / refvar_sweep_every / refvar_budget, read by the module).
+void setRefVarPollConfig(const RefVarPollCfg& cfg);
+struct RefVarPollStats {
+    uint64_t sweeps = 0, fastReads = 0;
+    size_t tracked = 0, pending = 0, watched = 0;
+};
+RefVarPollStats refVarPollStats();
+// The script of this reference just ended (the script-run observer calls this, see docs/handover/P5-requests.md): its variables are read now, so
+// a flag set and cleared by two runs inside one frame is two values, not none. Only watched references are read (every script run would be too many).
+void noteRefScriptRan(uint32_t refID);
 size_t pollRefVarsNow(std::vector<fnvcoop::RefScriptVar>* out);  // test/diagnostic: one full pass, returns number of changes
 
 // Client side. Applies SpawnRef/DespawnRef/RefScriptVar and WorldEffects without running scripts.

@@ -74,7 +74,7 @@
      ]
     }
    ],
-   "notes": "exit 0 pass, 1 failed checks, 3 not wired. npc_ref is the Goodsprings powder ganger of scenarios/goodsprings_enemies.json; load a save near it first.",
+   "notes": "exit 0 pass, 1 failed checks, 3 not wired. npc_ref is the Goodsprings powder ganger of scenarios/goodsprings_enemies.json and only a hint: when he is not loaded with 3D after the scenario jump, the script waits and then uses the nearest loaded character of the cell (tools/runner/npc_pick.py).",
    "also_roadmap": [],
    "pair": 0,
    "timeout_s": 900,
@@ -99,6 +99,14 @@
     "areadigest.status"
    ],
    "commands": [
+    {
+     "name": "load_scenario",
+     "argv": [
+      "tools/proof/drivers/load_scenario.py",
+      "--instances",
+      "{instances}"
+     ]
+    },
     {
      "name": "wiring",
      "argv": [
@@ -127,6 +135,7 @@
    "also_roadmap": [],
    "pair": 0,
    "timeout_s": 900,
+   "needs_world": true,
    "fake_commands": [
     {
      "name": "selftest",
@@ -143,7 +152,7 @@
      ]
     }
    ],
-   "notes": "provisions exactly the actors lane (nvcoop.ini live.actors=1, dev.bots=1) because the wiring step expects 'actors' only (live_wiring_proof.py --expect: nothing is on that was not asked for); the other live.* keys must be absent",
+   "notes": "the first command (drivers/load_scenario.py) jumps both copies to the Goodsprings scenario: a booted copy sits in the main menu, so no NPC is loaded and coop.owner knows none (NOT READY). npc_ref is only a hint: when both copies do not know it, proof_actor_port_two_copy.py waits for and uses an NPC of the host's cell that they do (tools/runner/npc_pick.py). provisions exactly the actors lane (nvcoop.ini live.actors=1, dev.bots=1) because the wiring step expects 'actors' only (live_wiring_proof.py --expect: nothing is on that was not asked for); the other live.* keys must be absent",
    "ini_absent": [
     "live.avatars",
     "live.combat",
@@ -354,7 +363,7 @@
      ]
     }
    ],
-   "notes": "--weapon is left out: the weapon steps print SKIP. exit 0 no FAIL, 1 FAIL, 3 anim.npc missing. The first command (drivers/load_scenario.py) loads the autosave and walks the player to the powder ganger (npc_ref), because a freshly booted copy has no save loaded and the NPC does not exist yet.",
+   "notes": "--weapon is left out: the weapon steps print SKIP. exit 0 no FAIL, 1 FAIL, 3 anim.npc missing or no loaded NPC. npc_ref is only a hint (the nearest loaded character is used when he is not loaded) and is turned into a runtime id: anim.npc.do parses the whole ref as hex. The first command (drivers/load_scenario.py) loads the autosave and walks the player to the powder ganger (npc_ref), because a freshly booted copy has no save loaded and the NPC does not exist yet.",
    "also_roadmap": [],
    "pair": 0,
    "snapshot": [],

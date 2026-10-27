@@ -1,4 +1,4 @@
-# Fallout: New Vegas co-op: story sync (developer preview)
+# Fallout: New Vegas co-op (developer preview)
 
 [![Discord](https://img.shields.io/badge/Discord-chat%20and%20help-5865F2?logo=discord&logoColor=white)](https://discord.gg/EXGB49R82t)
 
@@ -12,18 +12,27 @@
 > | Two game copies on one PC for automated tests | working |
 > | Quest stage sync between two real game copies | working: stages arrive exactly once, with no scripts re-run on the client |
 > | Goodsprings stage sweep | 65 of 104 stages pass |
-> | NV:MP alongside the plugin | both clients connect and see each other |
+> | Runs on its own, without NV:MP | yes: own networking, player avatars, NPC and combat sync |
 >
 > There is no player release yet. Progress updates land here.
 
 Play the whole **Fallout: New Vegas** story together: 2 to 4 players, one shared world, one shared quest
-state. This repo is the **story layer**: an xNVSE plugin plus a game-free sync core that keeps quests,
-objectives, dialogue results, reputation and karma identical on every machine.
+state. This repo is the whole co-op mod: an xNVSE plugin plus a game-free sync core. It keeps quests, objectives,
+dialogue, reputation and karma identical on every machine, and it has its own networking, player avatars, NPC and
+enemy sync, combat, loot and world sync.
 
 [![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/cranebeaker)
 
-Avatars, enemies and combat get their own sync layer (steps 1 to 4 of the roadmap). Until that ships, **NV:MP**,
-the existing New Vegas multiplayer mod by the NV:MP team, can run alongside. We do not modify or redistribute it.
+### About NV:MP
+
+This project does not use NV:MP. NV:MP (the New Vegas multiplayer mod by the NV:MP team) was only a starting point:
+early on we studied how it hooks into the game. NV:MP's networking is closed source, and none of its code is in this
+repo. Everything here is our own: the networking, the player avatars, NPC and enemy sync, combat, loot, and the whole
+quest and dialogue layer, which NV:MP does not have. The mod runs without NV:MP installed.
+
+There is one small, optional module (`plugin/nvmp`) left from that early phase. It only matters if you run NV:MP
+at the same time: it then patches NV:MP's client at runtime so the two do not fight over the same actors. Without
+NV:MP it does nothing.
 
 ## Roadmap: 10 steps to full co-op
 
@@ -129,7 +138,8 @@ playbook explains how to send it back.
   the code: the split-screen focus guard, the bot, scenario, pool and runner fixes, the bridge `exec` on a reference, and
   the first proof scripts to pass in the game. Thanks a lot for helping with the code!
 - **xNVSE** (the New Vegas Script Extender team): https://github.com/xNVSE/NVSE
-- **NV:MP** by the NV:MP team (nv-mp.com). Not included; we patch it only at runtime.
+- **NV:MP** by the NV:MP team (nv-mp.com): studied early on to learn how a multiplayer mod hooks the game. Not included
+  and not required.
 - **ENet** by Lee Salzman: https://github.com/lsalzman/enet (bundled in `third_party/enet`, MIT licensed).
 - **Nucleus Co-op** (SplitScreen.Me): the techniques for running several copies of a single-instance game on one
   PC: https://github.com/SplitScreen-Me/splitscreenme-nucleus

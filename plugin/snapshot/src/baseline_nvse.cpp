@@ -236,9 +236,9 @@ BaselineDumpStats g_lastStats;
 
 const BaselineDumpStats& LastBaselineStats() { return g_lastStats; }
 
-bool DumpBaselineShadowEx(fnvcoop::ShadowState* out, uint64_t* contentHash, std::string* err,
-                          const BaselineDumpOptions& opts) {
-	Filter flt;
+namespace {
+// Loads the volatile-keys file (option, env, then the default next to the dll) into the shared list. Idempotent: the sets just absorb the same lines.
+bool LoadVolatileFile(const BaselineDumpOptions& opts, std::string* vfOut, const char** howOut, std::string* err) {
 	std::string vf = opts.volatileKeysFile;
 	const char* how = "option";
 	if (vf.empty()) { const char* e = std::getenv("FNVCOOP_VOLATILE_KEYS"); if (e) { vf = e; how = "env"; } }
@@ -250,6 +250,39 @@ bool DumpBaselineShadowEx(fnvcoop::ShadowState* out, uint64_t* contentHash, std:
 		ss << fin.rdbuf();
 		if (!fnvcoop::volatileKeys().loadFromText(ss.str(), err)) return false;   // L4's loader: the single grammar
 	}
+	*vfOut = vf;
+	*howOut = how;
+	return true;
+}
+void ResolveNow() { fnvcoop::volatileKeys().resolveNames(ResolveVar); }
+bool GuardedResolve() {
+	__try {
+		ResolveNow();
+		return true;
+	} __except (1) {
+		return false;
+	}
+}
+}  // namespace
+
+bool PrepareVolatileKeys(const BaselineDumpOptions& opts, std::string* summary) {
+	std::string vf, err;
+	const char* how = "-";
+	if (!LoadVolatileFile(opts, &vf, &how, &err)) { if (summary) *summary = err; return false; }
+	const bool ok = GuardedResolve();
+	char buf[384];
+	std::snprintf(buf, sizeof buf, "volatile keys: file=%s (%s) entries=%zu unresolved-names=%zu%s", vf.empty() ? "(none)" : vf.c_str(), vf.empty() ? "-" : how,
+	              fnvcoop::volatileKeys().size(), fnvcoop::volatileKeys().unresolvedNames(), ok ? "" : " (access violation while resolving)");
+	if (summary) *summary = buf;
+	return ok && fnvcoop::volatileKeys().unresolvedNames() == 0;
+}
+
+bool DumpBaselineShadowEx(fnvcoop::ShadowState* out, uint64_t* contentHash, std::string* err,
+                          const BaselineDumpOptions& opts) {
+	Filter flt;
+	std::string vf;
+	const char* how = "option";
+	if (!LoadVolatileFile(opts, &vf, &how, err)) return false;
 	flt.stats.volatileFileEntries = fnvcoop::volatileKeys().size();
 	BaselineInput in;
 	bool ok = GuardedRead(&opts, &in, &flt);

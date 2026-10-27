@@ -148,7 +148,8 @@ TEST(intents_policy, guest_events) {
     CHECK(d.forward && d.kind == Kind::TriggerEnter && d.suppressLocal);
     d = decideEvent(c, ev::OnTriggerLeave, trig);
     CHECK(d.forward && d.kind == Kind::TriggerLeave && d.suppressLocal);
-    CHECK(!decideEvent(c, ev::OnTrigger, trig).forward);                       // the every-frame event is not forwarded
+    d = decideEvent(c, ev::OnTrigger, trig);
+    CHECK(d.forward && d.kind == Kind::TriggerStay && d.suppressLocal);       // the every-frame event becomes a throttled keep-alive (G04, test_intents_campaign.cpp)
     CHECK(!decideEvent(c, ev::OnHit, act).forward);                            // hit is opt-in
     Config hit = c; hit.hit = true;
     d = decideEvent(hit, ev::OnHit, act);
@@ -692,6 +693,131 @@ TEST(intents_client, ignores_verdicts_it_did_not_ask_for) {
     Bytes ib = encode(in);                                       // an Intent arriving at a client is not a verdict
     g.client->onDatagram(ib.data(), ib.size());
     CHECK(g.client->stats().badDatagrams == 2);
+}
+
+// ---- guest quest stage (the lab's "client sets stage 20 through the console, nobody hears of it") -----------------------------------------
+
+namespace {
+Intent stageIntent(const FormRef& q, int32_t stage, uint32_t id) {
+    Intent in = HostRig::mk(Kind::SetStage, q, id);
+    in.value = stage;
+    return in;
+}
+}  // namespace
+
+TEST(intents_host, guest_stage_request_runs_the_real_stage_as_the_guest) {
+    HostRig h;
+    h.eng.quests[R(0x1000)] = 10;
+    Verdict v = h.host->handle(1, stageIntent(R(0x1000), 20, 1));
+    CHECK(v.result == Result::Executed);
+    CHECK(h.eng.quests[R(0x1000)] == 20 && h.eng.count("setStage") == 1);
+    const FakeEngine::Call& c = h.eng.calls.back();
+    CHECK(c.what == "setStage" && c.arg == 20 && c.contextActor == 0x1001 && c.contextSlot == 1 && c.depth >= 1);   // the guest's puppet is `player` for the result scripts
+    REQUIRE(h.commits.size() == 1);
+    CHECK(h.commits[0].origin == 1 && h.commits[0].txn.cause.kind == fnvcoop::CauseKind::Intent && h.effects<SetStage>() == 1);   // one txn, the guest is the origin
+    CHECK(std::get<SetStage>(h.commits[0].txn.effects[0]).stage == 20);
+    CHECK(h.eng.outsideScope == 0 && h.host->stats().stagesApplied == 1 && h.host->stats().byKind[static_cast<size_t>(Kind::SetStage)] == 1);
+    h.puppets.clear();   // no puppet: the stage's scripts open no menu, the host's player stands in
+    CHECK(h.host->handle(1, stageIntent(R(0x1000), 30, 2)).result == Result::Executed && h.eng.calls.back().contextActor == kHostPlayerRef);
+}
+
+TEST(intents_host, guest_stage_request_never_reruns_a_stage_the_quest_reached) {
+    HostRig h;
+    h.eng.quests[R(0x1000)] = 20;
+    CHECK(h.host->handle(1, stageIntent(R(0x1000), 20, 1)).result == Result::NoAdvance);   // the host's own copy of the script got there first
+    CHECK(h.host->handle(1, stageIntent(R(0x1000), 10, 2)).result == Result::NoAdvance);   // and a lower stage is no advance either (merge is max)
+    CHECK(h.eng.count("setStage") == 0 && h.commits.empty());                               // nothing ran: no second set of rewards
+    CHECK(h.host->stats().stagesNoAdvance == 2 && h.stageRefusals.size() == 2 && std::get<3>(h.stageRefusals[0]) == Result::NoAdvance);   // and the host said so
+}
+
+TEST(intents_host, guest_stage_request_obeys_the_hosts_policy_and_says_so) {
+    HostRig h;
+    h.eng.quests[R(0x1000)] = 10;
+    h.allowStage = [](PlayerId, const FormRef&, uint32_t st) { return st != 120; };         // ExclusiveStages: the other outcome of the fork was committed first
+    CHECK(h.host->handle(1, stageIntent(R(0x1000), 120, 1)).result == Result::Denied);
+    CHECK(h.eng.count("setStage") == 0 && h.commits.empty() && h.eng.quests[R(0x1000)] == 10);
+    CHECK(h.host->stats().stagesRefused == 1 && h.stageRefusals.size() == 1 && std::get<2>(h.stageRefusals[0]) == 120 && std::get<3>(h.stageRefusals[0]) == Result::Denied);
+    CHECK(h.host->handle(1, stageIntent(R(0x1000), 110, 2)).result == Result::Executed);   // the allowed outcome goes through
+    // the rules engine's barrier / tether holds the stage: the guest is told, nothing is announced as done, the host releases it itself later
+    h.eng.quests[R(0x1001)] = 0;
+    h.eng.stageDefer.insert(R(0x1001));
+    CHECK(h.host->handle(1, stageIntent(R(0x1001), 30, 3)).result == Result::Deferred);
+    CHECK(h.host->stats().stagesDeferred == 1 && h.host->stats().stagesApplied == 1);
+    CHECK(h.stageRefusals.size() == 2 && std::get<3>(h.stageRefusals.back()) == Result::Deferred && std::get<2>(h.stageRefusals.back()) == 30);   // the host said so
+    h.eng.stageDefer.clear();
+    h.eng.stageFails = true;
+    CHECK(h.host->handle(1, stageIntent(R(0x1001), 40, 4)).result == Result::Failed && h.host->stats().stagesFailed == 1);
+}
+
+TEST(intents_host, guest_stage_request_guards) {
+    HostRig h;
+    h.eng.quests[R(0x1000)] = 10;
+    CHECK(h.host->handle(1, stageIntent(R(0x1000), 0, 1)).result == Result::BadTarget);
+    CHECK(h.host->handle(1, stageIntent(R(0x1000), 256, 2)).result == Result::BadTarget);
+    CHECK(h.host->handle(1, stageIntent(R(0x1000), -3, 3)).result == Result::BadTarget);
+    CHECK(h.host->handle(1, stageIntent(R(0x2222), 20, 4)).result == Result::NotLoaded);    // a quest this machine does not have
+    CHECK(h.eng.calls.empty() && h.host->stats().stagesBad == 3);
+    h.host->handle(1, stageIntent(R(0x1000), 20, 5));
+    h.host->handle(1, stageIntent(R(0x1000), 20, 5));                                         // a resend: the same verdict, nothing runs twice
+    CHECK(h.eng.count("setStage") == 1);
+    Config off = testConfig();
+    off.stage = false;
+    HostRig h2(off);
+    h2.eng.quests[R(0x1000)] = 10;
+    CHECK(h2.host->handle(1, stageIntent(R(0x1000), 20, 1)).result == Result::Disabled && h2.eng.calls.empty());   // [intents] stage=0
+    Config parsed;
+    std::string err;
+    CHECK(parseConfig("[intents]\nenable=1\nstage=0\n", &parsed, &err) && !parsed.stage && Config().stage);
+}
+
+TEST(intents_client, blocked_stage_becomes_one_request_per_burst) {
+    HostRig h;
+    h.eng.quests[R(0x1000)] = 10;
+    Loop loop(h);
+    Loop::Guest& g = loop.addGuest(1, on());
+    CHECK(g.client->onStageBlocked(R(0x1000), 20));                      // the guest's console / script setstage was dropped by the suppression ...
+    CHECK(g.client->stats().byKind[static_cast<size_t>(Kind::SetStage)] == 1 && g.client->pending() == 1);   // ... and went to the host
+    CHECK(!g.client->onStageBlocked(R(0x1000), 20) && g.client->stats().coalesced == 1);   // a script that retries every frame is one intent
+    CHECK(g.client->onStageBlocked(R(0x1000), 30));                      // a different stage of the same quest is not a retry
+    loop.pump();
+    CHECK(g.client->pending() == 0 && g.client->stats().verdicts == 2 && h.eng.quests[R(0x1000)] == 30);
+    loop.advance(5000);
+    CHECK(g.client->onStageBlocked(R(0x1000), 40));                      // long after: a new request
+    g.ready = false;
+    CHECK(!g.client->onStageBlocked(R(0x1000), 50) && g.client->stats().notReady == 1);   // not joined: nothing to send, the drop stays a drop
+    g.ready = true;
+    CHECK(!g.client->onStageBlocked(R(0x1000), 0) && !g.client->onStageBlocked(R(0x1000), 300) && g.client->stats().stageBad == 2);
+    Config off = on();
+    off.stage = false;
+    Loop::Guest& g2 = loop.addGuest(2, off);
+    CHECK(!g2.client->onStageBlocked(R(0x1000), 60) && g2.client->stats().stageOff == 1 && g2.client->stats().forwarded == 0);
+    Config disabled = on();
+    disabled.enable = false;
+    Loop::Guest& g3 = loop.addGuest(2, disabled);
+    CHECK(!g3.client->onStageBlocked(R(0x1000), 60) && g3.client->stats().forwarded == 0);
+}
+
+TEST(intents_e2e, guest_console_stage_reaches_the_host_and_both_agree) {
+    // the lab's quest room: the host is at stage 10, the CLIENT sets stage 20 through the console. Before: the suppression dropped it, host and client both
+    // stayed at 10. Now: the dropped call is forwarded, the host runs it for the guest, the txn comes back with the guest as origin.
+    HostRig h;
+    h.eng.quests[R(0x1000)] = 10;
+    Loop loop(h);
+    Loop::Guest& a = loop.addGuest(1, on());
+    Loop::Guest& b = loop.addGuest(2, on());
+    a.eng.quests[R(0x1000)] = b.eng.quests[R(0x1000)] = 10;
+    CHECK(a.client->onStageBlocked(R(0x1000), 20));
+    loop.pump();
+    CHECK(h.eng.quests[R(0x1000)] == 20);
+    REQUIRE(h.commits.size() == 1);
+    CHECK(h.commits[0].origin == 1 && h.effects<SetStage>() == 1);
+    CHECK(a.client->stats().verdicts == 1 && a.client->stats().rejected[static_cast<size_t>(Result::Executed)] == 0);
+    CHECK(a.eng.quests[R(0x1000)] == 10 && b.eng.quests[R(0x1000)] == 10);                   // a guest never applies an intent itself; the txn does that
+    // the host's own copy of the same script ran too: the guest's request for the same stage must not run the stage a second time
+    CHECK(b.client->onStageBlocked(R(0x1000), 20));
+    loop.pump();
+    CHECK(h.commits.size() == 1 && h.eng.count("setStage") == 1 && b.client->stats().rejected[static_cast<size_t>(Result::NoAdvance)] == 1);
+    CHECK(h.eng.outsideScope == 0);
 }
 
 // ---- end to end: the loopback host and guests ------------------------------------------------------------------------------------------

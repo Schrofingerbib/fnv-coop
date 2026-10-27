@@ -21,6 +21,16 @@ struct RepairItem {
     bool questRunning = false;   // client-only StartQuest / StopQuest entry: settled by the host's own running state (issue #25), fix = the client's entry
     bool stageZero = false;      // client-only SetStage q = 0 entry (quest not started): the host commits the same stage 0, fix = the client's entry
     uint8_t questState = 0;      // client-only real save state: 1 SetStage q = n (n > 0), 2 CompleteQuest, 3 FailQuest; adopted only when the host engine confirms it
+    bool objectiveZero = false;  // client-only SetObjective flags 0 entry (objective not displayed, not completed): the host commits the same flags 0, fix = the client's entry
+    uint8_t objectiveState = 0;  // client-only real objective state: 1 SetObjective with non-zero flags, 2 CompleteAllObjectives; adopted only when the host engine confirms it
+    bool scriptVar = false;      // client-only SetScriptVar entry (a quest / ref script var both copies loaded from the same save, never recorded by the baseline-less host): fix = the client's entry
+    bool global = false;         // client-only SetGlobal entry (same story as scriptVar): fix = the client's entry
+    bool acked = false;          // already acknowledged as a known divergence (matching values): listed, never repaired
+    bool dropAck = false;        // marker, not an entry: an acknowledgement whose two sides no longer differ in the way it was made for
+    bool hostHas = false, clientHas = false;
+    uint32_t hostVal = 0, clientVal = 0;   // value hashes of the two sides' entries for this key
+    uint8_t cls = 0;
+    bool noInverse = false;      // client-only entry of a kind the client can never revert (revertEffectFor has no case for it): a revert key would be skipped by the client and resent every round
     Effect fix;
     uint64_t key = 0;
 };
@@ -31,6 +41,7 @@ struct HostSession::Sync {
     uint64_t seq = 0, at = 0;
     std::shared_ptr<const ShadowState> state;   // host state as of seq
     std::vector<size_t> shards;
+    size_t badTotal = 0;   // mismatching shards found, of which `shards` were asked
 };
 
 struct HostSession::Job {
@@ -366,12 +377,22 @@ void HostSession::handle(PeerId from, const Message& m) {
         Client* cp = c;
         const uint32_t sess = c->session, dgId = dg->digestId, ep = epoch_;
         const uint64_t dseq = dg->seq;
-        runAsync<std::vector<size_t>>(worker_, mq_,
-            [st, theirs = dg->shards, cls = dopt_.compareClasses, maxShards = dopt_.maxShardsPerRound]() {
-                std::vector<uint32_t> hh = shardHashesOf(*st);
+        // Acknowledged divergences count as agreeing: the host sums the client's term for them instead of its own.
+        std::vector<ShardAdjust> adj;
+        if (!mutations().ackIgnored) for (auto& [k, a] : c->acks) adj.push_back({a.shard, a.clientTerm, a.hostTerm});
+        const size_t cursor = c->askCursor;
+        const size_t askMax = c->askShards ? std::min(c->askShards, dopt_.maxShardsPerRound) : dopt_.maxShardsPerRound;
+        runAsync<std::pair<std::vector<size_t>, size_t>>(worker_, mq_,
+            [st, theirs = dg->shards, cls = dopt_.compareClasses, maxShards = askMax, adj = std::move(adj), cursor]() {
+                std::vector<uint32_t> hh = shardHashesOf(*st, adj.empty() ? nullptr : &adj);
                 std::vector<size_t> bad;
                 for (size_t i = 0; i < kSyncShards; ++i)
                     if ((cls >> (i / 16) & 1u) && hh[i] != theirs[i]) bad.push_back(i);
+                const size_t badTotal = bad.size();
+                // Round-robin: start at the first bad shard at or after the cursor, so shards that never settle cannot starve the others
+                // (two-PC benchmark 2026-10-27: the same quest shards were asked first every round while 25 other shards waited).
+                if (!mutations().askLowestFirst)
+                    std::rotate(bad.begin(), std::lower_bound(bad.begin(), bad.end(), cursor), bad.end());
                 if (bad.size() > maxShards) bad.resize(maxShards);
                 // Ask for no more shards than the client's reply can hold (kMaxShardEntries, judged by our own counts): a truncated reply
                 // drops entries in no shard order, so the real drift could sit in the part cut off and never be repaired, while every
@@ -384,14 +405,17 @@ void HostSession::handle(PeerId from, const Message& m) {
                     while (keep < bad.size() && (keep == 0 || sum + perShard[bad[keep]] <= kMaxShardEntries)) sum += perShard[bad[keep++]];
                     bad.resize(keep);
                 }
-                return bad;
+                return std::make_pair(std::move(bad), badTotal);
             },
-            [this, cp, st, sess, dgId, ep, dseq](std::vector<size_t> bad) {
+            [this, cp, st, sess, dgId, ep, dseq](std::pair<std::vector<size_t>, size_t> res) {
+                std::vector<size_t> bad = std::move(res.first);
                 if (!cp->joined || cp->session != sess || epoch_ != ep) return;
                 if (bad.empty()) { ++stats_.digestsOk; return; }
                 ++stats_.digestsMismatch;
+                cp->askCursor = (bad.back() + 1) % kSyncShards;
                 cp->sync = std::make_shared<Sync>();
                 cp->sync->id = dgId; cp->sync->seq = dseq; cp->sync->at = now_; cp->sync->state = st; cp->sync->shards = bad;
+                cp->sync->badTotal = res.second;
                 ShardRequest rq;
                 rq.session = sess; rq.digestId = dgId;
                 for (size_t s : bad) (s < 64 ? rq.maskLo : rq.maskHi) |= 1ull << (s % 64);
@@ -401,6 +425,13 @@ void HostSession::handle(PeerId from, const Message& m) {
         if (!c->sync || se->session != c->session || se->digestId != c->sync->id) return;
         std::shared_ptr<Sync> sy = std::move(c->sync);
         c->sync.reset();
+        // The host cannot know how many entries a client holds per shard (its own world is nearly empty). A reply cut off at kMaxShardEntries
+        // holds only the first entries in class order, usually ones already settled, so the rest is never seen: ask for half as many shards
+        // next time, and again for more once a reply fits.
+        if (!mutations().askNeverShrinks) {
+            if (se->truncated) c->askShards = std::max<size_t>(1, sy->shards.size() / 2);
+            else if (c->askShards && c->askShards < dopt_.maxShardsPerRound) c->askShards = std::min(dopt_.maxShardsPerRound, c->askShards * 2);
+        }
         // keys changed by txns after the digest are in flight, not drifted
         std::set<uint64_t> touched;
         for (uint64_t s = sy->seq + 1; s <= log_.head(); ++s)
@@ -410,12 +441,18 @@ void HostSession::handle(PeerId from, const Message& m) {
         const uint32_t sess = c->session;
         const bool truncated = se->truncated;
         runAsync<std::vector<RepairItem>>(worker_, mq_,
-            [sy, clientEffects = se->entries, touched = std::move(touched), truncated = se->truncated]() {
+            [sy, clientEffects = se->entries, touched = std::move(touched), truncated = se->truncated, known = c->acks]() {
                 std::set<size_t> shardSet(sy->shards.begin(), sy->shards.end());
                 std::map<uint64_t, BaselineEntry> hostE, clientE;
                 for (auto& e : baselineEntries(*sy->state)) if (shardSet.count(shardOf(e))) hostE.emplace(e.key, e);
                 for (auto& e : clientEffects) { BaselineEntry be; if (entryOf(e, be) && shardSet.count(shardOf(be))) clientE.emplace(be.key, std::move(be)); }
                 std::vector<RepairItem> items;
+                // An acknowledgement still holds while both sides show the values it was made for.
+                auto isAcked = [&](const RepairItem& r) {
+                    auto k = known.find(r.key);
+                    return k != known.end() && k->second.hostHas == r.hostHas && (!r.hostHas || k->second.hostVal == r.hostVal) &&
+                           r.clientHas && k->second.clientVal == r.clientVal;
+                };
                 for (auto& [key, he] : hostE) {
                     auto it = clientE.find(key);
                     if (it != clientE.end() && it->second.value == he.value) continue;
@@ -426,20 +463,43 @@ void HostSession::handle(PeerId from, const Message& m) {
                     r.d.key = describeEntry(he.effect); r.d.keyHash = key; r.d.host = r.d.key;
                     r.d.client = it == clientE.end() ? "(missing)" : describeEntry(it->second.effect);
                     r.race = touched.count(key) > 0;
+                    r.hostHas = true; r.hostVal = he.value; r.cls = he.cls;
+                    r.clientHas = it != clientE.end(); r.clientVal = r.clientHas ? it->second.value : 0;
+                    r.acked = isAcked(r);
                     items.push_back(std::move(r));
                 }
                 for (auto& [key, ce] : clientE) {
                     if (hostE.count(key)) continue;
                     RepairItem r;
                     r.key = key; r.clientOnly = true;
+                    r.clientHas = true; r.clientVal = ce.value; r.cls = ce.cls;
                     r.questRunning = std::holds_alternative<StartQuest>(ce.effect) || std::holds_alternative<StopQuest>(ce.effect);
                     if (r.questRunning) r.fix = ce.effect;
                     if (auto* ss = std::get_if<SetStage>(&ce.effect); ss && ss->stage == 0) { r.stageZero = true; r.fix = ce.effect; }
                     else if (auto* ss2 = std::get_if<SetStage>(&ce.effect); ss2 && ss2->stage > 0) { r.questState = 1; r.fix = ce.effect; }
                     else if (std::holds_alternative<CompleteQuest>(ce.effect)) { r.questState = 2; r.fix = ce.effect; }
                     else if (std::holds_alternative<FailQuest>(ce.effect)) { r.questState = 3; r.fix = ce.effect; }
+                    else if (auto* so = std::get_if<SetObjective>(&ce.effect)) {
+                        if (so->flags == 0) r.objectiveZero = true; else r.objectiveState = 1;
+                        r.fix = ce.effect;
+                    }
+                    else if (std::holds_alternative<CompleteAllObjectives>(ce.effect)) { r.objectiveState = 2; r.fix = ce.effect; }
+                    else if (std::holds_alternative<SetScriptVar>(ce.effect)) { r.scriptVar = true; r.fix = ce.effect; }
+                    else if (std::holds_alternative<SetGlobal>(ce.effect)) { r.global = true; r.fix = ce.effect; }
+                    r.noInverse = !mayHaveRevert(ce.effect);
                     r.d.key = describeEntry(ce.effect); r.d.keyHash = key; r.d.client = r.d.key; r.d.host = "(absent)"; r.d.clientOnly = true;
                     r.race = touched.count(key) > 0;
+                    r.acked = isAcked(r);
+                    items.push_back(std::move(r));
+                }
+                // Acknowledgements of the asked shards that no longer match a difference (the two sides agree now, or one value moved on) are withdrawn.
+                for (auto& [key, k] : known) {
+                    if (!shardSet.count(k.shard)) continue;
+                    bool live = false;
+                    for (auto& r : items) if (r.key == key && r.acked) { live = true; break; }
+                    if (live) continue;
+                    RepairItem r;
+                    r.key = key; r.dropAck = true;
                     items.push_back(std::move(r));
                 }
                 return items;
@@ -450,6 +510,24 @@ void HostSession::handle(PeerId from, const Message& m) {
                 rep.id = ++reportCounter_; rep.atMs = now_; rep.atSeq = sy->seq; rep.epoch = epoch_; rep.slot = cp->slot;
                 for (size_t s : sy->shards) rep.shards.push_back(static_cast<uint32_t>(s));
                 rep.incomplete = truncated;
+                const Mutations& mu = mutations();
+                // Acknowledgements whose difference is gone (the sides agree now, or a value moved on) are withdrawn; the rest of the bookkeeping
+                // (repair attempts, unread rounds) of the asked shards forgets keys that no longer differ.
+                std::set<uint64_t> present;
+                {
+                    std::vector<RepairItem> real;
+                    for (auto& it : items) {
+                        if (it.dropAck) { if (cp->acks.erase(it.key)) ++stats_.ackDropped; continue; }
+                        present.insert(it.key);
+                        real.push_back(std::move(it));
+                    }
+                    items = std::move(real);
+                    std::set<size_t> asked(sy->shards.begin(), sy->shards.end());
+                    for (auto it = cp->attempts.begin(); it != cp->attempts.end();)
+                        it = (asked.count(it->second.shard) && !present.count(it->first)) ? cp->attempts.erase(it) : std::next(it);
+                    for (auto it = cp->unread.begin(); it != cp->unread.end();)
+                        it = (asked.count(it->second.shard) && !present.count(it->first)) ? cp->unread.erase(it) : std::next(it);
+                }
                 // newest txns touching each key: ONE pass over the newest part of the retained log (not one pass per entry)
                 std::map<uint64_t, std::vector<uint64_t>> recent;
                 {
@@ -469,44 +547,101 @@ void HostSession::handle(PeerId from, const Message& m) {
                 auto lastSeqs = [&](uint64_t key) { auto it = recent.find(key); return it == recent.end() ? std::vector<uint64_t>() : it->second; };
                 std::vector<Effect> fix;
                 std::vector<uint64_t> revert;
-                std::vector<FormRef> adopt;   // client-only quest running keys (issue #25)
+                std::vector<size_t> fixIdx, revertIdx;   // the item behind each planned fix / revert (repair attempts are counted per key)
+                std::vector<size_t> adoptRun;      // client-only quest running keys (issue #25): items
                 std::vector<FormRef> adoptStage;   // client-only "SetStage q = 0" keys: not started on the client, simply absent on the host
-                struct StateItem { uint8_t kind; Effect fx; FormRef quest; uint64_t key; };
+                struct StateItem { uint8_t kind; Effect fx; FormRef quest; size_t idx; };
                 std::vector<StateItem> stateItems;   // client-only real quest state, adopted only when the host engine confirms it
+                std::vector<Effect> adoptObjZero;   // client-only SetObjective flags 0 entries: not displayed / completed on the client, simply absent on the host
+                struct ObjItem { uint8_t kind; Effect fx; FormRef quest; size_t idx; };
+                std::vector<ObjItem> objItems;   // client-only real objective state, adopted only when the host engine confirms it
+                struct VarItem { SetScriptVar fx; size_t idx; };
+                std::vector<VarItem> varItems;   // client-only script vars: adopted outright at 0 (the untouched default), else only when the host engine confirms the value
+                struct GlobItem { SetGlobal fx; size_t idx; };
+                std::vector<GlobItem> globItems; // client-only globals: adopted only when the host engine holds the same value
+                // Old behaviour twins and the no-inverse guard share one switch: a revert key for an entry the client cannot undo is skipped by the client
+                // and would be sent again every round. Production never sends one.
+                const bool anyRevertTwin = mu.questRunningReverted || mu.stageZeroReverted || mu.questStateReverted || mu.objectiveZeroReverted ||
+                                           mu.objectiveStateReverted || mu.scriptVarReverted || mu.noInverseResent || mu.globalReverted;
+                std::set<size_t> newlyAcked;
+                // A key the host can neither adopt nor repair becomes a known divergence: reported once, then it no longer breaks the digest compare
+                // (the host sums the client's term for it, ShardAdjust) and is never sent again. Either side's value moving on withdraws it.
+                auto ackItem = [&](size_t i) {
+                    if (mu.ackIgnored || mu.healDisabled || cp->acks.size() >= kMaxAcks) return false;
+                    const RepairItem& it = items[i];
+                    Client::Known a;
+                    a.shard = static_cast<size_t>(it.cls) * 16 + static_cast<size_t>(it.key % 16);
+                    a.hostHas = it.hostHas; a.clientHas = it.clientHas; a.hostVal = it.hostVal; a.clientVal = it.clientVal;
+                    a.hostTerm = it.hostHas ? shardTerm(it.key, it.hostVal) : 0;
+                    a.clientTerm = it.clientHas ? shardTerm(it.key, it.clientVal) : 0;
+                    if (cp->acks.emplace(it.key, a).second) ++stats_.divergenceAcked;
+                    cp->attempts.erase(it.key); cp->unread.erase(it.key);
+                    newlyAcked.insert(i);
+                    return true;
+                };
+                // The host engine could not read the key this round: left alone, acknowledged when it stays unreadable.
+                auto noteUnread = [&](size_t i) {
+                    auto& u = cp->unread[items[i].key];
+                    u.shard = static_cast<size_t>(items[i].cls) * 16 + static_cast<size_t>(items[i].key % 16);
+                    if (++u.rounds >= kUnreadRounds) ackItem(i);
+                };
+                // No way to settle the key at all (no reader, a failing reader, or a kind with no inverse): counted, never sent, acknowledged.
+                auto unsettleable = [&](size_t i) {
+                    if (anyRevertTwin) { revert.push_back(items[i].key); return; }
+                    ++stats_.revertsSkippedNoInverse;
+                    ackItem(i);
+                };
                 size_t n = 0;
-                for (auto& it : items) {
+                for (size_t i = 0; i < items.size(); ++i) {
+                    RepairItem& it = items[i];
                     if (n++ < 64) it.d.lastSeqs = lastSeqs(it.key);
                     if (it.race) it.d.skippedRace = true;
-                    else if (it.clientOnly && it.questRunning && !mutations().questRunningReverted)
-                        adopt.push_back(std::holds_alternative<StartQuest>(it.fix) ? std::get<StartQuest>(it.fix).quest : std::get<StopQuest>(it.fix).quest);
-                    else if (it.clientOnly && it.stageZero && !mutations().stageZeroReverted)
+                    else if (it.acked && !mu.ackIgnored) it.d.acknowledged = true;   // a known divergence: listed, nothing sent
+                    else if (it.clientOnly && it.questRunning && !mu.questRunningReverted) adoptRun.push_back(i);
+                    else if (it.clientOnly && it.stageZero && !mu.stageZeroReverted)
                         adoptStage.push_back(std::get<SetStage>(it.fix).quest);
-                    else if (it.clientOnly && it.questState && hostQuestState && !mutations().questStateReverted) {
+                    else if (it.clientOnly && it.questState && hostQuestState && !mu.questStateReverted) {
                         FormRef q;
                         if (auto* s1 = std::get_if<SetStage>(&it.fix)) q = s1->quest;
                         else if (auto* s2 = std::get_if<CompleteQuest>(&it.fix)) q = s2->quest;
                         else q = std::get<FailQuest>(it.fix).quest;
-                        stateItems.push_back({it.questState, it.fix, q, it.key});
+                        stateItems.push_back({it.questState, it.fix, q, i});
                     }
-                    else if (it.clientOnly) revert.push_back(it.key);
-                    else { fix.push_back(it.fix); if (it.revertToo) revert.push_back(it.key); }
+                    else if (it.clientOnly && it.objectiveZero && !mu.objectiveZeroReverted)
+                        adoptObjZero.push_back(it.fix);
+                    else if (it.clientOnly && it.objectiveState && hostObjectives && !mu.objectiveStateReverted) {
+                        FormRef q = it.objectiveState == 1 ? std::get<SetObjective>(it.fix).quest : std::get<CompleteAllObjectives>(it.fix).quest;
+                        objItems.push_back({it.objectiveState, it.fix, q, i});
+                    }
+                    else if (it.clientOnly && it.scriptVar && !mu.scriptVarReverted)
+                        varItems.push_back({std::get<SetScriptVar>(it.fix), i});
+                    else if (it.clientOnly && it.global && !mu.globalReverted)
+                        globItems.push_back({std::get<SetGlobal>(it.fix), i});
+                    else if (it.clientOnly && it.noInverse && !anyRevertTwin) unsettleable(i);   // reported, never sent: the client has no inverse
+                    else if (it.clientOnly) { revert.push_back(it.key); revertIdx.push_back(i); }
+                    else { fix.push_back(it.fix); fixIdx.push_back(i); if (it.revertToo) { revert.push_back(it.key); revertIdx.push_back(i); } }
                     rep.entries.push_back(std::move(it.d));
                 }
                 rep.totalEntries = rep.entries.size();
-                if (rep.entries.size() > 64) rep.entries.resize(64);
                 // Issue #25: a quest's running flag has no inverse, so a revert key for it was skipped by the client and resent every round
                 // (the digest never converged). The host's shared world simply has no entry for these quests: settle them host-authoritatively
-                // by committing the host's OWN running state (the engine via hostQuestRunning, else the completeness default: not running).
-                // A normal txn: every client gets it, late joiners too, and the host's key space is complete afterwards.
+                // by committing the host's OWN running state (the engine via hostQuestRunning). A normal txn: every client gets it, late joiners too,
+                // and the host's key space is complete afterwards. A quest the engine cannot read is left alone (acknowledged when it stays unreadable).
+                // Only with no reader at all the completeness default (a quest the host does not list is not running) is committed; the game plugin
+                // always has one (2026-10-27 benchmark: the baseline-less host had none, so it committed "not running" for ~190 quests the client was
+                // running and the client stopped them).
                 size_t adopted = 0;
-                if (!adopt.empty() && !mutations().healDisabled) {
+                if (!adoptRun.empty() && !mu.healDisabled) {
+                    std::vector<FormRef> qs;
+                    for (size_t i : adoptRun)
+                        qs.push_back(std::holds_alternative<StartQuest>(items[i].fix) ? std::get<StartQuest>(items[i].fix).quest : std::get<StopQuest>(items[i].fix).quest);
                     std::map<FormRef, bool> running;
-                    const bool engineRead = hostQuestRunning && hostQuestRunning(adopt, running);
+                    const bool engineRead = hostQuestRunning && !mu.runningBlindStop && hostQuestRunning(qs, running);
                     std::vector<Effect> fx;
-                    for (auto& q : adopt) {
-                        auto r = running.find(q);
-                        if (r == running.end() && engineRead) continue;   // the engine could not read this one: leave it, it shows up again
-                        if (r != running.end() && r->second) fx.push_back(StartQuest{q}); else fx.push_back(StopQuest{q});
+                    for (size_t k = 0; k < adoptRun.size(); ++k) {
+                        auto r = running.find(qs[k]);
+                        if (r == running.end() && engineRead) { ++stats_.runningUnread; noteUnread(adoptRun[k]); continue; }   // the engine could not read this one
+                        if (r != running.end() && r->second) fx.push_back(StartQuest{qs[k]}); else fx.push_back(StopQuest{qs[k]});
                     }
                     const size_t nFx = fx.size();
                     Cause cause; cause.kind = CauseKind::Script;
@@ -515,40 +650,144 @@ void HostSession::handle(PeerId from, const Message& m) {
                 // A stage-0 key only the client has: SetStage merges by max, so a revert key can never remove it and every digest round resent
                 // the same ~200 repair effects (the host never reached ok, and the repair traffic starved its frame budget). Commit the same
                 // stage 0 on the host: its shared world then has the key too, the digests agree, and every client and late joiner gets it.
-                if (!adoptStage.empty() && !mutations().healDisabled) {
+                if (!adoptStage.empty() && !mu.healDisabled) {
                     std::vector<Effect> fx;
                     for (auto& q : adoptStage) fx.push_back(SetStage{q, 0});
                     const size_t nFx = fx.size();
                     Cause cause; cause.kind = CauseKind::Script;
                     if (nFx && commit(kHostPlayer, cause, std::move(fx))) { adopted += nFx; stats_.stageZeroAdopted += nFx; }
                 }
+                // An objective that is not displayed and not completed (flags 0) only the client has: the objective analogue of stage 0. SetObjective
+                // from a guest only adds bits and there is no inverse, so a revert key was skipped by the client and resent every round. Both copies
+                // loaded the same save, the host's shared world just never recorded the objective: commit the same flags 0 on the host.
+                if (!adoptObjZero.empty() && !mu.healDisabled) {
+                    const size_t nFx = adoptObjZero.size();
+                    Cause cause; cause.kind = CauseKind::Script;
+                    if (commit(kHostPlayer, cause, std::move(adoptObjZero))) { adopted += nFx; stats_.objectiveZeroAdopted += nFx; }
+                }
+                // Client-only objective with non-zero flags / all objectives completed: same rule as the quest state below, the host's OWN engine
+                // must show the same flags (every objective of the quest completed, for CompleteAllObjectives). A reader that fails adopts nothing;
+                // a quest it cannot read is left alone; a disagreement is a real divergence, acknowledged (reported once, never resent).
+                if (!objItems.empty() && !mu.healDisabled) {
+                    std::vector<FormRef> qs;
+                    for (auto& oi : objItems) qs.push_back(oi.quest);
+                    std::sort(qs.begin(), qs.end());
+                    qs.erase(std::unique(qs.begin(), qs.end()), qs.end());
+                    std::map<FormRef, std::map<uint32_t, uint8_t>> st;
+                    if (!hostObjectives(qs, st)) {
+                        for (auto& oi : objItems) noteUnread(oi.idx);
+                    } else {
+                        std::vector<Effect> fx;
+                        for (auto& oi : objItems) {
+                            auto e = st.find(oi.quest);
+                            if (e == st.end()) { noteUnread(oi.idx); continue; }   // the engine could not read this quest: left alone this round
+                            bool agree = false;
+                            if (oi.kind == 1) {
+                                auto& so = std::get<SetObjective>(oi.fx);
+                                auto o = e->second.find(so.objective);
+                                if (o == e->second.end()) { noteUnread(oi.idx); continue; }   // the host engine has no such objective: unknown, left alone
+                                agree = (o->second & 3) == (so.flags & 3);
+                            } else {
+                                if (e->second.empty()) { noteUnread(oi.idx); continue; }
+                                agree = true;
+                                for (auto& [id, fl] : e->second) if (!(fl & 2)) agree = false;
+                            }
+                            if (agree) fx.push_back(oi.fx); else { ++stats_.objectiveStateDisagreed; ackItem(oi.idx); }
+                        }
+                        const size_t nFx = fx.size();
+                        Cause cause; cause.kind = CauseKind::Script;
+                        if (nFx && commit(kHostPlayer, cause, std::move(fx))) { adopted += nFx; stats_.objectiveStateAdopted += nFx; }
+                    }
+                }
                 // Client-only real quest state (the host runs without a world baseline, so its shared world never recorded what both copies
                 // loaded from the same save): settle it host-authoritatively, but only where the host's OWN engine confirms the value. A key
-                // the engine disagrees with is a real divergence: it is not adopted and stays in the report. A reader that fails leaves the
-                // old behaviour (revert keys); quests it cannot read are left alone this round.
-                if (!stateItems.empty() && !mutations().healDisabled) {
+                // the engine disagrees with is a real divergence: it is not adopted, it is acknowledged (listed once, no longer a digest mismatch).
+                // A reader that fails adopts nothing; quests it cannot read are left alone this round.
+                if (!stateItems.empty() && !mu.healDisabled) {
                     std::vector<FormRef> qs;
                     for (auto& si : stateItems) qs.push_back(si.quest);
                     std::sort(qs.begin(), qs.end());
                     qs.erase(std::unique(qs.begin(), qs.end()), qs.end());
                     std::map<FormRef, HostQuestState> st;
                     if (!hostQuestState(qs, st)) {
-                        for (auto& si : stateItems) revert.push_back(si.key);
+                        for (auto& si : stateItems) noteUnread(si.idx);
                     } else {
                         std::vector<Effect> fx;
                         for (auto& si : stateItems) {
                             auto e = st.find(si.quest);
-                            if (e == st.end() || (si.kind == 1 && e->second.stage < 0)) continue;
+                            if (e == st.end() || (si.kind == 1 && e->second.stage < 0)) { noteUnread(si.idx); continue; }
                             bool agree = false;
                             if (si.kind == 1) agree = e->second.stage >= static_cast<int32_t>(std::get<SetStage>(si.fx).stage);
                             else if (si.kind == 2) agree = e->second.completed && !e->second.failed;
                             else agree = e->second.failed;
-                            if (agree) fx.push_back(si.fx); else ++stats_.questStateDisagreed;
+                            if (agree) fx.push_back(si.fx); else { ++stats_.questStateDisagreed; ackItem(si.idx); }
                         }
                         const size_t nFx = fx.size();
                         Cause cause; cause.kind = CauseKind::Script;
                         if (nFx && commit(kHostPlayer, cause, std::move(fx))) { adopted += nFx; stats_.questStateAdopted += nFx; }
                     }
+                }
+                // Client-only script vars (quest vars, and the vars of watched refs): the baseline-less host primes its poll with the engine's present
+                // values and drops them, so its shared world only has vars that CHANGED since the session started, while the client's dump (the digest)
+                // lists every var of every quest. SetScriptVar has no inverse, so the old revert keys were skipped by the client and resent every round
+                // (256 per round: 1180 repair effects per minute and a digest mismatch in every phase, even idle, of the 2026-10-26 benchmark).
+                // An untouched default (value 0) is the absent key's own meaning (completeness rule): the host commits the same 0, like stage 0.
+                // A non-zero value is real save state: adopted only where the host's OWN engine reads the same value (HostSession::hostScriptVars).
+                // A different engine value is a real divergence: not adopted, not resent, acknowledged (scriptVarDisagreed).
+                if (!varItems.empty() && !mu.healDisabled) {
+                    std::vector<std::pair<FormRef, uint16_t>> want;
+                    for (auto& vi : varItems) want.emplace_back(vi.fx.owner, vi.fx.index);
+                    std::sort(want.begin(), want.end());
+                    want.erase(std::unique(want.begin(), want.end()), want.end());
+                    std::map<std::pair<FormRef, uint16_t>, double> engine;
+                    const bool engineRead = hostScriptVars && hostScriptVars(want, engine);
+                    std::vector<Effect> fx;
+                    for (auto& vi : varItems) {
+                        auto e = engine.find({vi.fx.owner, vi.fx.index});
+                        const bool zero = vi.fx.value == 0.0;
+                        if (e != engine.end()) {
+                            if (sameScriptVarValue(vi.fx.owner, vi.fx.index, e->second, vi.fx.value)) fx.push_back(vi.fx);
+                            else { ++stats_.scriptVarDisagreed; ackItem(vi.idx); }
+                        } else if (zero) {
+                            fx.push_back(vi.fx);   // the engine shows nothing for it: the default
+                        } else if (!engineRead) {
+                            unsettleable(vi.idx);  // no reader: nothing non-zero is adopted blindly
+                        } else {
+                            noteUnread(vi.idx);    // reader ran but could not read this owner: left alone this round
+                        }
+                    }
+                    const size_t nFx = fx.size();
+                    Cause cause; cause.kind = CauseKind::Script;
+                    if (nFx && commit(kHostPlayer, cause, std::move(fx))) { adopted += nFx; stats_.scriptVarAdopted += nFx; }
+                } else if (!varItems.empty()) {
+                    for (auto& vi : varItems) unsettleable(vi.idx);
+                }
+                // Client-only globals: the same story as script vars. The baseline-less host only records globals that changed since the session started.
+                // Adopted only where the host's own engine holds the same value; a different value is a real divergence (acknowledged).
+                if (!globItems.empty() && !mu.healDisabled) {
+                    std::vector<FormRef> want;
+                    for (auto& gi : globItems) want.push_back(gi.fx.global);
+                    std::sort(want.begin(), want.end());
+                    want.erase(std::unique(want.begin(), want.end()), want.end());
+                    std::map<FormRef, double> engine;
+                    const bool engineRead = hostGlobals && hostGlobals(want, engine);
+                    std::vector<Effect> fx;
+                    for (auto& gi : globItems) {
+                        auto e = engine.find(gi.fx.global);
+                        if (e != engine.end()) {
+                            if (sameGlobalValue(gi.fx.global, e->second, double(gi.fx.value))) fx.push_back(gi.fx);
+                            else { ++stats_.globalDisagreed; ackItem(gi.idx); }
+                        } else if (!engineRead) {
+                            unsettleable(gi.idx);
+                        } else {
+                            noteUnread(gi.idx);
+                        }
+                    }
+                    const size_t nFx = fx.size();
+                    Cause cause; cause.kind = CauseKind::Script;
+                    if (nFx && commit(kHostPlayer, cause, std::move(fx))) { adopted += nFx; stats_.globalAdopted += nFx; }
+                } else if (!globItems.empty()) {
+                    for (auto& gi : globItems) unsettleable(gi.idx);
                 }
                 // bandwidth budget
                 if (repairTokens_ < 0) { repairTokens_ = double(dopt_.maxRepairEffectsPerMin); repairRefillAt_ = now_; }
@@ -556,10 +795,41 @@ void HostSession::handle(PeerId from, const Message& m) {
                 repairRefillAt_ = now_;
                 size_t allowed = std::min<size_t>({fix.size() + revert.size(), dopt_.maxRepairEffects, size_t(repairTokens_)});
                 if (allowed < fix.size() + revert.size()) { ++stats_.repairsDeferredBudget; rep.incomplete = true; }
-                if (fix.size() > allowed) fix.resize(allowed);
+                if (fix.size() > allowed) { fix.resize(allowed); fixIdx.resize(allowed); }
                 size_t revBudget = allowed - fix.size();
-                if (revert.size() > revBudget) revert.resize(revBudget);
-                if (!mutations().healDisabled && (!fix.empty() || !revert.empty())) {
+                if (revert.size() > revBudget) {
+                    revert.resize(revBudget);
+                    if (revertIdx.size() > revBudget) revertIdx.resize(revBudget);
+                }
+                // A key repaired kMaxRepairAttempts times with the same two values and still different is not going to converge by being sent again
+                // (a per-machine value the live stream rewrites, a state the client engine refuses): acknowledged instead of resent forever.
+                if (!mu.repairForever && !mu.healDisabled) {
+                    std::set<size_t> gaveUp, counted;
+                    for (size_t pass = 0; pass < 2; ++pass) {
+                        for (size_t i : (pass == 0 ? fixIdx : revertIdx)) {
+                            if (counted.count(i)) continue;
+                            counted.insert(i);
+                            const RepairItem& it = items[i];
+                            auto& a = cp->attempts[it.key];
+                            const bool same = a.sent && a.hostHas == it.hostHas && a.clientHas == it.clientHas && a.hostVal == it.hostVal && a.clientVal == it.clientVal;
+                            if (same && a.sent >= kMaxRepairAttempts) { gaveUp.insert(i); continue; }
+                            if (!same) { a = Client::Attempt(); a.hostHas = it.hostHas; a.clientHas = it.clientHas; a.hostVal = it.hostVal; a.clientVal = it.clientVal; }
+                            a.shard = static_cast<size_t>(it.cls) * 16 + static_cast<size_t>(it.key % 16);
+                            ++a.sent;
+                        }
+                    }
+                    std::set<uint64_t> dropKeys;
+                    for (size_t i : gaveUp) if (ackItem(i)) { ++stats_.repairGaveUp; dropKeys.insert(items[i].key); }
+                    if (!dropKeys.empty()) {
+                        std::vector<Effect> f2;
+                        std::vector<uint64_t> r2;
+                        for (size_t k = 0; k < fix.size(); ++k) if (!dropKeys.count(items[fixIdx[k]].key)) f2.push_back(std::move(fix[k]));
+                        for (size_t k = 0; k < revert.size(); ++k) if (!dropKeys.count(revert[k])) r2.push_back(revert[k]);
+                        fix = std::move(f2);
+                        revert = std::move(r2);
+                    }
+                }
+                if (!mu.healDisabled && (!fix.empty() || !revert.empty())) {
                     repairTokens_ -= double(fix.size() + revert.size());
                     SyncRepair rp;
                     rp.session = sess; rp.epoch = epoch_; rp.digestId = sy->id; rp.effects = std::move(fix); rp.revertKeys = std::move(revert);
@@ -570,13 +840,19 @@ void HostSession::handle(PeerId from, const Message& m) {
                     sendTo(cp->peer, rp);
                 }
                 if (adopted) {
-                    if (!rep.repaired) ++stats_.desyncRepairs;
+                    // Settling is the host recording, once, what both copies loaded from the same save (see the Adopted counters): bookkeeping, not repair.
+                    ++stats_.settleRounds;
+                    stats_.effectsSettled += adopted;
+                    if (mu.settleCountsAsRepair) stats_.desyncEffectsRepaired += adopted;
                     rep.repaired = true;
                     rep.effectsSent += adopted;
-                    stats_.desyncEffectsRepaired += adopted;
                 }
+                for (size_t i : newlyAcked) if (i < rep.entries.size()) rep.entries[i].acknowledged = true;
+                if (rep.entries.size() > 64) rep.entries.resize(64);
                 reports_.push_back(std::move(rep));
                 while (reports_.size() > dopt_.reportLimit) reports_.pop_front();
+                // The settle committed keys; the shards still unasked are probably the same story: ask for the next digest now instead of in 10 s.
+                if (adopted && (sy->badTotal > sy->shards.size() || truncated) && !mu.noSettleFollowUp && !mu.healDisabled) { ++stats_.settleFollowUps; requestDigest(cp->slot); }
             });
     } else if (auto* sc = std::get_if<BaselineSummaryChunk>(&m)) {
         if (!c->job || sc->session != c->session || sc->id != c->job->id || sc->total > 4096) return;
@@ -653,7 +929,15 @@ std::string HostSession::desyncsJson() const {
       << ",\"rateLimited\":" << stats_.digestsRateLimited << ",\"stale\":" << stats_.digestsStale << ",\"repairs\":" << stats_.desyncRepairs
       << ",\"effectsRepaired\":" << stats_.desyncEffectsRepaired << ",\"deferredByBudget\":" << stats_.repairsDeferredBudget
       << ",\"questRunningAdopted\":" << stats_.questRunningAdopted << ",\"stageZeroAdopted\":" << stats_.stageZeroAdopted
-      << ",\"questStateAdopted\":" << stats_.questStateAdopted << ",\"questStateDisagreed\":" << stats_.questStateDisagreed << "},\"desyncs\":[";
+      << ",\"objectiveZeroAdopted\":" << stats_.objectiveZeroAdopted
+      << ",\"questStateAdopted\":" << stats_.questStateAdopted << ",\"questStateDisagreed\":" << stats_.questStateDisagreed
+      << ",\"objectiveStateAdopted\":" << stats_.objectiveStateAdopted << ",\"objectiveStateDisagreed\":" << stats_.objectiveStateDisagreed
+      << ",\"scriptVarAdopted\":" << stats_.scriptVarAdopted << ",\"scriptVarDisagreed\":" << stats_.scriptVarDisagreed
+      << ",\"revertsSkippedNoInverse\":" << stats_.revertsSkippedNoInverse
+      << ",\"effectsSettled\":" << stats_.effectsSettled << ",\"settleRounds\":" << stats_.settleRounds << ",\"settleFollowUps\":" << stats_.settleFollowUps
+      << ",\"globalAdopted\":" << stats_.globalAdopted << ",\"globalDisagreed\":" << stats_.globalDisagreed << ",\"runningUnread\":" << stats_.runningUnread
+      << ",\"divergenceAcked\":" << stats_.divergenceAcked << ",\"ackDropped\":" << stats_.ackDropped << ",\"repairGaveUp\":" << stats_.repairGaveUp
+      << "},\"desyncs\":[";
     bool firstR = true;
     for (auto& r : reports_) {
         if (!firstR) o << ',';
@@ -666,7 +950,7 @@ std::string HostSession::desyncsJson() const {
             if (!firstE) o << ',';
             firstE = false;
             o << "{\"key\":\"" << esc(e.key) << "\",\"host\":\"" << esc(e.host) << "\",\"client\":\"" << esc(e.client) << "\",\"clientOnly\":"
-              << (e.clientOnly ? "true" : "false") << ",\"race\":" << (e.skippedRace ? "true" : "false") << ",\"lastSeqs\":[";
+              << (e.clientOnly ? "true" : "false") << ",\"race\":" << (e.skippedRace ? "true" : "false") << ",\"acked\":" << (e.acknowledged ? "true" : "false") << ",\"lastSeqs\":[";
             for (size_t i = 0; i < e.lastSeqs.size(); ++i) o << (i ? "," : "") << e.lastSeqs[i];
             o << "]}";
         }

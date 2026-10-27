@@ -199,7 +199,7 @@ Plan planWorldEffect(const WorldEffect& e, PlanEnv& env) {
         if (!exists(env, x->b, &b)) return missing(x->b);
         Step st;
         st.kind = StepKind::ConsoleGlobal;
-        st.line = setRelationLine(x->kind, a, b);
+        st.line = setRelationLine(x->kind, a, b, x->flags1, x->flags2);
         p.steps.push_back(st);
         return p;
     }
@@ -226,6 +226,21 @@ Plan planWorldEffect(const WorldEffect& e, PlanEnv& env) {
         Step st;
         st.kind = StepKind::ConsoleGlobal;
         st.line = setCellPublicFlagLine(cell, x->on);
+        p.steps.push_back(st);
+        return p;
+    }
+    if (auto* x = std::get_if<SetObjectState>(&e)) {
+        // the same console forms and order as the ObjectState effect (lock, open state, destroyed)
+        fnvcoop::ObjectState os;
+        os.ref = x->ref; os.mask = x->mask; os.open = x->open; os.locked = x->locked; os.level = x->level; os.destroyed = x->destroyed;
+        return planEffect(fnvcoop::Effect(os), env);
+    }
+    if (auto* x = std::get_if<Present>(&e)) {
+        uint32_t f = 0;
+        if (!exists(env, x->form, &f)) return missing(x->form);
+        Step st;
+        st.kind = StepKind::ConsoleGlobal;
+        st.line = presentLine(*x, f);
         p.steps.push_back(st);
         return p;
     }

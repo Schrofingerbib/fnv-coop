@@ -22,7 +22,7 @@ namespace nvcoop::actors::engine {
 
 struct FeedStats {
     uint64_t scans = 0, trackedNew = 0, trackedGone = 0, trackFailed = 0, createdSkipped = 0;
-    uint64_t deathsPolled = 0, deathsReported = 0, deathsRefused = 0;
+    uint64_t deathsPolled = 0, deathsReported = 0, deathsRefused = 0, deathsRearmed = 0;
     uint64_t sessions = 0, worldChanges = 0, poseUpdates = 0, rebased = 0;
 };
 

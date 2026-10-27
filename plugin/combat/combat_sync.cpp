@@ -1,6 +1,7 @@
 #include "combat/combat_sync.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include "../../tools/mut/fnvcoop_mut.h"
 
 // Mutation twins of this file are 701..760 (runtime style: FNVCOOP_MUT=<n>, tools/mut/run_twins.py). Each FNV_MUT(n) is a deliberately broken
@@ -214,6 +215,13 @@ GateDecision CombatSync::onEngineHit(const EngineHit& e) {
         if (a == GateAction::Proceed) ++stats_.proceeded;
         else if (a == GateAction::Clamp) ++stats_.clamped;
         else ++stats_.neutralized;
+        // what the gate decided and why, for a hit on a synced victim: a failed fight shows here whether the shot was forwarded or resolved natively
+        if (e.victimRef && (e.attackerRef || a != GateAction::Proceed)) {
+            char b[160];
+            std::snprintf(b, sizeof b, "%s: %s (victim ref %08X, attacker ref %08X, damage %.1f)", a == GateAction::Proceed ? "proceed" : a == GateAction::Clamp ? "clamp" : "neutralize",
+                          why, e.victimRef, e.attackerRef, static_cast<double>(e.healthDmg));
+            lastGate_ = b;
+        }
         return d;
     };
     cc::Entity atk, vic;
@@ -281,6 +289,19 @@ GateDecision CombatSync::onEngineHit(const EngineHit& e) {
     int32_t room = vv.health > 1 ? vv.health - 1 : 0;
     if (FNV_MUT(704)) room = vv.health + 1000000;   // 704: the copy takes the full local damage (and can die from a prediction)
     return decide(GateAction::Clamp, "forwarded to the victim's owner", room);
+}
+
+void CombatSync::noteNaturalLethal(const cc::Entity& who) {
+    EntityView v;
+    if (!who.isActor() || !world_.entity(who, v) || !v.known || !v.ref || !v.simulatedHere || v.alive) return;
+    // The engine applied a hit here and the victim is at health <= 0. A normal hit runs the death in the same call, a VATS kill (slow motion, kill
+    // cam) can leave the life state alive for a long time or for good, and the actor port declares only a life state death.
+    ++stats_.naturalLethal;
+    if (FNV_MUT(792)) return;                                  // 792: a natural lethal hit is never followed up
+    if ((v.named || v.essential) && !FNV_MUT(794)) return;     // a protected actor does not die; the engine knocks it down
+    if (eng_.lifeDead(v.ref)) return;                          // the engine's own death ran: the actor port declares it
+    for (const PendingKill& k : pendingKills_) if (k.who == who) return;
+    pendingKills_.push_back({who, now_ + cfg_.lethalSettleMs, true});
 }
 
 void CombatSync::forwardHit(const cc::HitEvent& h, PlayerId owner) {
@@ -398,7 +419,10 @@ void CombatSync::applyAccepted(const cc::HitEvent& h, PlayerId sender) {
     limbs_[h.victim] = vit.limbs;
     if (!o.applied) return;
     ++stats_.hitsApplied;
-    const int32_t amount = o.healthBefore - o.healthAfter;
+    int32_t amount = o.healthBefore - o.healthAfter;
+    // A lethal hit replays the WHOLE blow (and one point more), not the rounded remainder: the model's health is an integer, the engine's a float
+    // (12.4 reads 12; a replay of 12 leaves a 0.4 sliver standing and the owner's gecko "lives" while every other machine was told it died).
+    if (o.died && !FNV_MUT(790)) amount = std::max(amount, h.damage) + 1;
     if (amount > 0 && vv.ref && !FNV_MUT(707)) {
         if (eng_.damageHealth(h.victim, vv.ref, amount, haveAtk ? av.ref : 0, h)) stats_.damageApplied += static_cast<uint64_t>(amount);
         else { ++stats_.engineRefused; ++stats_.damageRefused; }
@@ -410,6 +434,7 @@ void CombatSync::applyAccepted(const cc::HitEvent& h, PlayerId sender) {
     if (h.victim.isActor() && haveAtk && av.ref && vv.ref && !o.died && !FNV_MUT(708)) {
         if (eng_.provoke(vv.ref, av.ref)) ++stats_.provoked;
     }
+    if (o.died && vv.ref && !FNV_MUT(791)) pendingKills_.push_back({h.victim, now_ + cfg_.killConfirmMs});   // tick() checks that it really died
     recordHit(h.victim, h.attacker, h.weapon, h.limb, false);
     vitalsDirty_.erase(h.victim);
     MVitals mv;
@@ -812,6 +837,15 @@ void CombatSync::tick(uint64_t nowMs) {
         EntityView vv;
         if (!world_.entity(f.hit.victim, vv) || !vv.known) { ++stats_.hitsAbandoned; continue; }
         PlayerId owner = f.hit.victim.isPlayer() ? static_cast<PlayerId>(f.hit.victim.id) : vv.owner;
+        if (owner == cfg_.self && !FNV_MUT(789)) {
+            // The handoff that NACKed this hit finished in OUR favour: we own the victim now and nobody else will ever resolve the hit. Resolve it
+            // here, as the owner does for a hit it receives (the copy was clamped when the hit was fired, so the damage is still owed).
+            const cc::HitEvent& h = f.hit;
+            const cc::HitVerdict v = validator_.judge(h, cfg_.self, cfg_.self, now_, *adapter_);
+            if (v.apply) { ++stats_.hitsResolvedLate; applyAccepted(h, cfg_.self); }
+            else { ++stats_.hitsAbandoned; remember(cc::toString(v.reason), v.detail); }
+            continue;
+        }
         if (owner == kNoPlayer || owner == cfg_.self) { ++stats_.hitsAbandoned; continue; }
         cc::HitEvent h = f.hit;
         if (!f.keepId && !FNV_MUT(717)) h.hitId = (h.explosionId ? h.hitId ^ (static_cast<uint64_t>(f.attempts + 1) << 40) : nextId());
@@ -821,12 +855,28 @@ void CombatSync::tick(uint64_t nowMs) {
         Envelope env; env.src = cfg_.self; env.dest = owner; env.body = MHit{h};
         send(env);
     }
+    // owner: a hit that the rules called lethal must have left the victim dead; if the engine still shows it standing, the owner kills it
+    for (size_t i = 0; i < pendingKills_.size();) {
+        if (pendingKills_[i].dueAt > now_) { ++i; continue; }
+        const cc::Entity who = pendingKills_[i].who;
+        const bool natural = pendingKills_[i].natural;
+        pendingKills_.erase(pendingKills_.begin() + static_cast<long>(i));
+        EntityView v;
+        if (!world_.entity(who, v) || !v.known || !v.ref || !v.simulatedHere) continue;
+        // lifeDead, not isDead: a health <= 0 actor whose life state never flipped (a lethal VATS hit) reads "dead" to isDead and nobody would ever declare it
+        if (FNV_MUT(793) ? eng_.isDead(v.ref) : eng_.lifeDead(v.ref)) continue;
+        if (natural && v.alive && !FNV_MUT(795)) continue;                                      // it was healed or resurrected in the meantime
+        if (natural && (v.named || v.essential) && !FNV_MUT(794)) continue;   // a protected actor does not die: the engine knocks it down
+        if (eng_.killActor(v.ref)) { ++stats_.killsForced; if (natural) ++stats_.naturalLethalStuck; }
+        else { ++stats_.engineRefused; remember("kill refused", cc::toString(who)); }
+    }
     // owner: natural hits publish their result (coalesced)
     for (auto it = vitalsDirty_.begin(); it != vitalsDirty_.end();) {
         if (it->second.dueAt <= now_) {
             const cc::Entity e = it->first;
             it = vitalsDirty_.erase(it);
             publishVitals(e, 0);
+            noteNaturalLethal(e);
         } else ++it;
     }
     // explosions: plan hits for victims the local engine did not iterate

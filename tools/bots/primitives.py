@@ -70,6 +70,9 @@ TYPE_ACTOR = 0x3B
 TYPE_CONTAINER = 0x1B
 TYPE_DOOR = 0x1C
 FLAG_DISABLED = 0x800          # UNVERIFIED TESForm flag bit for "initially disabled / disabled"
+FLAG_DELETED = 0x20            # TESForm "deleted": a world item that was picked up shows this and NOT the disabled bit (in game 2026-10-27, ref.info flags
+                               # 0x408 -> 0x4032A after activate.ref took it; the pickup postcondition watched only the disabled bit and failed on a pickup that worked)
+FLAGS_GONE = FLAG_DISABLED | FLAG_DELETED
 
 # Actor life state (ref.info lifeState, Actor+0x108): 0 alive, 1 dying, 2 dead, 3 unconscious, 5 restrained, 6 essential unconscious.
 # Actor::IsDead (0x8844F0, called with false) counts 1, 2 and 6 as dead. 3 and 5 are alive: in game (2026-10-21) Doc Mitchell
@@ -80,7 +83,7 @@ LIFE_DEAD = frozenset({1, 2, 6})
 MENU_FREE = frozenset({"none", "hud"})
 # bot.menu kinds that stop the player from moving, shooting and activating. Not "other" (a menu id the plugin does not know): that may be a
 # HUD overlay, so a walk that stands still under it still tries its sidesteps.
-MENU_BLOCKING = frozenset({"message", "dialogue", "container", "terminal", "pipboy", "barter", "hacking", "lockpick", "pause", "loading", "vats"})
+MENU_BLOCKING = frozenset({"message", "dialogue", "container", "terminal", "pipboy", "barter", "hacking", "lockpick", "pause", "loading", "vats", "tutorial"})
 
 # GetOpenState return values, UNVERIFIED
 OPEN_STATES = {1: "open", 2: "opening", 3: "closed", 4: "closing"}

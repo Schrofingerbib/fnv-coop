@@ -54,12 +54,23 @@ public:
     void setMenuResume(MenuResume r) { menuResume_ = std::move(r); }
 
     // ---- ModalChoice options for raiseMenu (act2 rule kind ModalChoice: decider=origin, consent=party|none, timeout_s)
+    // D3: how an irreversible choice is decided. Unanimous = a point of no return: every other player must answer "Ready" (one "Not yet"
+    // or the timeout cancels). Vote = a story fork: the party votes, the origin counts as agreeing, the majority wins and the HOST breaks
+    // a tie. Actor = a personal action (Caesar's surgery): the origin alone decides, nobody is asked.
+    enum class ConsentMode : uint8_t { Unanimous = 0, Vote = 1, Actor = 2 };
     struct ModalOptions {
         bool partyConsent = false;   // after the origin picks `confirmButton`, every other connected player must answer "Ready"
         int32_t confirmButton = 0;   // the "point of no return" button
         int32_t declineChoice = -1;  // what the script gets when anybody declines or the consent window times out
         uint32_t timeoutMs = 0;      // 0 = Config defaults
+        ConsentMode mode = ConsentMode::Unanimous;
+        bool anyButton = false;      // every button except declineChoice is the irreversible one (VMS42: two ways to blow up the caves)
     };
+    // Fork INFOs (Joshua or Daniel, Elijah's offer): the pick is held before any script runs, the party is asked, then it proceeds or
+    // the conversation closes with CloseReason::ConsentDenied.
+    struct ChoiceRule { ConsentMode mode = ConsentMode::Vote; uint32_t timeoutMs = 0; };
+    void setChoiceRules(std::map<FormRef, ChoiceRule> r) { choiceRules_ = std::move(r); }
+    size_t choiceRuleCount() const { return choiceRules_.size(); }
 
     // ---- forced dialogue: scripted SayTo / StartConversation. Called by the host hook after the script command ran.
     using ActorChooser = std::function<PlayerId(const FormRef& npc, uint8_t connectedMask)>;
@@ -233,11 +244,13 @@ public:
     uint32_t rejected() const { return rejected_; }
 
 private:
-    enum class St : uint8_t { AwaitPick, Playing };
+    enum class St : uint8_t { AwaitPick, Playing, Consenting };
     struct PendingMenu {
         uint32_t id = 0; PlayerId origin = 0; MenuKind kind = MenuKind::MessageBox;
         std::vector<std::string> buttons; int32_t defaultChoice = -1; uint32_t deadline = 0;
-        ModalOptions opt; std::string text; bool consenting = false; uint8_t need = 0, got = 0;
+        ModalOptions opt; std::string text; bool consenting = false; uint8_t need = 0, yes = 0, no = 0;
+        int32_t picked = -1;                       // the origin's button, resumed on approval
+        ConvId heldConv = 0;                       // != 0: a held fork INFO pick, not a script menu (nothing to resume)
     };
     struct Conv {
         ConvId id = 0; FormRef npc; PlayerId initiator = 0; uint32_t reqId = 0;
@@ -245,6 +258,7 @@ private:
         std::vector<Fact> facts; uint64_t beginTxn = 0, endTxn = 0; bool endDone = true;
         uint8_t locks = 0; uint32_t lastActive = 0;
         Lines lastLines; bool hasLines = false; Offer lastOffer; bool hasOffer = false;   // catch-up for late joiners
+        Pick held; bool lineDoneEarly = false;                                           // a fork pick waiting for the party's answer
     };
     static uint8_t bit(PlayerId p) { return p < 8 ? uint8_t(1u << p) : uint8_t(0); }
 
@@ -334,6 +348,7 @@ private:
         if (!c || !isInitiator(from, *c)) { ++rejected_; return; }
         c->lastActive = now;
         if (m.step == c->step && c->step != 0) {  // duplicate delivery: idempotent
+            if (c->st == St::Consenting) return;      // still waiting for the party: no Result yet
             if (mutations().replayDuplicatePick) c->beginTxn = runScript(*c, Phase::Begin);
             o.push_back({connected_, Result{c->id, c->step, Phase::Begin, c->beginTxn}});
             return;
@@ -341,6 +356,15 @@ private:
         if (c->st != St::AwaitPick || m.step != c->step + 1) { ++rejected_; return; }
         const bool command = comp_ && comp_->isCompanion(c->npc) && ownerOnly_.count(m.topic) != 0;
         if (command && comp_->ownerOf(c->npc) != c->initiator && !mutations().nonOwnerCommands) { ++rejected_; return; }
+        auto rule = choiceRules_.find(m.info);
+        if (rule != choiceRules_.end() && rule->second.mode != ConsentMode::Actor && others(*c) && !mutations().noChoiceConsent) {
+            holdPick(*c, m, rule->second, now, o);        // irreversible fork: ask the party BEFORE any script runs
+            return;
+        }
+        acceptPick(*c, m, command, o);
+    }
+    void acceptPick(Conv& cv, const Pick& m, bool command, std::vector<Out>& o) {
+        Conv* c = &cv;
         c->step = m.step; c->st = St::Playing; c->info = m.info; c->goodbye = m.goodbye;
         c->facts = m.facts; c->endDone = false;
         c->beginTxn = runScript(*c, Phase::Begin);
@@ -351,18 +375,36 @@ private:
         if (others(*c) && !hide) o.push_back({others(*c), l});
         o.push_back({connected_, Result{c->id, c->step, Phase::Begin, c->beginTxn}});
     }
+    void holdPick(Conv& c, const Pick& m, const ChoiceRule& rule, uint32_t now, std::vector<Out>& o) {
+        c.step = m.step; c.st = St::Consenting; c.info = m.info; c.goodbye = m.goodbye; c.held = m; c.lineDoneEarly = false; c.endDone = true;
+        PendingMenu pm;
+        pm.id = ++nextMenu_; pm.origin = c.initiator; pm.kind = MenuKind::MessageBox; pm.buttons = {"Agree", "Not yet"}; pm.defaultChoice = 1;
+        pm.deadline = now + (rule.timeoutMs ? rule.timeoutMs : cfg_.messageMenuMs);
+        pm.opt.partyConsent = true; pm.opt.mode = rule.mode; pm.opt.declineChoice = 1; pm.opt.confirmButton = 0;
+        pm.text = m.lines.empty() ? std::string() : m.lines.front().text.substr(0, 100);
+        pm.consenting = true; pm.need = others(c); pm.heldConv = c.id; pm.picked = 0;
+        MenuRequest rq; rq.menu = pm.id; rq.kind = MenuKind::MessageBox; rq.origin = c.initiator; rq.consent = true;
+        rq.text = "Player " + std::to_string(int(c.initiator)) + " is about to decide for the whole party: " + pm.text;
+        rq.buttons = pm.buttons; rq.defaultChoice = 1;
+        o.push_back({pm.need, rq});
+        menus_[pm.id] = std::move(pm);
+    }
     void handle(PlayerId from, const LineDone& m, uint32_t now, std::vector<Out>& o) {
         Conv* c = find(m.conv);
         if (!c || !isInitiator(from, *c)) { ++rejected_; return; }
         c->lastActive = now;
         if (m.step != c->step) { ++rejected_; return; }
+        if (c->st == St::Consenting) { c->lineDoneEarly = true; return; }   // the initiator's own line ended before the party answered
         if (c->st == St::AwaitPick) {  // duplicate: resend the result, never rerun
             o.push_back({connected_, Result{c->id, c->step, Phase::End, c->endTxn}});
             return;
         }
-        runEnd(*c, o);
-        c->st = St::AwaitPick;
-        if (c->goodbye) closeConv(*c, CloseReason::Goodbye, now, o);
+        finishLine(*c, now, o);
+    }
+    void finishLine(Conv& c, uint32_t now, std::vector<Out>& o) {
+        runEnd(c, o);
+        c.st = St::AwaitPick;
+        if (c.goodbye) closeConv(c, CloseReason::Goodbye, now, o);
     }
     void handle(PlayerId from, const EndReq& m, uint32_t now, std::vector<Out>& o) {
         Conv* c = find(m.conv);
@@ -380,21 +422,24 @@ private:
             ++rejected_; return;
         }
         PendingMenu& pm = it->second;
-        if (pm.consenting) {                             // phase 2: party consent, answers from the other players
+        if (pm.consenting) {                             // phase 2: party consent / vote, answers from the other players
             if (!(pm.need & bit(from)) && !mutations().anyoneRepliesMenu) { ++rejected_; return; }
             if (m.choice != 0 && m.choice != 1) { ++rejected_; return; }
-            if (m.choice == 1) { finishMenu(it, pm.opt.declineChoice, false, o); return; }
-            pm.got = uint8_t(pm.got | bit(from));
-            if ((pm.got & pm.need) == pm.need) finishMenu(it, pm.opt.confirmButton, false, o);
+            if (m.choice == 1) { pm.no = uint8_t(pm.no | bit(from)); pm.yes = uint8_t(pm.yes & ~bit(from)); }
+            else { pm.yes = uint8_t(pm.yes | bit(from)); pm.no = uint8_t(pm.no & ~bit(from)); }
+            const Verdict v = verdict(pm, false);
+            if (v != Verdict::Pending) finishMenu(it, v == Verdict::Approve ? pm.picked : pm.opt.declineChoice, false, o);
             return;
         }
         if (from != pm.origin && !mutations().anyoneRepliesMenu) { ++rejected_; return; }
         const int32_t maxChoice = int32_t(pm.buttons.empty() ? 1 : pm.buttons.size()) - 1;
         if ((m.choice < -1 || m.choice > maxChoice) && !mutations().anyMenuChoice) { ++rejected_; return; }
-        if (pm.opt.partyConsent && m.choice == pm.opt.confirmButton && !mutations().skipConsent) {
+        const bool irreversible = m.choice == pm.opt.confirmButton || (pm.opt.anyButton && m.choice >= 0 && m.choice != pm.opt.declineChoice);
+        const bool asks = pm.opt.mode != ConsentMode::Actor || mutations().actorAsksParty;   // Actor: a personal decision, nobody is asked
+        if (pm.opt.partyConsent && irreversible && asks && !mutations().skipConsent) {
             uint8_t need = uint8_t(connected_ & ~bit(pm.origin));
-            if (need) {                                  // point of no return: ask everybody else
-                pm.consenting = true; pm.need = need; pm.got = 0;
+            if (need) {                                  // point of no return / story fork: ask everybody else
+                pm.consenting = true; pm.need = need; pm.yes = 0; pm.no = 0; pm.picked = m.choice;
                 pm.deadline = now + (pm.opt.timeoutMs ? pm.opt.timeoutMs : cfg_.messageMenuMs);
                 MenuRequest rq; rq.menu = pm.id; rq.kind = pm.kind; rq.origin = pm.origin; rq.consent = true;
                 rq.text = "Player " + std::to_string(int(pm.origin)) + " wants to continue: " + pm.text.substr(0, 120);
@@ -406,14 +451,50 @@ private:
         finishMenu(it, m.choice, false, o);
     }
     template <class It> void finishMenu(It it, int32_t choice, bool timedOut, std::vector<Out>& o) {
-        closeMenu(it->second, choice, timedOut, o);
+        PendingMenu pm = it->second;
         menus_.erase(it);
+        closeMenu(pm, choice, timedOut, o);
+        if (pm.heldConv) resolveHeld(pm.heldConv, choice == 0, o);
     }
     void closeMenu(const PendingMenu& pm, int32_t choice, bool timedOut, std::vector<Out>& o) {
         std::string label;
         if (choice >= 0 && size_t(choice) < pm.buttons.size()) label = pm.buttons[size_t(choice)];
         o.push_back({connected_, MenuClosed{pm.id, choice, timedOut, label}});
-        if (menuResume_) menuResume_(pm.id, choice, timedOut);
+        if (menuResume_ && !pm.heldConv) menuResume_(pm.id, choice, timedOut);
+    }
+    // The party answered for a held fork INFO: run the pick as if it had just arrived, or close the conversation without any script.
+    void resolveHeld(ConvId id, bool approved, std::vector<Out>& o) {
+        Conv* c = find(id);
+        if (!c || c->st != St::Consenting) return;
+        if (!approved) { closeConv(*c, CloseReason::ConsentDenied, 0, o); return; }
+        const Pick p = c->held;
+        acceptPick(*c, p, false, o);
+        if (c->lineDoneEarly) { c->lineDoneEarly = false; finishLine(*c, 0, o); }
+    }
+    // D3 tally. Unanimous: every player still here must have said yes; one no ends it. Vote: the origin counts as yes; the majority of the
+    // players present wins as soon as it is certain; with everybody answered (or the window over) a tie goes to the host.
+    enum class Verdict : uint8_t { Pending, Approve, Decline };
+    static int popcount8(uint8_t v) { int n = 0; for (; v; v = uint8_t(v & (v - 1))) ++n; return n; }
+    Verdict verdict(const PendingMenu& pm, bool timedOut) const {
+        const bool vote = pm.opt.mode == ConsentMode::Vote && !mutations().voteIsUnanimous;
+        if (!vote) {
+            if (pm.no & connected_) return Verdict::Decline;
+            const uint8_t need = uint8_t(pm.need & connected_);
+            if ((pm.yes & need) == need) return Verdict::Approve;
+            return timedOut ? Verdict::Decline : Verdict::Pending;
+        }
+        const int total = popcount8(connected_);
+        const uint8_t agreeMask = uint8_t((pm.yes | bit(pm.origin)) & connected_);
+        const int agree = popcount8(agreeMask), disagree = popcount8(uint8_t(pm.no & connected_));
+        if (agree * 2 > total) return Verdict::Approve;
+        if (disagree * 2 > total) return Verdict::Decline;
+        const bool allAnswered = uint8_t((agreeMask | pm.no) & connected_) == connected_;
+        if (!allAnswered && !timedOut) return Verdict::Pending;
+        if (timedOut && mutations().voteTimeoutApproves) return Verdict::Approve;
+        if (agree > disagree) return Verdict::Approve;
+        if (agree < disagree) return Verdict::Decline;
+        if (mutations().voteNoHostTieBreak) return Verdict::Decline;
+        return (agreeMask & bit(fnvcoop::kHostPlayer)) ? Verdict::Approve : Verdict::Decline;   // tie: the host decides (no answer from the host = no)
     }
     // `leaver` = a player that just disconnected (kNoPlayer = only time-based expiry)
     void expireMenus(uint32_t now, std::vector<Out>& o, PlayerId leaver) {
@@ -422,10 +503,16 @@ private:
             const bool originGone = leaver != fnvcoop::kNoPlayer && pm.origin == leaver;
             if (pm.consenting && !originGone) {
                 if (leaver != fnvcoop::kNoPlayer) {      // a consenter left: they no longer count
-                    pm.need = uint8_t(pm.need & ~bit(leaver)); pm.got = uint8_t(pm.got & ~bit(leaver));
-                    if ((pm.got & pm.need) == pm.need) { auto cur = it++; finishMenu(cur, pm.opt.confirmButton, false, o); continue; }
+                    pm.need = uint8_t(pm.need & ~bit(leaver)); pm.yes = uint8_t(pm.yes & ~bit(leaver)); pm.no = uint8_t(pm.no & ~bit(leaver));
                 }
-                if (now >= pm.deadline && !mutations().noMenuDefault) { auto cur = it++; finishMenu(cur, pm.opt.declineChoice, true, o); continue; }
+                const bool late = now >= pm.deadline && !mutations().noMenuDefault;
+                const Verdict v = verdict(pm, late);
+                if (v != Verdict::Pending) {
+                    const int32_t choice = v == Verdict::Approve ? pm.picked : pm.opt.declineChoice;
+                    auto cur = it++;
+                    finishMenu(cur, choice, late, o);
+                    continue;
+                }
                 ++it;
                 continue;
             }
@@ -441,6 +528,7 @@ private:
     template <class T> void handle(PlayerId, const T&, uint32_t, std::vector<Out>&) { ++rejected_; }
 
     std::map<uint32_t, PendingMenu> menus_;
+    std::map<FormRef, ChoiceRule> choiceRules_;
     uint32_t nextMenu_ = 0, nextForced_ = 0;
     ActorChooser chooser_;
     MenuResume menuResume_;

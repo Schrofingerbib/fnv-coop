@@ -8,7 +8,7 @@ setlocal
 for %%I in ("%~dp0..\..") do set "REPO=%%~fI"
 if not defined PYTHON set "PYTHON=python"
 "%PYTHON%" -I "%REPO%\tools\build\build.py" --target nvcoop_wt_tests --label "world-time" || exit /b 1
-"%PYTHON%" -I "%REPO%\tools\mut\run_twins.py" --label "world-time" --twins 101-124,131-139,146-169 --real-regex ", 0 failed" --caught-regex ", [1-9][0-9]* failed" -- "%REPO%\build\all\wt_tests\nvcoop_wt_tests.exe" || exit /b 1
+"%PYTHON%" -I "%REPO%\tools\mut\run_twins.py" --label "world-time" --twins 101-124,131-139,146-171 --real-regex ", 0 failed" --caught-regex ", [1-9][0-9]* failed" -- "%REPO%\build\all\wt_tests\nvcoop_wt_tests.exe" || exit /b 1
 "%PYTHON%" -I "%REPO%\plugin\world_time\tools\worldtime_proof.py" --selftest || exit /b 1
 echo ALL OK
 exit /b 0

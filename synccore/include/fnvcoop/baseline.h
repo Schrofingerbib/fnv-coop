@@ -69,6 +69,9 @@ BaselineDiff diffBaseline(const ShadowState& hostWorld, const BaselineSummary& c
 // Client side: resolve a revert key against the client's own world (kills -> ResurrectActor). Returns false if the
 // entry kind has no safe inverse (counted as "unrevertable" by the session).
 bool revertEffectFor(const ShadowState& clientWorld, uint64_t key, Effect& out);
+// False for every effect kind revertEffectFor has no case for (SetScriptVar, SetStage, StartQuest, SetGlobal ...): a revert key for such an
+// entry can never be executed, whatever the client's pre-images hold. True means "may have an inverse" (it can still fail without a pre-image).
+bool mayHaveRevert(const Effect& e);
 
 // ---- runtime desync detection helpers ----
 constexpr size_t kSyncShards = 128;   // 8 entry classes x 16 key buckets
@@ -79,7 +82,15 @@ size_t shardOf(const BaselineEntry& e);   // class*16 + key%16
 // Order-independent per-shard hashes of an entry list (volatile keys never appear in entry lists).
 std::vector<uint32_t> shardHashes(const std::vector<BaselineEntry>& entries);
 // Shard hashes straight from the maps (no per-entry objects or allocations): what digests use. Same result as shardHashes(baselineEntries(w)).
-std::vector<uint32_t> shardHashesOf(const ShadowState& w);
+// `adjust` (host side only): acknowledged divergences, see HostSession. The shard sum is moved by add - sub per item, as if the host's world held
+// the client's entry for that key instead of its own (sub) or nothing.
+struct ShardAdjust { size_t shard = 0; uint64_t add = 0, sub = 0; };
+std::vector<uint32_t> shardHashesOf(const ShadowState& w, const std::vector<ShardAdjust>* adjust = nullptr);
+// An entry's term in its shard sum (what shardHashesOf adds for key / value hash), for building ShardAdjust items.
+uint64_t shardTerm(uint64_t key, uint32_t value);
+// True when two values of a quest / ref script var hash alike (the digest quantises: float noise and denormals fold together).
+bool sameScriptVarValue(const FormRef& owner, uint16_t index, double a, double b);
+bool sameGlobalValue(const FormRef& global, double a, double b);   // same for a global
 
 // One-level Merkle digest for the flight recorder (T1a): 256 order-independent bucket sums, bucket = key & 0xFF, entry term =
 // bucketMix(key, value hash). Same entries as baselineEntries(), computed straight from the maps (no per-entry objects).

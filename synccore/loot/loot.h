@@ -45,7 +45,7 @@ using NetId = uint32_t;
 using CellId = uint32_t;
 
 constexpr uint8_t kChannelLoot = 0xB1;            // first byte of every datagram of this module (docs/protocol.md section 2)
-constexpr uint8_t kLootWireVersion = 1;
+constexpr uint8_t kLootWireVersion = 2;   // 2: ReqClaim and MItemGone carry the placed item's own ref (a client cannot find a placed world item from its net id alone)
 constexpr NetId kItemIdBase = 0xFFB00000u;        // host-issued ids of dropped world items: [kItemIdBase, kItemIdEnd]
 constexpr NetId kItemIdEnd = 0xFFBFFFFFu;         // (spawn-arb issues [0xFFC00000, 0xFFFFFFFF]; the host engine's own 0xFF ids count up from 0xFF000000)
 constexpr size_t kMaxStacks = 512;                // distinct bases in one container
@@ -123,7 +123,7 @@ struct ReqMove { uint32_t txn = 0; NetId cont = 0; FormRef base; int32_t count =
 struct ReqClose { uint32_t txn = 0; NetId cont = 0; uint64_t digest = 0; };
 struct ReqHold { NetId cont = 0; };                                          // keep-alive for the lock
 struct ReqDrop { uint32_t txn = 0; FormRef base; int32_t count = 1; uint32_t meta = 0; CellId cell = 0; Vec3 pos, rot; };
-struct ReqClaim { uint32_t txn = 0; NetId item = 0; bool hasAdopt = false; WorldItem adopt; };   // adopt: a placed item the host has not heard of
+struct ReqClaim { uint32_t txn = 0; NetId item = 0; bool hasAdopt = false; WorldItem adopt; FormRef ref; };   // adopt: a placed item the host has not heard of. ref (with adopt): the placed world ref itself, plugin:localId
 struct ReqResync { NetId cont = 0; bool all = false; };
 struct ReqDigest { uint64_t digest = 0; uint32_t containers = 0, items = 0; };
 struct ReqTouch { NetId net = 0; Vec3 pos, rot; };                          // "I am moving this physics object": asks for clutter ownership
@@ -145,7 +145,7 @@ struct MContainer { ContainerRec rec; };                                     // 
 struct MDelta { NetId cont = 0; uint32_t rev = 0; FormRef base; int32_t newCount = 0; };   // absolute count of one base after the change
 struct MLock { NetId cont = 0; uint32_t lockSeq = 0; PlayerId holder = kNoPlayer; };
 struct MItemNew { WorldItem item; };
-struct MItemGone { NetId item = 0; PlayerId by = kNoPlayer; uint32_t txn = 0; };
+struct MItemGone { NetId item = 0; PlayerId by = kNoPlayer; uint32_t txn = 0; FormRef ref; };   // ref: a PLACED item's world ref (empty for a dropped one: the engine knows it by its net id)
 struct MContainerGone { NetId cont = 0; };                                   // the host forgot it (cell reset): the next resolve starts over
 struct MTableBegin { uint32_t seq = 0; };
 struct MTableEnd { uint32_t seq = 0; uint32_t containers = 0, items = 0; };  // ids not mentioned between Begin and End are removed from the view
@@ -166,6 +166,7 @@ struct HostConfig {
     uint32_t maxContainers = 65536;
     uint32_t maxItems = 16384;          // dropped items alive at once
     uint32_t maxPlacedTaken = 262144;   // tombstones of placed items that were picked up
+    uint32_t maxTableTombstones = 4096; // tombstones (with their ref) pushed in one join table, lowest id first: a client that joins after a pickup removes the item too
     uint32_t restMs = 400;              // clutter: an owner silent this long is idle and may be taken over
     uint32_t healMinMs = 2000;          // a digest mismatch triggers at most one table push per sender in this time
     uint32_t maxDigestAgeMs = 0;        // unused (reserved)
@@ -177,7 +178,7 @@ struct HostStats {
     uint64_t opens = 0, busy = 0, locksExpired = 0, locksReleasedOnLeave = 0;
     uint64_t takes = 0, puts = 0, refused = 0, notHolder = 0, insufficient = 0;
     uint64_t closes = 0, closeMismatch = 0;
-    uint64_t drops = 0, claimsWon = 0, claimsLost = 0, placedClaims = 0;
+    uint64_t drops = 0, claimsWon = 0, claimsLost = 0, placedClaims = 0, claimsRepeated = 0;   // claimsRepeated: the same player claimed an item it already won (answered Ok, not AlreadyTaken)
     uint64_t externalSets = 0, externalRefused = 0, cellResets = 0;
     uint64_t digestsSeen = 0, digestMismatch = 0, healsSent = 0, resyncsAnswered = 0;
     uint64_t clutterTracked = 0, clutterRelayed = 0, clutterRejected = 0, clutterTakeovers = 0, clutterDenied = 0;
@@ -257,6 +258,7 @@ private:
     std::map<NetId, Held> held_;
     std::map<NetId, WorldItem> items_;
     std::map<NetId, PlayerId> placedTaken_;
+    std::map<NetId, FormRef> placedRef_;   // the world ref a tombstone belongs to (plugin:localId), so a join table can tell a late client which item to remove
     std::map<NetId, PlayerId> recentTaken_;
     std::deque<NetId> recentOrder_;
     std::map<PlayerId, Ledger> ledgers_;
@@ -279,7 +281,7 @@ struct Action {
         Notify,           // tell the player (`notice`)
         BindDrop,         // the local world ref `ref` IS item `id` (issued by the host)
         CreateItem,       // make a local world ref for `item` (somebody else dropped it, or a late join)
-        RemoveItem,       // delete the local world ref of item `id` (it was taken)
+        RemoveItem,       // delete the local world ref of item `id` (it was taken). `placed` names the ref of a placed item (empty: a dropped item, found by `id`)
         SetPose,          // clutter `id`: show this pose (moving = interpolate / hold physics, !moving = final resting pose)
         ReadyToClose,     // container `id`: every pending op settled, read the engine contents and call LootClient::closeNow
         ClutterOwner,     // this machine now (owner=true) or no longer owns clutter `id`
@@ -291,6 +293,7 @@ struct Action {
     int32_t delta = 0;
     Items items;
     WorldItem item;
+    FormRef placed;       // RemoveItem of a placed item: its world ref
     Notice notice = Notice::InUse;
     Vec3 pos, rot;
     bool flag = false;    // SetPose: moving. ClutterOwner: owner
@@ -320,7 +323,7 @@ struct ClientStats {
     uint64_t sent = 0, resent = 0, results = 0, duplicateResults = 0, staleResults = 0, gaveUp = 0, abandoned = 0;
     uint64_t opens = 0, busy = 0, takes = 0, puts = 0, rollbacks = 0, rollbackItems = 0;
     uint64_t contentsReplaced = 0, registers = 0, adopted = 0, closes = 0, closeMismatch = 0;
-    uint64_t drops = 0, bound = 0, created = 0, removed = 0, claims = 0, claimsWon = 0, claimsLost = 0;
+    uint64_t drops = 0, bound = 0, created = 0, removed = 0, claims = 0, claimsWon = 0, claimsLost = 0, claimsDuplicate = 0, removedPlaced = 0;   // claimsDuplicate: a pickup of an item whose claim is already in flight (not sent twice)
     uint64_t deltasApplied = 0, deltasStale = 0, gaps = 0, resyncsAsked = 0, tablesApplied = 0, tablesIncomplete = 0, digestsSent = 0, wrongDirection = 0;
     uint64_t clutterSent = 0, clutterApplied = 0, clutterStale = 0, clutterOwned = 0, strayReleases = 0, auditCorrections = 0;
 };
@@ -359,7 +362,8 @@ public:
     // The local player dropped something (xNVSE OnDrop). `localRef` is the engine's ref of the dropped object.
     uint32_t dropped(uint32_t localRef, const FormRef& base, int32_t count, uint32_t meta, CellId cell, const Vec3& pos, const Vec3& rot, uint64_t now);
     // The local player picked a world item up. `item` = its net id (placed: derived, dropped: issued). The engine already gave the player the item.
-    void pickedUp(uint32_t localRef, NetId item, const FormRef& base, int32_t count, uint32_t meta, CellId cell, const Vec3& pos, uint64_t now);
+    void pickedUp(uint32_t localRef, NetId item, const FormRef& base, int32_t count, uint32_t meta, CellId cell, const Vec3& pos, uint64_t now,
+                  const FormRef& placedRef = FormRef());   // placedRef: a placed item's own ref (plugin:localId), so the others can find and remove it
     // Physics: samples of the clutter objects this machine can see moving (call every frame; the sender decides what is worth a datagram).
     struct Sample { NetId net = 0; Vec3 pos, rot; };
     void clutterSamples(const std::vector<Sample>& samples, uint64_t now);
@@ -376,11 +380,18 @@ public:
     const WorldItem* item(NetId id) const;
     bool isOpen(NetId cont) const;
     bool holdsLock(NetId cont) const;
+    // No menu / transfer of this container is in flight on this machine (nothing open, nothing waiting to close, no unanswered request): a menu-less
+    // transfer (a take or put the engine did without the container menu) may start one. Used by plugin/loot (LootSync::screenTransfer).
+    bool transferIdle(NetId cont) const;
     size_t pendingCount() const { return pending_.size(); }
     size_t pendingFor(NetId cont) const;
     uint64_t digest() const;
     bool owns(NetId clutter) const;
     std::string debugLocal(NetId cont) const;       // "open=1 granted=0 ..." for logs and tests
+    void containerIds(std::vector<NetId>& out, size_t max) const {   // every container of the shared view (the glue looks at those that have a ref on this machine)
+        out.clear();
+        for (const auto& kv : containers_) { if (out.size() >= max) break; out.push_back(kv.first); }
+    }
     size_t containerCount() const { return containers_.size(); }
     size_t itemCount() const { return items_.size(); }
 
@@ -419,7 +430,7 @@ private:
     void applyRecord(const ContainerRec& rec, bool fromTable, bool eager, uint64_t now);
     void applyDelta(const MDelta& d, uint64_t now);
     void askResync(NetId cont, uint64_t now);
-    void forgetItem(NetId id, PlayerId by);
+    void forgetItem(NetId id, PlayerId by, const FormRef& placedRef);
     void maybeReadyToClose(NetId cont);
     void reconcileLocal(uint64_t now);
     void bindDrop(const WorldItem& it);

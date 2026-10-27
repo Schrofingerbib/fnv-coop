@@ -316,6 +316,7 @@ class LiveEnv(NullEnv):
         split = ROOT / "out" / "L1split"
         if (split / "nvcoop.dll").exists() and (split / "nvcoop_mod.dll").exists():
             cmd += ["--plugin-dll", "out/L1split/nvcoop.dll", "--core-dll", "out/L1split/nvcoop_mod.dll"]
+        cmd += X.nvse_args()
         for spec in test.get("ini", []):
             cmd += [f"--ini={spec}"]
         return cmd
@@ -1096,7 +1097,7 @@ def npc_problem(t: Dict[str, Any]) -> Optional[str]:
 # when the player has a cell and 3D, so these scripts read "avatar runtime not created yet (no player in a cell)" / "waiting for the player" /
 # "the host has no puppet for player 1" (sweep 2026-10-22 13:50: puppet_loopback, puppet_two_copy, avatars_phases, avatars_lifecycle, social_proof;
 # loot_proof and worldtime_proof stand the players at a container / door of a scenario).
-WORLD_SCRIPTS = ("proof_puppet.py", "proof_avatars.py", "social_proof.py", "loot_proof.py", "worldtime_proof.py")
+WORLD_SCRIPTS = ("proof_puppet.py", "proof_avatars.py", "social_proof.py", "loot_proof.py", "worldtime_proof.py", "proof_actor_port_two_copy.py")
 
 
 def world_problem(t: Dict[str, Any]) -> Optional[str]:
@@ -1207,7 +1208,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.add_argument("--keep-up", action="store_true", help="leave the copies prove.py booted running (and the slot held) at the end")
         p.add_argument("--pairs", type=int, default=1, choices=range(1, X.MAX_PAIRS + 1),
                        help="run up to this many independent two-copy tests at the same time: pair 0 = instances 0,1, pair 1 = instances 2,3 "
-                            "(tests with 3 or more copies still run alone); fewer when the free RAM cannot hold the copies")
+                            "(at most %d pairs; PROOF_MAX_PAIRS raises that; tests with 3 or more copies still run alone); fewer when the free RAM cannot hold the copies" % X.MAX_PAIRS)
         p.add_argument("--reserve-gb", type=float, default=S.RESERVE_GB,
                        help="RAM left free for Windows and the tools when checking that the copies fit (each copy needs %.1f GB; default %%(default)s)" % S.COPY_GB)
     def pick(p):

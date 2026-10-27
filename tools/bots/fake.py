@@ -19,6 +19,8 @@ It implements the console grammar and bridge methods in primitives.py over a tin
   drop_wrong_ref    the OnDrop event names a different ref than the one the engine created
   travel_ignored    bot.fasttravel is accepted but the player never moves
   exec_ref_ignored  exec {cmd, ref} checks the ref, then runs the line with no calling reference
+  tutorial_stuck    a terminal opens under a first-use tutorial box and bot.menu.close says closed but the box stays (the plugin before 2026-10-27 refused it)
+  vats_freeze       bot.vats starts a job and then the game's main thread stops: every bridge request answers "main thread did not service the request"
   menu_close_ignored  bot.menu.close says closed but the container menu stays open (the plugin's call did nothing)
   msgbox_stuck      bot.menu.press presses the engine's message box natively, but the box never closes
   msgbox_ui_only    bot.menu.press only answers the UI layer's box (the plugin before the native path existed)
@@ -93,6 +95,7 @@ class Thing:
     open_state: int = 3             # 3 closed, 1 open
     locked: bool = False
     disabled: bool = False
+    deleted: bool = False           # ref.info flag 0x20: what the game shows for a world item that was picked up
     base_item: int = 0              # for kind == item: what picking it up gives
     topics_text: List[str] = field(default_factory=list)   # terminal entry names
     base_id: int = 0                # base form id (0 = same as id); used by dev.countRefs
@@ -211,6 +214,8 @@ class FakeBridge:
         self._next_ref = 0xFF000000
         self.held: set = set()
         self.terminal_used: Dict[str, List[Dict[str, Any]]] = {}
+        self.tutorial_on_terminal = False       # the first terminal opened shows the first-use tutorial box over it (tests set it)
+        self._tutorial_seen = False
         self.box = None                 # menu id of a message box being shown (tests set it)
         self.box_answers: List[int] = []
         self.native_boxes: List[int] = []     # engine message boxes (MessageMenu 1001) queued, each = its button count (tests set it)
@@ -284,6 +289,9 @@ class FakeBridge:
             if v is None:
                 return {"ok": False, "output": "unknown expression"}
             return {"ok": True, "output": f"NVCOOP_EVAL={v:g}"}
+        if self.mutant == "no_removeitemtarget" and re.match(r"(?:player\.)?removeitemtarget", text, re.I):
+            # the second PC's build: the console answers ok and prints the error in the output, nothing moves
+            return {"ok": True, "output": "SCRIPTS: Script SysWindowCompileAndRun, line 1: Script command RemoveItemTarget not found."}
         ok = self._stmt(text, self_ref)
         return {"ok": ok, "output": "" if ok else "unknown command"}
 
@@ -328,7 +336,7 @@ class FakeBridge:
             if t is None:
                 raise RpcError(-32000, "reference not loaded", method)
             return {"x": t.pos[0], "y": t.pos[1], "z": t.pos[2], "lifeState": t.life_state,
-                    "flags": P.FLAG_DISABLED if t.disabled else 0, "type": t.type_id, "cell": t.cell}
+                    "flags": (P.FLAG_DISABLED if t.disabled else 0) | (P.FLAG_DELETED | 0x4300A if t.deleted else 0), "type": t.type_id, "cell": t.cell}
         if method == P.M_ACTIVATE:
             t = self._by_ref(params["ref"])
             if t is None or t == "player":
@@ -359,6 +367,8 @@ class FakeBridge:
                 if self.mutant != "vats_noop":
                     t.health -= 40
                 self.vats_state = {"phase": "done" if self.mutant != "vats_fail" else "failed", "reason": "target_not_selectable"}
+                if self.mutant == "vats_freeze":
+                    self.vats_state = {"phase": "enter", "reason": ""}
                 return {"started": True}
             raise RpcError(-32000, "target not loaded", method)
         if method == P.M_BOT_SAY:
@@ -389,6 +399,10 @@ class FakeBridge:
                 top = "message"
             if top == "none":
                 raise RpcError(-32000, "no menu is open", method)
+            if top == "tutorial" and want in ("tutorial", "any"):
+                if self.mutant != "tutorial_stuck":
+                    self._menu = "terminal"
+                return {"closed": True, "menu": 0x423, "kind": "tutorial"}
             if (want == "any" and top in ("message", "dialogue")) or (want != "any" and top != want):
                 raise RpcError(-32000, f"the top menu is {top}, not {want}: left open", method)
             if self.mutant != "menu_close_ignored":
@@ -437,6 +451,8 @@ class FakeBridge:
             return {"menu": menu, "button": button, "path": "ui"} if method == P.M_BOT_PRESS else {"menu": menu, "button": button}
         if method == P.M_TERMINAL:
             t = self._by_ref(params["ref"])
+            if getattr(self, "_menu", "none") == "tutorial":
+                raise RpcError(-32000, "terminal menu is not open (top menu id 1059); activate the terminal first", method)
             if not isinstance(t, Thing) or t.kind != "terminal" or getattr(self, "_menu", "none") != "terminal":
                 raise RpcError(-32000, "terminal menu is not open", method)
             names = t.topics_text or ["Read log", "Exit"]
@@ -519,10 +535,16 @@ class FakeBridge:
                 me.in_dialogue = t.id
                 self.click_at = self.clock.t
         elif t.kind == "item":
-            t.disabled = True
+            if self.mutant == "pickup_deletes":     # the real game: the picked-up item is deleted, not disabled
+                t.deleted = True
+            else:
+                t.disabled = True
             me.items[t.base_item] = me.items.get(t.base_item, 0) + 1
         elif t.kind in ("container", "terminal"):
             self._menu = t.kind
+            if t.kind == "terminal" and self.tutorial_on_terminal and not self._tutorial_seen:
+                self._tutorial_seen = True
+                self._menu = "tutorial"          # the hint box is the top menu; the terminal menu is under it
 
     # ---- simulated input driver (plugin/bots): same method names and reply shapes as bot_rpc.h ----
     def _driver(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -530,6 +552,8 @@ class FakeBridge:
             raise RpcError(-32601, "unknown method: " + method, method)
         me = self.me
         if method == P.M_BOT_STATUS:
+            if self.mutant == "vats_freeze" and self.vats_state.get("phase") == "enter":
+                raise RpcError(-32000, "main thread did not service the request (is the game loading?)", method)   # the frozen game of the first lab run
             return {"enabled": True, "hooked": True, "frame": int(self.clock.t * 60), "held": sorted(self.held),
                     "shotsLeft": self.shots_left, "alwaysRun": self.always_run, "vats": self.vats_state}
         if method == P.M_BOT_MOVE:
@@ -721,6 +745,15 @@ class FakeBridge:
             if mut != "transfer_dup":
                 si[i] -= n
             di[i] = di.get(i, 0) + n
+            return True
+        if cmd == "removeitem":
+            items = self._holder_items(who)
+            if items is None:
+                return False
+            i, n = _hex(rest[0]), int(rest[1])
+            if items.get(i, 0) < n:
+                return True
+            items[i] -= n
             return True
         if cmd == "additem":
             items = self._holder_items(who)

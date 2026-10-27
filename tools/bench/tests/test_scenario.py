@@ -11,7 +11,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import arena as arena_mod  # noqa: E402
-import scenario  # noqa: E402
+import bench_scenario as scenario  # noqa: E402
 
 
 class R:
@@ -144,6 +144,60 @@ class Runner(unittest.TestCase):
         self.assertGreater(ctx.walk["legs"], 0)
         self.assertEqual(ctx.walk["legs_ok"], 0)
         self.assertIn("stuck: fake", ctx.walk["why"])
+
+    def test_a_walker_survives_errors_and_counts_them(self):
+        class Flaky(FakeBot):
+            def goto_pos(self, *a, **kw):
+                if self.calls < 2:
+                    self.calls += 1
+                    raise RuntimeError("main thread did not service the request")
+                return FakeBot.goto_pos(self, *a, **kw)
+        ctx, _, _ = make_ctx()
+        bot = Flaky()
+        scenario._walk_one(ctx, bot, "square", __import__("time").time() + 3)
+        self.assertGreater(ctx.walk["legs_ok"], 0, "the walker kept going after the errors")
+        self.assertTrue(any(k.startswith("error:") for k in ctx.walk["why"]))
+
+    def test_twin_walker_dies_on_the_first_error(self):
+        class Dead(FakeBot):
+            def goto_pos(self, *a, **kw):
+                raise RuntimeError("boom")
+        old = scenario.MUTANT
+        scenario.MUTANT = "walker_dies"
+        try:
+            ctx, _, _ = make_ctx()
+            with self.assertRaises(RuntimeError):
+                scenario._walk_one(ctx, Dead(), "square", __import__("time").time() + 3)
+        finally:
+            scenario.MUTANT = old
+
+    def test_exec_retry_waits_out_a_busy_game(self):
+        import phases
+        class NV:
+            def __init__(self):
+                self.fails, self.ran = 1, []
+
+            def eval(self, e):
+                return 0
+
+            def exec(self, line):
+                if self.fails:
+                    self.fails -= 1
+                    raise RuntimeError("busy")
+                self.ran.append(line)
+                return {"output": "ok"}
+
+        class B:
+            nv = NV()
+        old = phases.time.sleep
+        phases.time.sleep = lambda s: None
+        try:
+            self.assertEqual(phases.exec_retry(B, "cow x 1 1", lambda s: None)["output"], "ok")
+            B.nv.fails = 99
+            with self.assertRaises(RuntimeError):
+                phases.exec_retry(B, "cow x 1 1", lambda s: None, tries=2)
+        finally:
+            phases.time.sleep = old
 
     def test_a_failing_phase_does_not_end_the_run(self):
         ctx, phase, _ = make_ctx()

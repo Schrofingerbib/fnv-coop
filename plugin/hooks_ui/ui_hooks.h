@@ -61,6 +61,10 @@ bool openMenu(const fnvcoop_dlg::MenuRequest& rq);
 void closeMenu(uint32_t menu);          // timeout: forces the box shut without answering
 void pump();                            // per frame: starts the next queued box
 bool openDialogMenu(uint32_t speakerRefID, const FormRef& topic);   // forced conversation: `<npc>.StartConversation player <topic>`
+// G07 mirror: a read-only copy of a box that was raised to a remote player (one dummy button that re-shows the box when pressed) keeps
+// the engine in message-menu mode, so the script's `begin MenuMode 1001` block runs here. closeMirror when the origin answered.
+bool openMirror(uint32_t menu, const std::string& text, uint8_t origin);
+void closeMirror(uint32_t menu);
 bool forceCloseDialog();                // CloseAllMenusCore while the DialogMenu is open; never runs the END script locally
 bool dialogOpen();
 // Ending slideshow playback on a client: the SwapTexture the host script ran (`SwapTexture <ref> "old" "new"` through the console executor).
@@ -75,6 +79,10 @@ bool resumeTalk(uint32_t npcRefID);                         // deferred vanilla 
 void setControlsLocked(bool locked);                        // player controls (all-or-nothing, L5's SetPlayerControlsLocked)
 bool nearPlayer(uint32_t refID, float maxDist);             // same cell (or both exterior) and within maxDist game units of the local player
 }  // namespace ops
+
+// The one ShowSequencer of this process: slides (SlideClient) and scene narration (L8 glue, through NarrationGate) are ordered against
+// each other by the host's stamps; without a shared sequencer a stamped narration line could not be played at all.
+ShowSequencer& showSequencer();
 
 // Ending slideshow: the client side is the same on every machine; the host broadcasts through `send` (set once at session start).
 SlideClient& slideClient();

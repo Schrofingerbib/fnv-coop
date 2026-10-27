@@ -20,6 +20,7 @@
 #include "intents/intent_engine.h"
 #include "intents/intent_policy.h"
 #include "intents/intent_wire.h"
+#include "intents/storage_book.h"
 
 namespace nvcoop::intents {
 
@@ -43,6 +44,11 @@ struct HostDeps {
     //   interacted       told AFTER a guest's Activate / PickUp / ContainerOpen ran (Result::Executed): theft, trespass and break-in are judged from it
     std::function<bool(PlayerId slot, const FormRef& target)> allowActivation;
     std::function<void(PlayerId slot, bool pickup, const FormRef& target)> interacted;
+    // Kind::SetStage policy, asked AFTER the "quest is behind that stage" check and BEFORE anything runs. false = refuse (Result::Denied, counted in
+    // stagesRefused and logged through stageRefused). The module wires it to the rules engine's ExclusiveStages (a losing alternative outcome would
+    // run its result scripts on the host and only then have its SetStage dropped from the txn). Empty = allow.
+    std::function<bool(PlayerId slot, const FormRef& quest, uint32_t stage)> allowStage;
+    std::function<void(PlayerId slot, const FormRef& quest, uint32_t stage, Result why)> stageRefused;   // optional: the host says it refused / held / skipped a guest stage
 };
 
 struct HostStats {
@@ -54,11 +60,16 @@ struct HostStats {
     uint64_t reachChecked = 0, reachUnchecked = 0, scriptsSkipped = 0;
     uint64_t claimsWon = 0, claimsLost = 0, lockGrants = 0, lockBusy = 0, lockExpired = 0, lockReleased = 0, redirects = 0;
     uint64_t activationsRefused = 0, interactionsReported = 0;   // plugin/companions hooks (HostDeps::allowActivation / interacted)
+    uint64_t noteGrants = 0;                                    // a picked-up note went to the journal (AddNote), not to an inventory (G10)
+    uint64_t stayRaises = 0, stayStarted = 0, stayExpired = 0, stayDropped = 0;   // Kind::TriggerStay presences (G04)
+    uint64_t stashSwaps = 0, stashFailed = 0, stashKept = 0;    // gear stashes swapped in / failed to swap / left untouched (G35)
+    uint64_t stagesApplied = 0, stagesNoAdvance = 0, stagesRefused = 0, stagesDeferred = 0, stagesFailed = 0, stagesBad = 0;   // Kind::SetStage verdicts
 };
 
 class IntentHost {
 public:
-    IntentHost(HostDeps deps, Config cfg, ContainerRedirect redirect = ContainerRedirect());
+    // `stash`: the gear ledger (storage_book.h), owned by the caller so it outlives the session; null = no stashes.
+    IntentHost(HostDeps deps, Config cfg, ContainerRedirect redirect = ContainerRedirect(), StorageBook* stash = nullptr);
 
     // A datagram from `from` (a transport peer already mapped to a slot). Malformed input is counted and dropped.
     void onDatagram(PlayerId from, const uint8_t* data, size_t size);
@@ -75,6 +86,19 @@ public:
     std::vector<LockInfo> locks() const;
     bool claimed(const FormRef& item) const { return claims_.count(item) != 0; }
     size_t claimCount() const { return claims_.size(); }
+    size_t presenceCount() const { return presence_.size(); }   // (player, trigger) pairs the host re-raises OnTrigger for
+
+    // Gear stashes around a guest's interaction (G35). enter: the shared containers of the book hold exactly `slot`'s stash; exit: what they hold now becomes
+    // `slot`'s stash again and the parked contents return. No-ops for the host's own player, without a book or with [intents] storage=0. runScoped does this
+    // itself; the service uses it around a guest conversation's result scripts.
+    struct StashHold {
+        struct One { FormRef container; std::vector<StoredItem> parked, loaded; bool swapped = false; };
+        std::vector<One> held;
+        PlayerId slot = kNoPlayer;
+        bool active = false;
+    };
+    StashHold stashEnter(PlayerId slot);
+    void stashExit(StashHold& hold);
     const HostStats& stats() const { return stats_; }
     const Config& config() const { return cfg_; }
     std::string statusJson() const;
@@ -98,13 +122,16 @@ public:
     void noteActor(PlayerId slot, ActorMode mode, RefId actor);
 private:
     Result checkReach(const Actor& a, const TargetInfo& t, Kind k);
-    Result runScoped(PlayerId slot, const Actor& a, Kind k, const FormRef& target, const std::function<Result(IActingScope&)>& fn);
+    Result runScoped(PlayerId slot, const Actor& a, Kind k, const FormRef& target, const std::function<Result(IActingScope&)>& fn, bool stash = true);
+    Verdict doStay(PlayerId slot, const Intent& in, const TargetInfo& t);
+    void raisePresence();
     Verdict doActivate(PlayerId slot, const Intent& in, const TargetInfo& t);
     Verdict doPickUp(PlayerId slot, const Intent& in, const TargetInfo& t);
     Verdict doContainerOpen(PlayerId slot, const Intent& in, const TargetInfo& t);
     Verdict doContainerClose(PlayerId slot, const Intent& in);
     Verdict doEvent(PlayerId slot, const Intent& in, const TargetInfo& t, uint32_t mask);
     Verdict doTerminal(PlayerId slot, const Intent& in, const TargetInfo& t);
+    Verdict doSetStage(PlayerId slot, const Intent& in);
     uint64_t now() const { return deps_.nowMs ? deps_.nowMs() : 0; }
     Verdict verdictOf(const Intent& in, Result r) const;
     void count(const Intent& in, Result r);
@@ -112,6 +139,10 @@ private:
     HostDeps deps_;
     Config cfg_;
     ContainerRedirect redirect_;
+    StorageBook* stash_ = nullptr;
+    int stashDepth_ = 0;
+    struct Presence { uint64_t lastSeenMs = 0, lastRaiseMs = 0; };
+    std::map<std::pair<PlayerId, FormRef>, Presence> presence_;   // who is inside which trigger volume (TriggerEnter / TriggerStay), re-raised every host frame
     std::map<PlayerId, SlotState> slots_;
     std::map<PlayerId, ActorMode> lastMode_;   // last acting-player mode reported per slot
     struct Claim { PlayerId slot; uint64_t atMs; };

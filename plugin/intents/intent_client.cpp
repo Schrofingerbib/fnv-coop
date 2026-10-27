@@ -48,7 +48,9 @@ Obs IntentClient::finish(const GuestDecision& d, const FormRef& target) {
     const uint64_t t = now();
     const auto key = std::make_pair(d.kind, target);
     auto it = recent_.find(key);
-    if (it != recent_.end() && cfg_.coalesceMs > 0 && t - it->second < cfg_.coalesceMs && !FNV_MUT(321)) {   // MUTANT 321: a double click sends two intents
+    // a TriggerStay is a keep-alive of a presence the host re-raises every frame by itself: one per stay_keepalive_ms, not one per engine frame
+    const uint32_t window = d.kind == Kind::TriggerStay && !FNV_MUT(402) ? cfg_.stayKeepaliveMs : cfg_.coalesceMs;   // MUTANT 402: the guest sends a keep-alive for every engine frame
+    if (it != recent_.end() && window > 0 && t - it->second < window && !FNV_MUT(321)) {   // MUTANT 321: a double click sends two intents
         ++stats_.coalesced;
         if (d.suppressLocal) { ++stats_.suppressed; return Obs::Suppress; }
         ++stats_.proceeded;
@@ -76,6 +78,23 @@ Obs IntentClient::onEvent(uint32_t mask, const FormRef& target) {
     TargetInfo t;
     if (!deps_.eng->describe(target, t)) { ++stats_.proceeded; return Obs::Proceed; }
     return finish(decideEvent(cfg_, mask, t), target);
+}
+
+bool IntentClient::onStageBlocked(const FormRef& quest, uint32_t stage) {
+    ++stats_.observedStage;
+    if (!cfg_.enable || !cfg_.stage) { ++stats_.stageOff; return false; }
+    if (stage == 0 || stage > 255) { ++stats_.stageBad; return false; }
+    const uint64_t t = now();
+    const auto key = std::make_pair(quest, stage);
+    auto it = recentStage_.find(key);
+    if (it != recentStage_.end() && cfg_.coalesceMs > 0 && t - it->second < cfg_.coalesceMs && !FNV_MUT(332)) {   // MUTANT 332: a script that retries every frame sends 60 intents a second
+        ++stats_.coalesced;
+        return false;
+    }
+    if (submit(Kind::SetStage, quest, nullptr, static_cast<int32_t>(stage)) == 0) return false;
+    if (recentStage_.size() > 256) recentStage_.clear();
+    recentStage_[key] = t;
+    return true;
 }
 
 uint32_t IntentClient::submit(Kind kind, const FormRef& target, const FormRef* aux, int32_t value, std::vector<uint8_t> path) {
@@ -159,6 +178,7 @@ void IntentClient::tick() {
 std::string IntentClient::statusJson() const {
     std::ostringstream o;
     o << "{\"role\":\"guest\",\"session\":" << session_ << ",\"pending\":" << pending_.size() << ",\"observedActivate\":" << stats_.observedActivate
+      << ",\"observedStage\":" << stats_.observedStage << ",\"stageOff\":" << stats_.stageOff << ",\"stageBad\":" << stats_.stageBad
       << ",\"observedEvent\":" << stats_.observedEvent << ",\"forwarded\":" << stats_.forwarded << ",\"suppressed\":" << stats_.suppressed
       << ",\"proceeded\":" << stats_.proceeded << ",\"coalesced\":" << stats_.coalesced << ",\"notReady\":" << stats_.notReady
       << ",\"verdicts\":" << stats_.verdicts << ",\"unknownVerdicts\":" << stats_.unknownVerdicts << ",\"timeouts\":" << stats_.timeouts

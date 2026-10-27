@@ -544,6 +544,75 @@ TEST(vats_job_keeps_an_attack_queued_before_a_late_tutorial_box) {
     CHECK(r.g.execCalls == 1 && r.g.closeCalls >= 1);
 }
 
+TEST(vats_job_waits_before_the_accept_and_repeats_an_accept_that_started_nothing) {
+    // measured 2026-10-27: the accept in the frame after the queue started no playback (it did later); the module's auto fire waits 350 ms for the same reason
+    {
+        GlueRig r;
+        r.g.forms["T:1"] = 0x60000001;
+        r.g.buildVats({0x60000001, 0x60000002});
+        CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+        uint64_t queuedAt = 0, execAt = 0;
+        for (int i = 0; i < 700 && r.rpc.vats().running(); ++i) {
+            r.e.now += 50;
+            r.rpc.tick();
+            const int ex = r.g.execCalls;
+            if (ex && !execAt) execAt = r.e.now;
+            r.g.vatsFrame(r.in.filter(kVats, kPressed, 0) != 0);
+            if (r.g.queue > 0 && !queuedAt) queuedAt = r.e.now;
+            (void)ex;
+        }
+        CHECK(r.rpc.vats().phase() == VatsJob::kDone && queuedAt && execAt);
+        CHECK(execAt >= queuedAt + VatsJob::kExecDelayMs);
+    }
+    {   // the first accept starts nothing: the job accepts again and plays the attack once
+        GlueRig r;
+        r.g.forms["T:1"] = 0x60000001;
+        r.g.buildVats({0x60000001, 0x60000002});
+        r.g.ignoreExecs = 1;
+        CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+        vatsDrive(r);
+        CHECK(r.rpc.vats().phase() == VatsJob::kDone);
+        CHECK(r.g.execCalls == 2 && r.g.queuedTargets.size() == 1);
+    }
+    {   // an accept that never works ends in an error after three tries, never in a wait for the 25 s limit
+        GlueRig r;
+        r.g.forms["T:1"] = 0x60000001;
+        r.g.buildVats({0x60000001, 0x60000002});
+        r.g.ignoreExecs = 99;
+        CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+        vatsDrive(r);
+        CHECK(r.rpc.vats().phase() == VatsJob::kFailed && reasonHas(r, "playback_never_started"));
+        CHECK(r.g.execCalls == 3);
+        CHECK(r.e.now < 25000 + 5000);
+    }
+}
+
+TEST(vats_job_closes_a_tutorial_box_that_swallowed_the_accept_and_accepts_again) {
+    // measured 2026-10-27: the VATS hint box opened after the attack was queued and the accept, the queue stayed at 1 and the job waited in "playback" for ever
+    GlueRig r;
+    r.g.forms["T:1"] = 0x60000001;
+    r.g.buildVats({0x60000001, 0x60000002});
+    r.g.boxOverAccept = true;
+    CHECK(r.call("bot.vats", "{\"ref\":\"T:1\"}"));
+    const std::vector<std::string> seen = vatsDrive(r);
+    CHECK(r.rpc.vats().phase() == VatsJob::kDone);
+    if (r.rpc.vats().phase() != VatsJob::kDone) std::printf("  reason: %s\n", r.rpc.vats().reason().c_str());
+    CHECK(r.g.closeCalls >= 1 && !r.g.tutorialOpen);
+    CHECK(r.g.execCalls == 2 && r.g.queuedTargets.size() == 1);   // one attack, accepted twice (the first was swallowed)
+    CHECK(hasPhase(seen, "tutorial"));
+}
+
+TEST(vats_accept_gate_answers_pressed_a_limited_number_of_times) {
+    // a loop in the engine that asks the press-edge question until it is answered false froze the main thread for more than 50 s (first lab run)
+    VatsAcceptGate g;
+    g.arm(0);
+    int yes = 0;
+    for (int i = 0; i < 100000; ++i) yes += g.force(1, 0, 0) ? 1 : 0;
+    CHECK(yes == VatsAcceptGate::kMaxForced && !g.armed());
+    g.arm(0);
+    CHECK(g.force(1, 0, 0));   // armed again, a new allowance
+}
+
 TEST(vats_job_refuses_zero_hit_chance_and_zero_ap) {
     {   // hit chance 0: refused before the accept is armed
         GlueRig r;
@@ -921,6 +990,32 @@ TEST(terminal_pick_clicks_the_requested_entry_and_records_it) {
     CHECK(r.g.calls.back() == "termclick " + FakeGame::hex(FakeGame::kTerm + 0x10 + 0x20));
 }
 
+TEST(terminal_pick_reads_the_texts_and_clicks_the_tile_of_the_embedded_list) {
+    // the lab terminal (DefaultUnlockTermWALL) has ONE entry, "Disengage Lock": its text and tile come from the list head embedded in the ListBox
+    GlueRig r;
+    r.g.forms["FalloutNV.esm:EAC00"] = 0x70000000;
+    r.g.buildMenus();
+    r.g.buildTerminal({"Disengage Lock"}, 0x70000000);
+    r.g.topId = 0x421;
+    CHECK(r.call("dev.terminal", "{\"ref\":\"FalloutNV.esm:EAC00\",\"entry\":0}"));
+    CHECK(r.out.find("\"entries\":[\"Disengage Lock\"]") != std::string::npos && r.out.find("\"used\":\"Disengage Lock\"") != std::string::npos);
+    CHECK(!r.g.calls.empty() && r.g.calls.back() == "termclick " + FakeGame::hex(FakeGame::kTerm + 0x10));
+    CHECK(!r.call("dev.terminal", "{\"ref\":\"FalloutNV.esm:EAC00\",\"entry\":1}") && r.out.find("1 entries shown") != std::string::npos);
+}
+
+TEST(terminal_pick_closes_a_tutorial_box_over_the_menu_first) {
+    GlueRig r;
+    r.g.forms["FalloutNV.esm:EAC00"] = 0x70000000;
+    r.g.buildMenus();
+    r.g.buildTerminal({"Disengage Lock"}, 0x70000000);
+    r.g.tutorialOpen = true;
+    r.g.topId = 0x421;   // the fake keeps the terminal as its top menu id; the open tutorial box is found by its own lookup
+    r.g.calls.clear();
+    CHECK(r.call("dev.terminal", "{\"ref\":\"FalloutNV.esm:EAC00\",\"entry\":0}"));
+    CHECK(r.out.find("\"tutorialClosed\":true") != std::string::npos && !r.g.tutorialOpen);
+    CHECK(r.g.calls.size() >= 2 && r.g.calls[0] == "closetutorial" && r.g.calls.back().rfind("termclick", 0) == 0);
+}
+
 TEST(test_fasttravel_needs_the_test_helper_env) {
     GlueRig r;
     r.e.helpers = false;
@@ -958,6 +1053,26 @@ TEST(menu_close_leaves_the_container_menu_the_engine_way) {
     }
 }
 
+TEST(menu_close_closes_the_tutorial_box_with_the_tutorial_close_not_closeallmenus) {
+    // measured on the second PC (2026-10-27): the first-use hint over a terminal stayed open and bot.menu.close refused it, so every later input was eaten
+    for (const char* kind : {"tutorial", "any"}) {
+        GlueRig r;
+        r.g.buildMenus();
+        r.g.tutorialOpen = true;
+        r.g.topId = 0x423;
+        r.g.calls.clear();
+        CHECK(r.call("bot.menu.close", (std::string("{\"kind\":\"") + kind + "\"}").c_str()));
+        CHECK(r.out.find("\"closed\":true") != std::string::npos && r.out.find("\"kind\":\"tutorial\"") != std::string::npos);
+        CHECK(r.g.closeCalls == 1 && !r.g.tutorialOpen);
+        CHECK(closeCalls(r.g) == 0);   // CloseAllMenusCore is not what closes it
+    }
+    GlueRig r;   // the default kind (container) still leaves a tutorial box alone, and says so
+    r.g.buildMenus();
+    r.g.tutorialOpen = true;
+    r.g.topId = 0x423;
+    CHECK(!r.call("bot.menu.close", "{}") && r.out.find("is tutorial") != std::string::npos && r.g.closeCalls == 0);
+}
+
 TEST(menu_close_refuses_with_a_reason_and_touches_nothing) {
     GlueRig r;
     r.g.buildMenus();
@@ -970,8 +1085,8 @@ TEST(menu_close_refuses_with_a_reason_and_touches_nothing) {
     CHECK(!r.call("bot.menu.close", "{}") && r.out.find("is terminal") != std::string::npos && r.out.find("not container") != std::string::npos);
     r.g.topId = 0x3F1;   // a conversation is never closed as a container
     CHECK(!r.call("bot.menu.close", "{\"kind\":\"container\"}") && r.out.find("is dialogue") != std::string::npos);
-    // "any" never closes the message box, the loading screen, the pause menu, VATS, the tutorial box or the HUD
-    for (uint32_t id : {0x3E9, 0x3EF, 0x3F5, 0x420, 0x423, 0x3EC}) {
+    // "any" never closes the message box, the loading screen, the pause menu, VATS or the HUD (the tutorial box has its own close, below)
+    for (uint32_t id : {0x3E9, 0x3EF, 0x3F5, 0x420, 0x3EC}) {
         r.g.topId = id;
         CHECK(!r.call("bot.menu.close", "{\"kind\":\"any\"}") && r.out.find("not closed from code") != std::string::npos);
     }
@@ -1305,6 +1420,9 @@ int main() {
     run("vats_job_without_tutorial_on_the_default_target", vats_job_without_tutorial_on_the_default_target);
     run("vats_job_closes_a_tutorial_box_that_opens_late", vats_job_closes_a_tutorial_box_that_opens_late);
     run("vats_job_keeps_an_attack_queued_before_a_late_tutorial_box", vats_job_keeps_an_attack_queued_before_a_late_tutorial_box);
+    run("vats_job_waits_before_the_accept_and_repeats_an_accept_that_started_nothing", vats_job_waits_before_the_accept_and_repeats_an_accept_that_started_nothing);
+    run("vats_job_closes_a_tutorial_box_that_swallowed_the_accept_and_accepts_again", vats_job_closes_a_tutorial_box_that_swallowed_the_accept_and_accepts_again);
+    run("vats_accept_gate_answers_pressed_a_limited_number_of_times", vats_accept_gate_answers_pressed_a_limited_number_of_times);
     run("vats_job_refuses_zero_hit_chance_and_zero_ap", vats_job_refuses_zero_hit_chance_and_zero_ap);
     run("vats_job_never_executes_an_empty_queue", vats_job_never_executes_an_empty_queue);
     run("vats_job_fails_clearly", vats_job_fails_clearly);
@@ -1323,8 +1441,11 @@ int main() {
     run("refs_of_lists_enabled_refs_of_a_base", refs_of_lists_enabled_refs_of_a_base);
     run("count_refs_by_base_in_a_cell", count_refs_by_base_in_a_cell);
     run("terminal_pick_clicks_the_requested_entry_and_records_it", terminal_pick_clicks_the_requested_entry_and_records_it);
+    run("terminal_pick_reads_the_texts_and_clicks_the_tile_of_the_embedded_list", terminal_pick_reads_the_texts_and_clicks_the_tile_of_the_embedded_list);
+    run("terminal_pick_closes_a_tutorial_box_over_the_menu_first", terminal_pick_closes_a_tutorial_box_over_the_menu_first);
     run("test_fasttravel_needs_the_test_helper_env", test_fasttravel_needs_the_test_helper_env);
     run("menu_close_leaves_the_container_menu_the_engine_way", menu_close_leaves_the_container_menu_the_engine_way);
+    run("menu_close_closes_the_tutorial_box_with_the_tutorial_close_not_closeallmenus", menu_close_closes_the_tutorial_box_with_the_tutorial_close_not_closeallmenus);
     run("menu_close_refuses_with_a_reason_and_touches_nothing", menu_close_refuses_with_a_reason_and_touches_nothing);
     run("menu_close_pin_is_the_closeallmenus_core", menu_close_pin_is_the_closeallmenus_core);
     run("glue_methods_need_the_engine", glue_methods_need_the_engine);

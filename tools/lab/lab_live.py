@@ -1,0 +1,571 @@
+"""The real game behind the lab rooms: LiveMachine (one copy through the bridge and the bot layer) and LiveEnv (pairs, boot, lab plugin, load, coc).
+
+Nothing in this file has run in a game yet. LiveMachine only calls what tools/bots/bot.py and tools/runner/nvbridge.py already do; the parts that are
+guesses are marked UNVERIFIED and listed in docs/tools/lab.md. LiveEnv reuses prove.py's LiveEnv (slot, RAM guard, provisioning, boot, saves, crash watch)
+as its own lane ("lab"), so a proof queue and a lab run never share a lease name or an owned.json.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent.parent
+for _p in (ROOT / "tools", ROOT / "tools" / "runner", ROOT / "tools" / "proof", ROOT / "tools" / "scenarios", HERE):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+from lab_core import CLIENT, HOST, Blocked, Machine   # noqa: E402
+
+PY = [sys.executable, "-I", "-X", "utf8"]
+WHY = 400                             # characters of a bot failure kept in a check (the why of a bot failure is 150..300 characters and an AI reads it whole)
+ENTER_DIGEST_S = 25.0                 # how long entering the lab waits for the first ok digest (the spawn room judges it afterwards)
+SHOT_MIN, SHOT_MAX = 150.0, 500.0      # a shot is taken from between these distances (the pistol is accurate there; aim_at refuses under 100)
+STANDOFF = 350.0                      # the distance the bench shoots from (tools/bench/arena_content.py)
+WEAPON = "FalloutNV.esm:0E3778"       # 9mm pistol (the Goodsprings enemy scenarios use it)
+AMMO = "FalloutNV.esm:08ED03"         # 9mm ammo
+# the switches the lab needs in nvcoop.ini: the union of what the proof manifest's two-copy tests switch on (loot, vats, digests, dialogue included)
+LAB_INI = ["coop.enable=1", "dev.bots=1", "dev.animprobe=1", "live.actors=1", "live.avatars=1", "live.combat=1", "live.spawns=1", "avatar.enabled=1",
+           "combat.enabled=1", "combat.gate=1", "combat.native=1", "anim.enabled=1", "vats.enabled=1", "areadigest.enabled=1", "loot.enabled=1",
+           "coop.baseline=1", "coop.dialogue=1", "intents.enable=1", "intents.pickup=0", "intents.container=0"]
+
+
+def _hexid(form_or_hex: str) -> str:
+    return form_or_hex.split(":")[-1].lstrip("0") or "0"
+
+
+class LiveMachine(Machine):
+    """One game copy. `nv` is an NvBridge (or the bots' FakeBridge in the unit tests)."""
+
+    def __init__(self, nv, name: str, bot=None, weapon: str = WEAPON, ammo: str = AMMO):
+        from bots import Bot
+        self.nv, self.name, self.role = nv, name, name
+        self.bot = bot or Bot(nv, name=name)
+        self.bot.auto_dismiss = True
+        self.bot.look_via_console = True    # bot.look does nothing on a client copy (in game): a walk steers with the console line, which works on both
+        self.weapon, self.ammo = weapon, ammo
+        self._var_expr: Optional[str] = None
+
+    # ---- reads
+    def status(self) -> Dict[str, Any]:
+        st = dict(self.nv.call("coop.status", {}, timeout_s=10))
+        try:
+            st["areadigest"] = {"status": self.nv.call("areadigest.status", {}, timeout_s=10)}
+        except Exception as e:   # noqa: BLE001 - a build without the module: the heal counter is simply not there
+            if getattr(e, "code", None) != -32601:
+                raise
+        return st
+
+    def cell_of(self, ref: Optional[str] = None) -> int:
+        return int(self.bot.cell(ref))
+
+    def ref_id(self, ref: str) -> str:
+        try:
+            self.bot._info(ref)             # noqa: SLF001 (the bot's own lookup: the plugin must be loaded and the ref placed)
+            return self.bot._norm(ref)[1]   # noqa: SLF001 (the runtime id with this copy's load-order index)
+        except Exception:                   # noqa: BLE001
+            return ""
+
+    def exists(self, ref: str) -> bool:
+        return bool(self.ref_id(ref))
+
+    def pos(self, ref: Optional[str] = None) -> Tuple[float, float, float]:
+        return tuple(self.bot.pos(ref))
+
+    def alive(self, ref: str) -> bool:
+        return bool(self.bot.alive(ref))
+
+    def health(self, ref: str) -> float:
+        return float(self.bot.health(ref))
+
+    def enabled(self, ref: str) -> bool:
+        from bots import primitives as P
+        try:
+            return not (int(self.bot._info(ref)["flags"]) & P.FLAGS_GONE)   # noqa: SLF001 (disabled, or deleted: a picked-up item is deleted, see primitives.py)
+        except Exception:   # noqa: BLE001 - a picked-up item may stop resolving at all
+            return False
+
+    def item_count(self, item: str, holder: Optional[str] = None) -> int:
+        return int(self.bot.inventory_count(item, holder))
+
+    def door_state(self, ref: str) -> str:
+        return self.bot.door_state(ref)
+
+    def locked(self, ref: str) -> bool:
+        return bool(self.bot.locked(ref))
+
+    def stage(self, quest: str) -> int:
+        return int(self.bot.quest_stage(quest))
+
+    def owner(self, ref: str) -> Dict[str, Any]:
+        return dict(self.nv.call("coop.owner", {"ref": self.bot._norm(ref)[0]}, timeout_s=10))   # noqa: SLF001
+
+    def puppet_pos(self) -> Optional[Tuple[float, float, float]]:
+        """Where this copy shows the OTHER player (avatar.status puppets[0]; the ref's position through the console, as coop_bench samples it)."""
+        av = self.nv.call("avatar.status", {}, timeout_s=5)
+        pu = av.get("puppets") or []
+        if not pu or not pu[0].get("ref"):
+            return None
+        rid = str(pu[0]["ref"]).replace("0x", "")
+        return tuple(self.nv.eval(f"GetPos {a}", ref=rid) for a in "XYZ")
+
+    # ---- moving
+    def goto_ref(self, ref: str, dist: float = 0.0) -> Tuple[bool, str]:
+        r = self.bot.goto(ref, radius=100.0, mode="teleport")
+        if not r.ok:
+            return False, str(r)[:WHY]
+        if dist:
+            x, y, z = self.pos()
+            return self.goto_pos(x + dist, y, z)
+        return True, ""
+
+    def goto_pos(self, x: float, y: float, z: float) -> Tuple[bool, str]:
+        r = self.bot.goto_pos(x, y, z, mode="teleport")
+        return bool(r.ok), "" if r.ok else str(r)[:WHY]
+
+    def coc(self, cells: List[str]) -> Tuple[bool, str]:
+        try:
+            coc_into(self.nv, cells)
+            return True, ""
+        except Blocked as e:
+            return False, str(e)[:WHY]
+
+    def walk_to(self, x: float, y: float, z: float, timeout_s: float = 30.0, tick: Optional[Callable[[], None]] = None) -> Tuple[bool, str]:
+        """Real locomotion through the input driver when the build has one (the bot decides), else stepped SetPos. `tick` runs on this thread
+        every 0.25 s while the walk goes on in a worker; the bridge serialises the calls of the two threads."""
+        res: Dict[str, Any] = {}
+
+        def work():
+            try:
+                res["r"] = self.bot.goto_pos(x, y, z, timeout_s=timeout_s, mode="walk")
+            except BaseException as e:   # noqa: BLE001 - handed to the caller's thread below (a bridge error must not vanish with the worker)
+                res["exc"] = e
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        while th.is_alive():
+            if tick:
+                tick()
+            time.sleep(0.25)
+        th.join(1.0)
+        if "exc" in res:
+            if type(res["exc"]).__name__ in ("ConnectionLost", "GameCrashed"):
+                raise res["exc"]
+            return False, f"the walk raised {type(res['exc']).__name__}: {str(res['exc'])[:WHY]}"
+        r = res.get("r")
+        # NOT `r and r.ok`: a failed ActionResult is falsy (its __bool__ is ok), which once hid every walk failure behind "gave no result"
+        if r is None:
+            return False, "walk thread gave no result"
+        return bool(r.ok), "" if r.ok else str(r)[:WHY]
+
+    # ---- combat
+    def arm(self) -> Tuple[bool, str]:
+        """Health 5000 (a fight cannot end the lab), ammo, the 9mm pistol equipped. UNVERIFIED console lines from scenarios/goodsprings_enemies.json."""
+        try:
+            for line in ("player.setav Health 5000", f"player.additem {self.bot._norm(self.ammo)[1]} 300"):   # noqa: SLF001
+                self.nv.exec(line)
+            self.bot.ammo_item = self.ammo
+            r = self.bot.give(self.weapon, 1)
+            if not r.ok:
+                return False, "give weapon: " + str(r)[:WHY]
+            r = self.bot.equip(self.weapon)
+            return bool(r.ok), "" if r.ok else "equip: " + str(r)[:WHY]
+        except Exception as e:   # noqa: BLE001
+            if type(e).__name__ in ("ConnectionLost", "GameCrashed"):
+                raise
+            return False, str(e)[:WHY]
+
+    def enable(self, ref: str) -> Tuple[bool, str]:
+        """`ref.Enable` through exec with the ref as the calling reference (the lab's hostiles are placed disabled). Verified as a console line by the lab plugin author."""
+        r = self.nv.exec("enable", ref=self.bot._ref_of(ref))   # noqa: SLF001
+        return bool(r.get("ok", True)), "" if r.get("ok", True) else str(r.get("output", ""))[:WHY]
+
+    def disable(self, ref: str) -> Tuple[bool, str]:
+        r = self.nv.exec("disable", ref=self.bot._ref_of(ref))   # noqa: SLF001
+        return bool(r.get("ok", True)), "" if r.get("ok", True) else str(r.get("output", ""))[:WHY]
+
+    def kill(self, ref: str) -> Tuple[bool, str]:
+        r = self.nv.exec("KillActor", ref=ref)
+        return bool(r.get("ok")), "" if r.get("ok") else str(r.get("output", ""))[:WHY]
+
+    def step_back(self, ref: str, stand: Optional[str] = None, dist: float = STANDOFF) -> Tuple[bool, str]:
+        """Hop (teleport) to a spot `dist` units from `ref`: the stand marker when that is far enough from it, else on the line from the ref through
+        the player. aim_at refuses a target closer than 100 units (a player standing inside it aims at the floor); the bench uses the same 350 hop."""
+        tp = self.pos(ref)
+        me = self.pos()
+        if stand:
+            try:
+                sp = self.pos(stand)
+                if math.hypot(sp[0] - tp[0], sp[1] - tp[1]) >= 0.8 * dist:
+                    return self.goto_pos(sp[0], sp[1], me[2])
+            except Exception as e:   # noqa: BLE001
+                if type(e).__name__ in ("ConnectionLost", "GameCrashed"):
+                    raise
+        dx, dy = me[0] - tp[0], me[1] - tp[1]
+        n = math.hypot(dx, dy) or 1.0
+        if n < 1.0:
+            dx, dy, n = 0.0, -1.0, 1.0
+        return self.goto_pos(tp[0] + dx / n * dist, tp[1] + dy / n * dist, me[2])
+
+    def set_health(self, ref: str, hp: float) -> Tuple[bool, str]:
+        """`SetAV Health <hp>` on the ref (the owner of the actor, the host, does it; tools/bench/real_stage.py weakens a gecko the same way)."""
+        r = self.nv.exec(f"SetAV Health {hp:g}", ref=self.bot._ref_of(ref))   # noqa: SLF001
+        return bool(r.get("ok", True)), "" if r.get("ok", True) else str(r.get("output", ""))[:WHY]
+
+    def line_of_fire(self, ref: str) -> Tuple[bool, str]:
+        """(clear, words): the target is between SHOT_MIN and SHOT_MAX units away and this copy's player has line of sight to it (the console GetLOS
+        condition; when the build cannot answer it, only the distance counts). `words` says what was seen either way."""
+        d = math.dist(self.pos(ref), self.pos())
+        los: Optional[bool] = None
+        try:
+            los = bool(self.nv.eval(f"GetLOS {self.bot._norm(ref)[1]}", ref="player"))   # noqa: SLF001
+        except Exception as e:   # noqa: BLE001 - the expression may not exist in this build: then only the distance is judged
+            if type(e).__name__ in ("ConnectionLost", "GameCrashed"):
+                raise
+        words = f"{d:.0f} units, line of sight {'unknown' if los is None else ('yes' if los else 'NO')}"
+        return (SHOT_MIN <= d <= SHOT_MAX and los is not False), words
+
+    def _shot_note(self, ref: str, r) -> str:
+        """What a shot that hit nothing leaves to know: the target's health and distance, and what bot.fire said (ammo, weapon drawn)."""
+        try:
+            return f" (target health {self.health(ref):.0f}, {self.line_of_fire(ref)[1]}; last fire: {str(r)[:WHY]})"
+        except Exception as e:   # noqa: BLE001
+            if type(e).__name__ in ("ConnectionLost", "GameCrashed"):
+                raise
+            return ""
+
+    def shoot(self, ref: str, volleys: int = 12, stand: Optional[str] = None) -> Tuple[bool, str]:
+        """A real shot, as a player kills (a guest's console kill is refused on purpose): aim and fire until this copy shows the ref dead.
+        Before every volley the distance (SHOT_MIN..SHOT_MAX) and the line of sight are checked; a shooter that is too close, too far or blocked steps to
+        a spot STANDOFF away on the line from the ref through the stand marker (see step_back) and aims again from there."""
+        why = "no volley fired"
+        for _ in range(volleys):
+            if not self.alive(ref):
+                return True, ""
+            clear, words = self.line_of_fire(ref)
+            if not clear:
+                ok, hop = self.step_back(ref, stand)
+                why = f"not a clear shot ({words}); stepped to the standoff: {'ok' if ok else hop}"
+                time.sleep(0.3)
+                clear, words = self.line_of_fire(ref)
+                if not clear:
+                    why = f"no clear shot even from the standoff ({words})"
+                    continue
+            r = self.bot.fire(ref)
+            if not r.ok and r.code == "too_close":
+                ok, hop = self.step_back(ref, stand)
+                why = f"the shot failed: {str(r)[:WHY]}; stepped back: {'ok' if ok else hop}"
+                time.sleep(0.3)
+                continue
+            if not r.ok and "dead" not in str(r):
+                why = f"the shot failed: {str(r)[:WHY]}"
+                time.sleep(0.3)
+                continue
+            t0 = time.time()
+            while time.time() - t0 < 1.5:
+                if not self.alive(ref):
+                    return True, ""
+                time.sleep(0.1)
+            why = f"{volleys} volleys did not kill it"
+            if r.ok:
+                why += self._shot_note(ref, r)
+        return (not self.alive(ref)), why
+
+    def draw_weapon(self) -> bool:
+        """Take the equipped weapon out (the Ready control is a toggle, so only when it is holstered). True when it is out afterwards."""
+        try:
+            if self.bot._weapon_note().get("weapon_out") is not False:   # noqa: SLF001 (True, or the game could not say)
+                return True
+            self.nv.call("bot.input", {"tap": ["ReadyItem"]})
+            time.sleep(1.2)
+            return bool(self.bot._weapon_note().get("weapon_out"))       # noqa: SLF001
+        except Exception as e:   # noqa: BLE001
+            if type(e).__name__ in ("ConnectionLost", "GameCrashed"):
+                raise
+            return False
+
+    def vats(self, ref: str, limb: Optional[str] = None, stand: Optional[str] = None) -> Tuple[bool, str]:
+        """Real-time VATS on `ref`. No limb by default: plugin/bots answers any limb with "unsupported: limb selection in VATS is not implemented"
+        (bot_engine.h VatsJob::start); the engine picks the part itself, which is what run_vats.py's job does too."""
+        # VATS only opens with the weapon out and the target in view ("vats_not_entered (no weapon, no target in view, or no AP)", first in-game runs:
+        # weapon holstered): draw it and face the target first, as a player does
+        # A hostile enabled a moment ago has no 3D yet and is not "in view": VATS then stays closed (vats_not_entered, lab run 2026-10-27). Face it, give the
+        # engine a moment and try again, up to 3 times; any other refusal is final.
+        # A hostile that has walked up to the player (aim_at refuses under 100 units) is not in view either: step back to the standoff first, as shoot() does.
+        r = None
+        for attempt in range(3):
+            try:
+                if math.dist(self.pos(ref), self.pos()) < SHOT_MIN:
+                    self.step_back(ref, stand)
+            except Exception as e:   # noqa: BLE001
+                if type(e).__name__ in ("ConnectionLost", "GameCrashed"):
+                    raise
+            self.draw_weapon()
+            self.bot.aim_at(ref)
+            r = self.bot.vats_target(ref, limb.capitalize() if limb else None)
+            if r.ok or "vats_not_entered" not in str(r):
+                break
+            time.sleep(1.5)
+        return bool(r.ok), "" if r.ok else str(r)[:WHY]
+
+    # ---- loot, doors, terminals
+    def can_take(self) -> Tuple[bool, str]:
+        if self.role == HOST:
+            return True, ""
+        return False, ("a guest's console RemoveItem on a container is blocked on purpose (measured 2026-10-27: the chest stayed at 3 on both copies for 7 s "
+                       "while the guest's own AddItem went through); taking through the container menu needs a plugin/bots method that clicks the menu")
+
+    def take(self, container: str, item: str, n: int = 1) -> Tuple[bool, str]:
+        r = self.bot.take(container, item, n)
+        return bool(r.ok), "" if r.ok else str(r)[:WHY]
+
+    def pickup(self, ref: str) -> Tuple[bool, str]:
+        r = self.bot.pickup(ref)
+        return bool(r.ok), "" if r.ok else str(r)[:WHY]
+
+    def open_door(self, ref: str) -> Tuple[bool, str]:
+        r = self.bot.open_door(ref)
+        return bool(r.ok), "" if r.ok else str(r)[:WHY]
+
+    def close_door(self, ref: str) -> Tuple[bool, str]:
+        r = self.bot.close_door(ref)
+        return bool(r.ok), "" if r.ok else str(r)[:WHY]
+
+    def use_terminal(self, ref: str, entry: int) -> Tuple[bool, str]:
+        """Open the terminal, close the first-use hint box over it, click the entry (its result script runs), then leave the terminal menu: an open
+        menu eats the next door activation of this copy."""
+        r = self.bot.use_terminal(ref, entry)
+        if r.ok:
+            time.sleep(0.5)                               # the entry's result script ran with the click; the pause lets its result text show
+            self.bot.close_menu("any", timeout_s=3.0)     # best effort: a menu that stays is reported by the next step with the menu named
+        return bool(r.ok), "" if r.ok else str(r)[:WHY]
+
+    # ---- quest
+    def set_stage(self, quest: str, stage: int) -> Tuple[bool, str]:
+        r = self.nv.exec(f"setstage {self.bot._norm(quest)[1]} {int(stage)}")   # noqa: SLF001 (as scenlib's setstage op)
+        return bool(r.get("ok", True)), "" if r.get("ok", True) else str(r.get("output", ""))[:WHY]
+
+    def var(self, quest: str, name: str) -> Optional[float]:
+        """UNVERIFIED: no bridge method reads a quest variable. Tries NVSE expressions until one evaluates; None when none does (the room skips the check)."""
+        hexid = self.bot._norm(quest)[1]   # noqa: SLF001
+        forms = [self._var_expr] if self._var_expr else [f'GetQuestVariable {hexid} "{name}"', f"{hexid}.{name}"]
+        for f in forms:
+            try:
+                v = self.nv.eval(f)
+                self._var_expr = f
+                return v
+            except Exception as e:   # noqa: BLE001
+                if type(e).__name__ in ("ConnectionLost", "GameCrashed"):
+                    raise
+        return None
+
+    def set_var(self, quest: str, name: str, value: float) -> Tuple[bool, str]:
+        try:
+            self.nv.call("test.quest.setvar", {"quest": self.bot._norm(quest)[1], "var": name, "value": float(value)})   # noqa: SLF001
+            return True, ""
+        except Exception as e:   # noqa: BLE001
+            if type(e).__name__ in ("ConnectionLost", "GameCrashed"):
+                raise
+            return False, f"test.quest.setvar: {str(e)[:WHY]} (needs NVCOOP_TEST_HELPERS=1)"
+
+
+def coc_into(nv, names: List[str], wait_s: float = 90.0) -> None:
+    """`coc <name>` on one copy: the first editor id that the console accepts, retried while a cell load keeps the main thread busy, then the load
+    notices are dismissed. Blocked (class ENV) when none works within `wait_s`."""
+    end = time.time() + wait_s
+    last: Any = None
+    k = 0
+    while time.time() < end:
+        try:
+            nv.eval("GetGameHour")
+            out = nv.exec(f"coc {names[k]}")
+            if out.get("ok", True):
+                break
+            last = out
+            k = min(k + 1, len(names) - 1)
+        except Exception as e:   # noqa: BLE001 - "main thread did not service the request" while a cell loads
+            if type(e).__name__ in ("ConnectionLost", "GameCrashed"):
+                raise
+            last = e
+        time.sleep(2)
+    else:
+        raise Blocked(f"coc {'/'.join(names)} was refused: {str(last)[:WHY]}", "ENV")
+    from bots import Bot
+    Bot(nv).dismiss_messages(quiet_s=2, max_s=20, max_n=6)
+
+
+# ------------------------------------------------------------------ the live environment
+def _scenario_runner():
+    """tools/scenarios/runner.py by path: `import runner` would find the folder tools/runner first."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("scen_runner", ROOT / "tools" / "scenarios" / "runner.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["scen_runner"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _rel(p: Path) -> str:
+    try:
+        return Path(p).relative_to(ROOT).as_posix()
+    except ValueError:
+        return Path(p).as_posix()
+
+
+def sha1(p: Path) -> str:
+    return hashlib.sha1(p.read_bytes()).hexdigest()
+
+
+class LiveEnv:
+    """Pairs of real copies. The same interface as labfake.FakeEnv."""
+    live = True
+
+    def __init__(self, layout, args, log: Callable[[str], None] = lambda s: None, lab_dir: Optional[Path] = None):
+        import prove                                  # tools/proof/prove.py: the slot, the guard, provisioning, boot, the crash watch
+        self.layout, self.args, self.log = layout, args, log
+        self.lab_dir = Path(lab_dir or ROOT / "out" / "lab")
+        prove.OWNER = "lab"                            # its own slot lease and pid registry: a proof queue may run beside a lab run
+        prove.OUT = self.lab_dir / "state"
+        prove.OUT.mkdir(parents=True, exist_ok=True)
+        self.prove = prove
+        outer = self
+
+        class _Env(prove.LiveEnv):
+            def _boot(self, i, env_extra):
+                bad = outer.install(i)
+                return bad or super()._boot(i, env_extra)
+        self.pv = _Env(SimpleNamespace(provision=True, boot=True, pairs=int(getattr(args, "pairs", 1) or 1), reserve_gb=float(getattr(args, "reserve_gb", 1.5))))
+        self.nvs: Dict[int, Any] = {}
+        self.held: set = set()
+        self.t_start = time.time()
+        self.entered: Dict[int, bool] = {}
+        self.install_script = ROOT / "tools" / "lab" / "esp" / "install_lab.py"
+        self.esp = self.lab_dir / layout.plugin
+
+    def build_id(self) -> str:
+        return self.prove.build_id()
+
+    def pairs_allowed(self, n: int) -> Tuple[int, str]:
+        import pf_sched as X
+        cap = min(n, X.MAX_PAIRS)
+        k, note = self.pv.pairs_allowed(cap)
+        why = note or (f"PROOF_MAX_PAIRS allows {X.MAX_PAIRS} pair(s)" if cap < n else "")
+        return k, why
+
+    # ---- the lab plugin
+    def install(self, i: int) -> Optional[str]:
+        """Put the lab plugin into copy i (before it boots). A reason when that cannot be done."""
+        if not self.install_script.is_file():
+            return f"{_rel(self.install_script)} does not exist (the plugin generator in tools/lab/esp is missing or not merged)"
+        d = self.pv.idir(i)
+        cp = subprocess.run(PY + [str(self.install_script), "--instance-dir", str(d)], capture_output=True, text=True, cwd=ROOT)
+        if cp.returncode:
+            return f"install_lab.py failed for copy {i}: {(cp.stdout + cp.stderr).strip()[-200:]}"
+        return None
+
+    def stale_copies(self, instances: List[int]) -> List[int]:
+        """Running copies whose installed lab plugin differs from out/lab's: only a restart loads the new one."""
+        out = []
+        for i in instances:
+            f = self.pv.idir(i) / "Data" / self.layout.plugin
+            if self.pv.up(i) and f.is_file() and self.esp.is_file() and sha1(f) != sha1(self.esp):
+                out.append(i)
+        return out
+
+    def prepare(self, pair: int) -> Optional[Tuple[str, str]]:
+        """Provision, install the plugin, boot and wait until both copies serve requests. -> None, or (class, reason)."""
+        ins = [2 * pair, 2 * pair + 1]
+        if not self.install_script.is_file():
+            return "BLOCKED", self.install(ins[0]) or "install_lab.py missing"
+        test = {"id": f"lab{pair}", "copies": 2, "pair": pair, "n": 1, "ini": LAB_INI, "timeout_s": 1800, "snapshot": [], "commands": [],
+                "requires_methods": ["coop.status", "coop.owner", "bot.status", "avatar.status"], "also_roadmap": []}
+        self.pv.hold(ins)                                  # the RAM guard and the slot count every pair that runs beside this one
+        self.held.update(ins)
+        why = self.pv.preflight(test)
+        if why:
+            return "ENV", why
+        stale = self.stale_copies(ins)
+        if stale:
+            self.log(f"restarting copies {stale}: they run another lab plugin")
+            self.pv.finish(True, stale)
+            t0 = time.time()
+            while any(self.pv.up(i) for i in stale) and time.time() - t0 < 30:
+                time.sleep(1)
+        env_reason, build_reason, _fresh = self.pv.prepare(test, ins)
+        if env_reason:
+            return "ENV", env_reason
+        if build_reason:
+            return "BLOCKED", build_reason
+        import nvbridge
+        for i in ins:
+            if i in self.nvs:
+                continue
+            self.nvs[i] = nvbridge.NvBridge.connect(i, wait_s=30)
+        for i in ins:
+            plugs = [p.lower() for p in self.nvs[i].plugins()]
+            if self.layout.plugin.lower() not in plugs:
+                return "BLOCKED", (f"copy {i} runs without {self.layout.plugin} (loaded: {len(plugs)} plugins). It was started before the plugin was installed: "
+                                   f"python -I tools/lab/lab.py down, then run again")
+        return None
+
+    def machines(self, pair: int):
+        return (LiveMachine(self.nvs[2 * pair], HOST), LiveMachine(self.nvs[2 * pair + 1], CLIENT))
+
+    def clock(self, pair: int):
+        from lab_core import RealClock
+        return RealClock()
+
+    def probe(self, pair: int) -> Callable[[], List[str]]:
+        names = {2 * pair: HOST, 2 * pair + 1: CLIENT}
+        return lambda: [names[e["instance"]] for e in self.pv.crashes([2 * pair, 2 * pair + 1]) if e.get("instance") in names]
+
+    def crash_info(self, pair: int) -> List[str]:
+        """One line per copy of the pair that exited: instance, exit code, faulting module (pf_crash.collect reads the crash log and the minidump)."""
+        import pf_crash
+        return [pf_crash.one_line(self.pv.crash_info(i, self.t_start, None)) for i in (2 * pair, 2 * pair + 1) if self.pv.crashes([i])]
+
+    # ---- into the lab cell
+    def enter(self, pair: int) -> Callable[[], None]:
+        """The hook the spawn room calls first: load the save once on both copies, wait for the session, then `coc NVCoopLab` on both. UNVERIFIED in game."""
+        def go():
+            scen_runner = _scenario_runner()
+            nvs = [self.nvs[2 * pair], self.nvs[2 * pair + 1]]
+            save = getattr(self.args, "save", "nvcoop_autosave_ready")
+            r = scen_runner.Runner(nvs, prepared=False, log=self.log)
+            r._load_start_save({"start": {"save": save}})                  # noqa: SLF001 (the scenario runner's own load: prepared saves, refusals)
+            r._clear_load_messages()                                       # noqa: SLF001 (the DLC notices a load raises)
+            # clients rejoined, a digest judged ok. The digest part is short on purpose: the spawn room judges the digest itself (a pair that never gets
+            # an ok digest, first in-game run: SetGlobal 37 missing on the client, used 60 s of the room's time here before its first check)
+            sync = r._wait_coop_synced(digest_timeout_s=ENTER_DIGEST_S, digest_stall_s=ENTER_DIGEST_S / 2)   # noqa: SLF001
+            if sync and sync.get("synced") is False:
+                raise Blocked(f"the pair did not sync after loading {save!r}: {sync.get('reason')}", "ENV")
+            for k, nv in enumerate(nvs):
+                self._coc(nv)
+            self.entered[pair] = True
+        return go
+
+    def _coc(self, nv) -> None:
+        """`coc NVCoopLab` (verified on the second PC after loadSave); the stock cell name is the fallback if a build keeps the old editor id."""
+        coc_into(nv, [self.layout.cell_edid] + ([self.layout.cell_alt] if getattr(self.layout, "cell_alt", "") else []))
+
+    def reset(self, pair: int) -> None:
+        """Nothing to do: the spawn room's enter hook loads the save again, which is what a fresh lab is."""
+
+    def finish(self) -> None:
+        for nv in self.nvs.values():
+            try:
+                nv.close()
+            except Exception:   # noqa: BLE001
+                pass
+        self.nvs.clear()
+        self.pv.unhold(sorted(self.held))
+        self.held.clear()
+        if not getattr(self.args, "keep", False):
+            self.pv.finish(True)

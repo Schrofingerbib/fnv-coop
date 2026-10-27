@@ -1,12 +1,14 @@
 """In-game proof for the NPC animation layer (plugin/actors/anim). THE HELPER RUNS THIS on his PC, one game (caps) or one pair (sync) at a
 time. It has been WRITTEN but never run against a game; `--selftest` runs only the offline part (a fake game, no bridge).
 
-    python -I tools/animcheck/npc_proof.py caps --instance 0 --ref FalloutNV.esm:104C2F [--weapon] [--kill]
+    python -I tools/animcheck/npc_proof.py caps --instance 0 [--ref FalloutNV.esm:104C2F] [--no-fallback] [--npc-wait S] [--weapon] [--kill]
     python -I tools/animcheck/npc_proof.py sync --host 0 --client 1 --seconds 60 [--map HOSTREF=CLIENTREF] [--out out/npc/run1]
     python -I tools/animcheck/npc_proof.py --selftest
 
 caps (ONE game): proves, one primitive at a time, what the animation layer assumes about the engine. Setup: nvcoop.ini [dev] animprobe=1 and
-[anim] enabled=1, a loaded save, an ordinary NPC standing near the player (--ref), --weapon when that NPC carries a weapon (additem it first),
+[anim] enabled=1, a loaded save, an ordinary NPC standing near the player (--ref is a hint: when that NPC is not loaded with 3D, or is dead, the
+nearest loaded character of the player's cell is used, after waiting up to --npc-wait seconds; --no-fallback refuses instead; tools/runner/npc_pick.py.
+anim.npc.do and anim.probe parse the WHOLE ref as hex, so Plugin.esm:HEX is turned into the runtime form id first), --weapon when that NPC carries a weapon (additem it first),
 --kill to also prove the corpse placement (destroys the NPC: use a throw-away save). Every step prints PASS / FAIL / INFO and what it saw:
    1  anim.npc answers and the pinned direct calls (SetWeaponOut, SetIsAiming, MenuMode) are present in this exe
    2  the NPC can be restrained and read (valid, 3D)
@@ -36,6 +38,10 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(ROOT / "tools" / "runner"))
     __package__ = "animcheck"
 
+if str(ROOT / "tools" / "runner") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tools" / "runner"))
+import npc_pick  # noqa: E402  (tools/runner: the NPC that is really loaded, and Plugin.esm:HEX -> runtime id)
+
 from .config import mutant  # noqa: E402
 from .npc import analyze_npc, check_fight  # noqa: E402
 
@@ -52,9 +58,12 @@ class NotReady(Exception):
 class Proof:
     """Runs the caps steps against any object with call(method, params) and exec(cmd, ref=...)."""
 
-    def __init__(self, bridge: Any, ref: str, weapon: bool = False, kill: bool = False, sleep: Callable[[float], None] = time.sleep):
+    def __init__(self, bridge: Any, ref: str, weapon: bool = False, kill: bool = False, sleep: Callable[[float], None] = time.sleep,
+                 pick: bool = False, fallback: bool = True, wait_s: float = npc_pick.WAIT_S, now: Callable[[], float] = time.monotonic):
+        """pick=True: `ref` is only a hint (may be empty); step_read() waits for an NPC that is loaded and uses the nearest one when the hint is not."""
         self.b = bridge
         self.ref = ref
+        self.pick, self.fallback, self.wait_s, self.now = pick, fallback, wait_s, now
         self.weapon = weapon
         self.kill = kill
         self.sleep = sleep
@@ -111,13 +120,52 @@ class Proof:
         self.add("INFO", "1 other pins", f"set_aiming={pins.get('set_aiming')} push_actor_away={pins.get('push_actor_away')} direct flags: "
                  f"weapon_out={pins.get('direct_weapon_out')} aiming={pins.get('direct_aiming')} rate={pins.get('direct_rate')} knock={pins.get('direct_knock')}")
 
+    def read_ref(self, rid: int) -> dict:
+        r = self.b.call("anim.npc.do", {"ref": "%08X" % rid, "op": "read"})
+        return json.loads(r) if isinstance(r, str) else r
+
+    def runtime(self, spec: str) -> int:
+        plugins = None
+        if ":" in spec:
+            try:
+                plugins = self.b.call("plugins", {}).get("plugins", [])
+            except Exception as e:  # noqa: BLE001
+                raise NotReady(f"cannot resolve {spec} to a runtime id: plugins is not answering ({e})") from e
+        try:
+            return npc_pick.runtime_id(spec, plugins)
+        except ValueError as e:
+            raise NotReady(f"cannot resolve {spec} to a runtime id: {e}") from e
+
+    def select(self) -> None:
+        """The NPC to prove on, as the runtime id anim.npc.do / anim.probe / the console all accept (see the module doc)."""
+        hint = {"ref": self.ref, "id": self.runtime(self.ref)} if self.ref else None
+
+        def listed() -> List[dict]:
+            return [{"ref": a.get("ref") or "", "id": a.get("id")} for a in self.b.call("world.actors", {"max": npc_pick.MAX_CANDS}).get("actors", [])]
+
+        def player() -> Optional[Tuple[float, float, float]]:
+            p = self.read_ref(0x14)
+            return (float(p["x"]), float(p["y"]), float(p["z"]))
+
+        try:
+            got = npc_pick.find(lambda c: self.read_ref(int(c["id"])) if c.get("id") is not None else None, listed, hint, player, wait_s=self.wait_s,
+                                allow_fallback=self.fallback, allow_restrained=True, sleep=self.sleep, now=self.now)
+        except npc_pick.NotFound as e:
+            raise NotReady(f"{e}: load a save near an NPC, or pass another --ref") from e
+        self.ref = got.runtime
+        self.add("INFO", "1 NPC", f"{got.note} (runtime id {got.runtime})")
+
     def step_read(self) -> None:
+        if self.pick:
+            self.select()
+        elif ":" in self.ref:
+            self.ref = "%08X" % self.runtime(self.ref)
         self.b.exec("SetRestrained 1", ref=self.ref)
         r = self.read()
         ok = bool(r.get("valid")) and bool(r.get("has3D"))
         self.add("PASS" if ok else "FAIL", "2 restrain + read", f"valid={r.get('valid')} has3D={r.get('has3D')} dead={r.get('dead')} moveGroup={r.get('moveGroup')} moveFlags={r.get('moveFlags')}")
         if not ok:
-            raise NotReady("the NPC cannot be read: wrong ref, not loaded, or no 3D")
+            raise NotReady(f"the NPC {self.ref} cannot be read: not loaded, or no 3D (valid={r.get('valid')} has3D={r.get('has3D')})")
 
     def step_numbering(self) -> None:
         slots = set()
@@ -283,9 +331,32 @@ class FakeGame:
         self.pos = [1000.0, 2000.0, 100.0]
         self.freq = 1.0
         self.restrained = False
+        # None: every ref reads as a loaded NPC. A dict {runtime id: read} makes the fake strict like the engine: anim.npc.do parses the WHOLE ref string
+        # as hex (strtoul), so "FalloutNV.esm:104C70" is 0xFA, an actor that does not exist; world.actors lists the ids; a read can become valid later
+        self.placed = False
+        self.refs: Optional[Dict[int, dict]] = None
+        self.ready_at: Dict[int, float] = {}
 
     def sleep(self, s: float) -> None:
         self.t += s
+
+    @staticmethod
+    def strtoul16(text: str) -> int:
+        n, seen = 0, False
+        for ch in text[2:] if text[:2].lower() == "0x" else text:
+            if ch.lower() not in "0123456789abcdef":
+                break
+            n, seen = n * 16 + int(ch, 16), True
+        return n if seen else 0
+
+    def _strict_read(self, ref: Any) -> Optional[dict]:
+        """None when the game would not find the ref; else the read of that NPC (the keys the engine returns)."""
+        rd = (self.refs or {}).get(self.strtoul16(str(ref)))
+        if rd is None:
+            return {"ok": False, "valid": False, "has3D": False}
+        if self.t < self.ready_at.get(self.strtoul16(str(ref)), 0.0):
+            return dict(rd, has3D=False)
+        return rd
 
     def _live(self) -> Dict[int, int]:
         out = {}
@@ -309,15 +380,28 @@ class FakeGame:
             if self.action >= 0 and self.t - self.action_at < 0.9:
                 seqs.append({"slot": 4, "group": self.action, "state": 1, "freq": 1.0})
             return {"actors": [{"ref": p["refs"][0], "anim": {"seqs": seqs}, "dead": self.dead}]}
+        if method == "plugins":
+            return {"plugins": [{"name": "FalloutNV.esm", "index": 0}, {"name": "Extra.esm", "index": 2}]}
+        if method == "world.actors":
+            return {"actors": [{"id": i, "ref": "FalloutNV.esm:%X" % i} for i in (self.refs or {}) if i != 0x14]}
         if method != "anim.npc.do":
             raise RuntimeError("unknown method " + method)
         op = p["op"]
+        if op == "read" and self.refs is not None and not self._strict_read(p["ref"]).get("valid"):
+            return self._strict_read(p["ref"])
         if op == "read":
             live = self._live()
             act = self.action if self.action >= 0 and self.t - self.action_at < 0.9 else -1
-            return {"ok": True, "valid": True, "has3D": True, "dead": self.dead, "knocked": self.knocked, "ragdoll": self.knocked, "weaponOut": self.weapon, "aiming": self.aim,
-                    "moveFlags": 0, "moveGroup": (next(iter(live)) if live else -2), "actionGroup": act, "actionPlayMs": int((self.t - self.action_at) * 1000) if act >= 0 else -1,
-                    "x": self.pos[0], "y": self.pos[1], "z": self.pos[2], "yaw": 0.0}
+            out = {"ok": True, "valid": True, "has3D": True, "dead": self.dead, "knocked": self.knocked, "ragdoll": self.knocked, "weaponOut": self.weapon, "aiming": self.aim,
+                   "moveFlags": 0, "moveGroup": (next(iter(live)) if live else -2), "actionGroup": act, "actionPlayMs": int((self.t - self.action_at) * 1000) if act >= 0 else -1,
+                   "x": self.pos[0], "y": self.pos[1], "z": self.pos[2], "yaw": 0.0}
+            if self.refs is not None:      # strict game: this NPC's own flags and (until a body is placed) its own position
+                rd = self._strict_read(p["ref"])
+                out.update({k: rd[k] for k in ("has3D", "creature") if k in rd})
+                out["dead"] = bool(out["dead"] or rd.get("dead"))
+                if "x" in rd and not self.placed:
+                    out.update(x=rd["x"], y=rd["y"], z=rd["z"])
+            return out
         if op == "play":
             g = int(p["group"]) + self.numbering_offset
             if g in (32 + self.numbering_offset, 223 + self.numbering_offset):
@@ -349,6 +433,7 @@ class FakeGame:
             self.dead = True
             return {"result": "ok"}
         if op == "place":
+            self.placed = True
             if self.placed_moves:
                 self.pos = [float(p["x"]), float(p["y"]), float(p["z"])]
             return {"result": "ok"}
@@ -371,6 +456,39 @@ def selftest() -> int:
         bad = [r for r in res if r[0] == "FAIL"]
         print(f"selftest {label}: {len(bad)} FAIL (must be > 0)")
         ok &= bool(bad)
+    # the NPC is a hint, and a Plugin.esm:HEX ref reaches the game as a runtime id
+    def strict(refs: Dict[int, dict], hint: str, **kw) -> Tuple[Optional[List[Result]], str]:
+        g = FakeGame()
+        g.refs = refs
+        for i, rd in refs.items():
+            rd.setdefault("x", 1000.0 + i)
+            rd.setdefault("y", 2000.0)
+            rd.setdefault("z", 100.0)
+        try:
+            return Proof(g, hint, sleep=g.sleep, now=lambda: g.t, pick=True, **kw).run(), ""
+        except NotReady as e:
+            return None, str(e)
+
+    def npc(**kw) -> dict:
+        return dict({"ok": True, "valid": True, "has3D": True, "dead": False, "creature": False}, **kw)
+
+    res, why = strict({0x14: npc(x=0.0, y=0.0, z=0.0), 0x104C70: npc()}, "FalloutNV.esm:104C70")
+    print("selftest Plugin.esm:HEX hint reaches the game as a runtime id:", "OK" if res is not None and not [r for r in res if r[0] == "FAIL"] else f"FAILED {why}")
+    ok &= res is not None and not [r for r in res if r[0] == "FAIL"]
+    res, why = strict({0x14: npc(x=0.0, y=0.0, z=0.0), 0x104C70: npc(has3D=False), 0x200: npc(x=900.0), 0x300: npc(x=50.0)}, "FalloutNV.esm:104C70")
+    picked = [r for r in (res or []) if r[1] == "1 NPC"]
+    print("selftest an unloaded hint falls back to the nearest loaded character:", "OK" if picked and "00000300" in picked[0][2] else f"FAILED {res} {why}")
+    ok &= bool(picked) and "00000300" in picked[0][2]
+    res, why = strict({0x14: npc(x=0.0, y=0.0, z=0.0), 0x104C70: npc(dead=True), 0x200: npc(has3D=False)}, "FalloutNV.esm:104C70")
+    print("selftest nothing loaded is not ready, with the reasons:", "OK" if res is None and "dead" in why and "no 3D" in why else f"FAILED {res} {why}")
+    ok &= res is None and "dead" in why and "no 3D" in why
+    g2 = FakeGame()
+    g2.refs = {0x14: npc(x=0.0, y=0.0, z=0.0), 0x104C70: npc(x=1.0, y=2.0, z=3.0)}
+    g2.ready_at = {0x104C70: 6.0}
+    res = Proof(g2, "FalloutNV.esm:104C70", sleep=g2.sleep, now=lambda: g2.t, pick=True).run()
+    waited = not [r for r in res if r[0] == "FAIL"] and any("using FalloutNV.esm:104C70" in r[2] for r in res if r[1] == "1 NPC")
+    print("selftest an NPC that loads a few seconds late is waited for:", "OK" if waited else "FAILED")
+    ok &= waited
     # sync judge on synthetic streams: a clean pair passes, a pair where the copy never attacks fails
     from . import synth
     from .model import stream_from_probes
@@ -397,7 +515,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("mode", nargs="?", choices=("caps", "sync"))
     ap.add_argument("--instance", type=int, default=0)
-    ap.add_argument("--ref", default="")
+    ap.add_argument("--ref", default="", help="Plugin.esm:HEX or a runtime id: a hint; when it is not loaded the nearest loaded character is used")
+    ap.add_argument("--no-fallback", action="store_true", help="NOT READY instead of another NPC when --ref is not usable")
+    ap.add_argument("--npc-wait", type=float, default=npc_pick.WAIT_S, help="seconds to wait for a loaded NPC")
     ap.add_argument("--weapon", action="store_true")
     ap.add_argument("--kill", action="store_true")
     ap.add_argument("--host", type=int, default=0)
@@ -410,13 +530,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.selftest:
         return selftest()
     if a.mode == "caps":
-        if not a.ref:
-            print("caps needs --ref (an NPC reference, e.g. FalloutNV.esm:104C2F or a runtime id)")
-            return 2
         from nvbridge import NvBridge  # type: ignore
         try:
             with NvBridge.connect(instance=a.instance, wait_s=10.0) as nv:
-                return report(Proof(nv, a.ref, weapon=a.weapon, kill=a.kill).run())
+                return report(Proof(nv, a.ref, weapon=a.weapon, kill=a.kill, pick=True, fallback=not a.no_fallback, wait_s=a.npc_wait).run())
         except NotReady as e:
             print("NOT READY:", e)
             return 3

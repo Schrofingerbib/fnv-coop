@@ -295,7 +295,10 @@ class Bot:
         Does nothing (not even a bot.menu read) when auto_dismiss is off."""
         if self.auto_dismiss and self.has_input_driver():
             # a message box (a script's ShowMessage, the DLC notices) keeps the game in menu mode and eats every Attack and Activate pulse
-            if (self._optional_call(P.M_BOT_MENU) or {}).get("kind") == "message":
+            kind = (self._optional_call(P.M_BOT_MENU) or {}).get("kind")
+            if kind == "tutorial":
+                self.close_tutorial()    # a hint box eats the input like a message box does
+            if kind == "message":
                 d = self.dismiss_messages(quiet_s=0.0, max_s=15.0)
                 if not d.ok:
                     raise _Fail("menu", say="a message box is up and would not close: " + d.reason, why="a message box is up and would not close",
@@ -399,6 +402,11 @@ class Bot:
             return data
         return self._act("goto", run)
 
+    # bot.look runs SetAngle inside the plugin, and on the CLIENT copy of a co-op session it changes nothing (in game 2026-10-27: reply {yaw: 200}, the
+    # angle read back unchanged, the avatar walked straight north for 1700 units), while the bridge's exec of the same line works on both copies. A
+    # caller on a client copy sets this and the walk steers with the console line.
+    look_via_console = False
+
     STANDING_STILL = 25.0       # a walk that gained less than this many units did not move the avatar at all
 
     def _walk_fail(self, code: str, d: float, radius: float, start: Optional[Pos] = None, **data: Any) -> _Fail:
@@ -465,7 +473,10 @@ class Bot:
                 delta = (want - yaw + 180.0) % 360.0 - 180.0
                 maxturn = turn_dps * self.step_s
                 yaw = (yaw + max(-maxturn, min(maxturn, delta))) % 360.0
-                self.nv.call(P.M_BOT_LOOK, {"yaw": yaw, "pitch": 0})
+                if self.look_via_console:
+                    self._exec(P.setangle("Z", yaw), "setangle")
+                else:
+                    self.nv.call(P.M_BOT_LOOK, {"yaw": yaw, "pitch": 0})
                 self.nv.call(P.M_BOT_MOVE, {"forward": 1, "strafe": 0, "run": True})
                 self.clock.sleep(self.step_s)
                 if self.clock.monotonic() - w_start >= window_s:
@@ -764,8 +775,23 @@ class Bot:
                 raise _Fail("unsupported", need=P.M_BOT_VATS)
             if r.get("started"):   # real driver: a tick-driven job, poll its phase
                 st = {}
+                stuck = [0]
+
                 def finished() -> bool:
-                    st.update(self.nv.call(P.M_BOT_STATUS).get("vats", {}))
+                    # A game whose main thread no longer runs frames cannot tick the job (its own 25 s limit counts frames), and the bridge then answers
+                    # every request with "main thread did not service the request". Three of those in a row end the wait with that reason instead of
+                    # polling a frozen game for the rest of the limit (first in-game run: more than 50 s).
+                    try:
+                        st.update(self.nv.call(P.M_BOT_STATUS, timeout_s=6.0).get("vats", {}))
+                        stuck[0] = 0
+                    except RpcError as e:
+                        if "did not service" not in str(e):
+                            raise
+                        stuck[0] += 1
+                        if stuck[0] >= 3:
+                            raise _Fail("main_thread_stuck", say="the game's main thread stopped running frames during VATS (bridge: main thread did not "
+                                                                  f"service the request, {stuck[0]} times in a row); the job's last phase was {st.get('phase')!r}",
+                                        phase=st.get("phase"))
                     return st.get("phase") in ("done", "failed")
                 if not self._poll(finished, 30.0, 0.25):
                     raise _Fail("timeout", why="VATS job still running", phase=st.get("phase"))
@@ -842,6 +868,19 @@ class Bot:
                 raise _Fail(r.reason, **r.data)
             return dict(r.data)
         return self._act("close_container", run)
+
+    def close_tutorial(self, timeout_s: float = 3.0) -> bool:
+        """Close the first-use hint box (TutorialMenu 0x423) when it is the top menu. It lies over a terminal, VATS or lockpicking and eats every
+        click and key until it is closed (measured on the second PC, 2026-10-27: the unlock terminal's click did nothing under it). True when no
+        tutorial box is up afterwards. Does nothing, and asks the game nothing but bot.menu, when the build has no bot.menu.close."""
+        try:
+            if (self._optional_call(P.M_BOT_MENU) or {}).get("kind") != "tutorial":
+                return True
+            if self._try_call(P.M_BOT_MENU_CLOSE, {"kind": "tutorial"}) is None:
+                return False
+        except _Fail:
+            return False
+        return self._poll(lambda: (self._optional_call(P.M_BOT_MENU) or {}).get("kind") != "tutorial", timeout_s)
 
     def press_box(self, button: int) -> ActionResult:
         """Answer a message box with `button` (0-based, in the order the box lists its buttons). The UI layer's own box (consent prompt,
@@ -946,6 +985,8 @@ class Bot:
                 r = self.open(ref, timeout_s)
                 if not r.ok:
                     raise _Fail(r.reason, **r.data)
+            if not self.close_tutorial():
+                raise _Fail("postcondition", say="the tutorial box stays open over the terminal and eats the click; " + self._menu_words(self._menu_note()))
             r = self._need(P.M_TERMINAL, {"ref": self._norm(ref)[0], "entry": entry})
             self.clock.sleep(0.3)
             return dict(r)
@@ -1017,7 +1058,13 @@ class Bot:
             m = self._optional_call(P.M_BOT_MENU)
             if m is None:
                 raise _Fail("unsupported", need=P.M_BOT_MENU, why="cannot verify a container/terminal menu opened")
-            if not self._poll(lambda: (self._optional_call(P.M_BOT_MENU) or {}).get("kind") in ("container", "terminal"), timeout_s):
+            def menu_up() -> bool:
+                k = (self._optional_call(P.M_BOT_MENU) or {}).get("kind")
+                if k == "tutorial":      # the first-use hint of a terminal opens over it: close it, the menu is under it
+                    self.close_tutorial(1.5)
+                    k = (self._optional_call(P.M_BOT_MENU) or {}).get("kind")
+                return k in ("container", "terminal")
+            if not self._poll(menu_up, timeout_s):
                 note = self._menu_note()
                 raise _Fail("postcondition", say=f"the container or terminal menu did not open; {self._menu_words(note)}",
                             **{"menu": m.get("kind"), **note})
@@ -1043,7 +1090,13 @@ class Bot:
         if have < count:
             raise _Fail("not_enough", have=have, wanted=count)
         dst_before = int(self._eval(P.item_count(dh, ih)))
-        self._exec(P.transfer(sh, ih, self._norm(dst)[1], count), name)
+        out = self._exec(P.transfer(sh, ih, self._norm(dst)[1], count), name)
+        if "not found" in out.lower():
+            # The second PC's build has no RemoveItemTarget (in game 2026-10-27 the console answers ok:true with 'Script command "RemoveItemTarget" not
+            # found.' in the output, so nothing moved and the postcondition below failed at once). A take is then remove from the source + add to the
+            # destination, as tools/bench/real_stage.py does for a corpse.
+            self._exec(P.on(sh, f"RemoveItem {ih} {count} 1"), name + " (RemoveItem)")
+            self._exec(P.on(dh, f"AddItem {ih} {count} 1"), name + " (AddItem)")
         if not self._poll(lambda: int(self._eval(P.item_count(dh, ih))) == dst_before + count, timeout_s):
             raise _Fail("postcondition", why="destination count wrong", before=dst_before, wanted=count,
                         got=int(self._eval(P.item_count(dh, ih))))
@@ -1070,7 +1123,7 @@ class Bot:
                     i = self._info(ref)
                 except _Fail:
                     return True
-                return bool(int(i["flags"]) & P.FLAG_DISABLED)
+                return bool(int(i["flags"]) & P.FLAGS_GONE)
             if not self._poll(gone, timeout_s):
                 raise _Fail("postcondition", why="world ref still present")
             if item is not None and self.inventory_count(item) < before + 1:
@@ -1207,7 +1260,7 @@ class Bot:
         return bool(self._eval(f"GetStageDone {self._item(quest)} {stage}"))
 
     def ref_enabled(self, ref: Ref) -> bool:
-        return not (int(self._info(ref)["flags"]) & P.FLAG_DISABLED)
+        return not (int(self._info(ref)["flags"]) & P.FLAGS_GONE)
 
     def coop_status(self) -> Dict[str, Any]:
         return self.nv.call("coop.status")

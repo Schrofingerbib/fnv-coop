@@ -656,6 +656,150 @@ TEST(combat_projectile, a_duplicate_projectile_message_shows_one_copy) {
     CHECK(c.at(0).eng.projectiles.size() == 1);
 }
 
+
+// ---------------------------------------------------------------------------------------------------- bench 2026-10-27: a guest's kill must reach the owner
+// (out/bench/dino-20261027-144058, real_fight: "a kill by the client shows dead on the host: 8 volleys did not kill it; still alive on the host")
+TEST(combat_retry, a_hit_nacked_in_a_handoff_that_ends_with_the_attacker_as_owner_is_resolved_by_the_attacker) {
+    Cluster c(3);
+    c.addActor(A100, 1, 3, {800, 0, 0});
+    c.at(1).world.recs[cc::Entity::actor(A100)].pending = true;   // machine 1 is handing the actor to machine 2
+    c.cs(2).onEngineHit(c.shot(2, refOfActor(A100), 20));          // machine 2 fires: the copy is clamped, the hit goes to machine 1
+    c.run(60);
+    CHECK(c.cs(1).stats().nacksSent == 1);
+    c.setOwner(A100, 2, 4);                                        // the handoff ends: machine 2 owns it, nobody else will ever resolve this hit
+    c.run(500);
+    CHECK_MSG(damageOn(c, 2, refOfActor(A100)) == 20, "the hit was lost: damage " + std::to_string(damageOn(c, 2, refOfActor(A100))));
+    CHECK(c.cs(2).stats().hitsResolvedLate == 1);
+    CHECK(c.cs(2).stats().hitsAbandoned == 0);
+    CHECK(callsOn(c, 0) == 0 && callsOn(c, 1) == 0);
+}
+
+TEST(combat_retry, a_lethal_hit_nacked_in_a_handoff_to_the_attacker_kills_once_and_everyone_agrees) {
+    Cluster c(3);
+    c.addActor(A100, 1, 3, {800, 0, 0}, 1);                        // the host weakened it to 1 health
+    c.at(1).world.recs[cc::Entity::actor(A100)].pending = true;
+    c.cs(2).onEngineHit(c.shot(2, refOfActor(A100), 15));
+    c.run(60);
+    c.setOwner(A100, 2, 4);
+    c.run(600);
+    for (int i = 0; i < 3; ++i) CHECK_MSG(!alive(c, i, A100), "machine " + std::to_string(i) + " still shows it alive");
+    CHECK(c.cs(2).stats().deathsDeclared == 1);
+    CHECK(c.cs(0).stats().deathsAccepted == 1 && c.cs(1).stats().deathsAccepted == 1);
+}
+
+TEST(combat_death, a_lethal_hit_replays_the_whole_blow_so_a_float_sliver_cannot_keep_the_victim_alive) {
+    Cluster c(3);
+    c.addActor(A100, 1, 3, {800, 0, 0}, 12);
+    c.at(1).world.recs[cc::Entity::actor(A100)].sliver = 0.4f;     // the engine's health is 12.4, the model's 12
+    c.cs(2).onEngineHit(c.shot(2, refOfActor(A100), 20));
+    c.run(300);
+    CHECK_MSG(!alive(c, 1, A100), "a replay of the rounded remainder (12) leaves 0.4 standing");
+    CHECK(!alive(c, 0, A100) && !alive(c, 2, A100));
+    CHECK(c.at(1).eng.kills.empty());                              // the whole blow was enough: no forced kill
+}
+
+TEST(combat_death, an_accepted_lethal_hit_the_engine_did_not_finish_is_finished_by_the_owner) {
+    Cluster c(3);
+    c.addActor(A100, 1, 3, {800, 0, 0}, 12);
+    c.at(1).world.recs[cc::Entity::actor(A100)].sliver = 0.4f;
+    c.at(1).eng.refuseLethal = true;                               // armour, a clamp inside the engine: the replay can never take the last 0.4
+    c.cs(2).onEngineHit(c.shot(2, refOfActor(A100), 20));
+    c.run(100);
+    CHECK(alive(c, 1, A100));                                      // not yet: the owner waits killConfirmMs for the engine's own death
+    c.run(800);
+    CHECK_MSG(!alive(c, 1, A100), "the owner never killed the victim its own rules called dead");
+    CHECK(c.at(1).eng.kills.size() == 1);
+    CHECK(c.cs(1).stats().killsForced == 1);
+    CHECK(!alive(c, 0, A100) && !alive(c, 2, A100));               // the death reached the others through the owner's declaration
+    CHECK(c.cs(1).stats().deathsDeclared == 1);
+}
+
+TEST(combat_death, a_victim_that_died_by_the_replay_is_not_killed_twice_and_a_protected_one_is_not_killed_at_all) {
+    Cluster c(3);
+    c.addActor(A100, 1, 3, {800, 0, 0}, 5);
+    c.addActor(A102, 1, 2, {500, 0, 0}, 5);
+    c.forAll(A102, [](Rec& r) { r.named = true; });
+    c.cs(2).onEngineHit(c.shot(2, refOfActor(A100), 50));
+    c.cs(2).onEngineHit(c.shot(2, refOfActor(A102), 50));
+    c.run(1500);
+    CHECK(!alive(c, 1, A100));
+    CHECK(alive(c, 1, A102));
+    CHECK(c.at(1).eng.kills.empty());
+}
+
+// Lab, 2026-10-27, vats room: the host shot a weakened gecko in VATS; shots 1 to 3 agreed, shot 4 took the health to -14 on the host and the client kept a
+// living gecko. The shot goes through the same hit funnel (the gate logged PROCEED, "victim is resolved here"), so the owner's engine applied it; what a
+// VATS kill (slow motion, kill cam) does not do is flip the life state, and the actor port declares only a life state death.
+TEST(combat_death, a_natural_lethal_hit_that_leaves_the_life_state_alive_is_finished_by_the_owner_and_declared) {
+    Cluster c(2);
+    c.addActor(A100, 0, 1, {500, 0, 0}, 12);                        // the host owns the gecko and shoots it itself
+    c.cs(0).onEngineHit(c.shot(0, refOfActor(A100), 26));
+    c.at(0).world.recs[cc::Entity::actor(A100)].health = 0;         // what the engine did: health -14 (shown as 0 here), life state untouched
+    c.at(0).world.recs[cc::Entity::actor(A100)].alive = false;
+    c.at(0).world.recs[cc::Entity::actor(A100)].lifeLag = true;
+    c.run(1000);
+    CHECK(c.cs(0).stats().deathsDeclared == 0);                     // not yet: the engine gets lethalSettleMs for its own death
+    CHECK(alive(c, 1, A100));
+    c.run(1500);
+    CHECK_MSG(c.at(0).eng.kills.size() == 1, "the owner never finished the victim of its own lethal hit");
+    CHECK(c.cs(0).stats().naturalLethal == 1 && c.cs(0).stats().naturalLethalStuck == 1 && c.cs(0).stats().killsForced == 1);
+    CHECK_MSG(!alive(c, 1, A100), "the death never reached the other machine");
+    CHECK(c.cs(0).stats().deathsDeclared == 1);
+    CHECK(c.cs(1).stats().deathsAccepted == 1);
+}
+
+TEST(combat_death, a_natural_lethal_hit_the_engine_finishes_itself_is_not_killed_a_second_time) {
+    Cluster c(2);
+    c.addActor(A100, 0, 1, {500, 0, 0}, 12);
+    c.cs(0).onEngineHit(c.shot(0, refOfActor(A100), 26));
+    auto& r = c.at(0).world.recs[cc::Entity::actor(A100)];
+    r.health = 0; r.alive = false;                                  // health and life state together, as a normal shot does it
+    c.at(0).eng.deaths.push_back(refOfActor(A100));
+    c.run(3000);
+    CHECK(c.at(0).eng.kills.empty());
+    CHECK(c.cs(0).stats().naturalLethalStuck == 0 && c.cs(0).stats().killsForced == 0);
+    CHECK(!alive(c, 1, A100));
+    CHECK(c.cs(0).stats().deathsDeclared == 1);
+}
+
+TEST(combat_death, a_protected_victim_of_a_natural_lethal_hit_is_knocked_down_not_killed) {
+    Cluster c(2);
+    c.addActor(A100, 0, 1, {500, 0, 0}, 12);
+    c.addActor(A101, 0, 1, {500, 100, 0}, 12);
+    c.forAll(A100, [](Rec& r) { r.named = true; });
+    c.forAll(A101, [](Rec& r) { r.essential = true; });
+    for (uint32_t a : {A100, A101}) {
+        c.cs(0).onEngineHit(c.shot(0, refOfActor(a), 26));
+        auto& r = c.at(0).world.recs[cc::Entity::actor(a)];
+        r.health = 0; r.alive = false; r.lifeLag = true;
+    }
+    c.run(4000);
+    CHECK(c.at(0).eng.kills.empty());
+    CHECK(c.cs(0).stats().deathsDeclared == 0);
+    CHECK(alive(c, 1, A100) && alive(c, 1, A101));
+}
+
+TEST(combat_death, a_natural_lethal_victim_that_was_healed_in_the_settle_time_is_left_alone) {
+    Cluster c(2);
+    c.addActor(A100, 0, 1, {500, 0, 0}, 12);
+    c.cs(0).onEngineHit(c.shot(0, refOfActor(A100), 26));
+    auto& r = c.at(0).world.recs[cc::Entity::actor(A100)];
+    r.health = 0; r.alive = false; r.lifeLag = true;
+    c.run(500);
+    r.health = 40; r.alive = true; r.lifeLag = false;               // a stimpak, a script
+    c.run(3000);
+    CHECK(c.at(0).eng.kills.empty());
+    CHECK(alive(c, 1, A100));
+}
+
+TEST(combat_status, the_last_gate_decision_names_what_happened_to_a_shot_at_a_synced_victim) {
+    Cluster c(3);
+    c.addActor(A100, 0, 3, {800, 0, 0});
+    c.cs(1).onEngineHit(c.shot(1, refOfActor(A100), 20));
+    CHECK_MSG(c.cs(1).lastGate().find("clamp") == 0, c.cs(1).lastGate());
+    CHECK(c.cs(1).lastGate().find("forwarded") != std::string::npos);
+}
+
 // ---------------------------------------------------------------------------------------------------- crime and hostility
 TEST(combat_crime, a_witnessed_attack_on_a_faction_turns_it_hostile_for_everyone_exactly_once) {
     Cluster c(3, [](Config& cfg) { cfg.crimeSync = true; });

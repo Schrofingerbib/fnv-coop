@@ -198,8 +198,20 @@ using Fn_SetStage = bool(__thiscall*)(TESQuest*, UInt8);
 Fn_SetStage o_SetStage;
 StageGate g_stageGate;
 StageGateFn g_stageGateFn;
+StageRequestObserver g_stageReqObs;
+// Guest: the stage advance a script / console line just tried is not applied here (the host owns quest progress). It is not lost: the observer turns it
+// into a request the host judges and, if it passes, runs for real and broadcasts. The guest's own copy changes when that txn arrives.
+void forwardBlockedStage(TESQuest* q, UInt8 stage) {
+    ++g_sstats.stagesBlocked;
+    FormRef qr;
+    if (!g_stageReqObs || !formRef(q, &qr)) return;
+    if (g_stageReqObs(qr, stage)) ++g_sstats.stagesForwarded;
+}
 bool __fastcall h_SetStage(TESQuest* q, void*, UInt8 stage) {
-    if (blockedNow()) return false;
+    if (blockedNow()) {
+        forwardBlockedStage(q, stage);
+        return false;
+    }
     if (g_stageGateFn && g_hub && g_hub->enabled() && !g_stageGate.allow(q ? q->refID : 0, stage, g_pol.applying())) return false;
     if (!g_hub || !g_hub->enabled()) return o_SetStage(q, stage);
     Cause c;
@@ -1372,6 +1384,8 @@ void setStageGate(StageGateFn f) {
         return !g_res || !g_res->toRef(quest, &qr) || g_stageGateFn(qr, stage);
     });
 }
+void setStageRequestObserver(StageRequestObserver obs) { g_stageReqObs = std::move(obs); }
+uint64_t stageGateDeferred() { return g_stageGate.deferred(); }
 StageGateBypass::StageGateBypass() { g_stageGate.beginBypass(); }
 StageGateBypass::~StageGateBypass() { g_stageGate.endBypass(); }
 std::vector<std::pair<uint32_t, double>> questVarsDump(const FormRef& quest) {
@@ -1394,6 +1408,25 @@ int localQuestFlags(const FormRef& quest) {
     TESForm* f = id ? static_cast<TESForm*>(g_res->lookup(id)) : nullptr;
     if (!f || f->typeID != kFormType_TESQuest) return -1;
     return static_cast<TESQuest*>(f)->flags;
+}
+bool localGlobalValue(const FormRef& global, double& out) {
+    uint32_t id = g_res ? g_res->fromRef(global) : 0;
+    TESForm* f = id ? static_cast<TESForm*>(g_res->lookup(id)) : nullptr;
+    if (!f || f->typeID != kFormType_TESGlobal) return false;
+    out = static_cast<TESGlobal*>(f)->data;
+    return true;
+}
+bool localQuestObjectives(const FormRef& quest, std::map<uint32_t, uint8_t>& out) {
+    uint32_t id = g_res ? g_res->fromRef(quest) : 0;
+    TESForm* f = id ? static_cast<TESForm*>(g_res->lookup(id)) : nullptr;
+    if (!f || f->typeID != kFormType_TESQuest) return false;
+    TESQuest* q = static_cast<TESQuest*>(f);
+    // The list holds objectives and script variables; the data pointers ARE BGSQuestObjective* (same read as the baseline dump).
+    for (auto l = q->lVarOrObjectives.Begin(); !l.End(); ++l) {
+        BGSQuestObjective* ob = reinterpret_cast<BGSQuestObjective*>(l.Get());
+        if (ob && ob->quest == q) out[ob->objectiveId] = static_cast<uint8_t>(ob->status & 3u);
+    }
+    return true;
 }
 bool execConsoleLine(const std::string& line) { return g_consoleExec && g_consoleExec(line, 0); }
 bool execConsoleLineOn(const std::string& line, uint32_t refID) { return g_consoleExec && g_consoleExec(line, refID); }

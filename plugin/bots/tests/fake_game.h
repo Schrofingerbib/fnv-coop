@@ -94,14 +94,16 @@ struct FakeGame : nvbots::IEngine {
         set32(nvbots::eng::kInterfaceMgrPtr, kMgr);
         set32(nvbots::eng::kTerminalMenuPtr, kTerm);
         set32(kTerm + nvbots::eng::kTermRef, ref);
-        Addr32 node = kTerm + 0x1000;
-        set32(kTerm + nvbots::eng::kTermList + 4, node);
+        // the ListBox at menu+0x68 embeds its tList head node at +4 (data@+4, next@+8): the first item is that head's data, as measured in the game
+        Addr32 node = kTerm + nvbots::eng::kTermList + 4;
+        set32(node, 0);
+        set32(node + 4, 0);
         for (size_t i = 0; i < names.size(); ++i) {
             const Addr32 item = kTerm + 0x2000 + Addr32(i) * 0x20, entry = kTerm + 0x3000 + Addr32(i) * 0x20, text = kTerm + 0x4000 + Addr32(i) * 0x40;
             set32(item, kTerm + 0x10 + Addr32(i) * 0x10); set32(item + 4, entry); set32(entry, text);
             for (size_t k = 0; k <= names[i].size(); ++k) set8(text + Addr32(k), k < names[i].size() ? (uint8_t)names[i][k] : 0);
             set32(node, item);
-            const Addr32 next = i + 1 < names.size() ? node + 0x10 : 0;
+            const Addr32 next = i + 1 < names.size() ? kTerm + 0x1000 + Addr32(i + 1) * 0x10 : 0;
             set32(node + 4, next);
             node = next;
         }
@@ -243,9 +245,14 @@ struct FakeGame : nvbots::IEngine {
         return true;
     }
     int vatsQueueCount() override { return queue; }
+    int ignoreExecs = 0;             // the first N accepts start nothing (measured 2026-10-27: the accept in the frame after the queue did nothing)
+    bool boxOverAccept = false;      // the first accept is swallowed by a tutorial box that opens over the VATS menu
     bool vatsExecute() override {
         ++execCalls;
         calls.push_back("vatsexec " + std::to_string(queue));
+        if (tutorialOpen) return true;                       // VATSMenu is behind the box: nothing happens
+        if (ignoreExecs > 0) { --ignoreExecs; return true; }
+        if (boxOverAccept && queue > 0) { boxOverAccept = false; tutorialOpen = true; topId = 0x423; return true; }
         if (queue == 0) { ++execEmpty; set32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode, 0); topId = 0; }
         else { set32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode, 4); playLeft = playbackFrames; }
         return true;
