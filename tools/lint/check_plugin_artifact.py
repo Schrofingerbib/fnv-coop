@@ -8,7 +8,9 @@ and nvcoop_*.txt files next to it; without nvcoop_guest_local_run.json a guest b
    never uploaded), with `if-no-files-found: error`.
 2. Its `path:` patterns cover out/L1/nvcoop.dll and every file the CMake build writes to ${NVCOOP_OUT_DIR} that provision
    installs (nvcoop_*.json, nvcoop_*.txt). A data file added later must not silently go missing from the download.
-3. The artifact name is the one docs/tools/proton-deck.md downloads (`gh run download ... -n <name>`).
+   A later `!pattern` excludes, as in upload-artifact.
+3. The artifact name is the one docs/tools/proton-deck.md downloads (`gh run download ... -n <name>`), and the doc only downloads
+   after it found the commit's run: with an empty run ID `gh run download` takes the newest artifact of any commit.
 
     python -I tools/lint/check_plugin_artifact.py              # check the repo (prints N checks, 0 failed)
     python -I tools/lint/check_plugin_artifact.py --self-test  # the checker's own tests and twins (prints ALL OK)
@@ -30,6 +32,19 @@ PLUGIN = ROOT / "plugin"
 
 OUT_FILE = re.compile(r"\$\{NVCOOP_OUT_DIR\}/([A-Za-z0-9_.\-]+)")
 DOC_DOWNLOAD = re.compile(r"gh run download\b[^\n]*?\s-n\s+(\S+)")
+# The download only runs after the run ID was found: `gh run download` with an empty ID takes the newest artifact of that name
+# from any run, so a checkout CI never built would get another commit's DLL (found running the doc's command, 2026-10-26).
+DOC_RUN_GUARD = re.compile(r"\[\s+-n\s+\"\$(\w+)\"\s+\]\s+&&\s+gh run download\b[^\n]*\"\$\1\"")
+
+
+def uploaded(out: str, patterns: List[str]) -> bool:
+    """Whether actions/upload-artifact uploads `out`: the patterns in order, the last one that matches wins, `!` excludes."""
+    keep = False
+    for p in patterns:
+        neg = p.startswith("!")
+        if fnmatch.fnmatchcase(out, p[1:] if neg else p):
+            keep = not neg
+    return keep
 
 
 def provision_installs(name: str) -> bool:
@@ -118,15 +133,21 @@ def problems_in(ci: str, cmake_texts: Dict[str, str], doc: str) -> Tuple[List[st
                    "the checker no longer sees the build's outputs")
     for out in outputs:
         checks += 1
-        if not any(fnmatch.fnmatchcase(out, p) for p in patterns):
+        if not uploaded(out, patterns):
             bad.append(f"the artifact's path ({patterns}) does not cover {out}, which provision installs with nvcoop.dll")
     name = step_value(up, "name")
-    doc_names = DOC_DOWNLOAD.findall(doc)
+    doc_lines = [ln for ln in doc.splitlines() if DOC_DOWNLOAD.search(ln)]
+    doc_names = [DOC_DOWNLOAD.search(ln).group(1) for ln in doc_lines]
     checks += 1
     if not doc_names:
         bad.append("docs/tools/proton-deck.md has no `gh run download ... -n <name>` command for the plugin artifact")
     elif any(n.strip("'\"") != name for n in doc_names):
         bad.append(f"docs/tools/proton-deck.md downloads {doc_names}, the plugin job uploads {name!r}")
+    checks += 1
+    unguarded = [ln.strip() for ln in doc_lines if not DOC_RUN_GUARD.search(ln)]
+    if unguarded:
+        bad.append("docs/tools/proton-deck.md runs `gh run download` without checking the run ID first (`[ -n \"$RUN\" ] && ...`): "
+                   f"with no run for the commit, gh downloads the newest artifact of any commit: {unguarded[0][:80]}")
     return bad, checks
 
 
@@ -160,7 +181,8 @@ jobs:
 GOOD_CMAKE = {"plugin/hooks/CMakeLists.txt":
               "configure_file(${NVH_DIR}/data/guest_local_run.json ${NVCOOP_OUT_DIR}/nvcoop_guest_local_run.json COPYONLY)\n"
               "set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${NVCOOP_OUT_DIR}/bin)\n"}
-GOOD_DOC = "   gh run download -R o/r -n nvcoop-plugin-win32 -D out/L1 \"$(gh run list ...)\"\n"
+GOOD_DOC = ("   RUN=\"$(gh run list ...)\"\n"
+            "   if [ -n \"$RUN\" ] && gh run download -R o/r -n nvcoop-plugin-win32 -D \"$DL\" \"$RUN\"; then mv -f \"$DL\"/* out/L1/; fi\n")
 
 
 def self_test() -> int:
@@ -177,6 +199,10 @@ def self_test() -> int:
     expect("an inline path that covers both", GOOD_CI.replace(
         "          path: |\n            out/L1/nvcoop.dll\n            out/L1/nvcoop_*.json\n", "          path: out/L1/nvcoop*\n"),
         GOOD_CMAKE, GOOD_DOC, False)
+    expect("an exclusion that leaves the required files", GOOD_CI.replace("            out/L1/nvcoop_*.json\n",
+           "            out/L1/nvcoop_*.json\n            !out/L1/*.pdb\n"), GOOD_CMAKE, GOOD_DOC, False)
+    expect("an exclusion undone by a later pattern", GOOD_CI.replace("            out/L1/nvcoop_*.json\n",
+           "            !out/L1/nvcoop_*.json\n            out/L1/nvcoop_*.json\n"), GOOD_CMAKE, GOOD_DOC, False)
     # twins: each one is a real defect the checker must refuse
     expect("twin: no upload", GOOD_CI.replace("      - uses: actions/upload-artifact@v4\n", "      - uses: actions/cache@v4\n"),
            GOOD_CMAKE, GOOD_DOC, True)
@@ -199,6 +225,12 @@ def self_test() -> int:
     expect("twin: the checker sees no build output", GOOD_CI, {"plugin/CMakeLists.txt": "project(nvcoop)\n"}, GOOD_DOC, True)
     expect("twin: the doc downloads another name", GOOD_CI, GOOD_CMAKE, GOOD_DOC.replace("-n nvcoop-plugin-win32", "-n nvcoop-win32"), True)
     expect("twin: the doc has no download", GOOD_CI, GOOD_CMAKE, "Build it on Windows.\n", True)
+    expect("twin: a data file excluded after its pattern", GOOD_CI.replace("            out/L1/nvcoop_*.json\n",
+           "            out/L1/nvcoop_*.json\n            !out/L1/nvcoop_guest_local_run.json\n"), GOOD_CMAKE, GOOD_DOC, True)
+    expect("twin: the doc downloads with an unchecked run ID", GOOD_CI, GOOD_CMAKE,
+           GOOD_DOC.replace("if [ -n \"$RUN\" ] && gh run download", "if gh run download"), True)
+    expect("twin: the doc checks one ID and downloads another", GOOD_CI, GOOD_CMAKE,
+           GOOD_DOC.replace("-D \"$DL\" \"$RUN\"", "-D \"$DL\" \"$(gh run list ...)\""), True)
     if ok:
         print("ALL OK")
         return 0
