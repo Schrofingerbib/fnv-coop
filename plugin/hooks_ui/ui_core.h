@@ -101,12 +101,18 @@ struct IUiEngine {
     virtual void setMessageBoxResult(uint32_t scriptRefID, int32_t button) = 0;
     virtual bool refOf(uint32_t refID, FormRef& out) = 0;  // runtime refID -> (plugin, local id)
     virtual void log(const std::string& s) = 0;
+    // G07 "mirror": a box that was raised to a remote player is shown here as a read-only copy, so the engine really is in message-menu
+    // mode and the script's `begin MenuMode 1001` block runs on this machine. closeMirror removes it once the origin answered.
+    virtual void openMirror(uint32_t /*menu*/, const std::string& /*text*/, uint8_t /*origin*/) {}
+    virtual void closeMirror(uint32_t /*menu*/) {}
 };
 
-struct ConsentRule {  // point-of-no-return message box (VEndGameWarningMsg*, Fort/Moore/YesMan confirms)
+struct ConsentRule {  // irreversible message box (VEndGameWarningMsg*, Fort/Moore/YesMan confirms, nuke targets, VMS42 charges)
     int32_t confirmButton = 0;
     int32_t declineChoice = -1;
     uint32_t timeoutMs = 0;
+    uint8_t mode = 0;          // 0 unanimous, 1 vote (host breaks ties), 2 actor (nobody is asked): HostDialogue::ConsentMode
+    bool anyButton = false;    // every button except declineChoice is the irreversible one
 };
 
 struct ForcedSayArgs {
@@ -151,6 +157,7 @@ struct MessageBoxCall {
     uint32_t scriptRefID = 0;  // what the vanilla command stored in ShowMessageBox_pScriptRefID
     uint32_t thisObj = 0;      // calling reference (refID), 0 = none (quest script)
     FormRef message;           // the MESG form (empty if unknown)
+    FormRef script;            // the running script (SCPT form): does it have a `begin MenuMode 1001` block that needs the box open?
     std::string text;
     std::vector<std::string> buttons;
 };
@@ -193,6 +200,12 @@ public:
     // L8 HostDialogue::MenuResume.
     void onMenuResume(uint32_t menu, int32_t choice, bool timedOut);
     size_t pendingBoxes() const { return pending_.size(); }
+    // G07. Off: a box raised to a remote player leaves the script's MenuMode block un-run (logged once per script). Mirror: the host shows a
+    // read-only copy of that box until the origin answered, so the block runs. `hasBlock(script)` says which scripts have one.
+    enum class MenuModeMode : uint8_t { Off = 0, Mirror = 1 };
+    void setMenuMode(MenuModeMode m, std::function<bool(const FormRef&)> hasBlock) { mmMode_ = m; mmHasBlock_ = std::move(hasBlock); }
+    MenuModeMode menuModeMode() const { return mmMode_; }
+    size_t mirrors() const { return mirrors_.size(); }
 
     // ---- service menus ----------------------------------------------------------------------------------------------
     // Host, inside ShowBarterMenu & co. Suppressed = raised to the origin instead; the script continues immediately.
@@ -229,6 +242,7 @@ public:
     struct Stats {
         uint64_t boxesRouted = 0, boxesLocal = 0, resumes = 0, dupResumes = 0, serviceRouted = 0, serviceLocal = 0;
         uint64_t condViews = 0, condChanged = 0, forced = 0, forcedIgnored = 0, vetoes = 0, slides = 0;
+        uint64_t mirrorsOpened = 0, mirrorsClosed = 0, menuModeSkipped = 0, hostConsent = 0;
     };
     const Stats& stats() const { return stats_; }
 
@@ -238,6 +252,7 @@ private:
         int32_t buttons = 0;
     };
     void finishBox(const Pending& p, int32_t choice);
+    void closeMirror(uint32_t menu);
 
     IUiEngine& eng_;
     Bridge br_;
@@ -249,6 +264,10 @@ private:
     std::optional<std::pair<uint32_t, int32_t>> early_;
     std::vector<Slide> slides_;
     uint32_t slideSeq_ = 0;
+    MenuModeMode mmMode_ = MenuModeMode::Off;
+    std::function<bool(const FormRef&)> mmHasBlock_;
+    std::set<uint32_t> mirrors_;
+    std::set<FormRef> mmWarned_;
     Stats stats_;
 };
 

@@ -17,7 +17,9 @@ foreach(twin no_npc_lock anyone_picks replay_duplicate_pick drop_end_on_close no
              keep_companions_of_leaver menu_on_host menu_to_spectators anyone_replies_menu resume_menu_twice any_menu_choice
              no_menu_default no_menu_default_disconnect
              forced_no_dedupe forced_start_to_all forced_no_preempt forced_always_host skip_consent no_menu_default_consent
-             anyone_replies_consent)
+             anyone_replies_consent
+             vote_is_unanimous vote_is_unanimous_dissent vote_no_host_tie_break vote_timeout_approves vote_skip_consent actor_asks_party
+             no_choice_consent no_choice_consent_denied)
   add_test(NAME dialogue_twin_${twin} COMMAND dialogue_tests --group twin --name ${twin})
 endforeach()
 
@@ -35,7 +37,7 @@ foreach(t adapter_tests engine_tests)
   endif()
   add_executable(${t} ${src})
   target_link_libraries(${t} PRIVATE fndlg_engine_core fndlg_transport)
-  add_test(NAME dialogue_${t} COMMAND ${t})
+  add_test(NAME dialogue_${t} COMMAND ${t} WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR})
 endforeach()
 # engine/engine_xnvse.cpp is added to the nvcoop target by plugin/CMakeLists.txt (needs xNVSE headers, Win32 only):
 #   target_sources(nvcoop PRIVATE dialogue/engine/engine_xnvse.cpp)  + include dirs dialogue/include dialogue/engine

@@ -312,6 +312,21 @@ void TryStart() {
         failed = (fl & 0x40) != 0;
         return true;
     });
+    g_rt->setQuestRunningReader([](const fnvcoop::FormRef& q, bool& running) {
+        const int fl = nvhooks::localQuestFlags(q);
+        if (fl < 0) return false;
+        running = (fl & 0x01) != 0;   // the same bit the world dump reads (baseline_nvse.cpp: q->flags & 0x01)
+        return true;
+    });
+    g_rt->setGlobalReader([](const fnvcoop::FormRef& g, double& value) { return nvhooks::localGlobalValue(g, value); });
+    g_rt->setObjectiveStateReader([](const fnvcoop::FormRef& q, std::map<uint32_t, uint8_t>& objectives) {
+        return nvhooks::localQuestObjectives(q, objectives);
+    });
+    g_rt->setScriptVarReader([](const fnvcoop::FormRef& q, std::map<uint16_t, double>& vars) {
+        for (auto& kv : nvhooks::questVarsDump(q))   // the ScriptLocals the host poll reads (empty: not a quest, or no script event list yet)
+            if (kv.first <= 0xFFFFu) vars[static_cast<uint16_t>(kv.first)] = kv.second;
+        return !vars.empty();
+    });
 #ifdef NVCOOP_WITH_FLIGHT
     if (auto* fr = nvcoop::flight::service().recorder()) g_rt->setFlight(fr);   // T1a: record every datagram and applied / committed effect
 #endif
@@ -328,6 +343,19 @@ void TryStart() {
         // with baseline=1, so a baseline-less host never shared a var an object script wrote, e.g. VMS16.nGangerDeathCount from the gangers' OnDeath).
         g_rt->setStatePoll([](fnvcoop::StateReplicator& to, bool first, bool prime) {
             (void)to;
+#ifdef NVCOOP_WITH_SNAPSHOT
+            {   // The volatile list is otherwise only loaded by a world dump, which this host never runs: load it (and resolve the var names) here.
+                static int tries = 0;
+                static uint32_t calls = 0;
+                if (first || (tries > 0 && tries < 40 && (++calls % 300) == 0 && fnvcoop::volatileKeys().unresolvedNames() > 0)) {
+                    std::string sum;
+                    const bool done = fnvcoop::snapshot::PrepareVolatileKeys(fnvcoop::snapshot::BaselineDumpOptions(), &sum);
+                    ++tries;
+                    if (first || done) nvcoop::Log("coop: host %s%s", sum.c_str(), done ? "" : " (will retry)");
+                    if (done) tries = 40;
+                }
+            }
+#endif
             if (first) {
                 nvhooks::enableStatePolling(true, prime);   // clears the tracker; prime = take the present values as known
                 if (prime) { NullSink drop; nvhooks::pollHostState(drop); nvcoop::Log("coop: state poll primed (no world baseline)"); return; }

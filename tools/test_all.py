@@ -32,6 +32,8 @@ SUITES = [
     ("lint every Python file parses", [sys.executable, "-I", "tools/lint/check_py_compiles.py"], False, NO),
     ("lint loot service is in the live hub (+ twins)", [sys.executable, "-I", "tools/lint/check_loot_wiring.py", "--self-test"], False, NO),
     ("lint loot service wiring", [sys.executable, "-I", "tools/lint/check_loot_wiring.py"], False, NO),
+    ("lint host engine readers are wired (+ twins)", [sys.executable, "-I", "tools/lint/check_host_readers_wiring.py", "--self-test"], False, NO),
+    ("lint host engine readers wiring", [sys.executable, "-I", "tools/lint/check_host_readers_wiring.py"], False, NO),
     ("lint workflow inputs stay out of run scripts, soak seed and count checked (+ twins)", [sys.executable, "-I", "tools/lint/check_workflow_inputs.py", "--self-test"], False, NO),
     ("lint workflow inputs", [sys.executable, "-I", "tools/lint/check_workflow_inputs.py"], False, NO),
     ("test_all preflight", [sys.executable, "-I", "tools/test_all_selftest.py"], False, NO),
@@ -47,10 +49,12 @@ SUITES = [
     ("Enemy sync tests: fight, handoff, spawn, corpse loot (fake world + twins, load-robust clock)", [sys.executable, "-I", "tools/bots/playbooks/tests/run_enemy_tests.py"], False, NO),
     ("Questline sweeps: 17 plans, two-copy playthrough playbooks (fake world + twins), rules overlay", [sys.executable, "-I", "tools/questsweep/run_tests.py"], False, NO),
     ("T4a warm pool", [sys.executable, "-I", "tools/pool/run_tests.py"], False, NO),
+    ("Lab plugin generator NVCoopLab.esp: TES4 reader/writer, real-esm layout proofs, generated plugin + layout.json, installer (+ 22 twins; the game-file part skips without FalloutNV.esm)", [sys.executable, "-I", "tools/lab/esp/run_tests.py"], False, NO),
     ("Live wiring in-game proof (selftest + injected defects)", [sys.executable, "-I", "tools/runner/live_wiring_proof.py", "--selftest"], False, NO),
     ("Release: installer, uninstaller, packager (fake game folder + twins)", [sys.executable, "-I", "tools/installer/run_tests.py"], False, NO),
     ("Release: launcher (settings, nvcoop.ini, port checks, start; + twins)", [sys.executable, "-I", "tools/launcher/run_tests.py"], False, NO),
     ("Proof harness: prove.py classifier, packet, ledger, owner-PC safety, --pairs scheduler, RAM guard (fake worlds, stub runners + 22 twins)", [sys.executable, "-I", "tools/proof/tests/run_tests.py"], False, NO),
+    ("Lab runner (rooms on a fake two-copy world, one test per fake bug, fail fast, time boxes, summary.md under 5 KB + 7 twins)", [sys.executable, "-I", "tools/lab/run_tests.py"], False, NO),
     ("Proof drivers: release .cmd scripts, launcher loopback, public tree build, split-screen smoke (fake runners, damaged-release and launcher-fault twins + 5 twins)", [sys.executable, "-I", "tools/proof/drivers/tests/run_tests.py"], False, NO),
     ("T4b scenarios", [sys.executable, "-I", "-X", "utf8", "tools/scenarios/run_tests.py"], False, NO),
     ("T1b flight analyzer (fast)", [sys.executable, "-I", "tools/flight/run_tests.py"], False, NO),
@@ -95,6 +99,7 @@ SUITES = [
     ("companions-crime (SocialSync on 3 machines: companions, crime, kill rewards + 28 twins)", ["cmd", "/c", r"plugin\companions\run_tests.cmd"], True, CM),
     ("companions-crime in-game proof checker (selftest)", [sys.executable, "-I", "plugin/companions/proof/social_proof.py", "--selftest"], False, NO),
     ("Readiness wait shared by prove.py and the proof scripts (+ twins, wiring of every script)", [sys.executable, "-I", "tools/runner/tests/test_nvready.py"], False, NO),
+    ("NPC pick for the in-game NPC proofs: loaded NPC or the nearest one, runtime ids (+ 7 twins)", [sys.executable, "-I", "tools/runner/tests/test_npc_pick.py"], False, NO),
     ("Proton launch scripts: Steam launch option and in-session runner (stubbed Steam client + 7 twins)", [sys.executable, "-I", "tools/runner/tests/test_proton_scripts.py"], False, NO),
     ("loot in-game proof checker (selftest + late-session twin)", [sys.executable, "-I", "plugin/loot/tools/loot_proof.py", "--selftest"], False, NO),
     ("world-time in-game proof checker (selftest + press-blind twin)", [sys.executable, "-I", "plugin/world_time/tools/worldtime_proof.py", "--selftest"], False, NO),
@@ -238,6 +243,7 @@ EXTRA_DEPS = {
     "L4 synccore": ("synccore/",),
     "repo hygiene (": ("synccore/", "plugin/", "tools/lint/"),
     "T2b simfuzz": ("synccore/", "tools/simfuzz/", "scenarios/simfuzz/"),
+    "NPC pick for": ("tools/actors/", "tools/animcheck/npc_proof.py"),   # the scripts that must use it (Wiring)
     "Enemy sync tests": ("tools/animcheck/", "tools/scenarios/", "scenarios/goodsprings_enemies.json"),   # thresholds, scenario validator, the scenario file
 }
 

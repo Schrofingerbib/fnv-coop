@@ -47,6 +47,21 @@ struct HostStats { uint64_t commits = 0, droppedByPolicy = 0, retransmitBatches 
                    stageZeroAdopted = 0,      // client-only "SetStage q = 0" keys settled by committing the same stage 0 on the host (its key space is then complete)
                    questStateAdopted = 0,     // client-only non-zero SetStage / CompleteQuest / FailQuest keys the host engine confirmed and committed
                    questStateDisagreed = 0,   // client-only quest state keys the host engine does NOT agree with (a real divergence: not adopted, reported every round)
+                   objectiveZeroAdopted = 0,  // client-only "SetObjective flags 0" keys settled by committing the same flags 0 on the host
+                   objectiveStateAdopted = 0,   // client-only SetObjective (non-zero flags) / CompleteAllObjectives keys the host engine confirmed and committed
+                   objectiveStateDisagreed = 0, // client-only objective keys the host engine does NOT agree with (a real divergence: not adopted, reported every round)
+                   scriptVarAdopted = 0,        // client-only SetScriptVar keys settled by committing the client's value on the host (0 outright, non-zero after the host engine confirmed it)
+                   scriptVarDisagreed = 0,      // client-only SetScriptVar keys whose value the host engine does NOT share (a real divergence: not adopted, not resent, reported)
+                   revertsSkippedNoInverse = 0, // client-only keys of a kind the client can never revert: counted, no longer sent as revert keys every round
+                   effectsSettled = 0,          // effects committed by the host to settle client-only keys of the loaded save (every *Adopted above): host bookkeeping once per key, NOT drift repair, so not in desyncEffectsRepaired
+                   settleRounds = 0,            // digest rounds that settled at least one key
+                   settleFollowUps = 0,         // immediate digest requests after a settle round that left bad shards unasked
+                   globalAdopted = 0,           // client-only SetGlobal keys the host engine confirmed and committed
+                   globalDisagreed = 0,         // client-only SetGlobal keys whose value the host engine does NOT share
+                   runningUnread = 0,           // client-only quest running keys the host engine could not read (left alone, acknowledged after a few rounds)
+                   divergenceAcked = 0,         // keys acknowledged as a known divergence the host can neither adopt nor repair (reported once, no longer a digest mismatch)
+                   ackDropped = 0,              // acknowledgements withdrawn because either side's value for the key changed
+                   repairGaveUp = 0,            // keys repaired kMaxRepairAttempts times with the same two values and still different: acknowledged instead of resent forever
                    resumesRefused = 0; };     // Hellos whose resume cursor this host never handed out in this epoch (a save of another timeline): rebased
 
 // Empty string = compatible; otherwise a player-facing explanation and the reject reason code.
@@ -100,7 +115,7 @@ public:
     struct DesyncOptions {
         uint32_t minDigestIntervalMs = 2000;       // per-client rate limit (digests arriving faster are ignored)
         uint32_t maxRepairEffectsPerMin = 1200;    // repair bandwidth budget (token bucket)
-        size_t maxShardsPerRound = 8;              // shards inspected per mismatching digest
+        size_t maxShardsPerRound = 32;             // shards inspected per mismatching digest (also limited by the reply cap kMaxShardEntries)
         size_t maxRepairEffects = 256;             // per repair message
         uint8_t compareClasses = 0xFF;             // entry classes 0..7 that are compared (the dumper's coverage)
         size_t reportLimit = 256;                  // reports kept
@@ -109,6 +124,7 @@ public:
         std::string key, host, client;             // key = host description (or client's for client-only entries)
         uint64_t keyHash = 0;
         bool clientOnly = false, skippedRace = false;
+        bool acknowledged = false;                 // a known divergence the host could not settle: listed, but neither repaired nor a digest mismatch any more
         std::vector<uint64_t> lastSeqs;            // newest txns touching the key
     };
     struct DesyncReport {
@@ -179,6 +195,30 @@ public:
     // Unset (the game-free default) or returning false: the old behaviour, such keys go out as revert keys (nothing is adopted blindly).
     struct HostQuestState { int32_t stage = -1; bool completed = false, failed = false; };
     std::function<bool(const std::vector<FormRef>& quests, std::map<FormRef, HostQuestState>& out)> hostQuestState;
+    // Same idea for objectives: a client-only SetObjective with non-zero flags or CompleteAllObjectives. The hook fills `out` with the host
+    // engine's status flags (bit0 displayed, bit1 completed) of EVERY objective of each quest it can read, and returns true. A SetObjective is
+    // adopted when the engine's flags for that objective equal the client's; CompleteAllObjectives when the quest has objectives and all are
+    // completed. A disagreement is a real divergence: not adopted, still reported. Quests the hook leaves out are not settled this round.
+    // Unset or returning false: such keys go out as revert keys (the old behaviour). A client-only SetObjective with flags 0 needs no reader
+    // (it is adopted unconditionally, like stage 0).
+    std::function<bool(const std::vector<FormRef>& quests, std::map<FormRef, std::map<uint32_t, uint8_t>>& out)> hostObjectives;
+    // Desync repair: a client reported script vars (SetScriptVar) the host's shared world has no entry for. The baseline-less host primes its
+    // engine poll with the present values and drops them, so it only records vars that changed since the session started, while the client's
+    // digest lists every var of every quest. SetScriptVar has no inverse (a revert key was skipped by the client and resent every round).
+    // A value of 0 is the untouched default: the host commits the same 0 outright (the key space is then complete), unless this hook shows a
+    // different engine value. A non-zero value is adopted only when the hook reads the same value on the host's own engine. The hook fills
+    // `out` for the (owner, index) pairs it can read and returns true; pairs left out are unknown (zero: adopted as the default, non-zero:
+    // left alone this round). A value that differs is a real divergence: not adopted, not resent, reported (scriptVarDisagreed).
+    // Unset or returning false: zero is still adopted, non-zero is never adopted blindly (and never resent: nothing can revert it).
+    std::function<bool(const std::vector<std::pair<FormRef, uint16_t>>& vars, std::map<std::pair<FormRef, uint16_t>, double>& out)> hostScriptVars;
+    // Same for client-only globals (SetGlobal): the baseline-less host only records globals that changed since the session started, the client's
+    // dump lists all of them. The hook fills `out` with the host engine's value for each global it can read and returns true. A global is adopted
+    // (the client's value committed on the host) when the engine holds the same value (digest quantisation); a different value is a real
+    // divergence (globalDisagreed). Unset or returning false: nothing is adopted blindly and nothing is resent (no inverse the client could run).
+    std::function<bool(const std::vector<FormRef>& globals, std::map<FormRef, double>& out)> hostGlobals;
+    static constexpr size_t kMaxRepairAttempts = 3;   // the same two values repaired this many times and still different: acknowledged, never resent again
+    static constexpr size_t kUnreadRounds = 3;        // a key the host engine could not read this many digest rounds in a row is acknowledged
+    static constexpr size_t kMaxAcks = 4096;          // per client
     std::function<void(PlayerId slot, uint16_t channel, const Bytes& payload)> onApp;
     void sendApp(PlayerId toSlot, uint16_t channel, const Bytes& payload);  // kNoPlayer = every joined client
     void relayApp(PlayerId fromSlot, uint16_t channel, const Bytes& payload);  // to every joined client except fromSlot
@@ -199,6 +239,17 @@ private:
         std::shared_ptr<Job> job;
         bool rebasePending = false; uint64_t lastRebaseSend = 0;
         std::shared_ptr<Sync> sync; uint64_t lastDigestAt = 0; bool digestRequested = false;
+        // Known divergences the host could not settle (the host engine disagrees, cannot read the key, or the client has no inverse), and keys it
+        // repaired in vain. Both are keyed by the entry key hash. An acknowledged key is treated as agreeing in the digest compare (the host sums the
+        // client's term instead of its own, see ShardAdjust) so it stops being a mismatch and a repair; either side's value changing withdraws it.
+        struct Known { size_t shard = 0; bool hostHas = false, clientHas = false; uint32_t hostVal = 0, clientVal = 0; uint64_t hostTerm = 0, clientTerm = 0; };
+        struct Attempt { uint32_t hostVal = 0, clientVal = 0; size_t sent = 0; bool hostHas = false, clientHas = false; size_t shard = 0; };
+        struct Unread { size_t rounds = 0; size_t shard = 0; };
+        std::map<uint64_t, Known> acks;
+        std::map<uint64_t, Attempt> attempts;
+        std::map<uint64_t, Unread> unread;
+        size_t askShards = 0;   // shards asked per round while replies get cut off (0 = DesyncOptions::maxShardsPerRound)
+        size_t askCursor = 0;   // the bad shards are asked round-robin from here, so shards that never settle cannot starve the rest
         double bulkTokens = -1; uint64_t bulkAt = 0, lastWelcomeAt = 0; uint32_t welcomeResends = 0;
         uint32_t welcomedEpoch = 0;   // the world epoch this host instance last welcomed this token in (a resume cursor is only ours if it matches)
     };

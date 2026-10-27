@@ -85,6 +85,7 @@ public:
     bool SetYaw(RefId ref, float yawRad) override;
     bool MoveToCell(RefId ref, CellId cell, const Vec3& pos, float yawRad) override;
     bool GetPose(RefId ref, CellId& cell, Vec3& pos) override;
+    bool GetLocalPose(CellId& cell, Vec3& pos) override;
     bool PlayGroup(RefId ref, int baseGroup, int flags) override;
     int CurrentGroup(RefId ref) override;
     bool SetSneak(RefId ref, bool on) override;

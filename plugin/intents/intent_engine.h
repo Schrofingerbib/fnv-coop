@@ -46,11 +46,19 @@ struct TargetInfo {
     uint32_t cell = 0;
     FormRef base;             // Item: the base form that goes into an inventory (empty = unknown)
     int32_t count = 1;        // Item: stack size of the world reference
+    bool note = false;        // Item whose base is a NOTE (a note / holotape): picking it up adds it to the pipboy journal, it is not an inventory item
+};
+
+// One line of a container's contents (the stash ledger, storage_book.h).
+struct StoredItem {
+    FormRef item;
+    int32_t count = 0;
+    bool operator==(const StoredItem& o) const { return item == o.item && count == o.count; }
 };
 
 // ScriptEventList::kEvent_* (xNVSE GameAPI.h). These are the masks MarkBaseExtraListScriptEvent @0x5AC750 takes.
 namespace ev {
-constexpr uint32_t OnAdd = 0x1, OnHit = 0x80, OnOpen = 0x10000, OnClose = 0x20000, OnTrigger = 0x10000000, OnTriggerEnter = 0x20000000,
+constexpr uint32_t OnAdd = 0x1, OnHit = 0x80, OnStartCombat = 0x8000, OnOpen = 0x10000, OnClose = 0x20000, OnTrigger = 0x10000000, OnTriggerEnter = 0x20000000,
                    OnTriggerLeave = 0x40000000;
 }
 
@@ -86,6 +94,20 @@ public:
     virtual bool runInfoResult(RefId actor, PlayerId slot, const FormRef& info, const FormRef& npc, bool onEnd, bool* supported) = 0;
     // Disables the reference (a picked-up item leaves the world). The engine's own hook records the DisableRef effect into the open scope.
     virtual bool disableRef(const FormRef& target) = 0;
+    // The host's journal gains `note` (the console's AddNote). The engine's own AddNote hook records the shared AddNote effect into the open scope, so the
+    // guest and every other copy get the note through the normal txn, and the host's own GetHasNote answers true (G10). false: the engine refused.
+    virtual bool addNote(const FormRef& note) = 0;
+    // Gear stashes (storage_book.h). readItems: the whole contents of the container (false: not readable here). replaceItems: make the contents exactly
+    // `items`; it must NOT capture anything (the ledger moves items between players, the world did not change) and it is called outside any acting scope.
+    virtual bool readItems(const FormRef& container, std::vector<StoredItem>* out) = 0;
+    virtual bool replaceItems(const FormRef& container, const std::vector<StoredItem>& items) = 0;
+    // Quest stage requests (Kind::SetStage). questStage: the quest's current stage here (false: the quest form is not loaded / the plugin is missing).
+    virtual bool questStage(const FormRef& quest, int32_t* stage) = 0;
+    // The real SetStage on this machine, through the same detour a script call takes (the stage gate of the rules engine included, result scripts run and
+    // are captured into the open scope). Applied = the quest reached `stage`; Deferred = the rules engine holds it (it re-issues the stage itself on release);
+    // Failed = the engine refused (undefined stage, not startable).
+    enum class StageOutcome : uint8_t { Applied, Deferred, Failed };
+    virtual StageOutcome setStage(const FormRef& quest, uint32_t stage) = 0;
 
     // ---- guest: UI feedback for a rejected intent ----
     virtual void closeMenus() = 0;                       // container / terminal / lockpick menus opened by the local activation

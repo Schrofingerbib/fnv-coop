@@ -7,7 +7,9 @@ catches a broken port.
 
 Setup: one game copy, nvcoop.ini `[dev] actorport=1` (registers actors.read / actors.dev), a save standing in a cell with at least one
 ordinary living NPC near the player (Goodsprings is fine). No co-op session is needed: the dev methods drive the same EnginePort the
-session uses, without ActorSync. Pass --ref to choose a harmless NPC; otherwise the first suitable actor of world.actors is used.
+session uses, without ActorSync. Pass --ref to choose a harmless NPC (a hint: when it is not loaded with 3D, or is dead / restrained, the nearest
+usable character of the player's cell is used instead, after waiting up to --npc-wait seconds; --no-fallback refuses instead); without --ref the
+nearest usable character is used (tools/runner/npc_pick.py).
 It changes the chosen NPC (restrain, move, heading) and puts everything back; two disposable clones are created and deleted.
 
 What it asserts, in order (each line of the report is one check):
@@ -40,6 +42,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools" / "runner"))
+import npc_pick  # noqa: E402
 
 TOL_POS = 0.75          # game units, console prints %g
 TOL_ANGLE = 1.5         # degrees
@@ -96,7 +99,9 @@ class Proof:
     """Runs the checks against anything with call(method, params), eval(expr, ref=...) and exec(cmd, ref=...) (NvBridge or the fake)."""
 
     def __init__(self, bridge: Any, res: Result, ref_hint: Optional[str] = None, pick: Optional[str] = None,
-                 game_dir: Optional[str] = None, sleep: Callable[[float], None] = time.sleep) -> None:
+                 game_dir: Optional[str] = None, sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic,
+                 wait_s: float = npc_pick.WAIT_S, fallback: bool = True) -> None:
+        self.now, self.wait_s, self.fallback = now, wait_s, fallback
         self.b = bridge
         self.r = res
         self.ref_hint = ref_hint
@@ -138,27 +143,26 @@ class Proof:
             self.r.check(f"wiring.pin.{k}", bool(pins.get(k)), "prologue bytes at the recorded address differ from the exe the port was written for")
         self.r.check("wiring.seh_faults_zero", st.get("sehFaults", 0) == 0, str(st.get("sehFaults")))
 
+    def list_characters(self) -> List[dict]:
+        return [{"ref": a.get("ref") or "", "id": a.get("id")} for a in self.b.call("world.actors", {"max": npc_pick.MAX_CANDS}).get("actors", [])]
+
+    def player_pos(self) -> Optional[Tuple[float, float, float]]:
+        p = self.read("14")
+        return (float(p["x"]), float(p["y"]), float(p["z"]))
+
     def choose(self) -> Tuple[str, dict]:
-        if self.ref_hint:
-            rd = self.read(self.ref_hint)
-            if not rd.get("has3D"):
-                # the engine ignores console writes (ForceActorValue, SetPos ...) on an actor that is not loaded, and a stand-in next to it is not in
-                # world.actors; every check below would fail for that reason alone (sweep 2026-10-22: --ref 104C70 with the save elsewhere)
-                raise NotReady(f"{self.ref_hint} is not loaded (has3D false, cell {rd.get('cell')}): load a save near it, or pass another --ref")
-            return self.ref_hint, rd
-        actors = self.b.call("world.actors", {"max": 40}).get("actors", [])
-        for a in actors:
-            ref = a.get("ref") or ""
-            if not ref:
-                continue
-            try:
-                rd = self.read(ref)
-            except Exception:
-                continue
-            if rd.get("dead") or rd.get("disabled") or rd.get("restrained") or not rd.get("has3D") or hexid(rd.get("ref", "0")) == 0x14:
-                continue
-            return ref, rd
-        raise NotReady("no suitable living, unrestrained NPC with 3D in world.actors: stand near one and retry, or pass --ref")
+        """--ref is a hint: it is used when it is loaded with 3D, alive and free; otherwise the nearest usable character of the player's cell is
+        (npc_pick.py; the ganger of the scenario is not always loaded right after the jump). The NPC is waited for, up to wait_s."""
+        hint = {"ref": self.ref_hint, "id": None} if self.ref_hint else None
+        try:
+            pick = npc_pick.find(lambda c: self.read(c["ref"]), self.list_characters, hint, self.player_pos, wait_s=self.wait_s,
+                                 allow_fallback=self.fallback, sleep=self.sleep, now=self.now)
+        except npc_pick.NotFound as e:
+            raise NotReady(f"{e}: load a save near an NPC, or pass another --ref") from e
+        self.r.info["npc_note"] = pick.note
+        if pick.fallback:
+            print(f"proof_actor_port: {pick.note}")
+        return pick.ref, pick.read
 
     def check_read(self, ref: str, rd: dict) -> None:
         cx, cy, cz = self.pos_console(ref)
@@ -498,6 +502,50 @@ def selftest() -> int:
         ok = False
     except NotReady:
         print("selftest: a missing actors.port is reported as not ready")
+    # the NPC is only a hint: a hint that is not loaded falls back to the nearest loaded character; nothing loaded is NOT READY with the reasons
+    class Clock:
+        t = 0.0
+
+        def sleep(self, s: float) -> None:
+            self.t += s
+
+        def now(self) -> float:
+            return self.t
+
+    def hinted(hint: str, setup: Callable[["FakeBridge"], None]) -> Tuple[Result, str]:
+        import io
+        import contextlib
+        res, fb, clk, buf = Result(), FakeBridge(set()), Clock(), io.StringIO()
+        setup(fb)
+        with contextlib.redirect_stdout(buf):
+            Proof(fb, res, hint, sleep=clk.sleep, now=clk.now).run()
+        return res, buf.getvalue()
+
+    def unloaded_hint(fb: "FakeBridge") -> None:
+        fb.add("00100002", 5000.0, 5000.0, 0.0, 0.0)
+        fb.actors["00100002"]["has3D"] = False
+
+    res, out = hinted("Fake.esm:100002", unloaded_hint)
+    if res.failures or "using Fake.esm:100001" not in out:
+        print("selftest: an unloaded --ref did not fall back to the loaded character:", res.failures, out.strip()[:200])
+        ok = False
+    else:
+        print("selftest: an unloaded --ref falls back to the loaded character")
+
+    def nobody(fb: "FakeBridge") -> None:
+        for a in fb.actors.values():
+            if not a["player"]:
+                a["has3D"] = False
+    try:
+        hinted("Fake.esm:100001", nobody)
+        print("selftest: a cell without a loaded character was not reported as not ready")
+        ok = False
+    except NotReady as e:
+        if "no 3D" in str(e) and "Fake.esm:100001 is not usable" in str(e):
+            print("selftest: a cell without a loaded character is reported as not ready, with the reason")
+        else:
+            print("selftest: the not-ready text does not say why:", e)
+            ok = False
     if ok:
         print("proof_actor_port selftest: ALL OK")
     return 0 if ok else 1
@@ -506,7 +554,9 @@ def selftest() -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--instance", type=int, default=0)
-    ap.add_argument("--ref", default=None, help="Plugin.esm:HEX of the NPC to use")
+    ap.add_argument("--ref", default=None, help="Plugin.esm:HEX of the NPC to use; a hint: when it is not loaded the nearest loaded character is used")
+    ap.add_argument("--no-fallback", action="store_true", help="NOT READY instead of another NPC when --ref is not usable")
+    ap.add_argument("--npc-wait", type=float, default=npc_pick.WAIT_S, help="seconds to wait for a usable NPC (a fresh jump loads its cell late)")
     ap.add_argument("--pick", default=None, help="Plugin.esm:HEX of a base form for the leveled-pick swap check")
     ap.add_argument("--game-dir", default=None, help="game directory (to check the ledger file)")
     ap.add_argument("--out", default="out/actor-port/proof")
@@ -524,7 +574,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     res = Result()
     try:
         with NvBridge.connect(a.instance, wait_s=10.0) as b:
-            Proof(b, res, a.ref, a.pick, a.game_dir).run()
+            Proof(b, res, a.ref, a.pick, a.game_dir, wait_s=a.npc_wait, fallback=not a.no_fallback).run()
     except NotReady as e:
         print(f"proof_actor_port: NOT READY: {e}")
         return 3

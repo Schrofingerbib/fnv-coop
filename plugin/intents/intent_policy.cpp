@@ -90,6 +90,21 @@ GuestDecision decideEvent(const Config& cfg, uint32_t mask, const TargetInfo& t)
         d.forward = true; d.kind = Kind::TriggerLeave; d.suppressLocal = true; d.why = "trigger leave";
         return d;
     }
+    if (mask & ev::OnTrigger) {
+        // Every frame while the player is inside a volume: the guest sends one TriggerStay per stay_keepalive_ms and the HOST raises OnTrigger itself every
+        // frame for as long as the presence lasts (intent_host.cpp doStay / raisePresence). The local per-frame event is not raised on the guest.
+        if (!cfg.trigger || !cfg.triggerStay) { d.why = "trigger stay off"; return d; }
+        d.forward = true; d.kind = Kind::TriggerStay; d.suppressLocal = true; d.why = "trigger stay";
+        return d;
+    }
+    if (mask & ev::OnStartCombat) {
+        // An actor started combat with THIS guest's player: its `OnStartCombat` blocks that filter on `player` never pass on the host (player is the host's).
+        const bool actor = t.cls == TargetClass::Npc || t.cls == TargetClass::Creature;
+        if (!cfg.combat) { d.why = "combat off"; return d; }
+        if (!actor && !FNV_MUT(413)) { d.why = "not an actor"; return d; }   // MUTANT 413: a non-actor is forwarded too (the host answers BadTarget for every one of them)
+        d.forward = true; d.kind = Kind::StartCombat; d.suppressLocal = false; d.why = "start combat";
+        return d;
+    }
     if (mask & ev::OnHit) {
         if (!cfg.hit) { d.why = "hit off"; return d; }
         const bool actor = t.cls == TargetClass::Npc || t.cls == TargetClass::Creature;
@@ -97,7 +112,7 @@ GuestDecision decideEvent(const Config& cfg, uint32_t mask, const TargetInfo& t)
         d.forward = true; d.kind = Kind::Hit; d.suppressLocal = false; d.why = "hit";
         return d;
     }
-    d.why = "event not forwarded";   // OnTrigger (every frame inside a volume), OnAdd / OnOpen / OnClose (covered by the container flow) ...
+    d.why = "event not forwarded";   // OnAdd / OnOpen / OnClose (covered by the container flow) ...
     return d;
 }
 
@@ -108,7 +123,9 @@ float reachOf(const Config& cfg, Kind k) {
         case Kind::Activate: return cfg.reachActivate;
         case Kind::PickUp: return cfg.reachPickup;
         case Kind::TriggerEnter:
-        case Kind::TriggerLeave: return cfg.reachTrigger;
+        case Kind::TriggerLeave:
+        case Kind::TriggerStay: return cfg.reachTrigger;
+        case Kind::StartCombat: return cfg.reachCombat;
         case Kind::ContainerOpen:
         case Kind::ContainerClose: return cfg.reachContainer;
         case Kind::TerminalUse: return cfg.reachTerminal;
@@ -122,9 +139,12 @@ bool kindEnabled(const Config& cfg, Kind k) {
         case Kind::Activate: return cfg.activate;
         case Kind::TriggerEnter:
         case Kind::TriggerLeave: return cfg.trigger;
+        case Kind::TriggerStay: return cfg.trigger && cfg.triggerStay;
+        case Kind::StartCombat: return cfg.combat;
         case Kind::PickUp: return cfg.pickup;
         case Kind::Hit: return cfg.hit;
         case Kind::DialogueStart: return cfg.dialogue;
+        case Kind::SetStage: return cfg.stage;
         case Kind::TerminalUse: return cfg.terminal;
         case Kind::ContainerOpen:
         case Kind::ContainerClose: return cfg.container;
@@ -138,10 +158,13 @@ bool standInAllowed(const Config& cfg, Kind k, TargetClass cls) {
         case Kind::PickUp:           // direct grant: no inventory of any actor is touched
         case Kind::TriggerEnter:
         case Kind::TriggerLeave:
+        case Kind::TriggerStay:
+        case Kind::StartCombat:
         case Kind::Hit:
         case Kind::TerminalUse:      // runs the entry's result script; opens nothing
         case Kind::ContainerClose:
         case Kind::DialogueStart:
+        case Kind::SetStage:         // the stage's result scripts run with the host's player standing in; they open no menu
             return true;
         case Kind::Activate:
         case Kind::ContainerOpen:    // the script half is the only thing that needs an actor, and Activate would open the host's menu
@@ -211,18 +234,24 @@ bool readConfig(const IniGetter& get, Config* out, std::string* err) {
         *dst = static_cast<uint32_t>(std::min(hi, std::max(lo, d)));
         return true;
     };
-    bool ok = B("enable", &c.enable) && B("activate", &c.activate) && B("trigger", &c.trigger) && B("pickup", &c.pickup) &&
-              B("terminal", &c.terminal) && B("container", &c.container) && B("hit", &c.hit) && B("dialogue", &c.dialogue) && B("dialogue_results", &c.dialogueResults) &&
+    bool ok = B("enable", &c.enable) && B("activate", &c.activate) && B("trigger", &c.trigger) && B("trigger_stay", &c.triggerStay) && B("combat", &c.combat) && B("storage", &c.storage) && B("pickup", &c.pickup) &&
+              B("terminal", &c.terminal) && B("container", &c.container) && B("hit", &c.hit) && B("stage", &c.stage) && B("dialogue", &c.dialogue) && B("dialogue_results", &c.dialogueResults) &&
               B("standin", &c.standIn) && B("standin_unsafe", &c.standInUnsafe) && B("require_puppet", &c.requirePuppet) &&
               B("check_reach", &c.checkReach) && B("save_gate", &c.saveGate) && F("reach_activate", &c.reachActivate, 1, 100000) && F("reach_pickup", &c.reachPickup, 1, 100000) &&
               F("reach_trigger", &c.reachTrigger, 1, 100000) && F("reach_container", &c.reachContainer, 1, 100000) &&
-              F("reach_terminal", &c.reachTerminal, 1, 100000) && F("reach_hit", &c.reachHit, 1, 100000) && U("rate_burst", &c.rateBurst, 1, 1000) &&
+              F("reach_terminal", &c.reachTerminal, 1, 100000) && F("reach_hit", &c.reachHit, 1, 100000) && F("reach_combat", &c.reachCombat, 1, 100000) &&
+              U("stay_keepalive_ms", &c.stayKeepaliveMs, 50, 60000) && U("stay_lease_ms", &c.stayLeaseMs, 200, 600000) && U("stay_raise_ms", &c.stayRaiseMs, 0, 10000) &&
+              U("stay_max", &c.stayMax, 1, 1024) && U("rate_burst", &c.rateBurst, 1, 1000) &&
               F("rate_per_sec", &c.ratePerSec, 0.1, 1000) && U("lock_lease_ms", &c.lockLeaseMs, 1000, 3600000) &&
               U("trigger_cooldown_ms", &c.triggerCooldownMs, 0, 600000) && U("pending_timeout_ms", &c.pendingTimeoutMs, 500, 600000) &&
               U("coalesce_ms", &c.coalesceMs, 0, 10000) && U("claim_memory", &c.claimMemory, 16, 1000000);
     if (!ok) return false;
     std::string rf = get("redirect_file", "");
-    if (!rf.empty()) c.redirectFile = trim(rf);
+    if (!rf.empty()) {
+        c.redirectFile = trim(rf);
+        const std::string l = lower(c.redirectFile);
+        if (l == "none" || l == "off" || l == "0") c.redirectFile.clear();   // no data file: shared storage stays shared
+    }
     *out = c;
     return true;
 }

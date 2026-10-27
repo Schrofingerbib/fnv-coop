@@ -54,6 +54,18 @@ struct Mutations {
     bool questRunningReverted = false; // issue #25: client-only quest running keys go out as revert keys again (no inverse: never converges)
     bool stageZeroReverted = false;    // client-only "SetStage q = 0" keys go out as revert keys again (SetStage merges by max, no inverse: the digest never converges, a repair every round)
     bool questStateReverted = false;   // client-only non-zero SetStage / CompleteQuest / FailQuest keys go out as revert keys again (no inverse: never converges, resent every round)
+    bool objectiveZeroReverted = false; // client-only "SetObjective flags 0" keys go out as revert keys again (no inverse: the digest never converges, a repair every round)
+    bool objectiveStateReverted = false; // client-only non-zero SetObjective / CompleteAllObjectives keys go out as revert keys again (no inverse: never converges)
+    bool scriptVarReverted = false;     // client-only SetScriptVar keys go out as revert keys again (no inverse: never converges, 256 repair effects per digest round)
+    bool noInverseResent = false;       // client-only keys of a kind the client cannot revert are sent as revert keys anyway, every round (the client skips them)
+    bool ackIgnored = false;            // known divergences are never acknowledged: a key the host can neither adopt nor repair stays a digest mismatch in every round
+    bool askLowestFirst = false;        // bad shards are always asked lowest first: shards that never settle starve the others (the 2026-10-27 benchmark settled 25 rounds late)
+    bool askNeverShrinks = false;       // the number of shards asked per round stays at the maximum when the client's reply is cut off: the unseen entries behind the settled ones are never reached
+    bool noSettleFollowUp = false;      // no immediate digest request after a settle round: the next bad shards wait for the 10 s timer
+    bool settleCountsAsRepair = false;  // settled keys are counted as repair effects again (the benchmark's 744 effects per minute were mostly these)
+    bool repairForever = false;         // a key repaired in vain is resent every round, no give-up (the same two values, kMaxRepairAttempts times)
+    bool runningBlindStop = false;      // the host ignores its engine for client-only quest running keys and commits "not running": the client's running quests are stopped
+    bool globalReverted = false;        // client-only SetGlobal keys go out as revert keys again (no inverse: never converges)
     bool digestKeepsRefVars = false;   // the host digest compares RefScriptVar (polled object / NPC script vars): the client's world dump never carries them, so every one is "missing" and repaired forever (digest never ok)
     bool digestKeepsWorldEnv = false;  // the digest compares the host's last SetWeather / SetTimeScale: the client's world dump cannot read either one, so both are "missing" and repaired every round
     bool trustForeignCursor = false;   // a Hello's resume cursor of the host's epoch is replayed / snapshotted without checking it is this host's timeline

@@ -327,6 +327,29 @@ TEST(feed, an_actor_that_died_before_a_load_can_die_again_after_it) {
     CHECK(r.sync->isDead(id));
 }
 
+TEST(feed, an_actor_a_script_resurrected_can_die_again_and_the_second_death_is_published) {
+    // bench 2026-10-27 (real_fight): the harness resurrects the gangers with a console `Resurrect` before every fight; the feed kept "dead" on the
+    // actor for the rest of the session, so the second death was never polled, never declared, and the other machines never heard of it
+    FeedRig r;
+    crowd(r, 1);
+    r.startSession();
+    r.run(1500);
+    NetId id = r.id(0x100);
+    r.eng.a[0x100].life = 2;
+    r.eng.a[0x100].av[kAvHealth] = 0;
+    r.run(300);
+    CHECK(r.sync->isDead(id) && r.feed.stats().deathsReported == 1);
+    // the story host resurrects it (ResurrectActor effect): ActorSync forgets the death, the port stands it up again
+    r.sync->onEffect(fnvcoop::ResurrectActor{r.eng.refForm(0x100)});
+    r.run(800);
+    CHECK_MSG(r.eng.a[0x100].life == 0 && !r.sync->isDead(id), "the resurrect did not take");
+    r.eng.a[0x100].life = 2;
+    r.eng.a[0x100].av[kAvHealth] = 0;
+    r.run(600);
+    CHECK_MSG(r.feed.stats().deathsReported == 2, "the second death was not published: " + std::to_string(r.feed.stats().deathsReported));
+    CHECK(r.sync->isDead(id));
+}
+
 TEST(feed, a_loaded_game_forgets_the_old_world_and_undoes_what_a_save_left_behind) {
     FeedRig r(false);
     crowd(r, 2);

@@ -93,6 +93,7 @@ inline ReqClaim claimReq(uint32_t txn, NetId item) { ReqClaim q; q.txn = txn; q.
 inline ReqClaim claimPlaced(uint32_t txn, NetId item, uint32_t base, int32_t n = 1) {
     ReqClaim q; q.txn = txn; q.item = item; q.hasAdopt = true;
     q.adopt.id = item; q.adopt.base = F(base); q.adopt.count = n; q.adopt.cell = 7;
+    q.ref = F(0x842, "nvcooplab.esp");   // the placed world ref itself (a plugin's persistent ref)
     return q;
 }
 

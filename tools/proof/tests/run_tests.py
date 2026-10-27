@@ -42,7 +42,7 @@ TWINS = {
     "steam_error_ignored": ("a booted copy showing a 'Steam Error' window is waited for 300 s", ["SteamSignedIn"]),
     "wiring_unchecked": ("a test may provision other live.* lanes than its wiring command expects", ["ManifestSetup"]),
     "npc_load_unchecked": ("a test that reads a live NPC may skip loading the scenario first", ["ManifestSetup"]),
-    "world_load_unchecked": ("a test whose script needs the player in a cell may skip loading the scenario first (avatar runtime never starts)", ["ManifestSetup.test_a_world_test_without_the_scenario_or_the_mark_is_reported"]),
+    "world_load_unchecked": ("a test whose script needs the player in a cell may skip loading the scenario first (avatar runtime never starts)", ["ManifestSetup.test_a_world_test_without_the_scenario_or_the_mark_is_reported", "ManifestSetup.test_the_two_copy_actor_port_test_jumps_to_the_scenario_before_coop_owner_is_asked"]),
     "weapon_edid_unchecked": ("a VATS weapon param may be an editor id the bridge console cannot resolve", ["ManifestSetup.test_the_vats_weapons_are_form_ids_not_editor_ids"]),
     "adopt_foreign": ("a game copy of another lane or the owner's own game is adopted as ours when owned.json is rebuilt", ["OrphanCopies.test_a_copy_of_another_lane_and_the_owners_own_game_are_left_alone"]),
     "orphans_not_adopted": ("copies our lane launched are not taken back when owned.json is lost: BLOCKED instead of re-provisioned", ["OrphanCopies.test_a_running_copy_with_the_wrong_ini_is_stopped_reprovisioned_and_rebooted_although_owned_json_was_lost"]),
@@ -58,6 +58,8 @@ TWINS = {
     "stub_shared_log": ("two stub runners append to one log file and lose lines when they start together", ["Parallel.test_stubs_that_start_together_each_keep_their_own_log"]),
     "build_unchecked": ("a copy of pair 1 with another nvcoop_mod.dll than pair 0 is run (and fails as a test, 'bridge method missing')", ["PairBuildAndSaves.test_a_pair_one_copy_with_another_core_is_a_build_problem", "PairBuildAndSaves.test_a_missing_core_a_stale_core_and_a_loader_that_would_not_load_it"]),
     "ready_skipped": ("a copy is used as soon as its pipe is up, before the game serves requests", ["PairBuildAndSaves.test_a_copy_that_does_not_serve_requests_yet_is_env_and_is_not_asked_for_methods"]),
+    "max_pairs_env_ignored": ("PROOF_MAX_PAIRS is ignored: --pairs 3 is refused on a PC that can run three pairs", ["Sched.test_max_pairs_defaults_to_two_and_the_env_raises_it"]),
+    "nvse_dir_ignored": ("PROOF_NVSE_DIR is ignored: a provision on a PC whose copies come from the xNVSE cache folder leaves the loader out", ["Sched.test_nvse_dir_comes_from_the_env_into_the_provision_command"]),
     "saves_not_seeded": ("the copies of pair 1 start a scenario with an empty Saves folder", ["PairBuildAndSaves.test_prepare_seeds_the_saves_of_every_copy", "PairBuildAndSaves.test_an_empty_copy_gets_the_save_family_of_a_donor_of_its_own_role"]),
 }
 if os.name == "nt" or not os.path.isdir("/proc/self"):   # their tests are the POSIX branches: PosixProcessHelpers skips here

@@ -123,6 +123,23 @@ def main() -> int:
     for fname in ("proof_actor_port_two_copy", "proof_actor_port_save_check"):
         if not scripted_proof(fname):
             return 1
+
+    # twin: a proof that insists on the manifest's NPC (no fallback to a loaded one) must be caught by the self-tests of the NPC choice
+    npc_pick = sys.modules["npc_pick"]
+    for fname, m in (("proof_actor_port", mod), ("proof_actor_port_two_copy", sys.modules["proof_actor_port_two_copy"])):
+        npc_pick.MUTANT = "no_fallback"
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = m.selftest()
+        except Exception:  # noqa: BLE001 - the proof gave up (NOT READY) on the NPC the manifest named: caught
+            rc = 1
+        finally:
+            npc_pick.MUTANT = ""
+        if rc == 0:
+            print(f"tools/actors: {fname}: TWIN SURVIVED: a proof without the NPC fallback passed its own self-test")
+            return 1
+        print(f"tools/actors: {fname}: twin 'no NPC fallback' caught by the self-test")
     print("tools/actors: ALL OK")
     return 0
 

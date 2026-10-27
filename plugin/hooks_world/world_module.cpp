@@ -63,6 +63,15 @@ void TryInit() {
     GetPrivateProfileStringA("coop", "role", "host", role, sizeof role, IniPath().c_str());
     std::string r = role;
     g_role = (r == "client" || r == "guest") ? nvhooks::Role::Guest : r == "gateonly" ? nvhooks::Role::Client : nvhooks::Role::Host;
+    {   // ref variable poll schedule (G15): [world] refvar_fast_every (frames, 0 = off), refvar_sweep_every, refvar_fast_budget, refvar_sweep_budget
+        nvworld::RefVarPollCfg pc = nvworld::RefVarPoller().config();
+        const std::string ini = IniPath();
+        pc.fastEvery = static_cast<uint32_t>(GetPrivateProfileIntA("world", "refvar_fast_every", static_cast<int>(pc.fastEvery), ini.c_str()));
+        pc.sweepEvery = static_cast<uint32_t>(GetPrivateProfileIntA("world", "refvar_sweep_every", static_cast<int>(pc.sweepEvery), ini.c_str()));
+        pc.fastBudget = static_cast<size_t>(GetPrivateProfileIntA("world", "refvar_fast_budget", static_cast<int>(pc.fastBudget), ini.c_str()));
+        pc.sweepBudget = static_cast<size_t>(GetPrivateProfileIntA("world", "refvar_sweep_budget", static_cast<int>(pc.sweepBudget), ini.c_str()));
+        nvworld::setRefVarPollConfig(pc);
+    }
     g_report = nvworld::Init(*hub, g_role);
     g_applier.reset(new nvworld::WorldApplier(*hub, nvhooks::resolver()));
     g_applier->setExecLine([](const std::string& line, uint32_t refID) { return nvhooks::execConsoleLineOn(line, refID); });
@@ -90,9 +99,13 @@ bool MStatus(const std::string&, std::string& out) {
     led.set("pending", (int64_t)nvworld::ledger().pending()).set("created", (int64_t)nvworld::ledger().map().size())
         .set("deferred", (int64_t)nvworld::ledger().deferred().size()).set("deferredDropped", (int64_t)nvworld::ledger().deferred().dropped())
         .set("deferredExpired", (int64_t)nvworld::ledger().deferred().expired());
+    const nvworld::RefVarPollStats rv = nvworld::refVarPollStats();
+    Value rvo = Value::object();
+    rvo.set("sweeps", (int64_t)rv.sweeps).set("fastReads", (int64_t)rv.fastReads).set("tracked", (int64_t)rv.tracked).set("pending", (int64_t)rv.pending)
+        .set("watched", (int64_t)rv.watched);
     Value o = Value::object();
     o.set("inited", g_inited).set("role", RoleName(g_role)).set("installed", g_report.ok).set("failed", g_report.failed)
-        .set("hooks", hs).set("ledger", led);
+        .set("hooks", hs).set("ledger", led).set("refvars", rvo);
     out = o.dump();
     return true;
 }

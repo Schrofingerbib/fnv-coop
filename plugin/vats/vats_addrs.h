@@ -71,6 +71,14 @@ inline constexpr uint8_t kGetTimeMultPrologue[16] = {0x55, 0x8B, 0xEC, 0x83, 0xE
 // to fill kPausedByMenu (PROVEN).
 constexpr uint32_t kMenuMode = 0x00702360;
 inline constexpr uint8_t kMenuModePrologue[16] = {0x55, 0x8B, 0xEC, 0xE8, 0xA8, 0x4E, 0xDB, 0xFF, 0x85, 0xC0, 0x74, 0x21, 0xE8, 0x9F, 0x4E, 0xDB};
+// Worker-thread wait of the menu update. While any menu is open the main loop (0x871C6B: `if (MenuMode()) 0x7058E0()`) runs the menu update 0x713C70, which, when
+// the worker threads are started (`bool 0x713D90`, = byte 0x11DFA19), waits with INFINITE timeout for a worker event (0x8C7A70, WaitForSingleObject on handle
+// group 0 slot 1). That handshake belongs to a PAUSED world. With the pause removed (real-time VATS) the event is never signalled in the VATS zoom (camera mode 3):
+// MEASURED 2026-10-27 on the second PC, a minidump of the hung main thread: the stack is 0x871C7C -> 0x70590B -> 0x713CA9 -> 0x8C7A93 -> NtWaitForSingleObject,
+// every worker idle, CPU 0, window still answering. The one call at 0x713C8D asks 0x713D90; the thunk answers "no workers" while the VATS menu is open and the
+// world is not paused, so the menu update skips the wait. The world-frame readers of the byte (0x825218, 0x8C7AC1) are left alone: they still join the workers.
+constexpr uint32_t kThreadsActive = 0x00713D90;
+inline constexpr uint8_t kThreadsActivePrologue[16] = {0x55, 0x8B, 0xEC, 0xA0, 0x19, 0xFA, 0x1D, 0x01, 0x5D, 0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
 // MenuMode(id), cdecl bool(int id): is the menu with this id the top menu. 0x420 = VATS (PROVEN: the VATS menu update asks exactly this).
 constexpr uint32_t kMenuModeOf = 0x00702450;
 inline constexpr uint8_t kMenuModeOfPrologue[16] = {0x55, 0x8B, 0xEC, 0x51, 0xE8, 0xB7, 0x4D, 0xDB, 0xFF, 0x85, 0xC0, 0x74, 0x74, 0xE8, 0xAE, 0x4D};
@@ -127,6 +135,8 @@ inline constexpr Site kPauseSitesExtended[] = {
     {"proc_89C6CA", 0x0089C6CA},     {"proc_89C74A", 0x0089C74A},   {"proc_89CEBA", 0x0089CEBA},   {"proc_89CF56", 0x0089CF56},
 };
 inline constexpr size_t kPauseSiteExtendedCount = sizeof kPauseSitesExtended / sizeof kPauseSitesExtended[0];
+inline constexpr Site kThreadWaitSites[] = {{"menu_update_713C8D", 0x00713C8D}};
+inline constexpr size_t kThreadWaitSiteCount = sizeof kThreadWaitSites / sizeof kThreadWaitSites[0];
 
 // The five bytes a call site must hold: E8 + rel32 reaching `target` (computed, so the table above cannot drift from the target constants).
 constexpr uint32_t relTo(uint32_t site, uint32_t target) { return target - (site + 5u); }

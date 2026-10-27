@@ -27,8 +27,28 @@ const char* worldEffectName(const WorldEffect& e) {
         case 7: return "SetOwner";
         case 8: return "SetCellOwner";
         case 9: return "SetCellPublic";
+        case 10: return "SetObjectState";
+        case 11: return "Present";
     }
     return "?";
+}
+
+bool isEphemeral(const WorldEffect& e) { return std::holds_alternative<Present>(e) && !FNV_MUT(59); }   // MUTANT 59: a fade is replayed to every late joiner
+
+std::string worldEffectKey(const WorldEffect& e) {
+    auto r = [](const FormRef& f) { return nvhooks::refToStr(f); };
+    if (auto* x = std::get_if<SetActorValueRef>(&e)) return x->mode == AvMode::Set ? "av:" + r(x->actor) + ":" + std::to_string(x->av) : std::string();
+    if (auto* x = std::get_if<SetEssential>(&e)) return "ess:" + r(x->actor) + (x->refOnly ? ":ref" : ":base");
+    if (auto* x = std::get_if<SetRestrained>(&e)) return "rst:" + r(x->actor);
+    if (auto* x = std::get_if<SetRelation>(&e)) return "rel:" + r(x->a) + ":" + r(x->b);
+    if (auto* x = std::get_if<SetScriptPackage>(&e)) return "pkg:" + r(x->actor) + ":" + r(x->package);
+    if (auto* x = std::get_if<SetIgnoreCrime>(&e)) return "ign:" + r(x->actor);
+    if (auto* x = std::get_if<SetFactionPlayerEnemy>(&e)) return "fpe:" + r(x->faction);
+    if (auto* x = std::get_if<SetOwner>(&e)) return "own:" + r(x->ref);
+    if (auto* x = std::get_if<SetCellOwner>(&e)) return "cown:" + r(x->cell);
+    if (auto* x = std::get_if<SetCellPublic>(&e)) return "cpub:" + r(x->cell);
+    if (auto* x = std::get_if<SetObjectState>(&e)) return FNV_MUT(60) ? std::string() : "obj:" + r(x->ref) + ":" + std::to_string(x->mask);   // MUTANT 60: no coalescing, a joiner replays every lock flip
+    return std::string();
 }
 
 // ------------------------------------------------------------------------------------------------ CreatedRefMap
@@ -122,7 +142,7 @@ bool createdTargetOf(const WorldEffect& e, FormRef* out) {
             if constexpr (std::is_same_v<T, SetActorValueRef> || std::is_same_v<T, SetEssential> || std::is_same_v<T, SetRestrained> ||
                           std::is_same_v<T, SetScriptPackage> || std::is_same_v<T, SetIgnoreCrime>)
                 r = &x.actor;
-            else if constexpr (std::is_same_v<T, SetOwner>)
+            else if constexpr (std::is_same_v<T, SetOwner> || std::is_same_v<T, SetObjectState>)
                 r = &x.ref;
         },
         e);
@@ -153,9 +173,14 @@ Route routeEffect(const WorldEffect& e, const CreatedRefMap& m, FormRef* waitOn)
 bool retriable(const fnvcoop::Effect& e, Outcome o) {
     if (o == Outcome::Missing) return true;
     // the variable list exists once the object's script has been instantiated (cell attached); a rejected write may succeed later
+    // ... and so may a lock / open / destroyed change: the console refuses it while the door's cell is still attaching (a client that just joined)
+    if (o == Outcome::Rejected && std::holds_alternative<fnvcoop::ObjectState>(e) && !FNV_MUT(65)) return true;   // MUTANT 65: a refused door change is dropped for good
     return o == Outcome::Rejected && std::holds_alternative<fnvcoop::RefScriptVar>(e);
 }
-bool retriable(const WorldEffect&, Outcome o) { return o == Outcome::Missing; }
+bool retriable(const WorldEffect& e, Outcome o) {
+    if (o == Outcome::Rejected && std::holds_alternative<SetObjectState>(e) && !FNV_MUT(65)) return true;
+    return o == Outcome::Missing;
+}
 
 void DeferredQueue::hold(HeldEffect h) {
     ++holds_;
@@ -279,27 +304,45 @@ std::vector<fnvcoop::SpawnRef> SpawnLedger::takeReady(const std::function<bool(c
 // ------------------------------------------------------------------------------------------------ RefVarTracker
 static uint64_t varKey(uint32_t ref, uint16_t idx) { return (uint64_t(ref) << 16) | idx; }
 
-bool RefVarTracker::observe(uint32_t refID, uint16_t index, double value) {
+bool RefVarTracker::observe(uint32_t refID, uint16_t index, double value, bool reportFirst) {
     auto k = varKey(refID, index);
     auto it = last_.find(k);
     if (it == last_.end()) {
-        last_[k] = value;
+        Entry e;
+        e.last = value;
         if (FNV_MUT(7)) {
+            last_[k] = e;
             return true;  // MUTANT: the baseline value is reported as a change
         }
+        if (reportFirst && value != 0 && !FNV_MUT(53) && reported_ < budget_) {
+            ++reported_;  // a watched ref first seen with a value nothing ever reported (its cell loaded after the write)
+            last_[k] = e;
+            return true;
+        }
+        if (reportFirst && value != 0 && !FNV_MUT(53)) e.last = 0;  // over budget: stays unreported, the next poll reports it
+        last_[k] = e;
         return false;
     }
+    Entry& en = it->second;
     if (FNV_MUT(9)) {
         ++reported_;
-        it->second = value;
+        en.last = value;
         return true;  // MUTANT: unchanged values are reported too
     }
-    if (it->second == value) return false;
+    if (en.last == value) {
+        en.streak = 0;
+        return false;
+    }
+    if (en.quietUntil > round_ && !FNV_MUT(54)) return false;  // a timer variable is held back (MUTANT 54: it is not)
     if (!FNV_MUT(8)) {
         if (reported_ >= budget_) return false;  // deferred: the tracker keeps the old value, so a later poll reports it
     }
-    it->second = value;
+    en.last = value;
     ++reported_;
+    if (++en.streak >= kHotStreak) {
+        en.streak = 0;
+        en.quietUntil = round_ + kHotQuiet;
+    }
     return true;
 }
 
@@ -309,6 +352,17 @@ void RefVarTracker::forgetRef(uint32_t refID) {
     }
     for (auto it = last_.begin(); it != last_.end();) {
         if ((it->first >> 16) == refID) it = last_.erase(it);
+        else ++it;
+    }
+}
+
+void RefVarTracker::forgetAllExcept(const std::unordered_set<uint32_t>& keep) {
+    if (FNV_MUT(55)) {
+        last_.clear();  // MUTANT 55: a cell change forgets the watched refs too (a change made while the player was away is adopted as the baseline, never sent)
+        return;
+    }
+    for (auto it = last_.begin(); it != last_.end();) {
+        if (keep.count(static_cast<uint32_t>(it->first >> 16)) == 0) it = last_.erase(it);
         else ++it;
     }
 }
@@ -424,13 +478,16 @@ std::string setEssentialLine(const SetEssential& e, uint32_t id) {
 
 std::string setRestrainedLine(bool on) { return on ? "SetRestrained 1" : "SetRestrained 0"; }
 
-std::string setRelationLine(Relation kind, uint32_t a, uint32_t b) {
+std::string setRelationLine(Relation kind, uint32_t a, uint32_t b, uint8_t flags1, uint8_t flags2) {
     if (FNV_MUT(20)) {
         std::swap(a, b);  // MUTANT
     }
     const char* cmd = kind == Relation::Ally ? "SetAlly " : "SetEnemy ";
     // Neutral: SetEnemy with flags 0 (engine clears the relation); enemy/ally set both directions' default flags.
-    return cmd + hex(a) + " " + hex(b) + (kind == Relation::Neutral ? " 0" : "");
+    std::string line = cmd + hex(a) + " " + hex(b) + (kind == Relation::Neutral ? " 0" : "");
+    // the optional integers the script gave, as given (they were captured and then dropped: "SetEnemy A B 1 1" was replayed as "SetEnemy A B")
+    if ((flags1 || flags2) && kind != Relation::Neutral && !FNV_MUT(61)) line += " " + std::to_string(flags1) + " " + std::to_string(flags2);   // MUTANT 61: the flags are dropped again
+    return line;
 }
 
 std::string scriptPackageLine(bool add, uint32_t packageID) {
@@ -486,6 +543,32 @@ std::string placeAtMeLine(uint32_t baseID, int count) {
     return "PlaceAtMe " + hex(baseID) + " " + std::to_string(count);
 }
 
+std::optional<SetObjectState> worldCopyOfObjectState(const fnvcoop::ObjectState& os, int32_t causeAux) {
+    if (FNV_MUT(62)) return std::nullopt;                       // MUTANT 62: the world copy is not made
+    if (causeAux == kObjectPollAux && !FNV_MUT(63)) return std::nullopt;   // MUTANT 63: the poll's own change is sent twice
+    SetObjectState w;
+    w.mask = static_cast<uint8_t>(os.mask & (fnvcoop::kObjOpen | fnvcoop::kObjLock | fnvcoop::kObjDestroyed));
+    if (!w.mask) return std::nullopt;
+    w.ref = os.ref;
+    w.open = os.open;
+    w.locked = os.locked;
+    w.level = os.level;
+    w.destroyed = os.destroyed;
+    return w;
+}
+
+std::string presentLine(const Present& p, uint32_t formID) {
+    switch (p.kind) {
+        case PresentKind::ApplyImageSpace:
+            return "ApplyImageSpaceModifier " + hex(formID) + (p.hasValue ? " " + num(p.value) : std::string());
+        case PresentKind::RemoveImageSpace:
+            return "RemoveImageSpaceModifier " + hex(formID) + (p.hasValue ? " " + num(p.value) : std::string());
+        case PresentKind::PlayMusic: return "PlayMusic " + hex(formID);
+        case PresentKind::PlaySound: return "PlaySound " + hex(formID) + (p.hasValue ? " " + std::to_string(static_cast<int>(p.value)) : std::string());
+    }
+    return std::string();
+}
+
 std::string setPosLine(char axis, float v) { return std::string("SetPos ") + axis + " " + num(v); }
 
 // ------------------------------------------------------------------------------------------------ WorldLog
@@ -516,6 +599,8 @@ void WorldLog::push(const WorldEffect& e) {
                 same = co->cell == std::get<SetCellOwner>(q).cell;
             } else if (auto* cp = std::get_if<SetCellPublic>(&e)) {
                 same = cp->cell == std::get<SetCellPublic>(q).cell;
+            } else if (auto* os = std::get_if<SetObjectState>(&e)) {
+                same = os->ref == std::get<SetObjectState>(q).ref && os->mask == std::get<SetObjectState>(q).mask;
             }
             if (same) {
                 q = e;
@@ -608,6 +693,7 @@ void fold(std::vector<WorldEffect>& q, const WorldEffect& e) {
         if (auto* x = std::get_if<SetOwner>(&e)) return std::get<SetOwner>(w).ref == x->ref;
         if (auto* x = std::get_if<SetCellOwner>(&e)) return std::get<SetCellOwner>(w).cell == x->cell;
         if (auto* x = std::get_if<SetCellPublic>(&e)) return std::get<SetCellPublic>(w).cell == x->cell;
+        if (auto* x = std::get_if<SetObjectState>(&e)) return std::get<SetObjectState>(w).ref == x->ref && std::get<SetObjectState>(w).mask == x->mask;
         if (auto* x = std::get_if<SetRelation>(&e)) return std::get<SetRelation>(w).a == x->a && std::get<SetRelation>(w).b == x->b;
         if (auto* x = std::get_if<SetScriptPackage>(&e))
             return std::get<SetScriptPackage>(w).actor == x->actor && std::get<SetScriptPackage>(w).package == x->package;
@@ -622,7 +708,10 @@ void fold(std::vector<WorldEffect>& q, const WorldEffect& e) {
 }
 }  // namespace
 
-void WorldBaseline::onWorld(const WorldEffect& e) { fold(world_, e); }
+void WorldBaseline::onWorld(const WorldEffect& e) {
+    if (isEphemeral(e)) return;   // a fade or a sound is not state: a joiner does not replay it
+    fold(world_, e);
+}
 
 BaselineSnapshot WorldBaseline::snapshot() const {
     BaselineSnapshot b;
@@ -661,6 +750,7 @@ std::string worldEffectToJson(const WorldEffect& e) {
         o.set("actor", J(z->actor)).set("on", z->on);
     } else if (auto* r = std::get_if<SetRelation>(&e)) {
         o.set("a", J(r->a)).set("b", J(r->b)).set("kind", (int64_t)r->kind);
+        if (r->flags1 || r->flags2) o.set("f1", (int64_t)r->flags1).set("f2", (int64_t)r->flags2);
     } else if (auto* p = std::get_if<SetScriptPackage>(&e)) {
         o.set("actor", J(p->actor)).set("package", J(p->package)).set("add", p->add);
     } else if (auto* c = std::get_if<SetIgnoreCrime>(&e)) {
@@ -677,6 +767,12 @@ std::string worldEffectToJson(const WorldEffect& e) {
         o.set("cell", J(co->cell)).set("owner", J(co->owner));
     } else if (auto* cp = std::get_if<SetCellPublic>(&e)) {
         o.set("cell", J(cp->cell)).set("on", cp->on);
+    } else if (auto* os = std::get_if<SetObjectState>(&e)) {
+        o.set("ref", J(os->ref)).set("mask", (int64_t)os->mask).set("open", os->open).set("locked", os->locked).set("level", (int64_t)os->level)
+            .set("destroyed", os->destroyed);
+    } else if (auto* pr = std::get_if<Present>(&e)) {
+        o.set("kind", (int64_t)pr->kind).set("form", J(pr->form));
+        if (pr->hasValue) o.set("value", (double)pr->value);
     }
     return o.dump();
 }
@@ -712,6 +808,8 @@ bool worldEffectFromJson(const std::string& text, WorldEffect* out, std::string*
         SetRelation x;
         if (!ref("a", &x.a) || !ref("b", &x.b)) { if (err) *err = "bad faction"; return false; }
         x.kind = (Relation)v.get("kind").asInt();
+        x.flags1 = (uint8_t)v.get("f1").asInt(0);
+        x.flags2 = (uint8_t)v.get("f2").asInt(0);
         *out = x;
     } else if (t == "SetScriptPackage") {
         SetScriptPackage x;
@@ -742,6 +840,26 @@ bool worldEffectFromJson(const std::string& text, WorldEffect* out, std::string*
         SetCellPublic x;
         if (!ref("cell", &x.cell)) { if (err) *err = "bad cell"; return false; }
         x.on = v.get("on").asBool();
+        *out = x;
+    } else if (t == "SetObjectState") {
+        SetObjectState x;
+        if (!ref("ref", &x.ref)) { if (err) *err = "bad ref"; return false; }
+        const int64_t m = v.get("mask").asInt();
+        if (m < 1 || m > 7) { if (err) *err = "bad mask"; return false; }
+        x.mask = (uint8_t)m;
+        x.open = v.get("open").asBool();
+        x.locked = v.get("locked").asBool();
+        x.level = (int32_t)v.get("level").asInt();
+        x.destroyed = v.get("destroyed").asBool();
+        *out = x;
+    } else if (t == "Present") {
+        Present x;
+        if (!ref("form", &x.form)) { if (err) *err = "bad form"; return false; }
+        const int64_t k = v.get("kind").asInt(-1);
+        if (k < 0 || k > 3) { if (err) *err = "bad kind"; return false; }
+        x.kind = (PresentKind)k;
+        x.hasValue = !v.get("value").isNull();
+        if (x.hasValue) x.value = (float)v.get("value").asNumber();
         *out = x;
     } else {
         if (err) *err = "unknown world effect type: " + t;

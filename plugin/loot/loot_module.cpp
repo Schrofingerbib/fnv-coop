@@ -5,9 +5,11 @@
 //   sweep=1          host: scripts' changes to unheld containers follow into the table
 //   resolve=1        register containers when told their cell loaded (corpses are registered shortly after death regardless)
 //   corpse_delay_ms=700
+//   menuless=1       a take / put the engine did on a closed container without the menu (console RemoveItem + AddItem, quick-loot mods) goes through the lock too
 #include <Windows.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -72,9 +74,20 @@ void OnActivateEvent(TESObjectREFR* thisObj, void* parameters) {
     }
     bool playerSeen = false;
     for (uint32_t r : refs) if (r == kPlayerRef) playerSeen = true;
+    g_sync->noteActivate(playerSeen);
     if (!playerSeen) return;
-    for (uint32_t r : refs)
-        if (r && r != kPlayerRef) g_sync->onPickup(kPlayerRef, r);
+    // One pickup is one claim: the same ref can sit in more than one slot (this / argument 0), and a second claim for an item the player already won
+    // is a loss to the host (the item would be taken back from the player).
+    uint32_t done[3] = {0, 0, 0};
+    int n = 0;
+    for (uint32_t r : refs) {
+        if (!r || r == kPlayerRef) continue;
+        bool dup = false;
+        for (int i = 0; i < n; ++i) if (done[i] == r) dup = true;
+        if (dup) continue;
+        done[n++] = r;
+        g_sync->onPickup(kPlayerRef, r);
+    }
 }
 
 void InstallHandlers() {
@@ -105,6 +118,7 @@ void Create() {
     cfg.pollMs = static_cast<uint32_t>(GetPrivateProfileIntA("loot", "poll_ms", 50, ini.c_str()));
     cfg.hostSweep = GetPrivateProfileIntA("loot", "sweep", 1, ini.c_str()) != 0;
     cfg.resolveOnLoad = GetPrivateProfileIntA("loot", "resolve", 1, ini.c_str()) != 0;
+    cfg.menuless = GetPrivateProfileIntA("loot", "menuless", 1, ini.c_str()) != 0;
     cfg.corpseDelayMs = static_cast<uint32_t>(GetPrivateProfileIntA("loot", "corpse_delay_ms", 700, ini.c_str()));
     g_enabled = cfg.enabled;
     g_engine = std::make_unique<RealLootEngine>();
@@ -178,11 +192,36 @@ LootSync& service() {
     return *g_sync;
 }
 
+// A form / ref id as a hex string ("104C70", "0x104C70") or a number
+static uint32_t IdOf(const nvcoop::json::Value& v) {
+    if (v.isNumber()) return static_cast<uint32_t>(v.asInt());
+    if (v.isString()) return static_cast<uint32_t>(std::strtoul(v.asString().c_str(), nullptr, 16));
+    return 0;
+}
+
+// Test helper, needs env NVCOOP_TEST_HELPERS=1 (the benchmark sets it):  coop.loot {"grab":{"container":"<runtime ref hex>","item":"<runtime form hex>","count":1,"phase":"both|remove|add"}}
+// A quick-loot style take: RemoveItem on the container + AddItem on the local player, with the guest gate lifted. The benchmark cannot do this with console lines on a
+// GUEST: "RemoveItem <item> 1 1" with the corpse as calling reference is a script mutation and the guest gate (plugin/hooks/suppress_policy.cpp) drops it, so the old
+// grab took nothing out of the guest's corpse while the "player.AddItem" line (a local-player line) still gave the guest the item.
+static bool GrabRpc(const nvcoop::json::Value& g, std::string& out) {
+    const char* gate = std::getenv("NVCOOP_TEST_HELPERS");
+    if (!gate || gate[0] != '1') { out = "test helpers disabled (start the game with NVCOOP_TEST_HELPERS=1)"; return false; }
+    if (!g_engine) { out = "loot engine not created"; return false; }
+    const std::string phase = g.get("phase").asString("both");
+    if (phase != "both" && phase != "remove" && phase != "add") { out = "grab.phase must be both, remove or add"; return false; }
+    std::string why;
+    const bool ok = g_engine->testGrab(IdOf(g.get("container")), IdOf(g.get("item")), static_cast<int32_t>(g.get("count").asInt(1)), phase != "add", phase != "remove", &why);
+    if (!ok) { out = "grab refused: " + why; return false; }
+    out = "{\"grab\":true,\"phase\":\"" + phase + "\"}";
+    return true;
+}
+
 bool glueRpc(const std::string& paramsJson, std::string& out) {
     if (!g_sync) { out = "{\"enabled\":false}"; return true; }
     nvcoop::json::Value p;
     std::string err;
     if (!paramsJson.empty() && paramsJson != "null" && !nvcoop::json::parse(paramsJson, p, err)) { out = "bad params: " + err; return false; }
+    if (p.isObject() && p.get("grab").isObject()) return GrabRpc(p.get("grab"), out);
     if (p.isObject() && p.get("container").isNumber()) {
         const lc::ContainerRec* c = g_sync->client() ? g_sync->client()->container(static_cast<NetId>(p.get("container").asInt())) : nullptr;
         if (!c) { out = "{\"known\":false}"; return true; }

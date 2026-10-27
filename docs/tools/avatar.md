@@ -10,7 +10,7 @@ and a slot -> puppet ref map (the "ghost-ref map" of the acting-player design, `
 - `plugin\avatar\run_tests.cmd` (one command, ends in `avatar: ALL OK`). It builds standalone in `%TEMP%\nvav_build` (Ninja, 2 jobs,
   takes `out\locks\build.lock` only while compiling) and then runs:
   1. `python -I tools/avatar/check_groups.py` (+ its `--mutant`): `avatar_groups.h` equals the generated xNVSE group table.
-  2. `avatar_tests`: the suite, then the whole suite once per runtime mutation twin (37 twins, each must fail at least one check).
+  2. `avatar_tests`: the suite, then the whole suite once per runtime mutation twin (38 twins, each must fail at least one check).
      `--no-twins`, `--twin NAME`, `--list-twins`, `--verbose` for debugging.
   3. `avatar_live_tests`: the driver on top of the REAL `synccore/live` (sender delta codec, lossy jittery link, receiver, InterpBuffer),
      judged by game-free versions of the T7 detectors (slide, skate, T-pose proxy, float, jitter, rubber band, silence). 5 twins incl. two live-layer faults and the engine push.
@@ -70,6 +70,7 @@ commands, animation re-assert after menus, speed matching, cell borders vs trans
 | 25 | snap and physics push | snapped sample forces SetPos + animation; drift > 2 m is corrected and counted | `snap_and_drift` | |
 | 26 | script text must be exact | `ScriptPuppetEngine` pins every line | `script_backend`, `manager_on_script_backend` | |
 | 26b | a body in the way (the real player standing in the puppet) pushes the puppet hundreds of units, and the buffer eases it back from the pushed place | `PuppetManager::ActualPose` reports the last applied place when the engine place is farther than `driftUnits` (the same Tick's drift check then undoes the push with one `SetPos`); `avatar.status` counts `pushesIgnored` | `physics_push_not_adopted`; live: 4 pushes in the integration scenario (`shoveFrames`) | `adoptPhysicsPush` |
+| 26c | the remote player stands in (or runs through) the place of the REAL player of this machine: the driver's `SetPos` puts the puppet into the same spot every frame and the engine shoves the real player, hundreds of units in a second | `PuppetManager::MakeRoom` sends the engine a place at `Config::bodyRoomUnits` (70) from the local player when the true place is closer (same cell, within `bodyRoomHeightUnits`); the true place is used again once the bodies are apart; `IPuppetEngine::GetLocalPose` (engine: the player ref) says where the local player is; `avatar.status` counts `bodyYields` | `body_room` (fake engine shoves the real player by the overlap of every write), engine `get_local_pose_reads_the_player`, `stack_makes_room_for_the_local_player` | `noBodyRoom`, engine `86` |
 
 Bench note (2026-10-23, `tools/bench/coop_bench.py` step walk): the client's puppet of the host jumped about 6 times a minute while the host walked, the host's puppet of the
 client never did. The step walk issues `player.SetPos` console lines; on the host those are captured and replayed on the guest (a guest's own `player.` lines are muted,
@@ -77,6 +78,15 @@ client never did. The step walk issues `player.SetPos` console lines; on the hos
 `ActualPose` handed the pushed place to `InterpBuffer`, which eased the puppet back over 0.3 to 0.6 s (a 2 to 10 m error is eased, not snapped). The fix above removes the
 easing; the carrying of the guest's player by the host's console lines is outside this module and is not changed here. UNVERIFIED in the game.
 
+Bench note (2026-10-25, `tools/bench/coop_bench.py` with real movement input in the arena): the recorded run showed the GUEST's real player displaced, not only its puppet.
+While the host walked (the guest idle) the guest's player moved 113, 122, 67 and 106 units in single samples, in the walking direction of the host's puppet, each time the puppet
+passed through the guest's standing place (the two players start 90 units apart). Later, during the guest's own legs, the guest's position changed by 1000 to 2400 units per
+sample for 1 to 1.5 s, five times, ending 3.5 to 26 km from the course (the legs that "did not arrive"). The puppet side of the host followed those jumps as designed (a source
+that moves more than 10 m between snapshots is held and then snapped; at 5 Hz far-tier rate that is the staircase the bench counted as teleports and freezes), so the p95 error
+of 574 / 4,307 units measures the displaced PLAYER, not a puppet defect. The driver's part that is certain from the code: a puppet standing in the real player was re-sent by
+`SetPos` into the same spot on every drift check, which the engine answers by pushing the bodies apart. 26c removes that. Whether it also removes the large displacements is
+UNVERIFIED (nothing in the data shows a puppet near the player during those); after the next arena run read `avatar.status` `local.teleports` (the sampler counts position jumps of
+the local player above 350 units) next to `bodyYields` and `pushesIgnored` to tell the two apart.
 Live integration (`avatar_live_tests`): a scripted 24 s owner (stand, run 300 u/s, sneak-walk, strafe, draw/aim, jump, 28 m teleport, 2 s silence)
 through the real codec, 0% and 10% loss, 3 seeds each. Asserted: no slide, no skate, no T-pose proxy, no float, no jitter, exactly one big jump (the teleport),
 max step < 12 units, legs stop within 800 ms of silence, exactly one spawn, no refused or foreign commands.
@@ -118,7 +128,7 @@ made the template configurable (`template=player` needs no ESP). `bindPlayerRefs
 The fake models what we expect the engine to do and is strict about console grammar; the first in-game run is `proof_puppet.py --loopback`.
 
 Run: `plugin\avatar\engine\run_tests.cmd` (one command, ends in `avatar engine: ALL OK`). It builds `avatar_engine_tests` in the shared tree
-(`tools/build/build.py`), runs the suite once for real and once per runtime mutation twin (`FNV_MUT`, 63 twins: 1-34, 40-56, 60-71, each must fail
+(`tools/build/build.py`), runs the suite once for real and once per runtime mutation twin (`FNV_MUT`, 71 twins: 1-34, 40-56, 60-72, 80-86, each must fail
 at least one check), builds nvcoop.dll (the game side must compile), then `tools/avatar/verify_engine_pins.py` (+ `--selftest`) and
 `tools/avatar/proof_puppet.py --selftest`. Registered in `tools/test_all.py` as "M2 avatar engine".
 
@@ -230,7 +240,7 @@ counters of `avatar.status` (no console exceptions, no refused foreign write, no
 **Everything below is unit tested on a fake game / a simulated network and compiles into nvcoop.dll. NOTHING of it has run in the game.**
 Run: `plugin\avatar\full\run_tests.cmd` (one command, ends in `avatar full: ALL OK`; registered in `tools/test_all.py` as "M2 avatar full"). It builds in the
 shared tree, runs the new 3-machine suite once for real and once per runtime twin (101..109), re-runs the suites that share the changed code (`avatar_tests`
-with 37 twins, `avatar_engine_tests` with 69 twins, dll-wiring's `nvcoop_live_tests` with 34 twins) and `tools/avatar/proof_avatars.py --selftest`.
+with 38 twins, `avatar_engine_tests` with 71 twins, dll-wiring's `nvcoop_live_tests` with 34 twins) and `tools/avatar/proof_avatars.py --selftest`.
 
 | Piece | Where | What it does |
 |---|---|---|

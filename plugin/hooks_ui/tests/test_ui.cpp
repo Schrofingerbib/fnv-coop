@@ -2,6 +2,7 @@
 //   1 origin ignored            2 menu resume not one-shot     3 button off-by-one       4 condition view uses host slot
 //   5 NPC-to-NPC lines captured 6 synchronous resume dropped   7 sticky origin forever   8 host DialogMenu opens for a remote actor
 //   9 slides recorded out of order
+//   21 forced lines carry no voice token  22 MenuMode mirror never opened  23 host-origin party box stays local  24 mirror not closed on the answer
 // Optional: NVUI_EXE=<dump of the running game image> also compares every pinned prologue with the real image.
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 #include "fnvcoop_mut.h"
 #include "../ui_addrs.h"
 #include "../ui_core.h"
+#include "../voice_token.h"
 
 using namespace nvui;
 
@@ -53,7 +55,11 @@ struct FakeEngine : IUiEngine {
         out = FormRef("falloutnv.esm", id);
         return true;
     }
-    void log(const std::string&) override {}
+    std::vector<std::string> logs;
+    std::vector<uint32_t> mirrorsOpen, mirrorsClosed;
+    void log(const std::string& s) override { logs.push_back(s); }
+    void openMirror(uint32_t menu, const std::string&, uint8_t) override { mirrorsOpen.push_back(menu); }
+    void closeMirror(uint32_t menu) override { mirrorsClosed.push_back(menu); }
     int32_t lastButton() const { return writes.empty() ? -2 : writes.back().button; }
 };
 
@@ -97,6 +103,8 @@ struct Rig {
         };
         b.consentFor = [](const FormRef& m) -> std::optional<ConsentRule> {
             if (m.localId == 0xBEEF) return ConsentRule{0, 1, 0};
+            if (m.localId == 0xCAE5) return ConsentRule{-1, 0, 0, 2, true};   // a personal decision (Caesar's surgery): the actor alone
+            if (m.localId == 0xF0F0) return ConsentRule{1, 0, 0, 1, false};   // a story fork: the party votes
             return std::nullopt;
         };
         b.watchesQuest = [](uint32_t q) { return q == 0x500; };
@@ -227,6 +235,24 @@ TEST(box_point_of_no_return_uses_modal) {
     g.r.onMessageBox(c);
     REQUIRE(g.raised.size() == 1 && g.raised[0].modal);
     CHECK(g.raised[0].rule.declineChoice == 1);
+}
+TEST(party_box_decided_by_the_host_is_still_raised_to_the_party) {
+    Rig g;
+    MessageBoxCall c = box();
+    c.message = FormRef("falloutnv.esm", 0xBEEF);   // no scope: the host player is the origin
+    CHECK(g.r.onMessageBox(c) == Route::Suppressed);
+    REQUIRE(g.raised.size() == 1 && g.raised[0].modal && g.raised[0].origin == kHost);
+    g.r.onMenuResume(1, 1, false);
+    CHECK(g.eng.lastButton() == 1);
+    // a vote-mode fork is raised too, a personal decision is not
+    MessageBoxCall fork = box(78);
+    fork.message = FormRef("falloutnv.esm", 0xF0F0);
+    CHECK(g.r.onMessageBox(fork) == Route::Suppressed);
+    REQUIRE(g.raised.size() == 2 && g.raised[1].rule.mode == 1);
+    MessageBoxCall personal = box(79);
+    personal.message = FormRef("falloutnv.esm", 0xCAE5);
+    CHECK(g.r.onMessageBox(personal) == Route::Local);
+    CHECK(g.raised.size() == 2 && g.r.stats().hostConsent == 2);
 }
 TEST(box_follow_up_of_same_script_follows_origin) {
     Rig g;
@@ -409,6 +435,66 @@ TEST(default_choice) {
     CHECK(defaultChoiceFor(4) == 3);
 }
 
+// ---- G07: a MenuMode 1001 block needs the box open on the machine that runs the script ----------------------------------------------
+static bool hasBlock(const FormRef& s) { return s.localId == 0x137622; }
+static MessageBoxCall boxOf(uint32_t scriptForm, uint32_t script = 77) {
+    MessageBoxCall c = box(script);
+    c.script = FormRef("falloutnv.esm", scriptForm);
+    return c;
+}
+TEST(menumode_box_is_mirrored_on_the_host_until_the_guest_answers) {
+    Rig g;
+    g.r.setMenuMode(UiRouter::MenuModeMode::Mirror, hasBlock);
+    OriginScope s(g.r.origin(), OriginContext::Kind::Acting, 2);
+    const Route routed = g.r.onMessageBox(boxOf(0x137622));
+    REQUIRE(routed == Route::Suppressed);
+    CHECK(g.eng.mirrorsOpen.size() == 1 && g.eng.mirrorsOpen[0] == 1 && g.r.mirrors() == 1);
+    CHECK(g.eng.lastButton() == kNoButton && g.eng.mirrorsClosed.empty());   // the block polls GetButtonPressed: nothing yet
+    g.r.onMenuResume(1, 1, false);
+    CHECK(g.eng.lastButton() == 1);                                           // the answer reaches the script...
+    CHECK(g.eng.mirrorsClosed.size() == 1 && g.r.mirrors() == 0);             // ...and the host's copy goes away
+    g.r.onMenuResume(1, 1, false);                                            // a duplicate answer closes nothing twice
+    CHECK(g.eng.mirrorsClosed.size() == 1);
+}
+TEST(menumode_off_logs_the_dead_block_once_and_mirrors_nothing) {
+    Rig g;
+    g.r.setMenuMode(UiRouter::MenuModeMode::Off, hasBlock);
+    OriginScope s(g.r.origin(), OriginContext::Kind::Acting, 2);
+    g.r.onMessageBox(boxOf(0x137622));
+    g.r.onMenuResume(1, 0, false);
+    g.r.onMessageBox(boxOf(0x137622));
+    CHECK(g.eng.mirrorsOpen.empty() && g.eng.logs.size() == 1 && g.r.stats().menuModeSkipped == 1);
+}
+TEST(menumode_mirror_only_for_scripts_with_a_block_and_remote_origins) {
+    Rig g;
+    g.r.setMenuMode(UiRouter::MenuModeMode::Mirror, hasBlock);
+    {
+        OriginScope s(g.r.origin(), OriginContext::Kind::Acting, 2);
+        g.r.onMessageBox(boxOf(0x999999, 91));                                // a script without a MenuMode block
+    }
+    CHECK(g.eng.mirrorsOpen.empty());
+    CHECK(g.r.onMessageBox(boxOf(0x137622, 92)) == Route::Local);            // the host plays: its own box already is the menu
+    CHECK(g.eng.mirrorsOpen.empty());
+    g.resumeSync = true;                                                      // answered before the router returned: no mirror to leave behind
+    OriginScope s2(g.r.origin(), OriginContext::Kind::Acting, 2);
+    g.r.onMessageBox(boxOf(0x137622, 93));
+    CHECK(g.eng.mirrorsOpen.empty());
+}
+
+TEST(forced_lines_carry_the_voice_token_of_their_topic_and_info) {
+    Rig g;
+    OriginScope s(g.r.origin(), OriginContext::Kind::Acting, 2);
+    ForcedCall c = sayTo(0x14);
+    c.lines.push_back(c.lines[0]);
+    g.r.onForced(c);
+    REQUIRE(g.said.size() == 1 && g.said[0].lines.size() == 2);
+    VoiceToken v;
+    REQUIRE(parseVoiceToken(g.said[0].lines[1].voice, v));
+    CHECK(v.topic.localId == 0x700 && v.info.localId == 0x701 && v.response == 2);
+    REQUIRE(parseVoiceToken(g.said[0].lines[0].voice, v));
+    CHECK(v.response == 1);
+}
+
 // ---- engine address pins -----------------------------------------------------------------------------------------------------
 struct Pin {
     const char* name;
@@ -533,6 +619,11 @@ int main() {
     run("slides_are_recorded_in_order_and_forwarded", slides_are_recorded_in_order_and_forwarded);
     run("slides_ignored_on_guest", slides_ignored_on_guest);
     run("default_choice", default_choice);
+    run("party_box_decided_by_the_host_is_still_raised_to_the_party", party_box_decided_by_the_host_is_still_raised_to_the_party);
+    run("menumode_box_is_mirrored_on_the_host_until_the_guest_answers", menumode_box_is_mirrored_on_the_host_until_the_guest_answers);
+    run("menumode_off_logs_the_dead_block_once_and_mirrors_nothing", menumode_off_logs_the_dead_block_once_and_mirrors_nothing);
+    run("menumode_mirror_only_for_scripts_with_a_block_and_remote_origins", menumode_mirror_only_for_scripts_with_a_block_and_remote_origins);
+    run("forced_lines_carry_the_voice_token_of_their_topic_and_info", forced_lines_carry_the_voice_token_of_their_topic_and_info);
     run("pins_match_generated_header", pins_match_generated_header);
     run("pins_match_real_exe_if_available", pins_match_real_exe_if_available);
     std::printf("%d checks, %d failed\n", g_checks, g_fail);

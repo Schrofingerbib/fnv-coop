@@ -25,6 +25,7 @@ namespace {
 // ---- raw reads (SEH) -----------------------------------------------------------------------------------------------------------------
 
 constexpr uint8_t kRefr = 0x3A, kAchr = 0x3B, kAcre = 0x3C;
+constexpr uint8_t kNoteForm = 0x31;   // BGSNote (the xNVSE "inv object" table in isItemType lists it as NOTE)
 constexpr uint8_t kActi = 0x15, kTalkActi = 0x16, kTerm = 0x17, kCont = 0x1B, kDoor = 0x1C, kFurn = 0x27;
 // The form flags that mean "not in the world any more": kFlags_Deleted (a taken reference, xNVSE GameObjects.h) and the GECK "initially
 // disabled" bit 0x800 which the Disable command sets on the reference. TODO-RE: confirm 0x800 with ref.info in a game (it is not in xNVSE's header);
@@ -133,6 +134,21 @@ bool infoRunSEH(void* info, uint32_t onEnd, void* npc) {
     }
 }
 
+// ---- quests --------------------------------------------------------------------------------------------------------------------------
+
+constexpr uint8_t kQuestForm = 0x47;   // kFormType_TESQuest (xNVSE GameForms.h, TESIdleForm is 0x48)
+
+bool questStageSEH(void* form, int32_t* stage) {
+    __try {
+        TESForm* f = static_cast<TESForm*>(form);
+        if (!f || f->typeID != kQuestForm) return false;
+        *stage = static_cast<TESQuest*>(form)->currentStage;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // ---- terminals -----------------------------------------------------------------------------------------------------------------------
 // BGSTerminal::menuEntries is a tList<TerminalEntry> at +0x98 (xNVSE GameForms.h); an entry that opens a sub menu names the BGSTerminal in +0x70.
 
@@ -185,6 +201,39 @@ bool findPathSEH(BGSTerminal* t, void* entry, uint8_t* path, int depth, int* bud
     }
 }
 
+// ---- container contents (gear stashes) -------------------------------------------------------------------------------------------------------------
+// ExtraContainerChanges entries: item refID -> countDelta relative to the base form's own inventory. The shared gear containers have an EMPTY base inventory
+// (nvcoop_intents.json lists only those), so the deltas are the whole contents.
+
+struct RawItem { uint32_t id; int32_t n; };
+constexpr size_t kMaxStoredLines = 512;
+
+bool readContainerSEH(void* ref, RawItem* out, size_t* n) {
+    *n = 0;
+    __try {
+        TESObjectREFR* r = static_cast<TESObjectREFR*>(ref);
+        auto* xc = static_cast<ExtraContainerChanges*>(r->extraDataList.GetByType(kExtraData_ContainerChanges));
+        ExtraContainerChanges::EntryDataList* list = xc ? xc->GetEntryDataList() : nullptr;
+        if (!list) return true;   // never touched: empty
+        for (auto it = list->Begin(); !it.End(); ++it) {
+            if (!it.Get() || !it.Get()->type) continue;
+            if (it.Get()->countDelta == 0) continue;
+            if (*n >= kMaxStoredLines) return false;   // more lines than the ledger keeps: refuse rather than silently drop gear
+            out[(*n)++] = {it.Get()->type->refID, static_cast<int32_t>(it.Get()->countDelta)};
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Mutes the capture hub for a scope: moving gear between the ledger and a container is not a change of the world.
+struct HubMute {
+    nvhooks::CaptureHub* hub;
+    HubMute() : hub(nvhooks::hub()) { if (hub) hub->pushMute(); }
+    ~HubMute() { if (hub) hub->popMute(); }
+};
+
 // ---- the acting scope ----------------------------------------------------------------------------------------------------------------
 
 class GameScope : public IActingScope {
@@ -220,6 +269,7 @@ public:
         if (out.cls == TargetClass::Item) {
             nvhooks::resolver().toRef(r.baseId, &out.base);
             out.count = r.count;
+            out.note = r.baseType == kNoteForm;
         }
         return true;
     }
@@ -288,6 +338,68 @@ public:
     bool disableRef(const FormRef& target) override {
         uint32_t id = nvhooks::resolver().fromRef(target);
         return id && nvhooks::execConsoleLineOn("Disable", id);   // the engine's own hook records the DisableRef effect into the open scope
+    }
+
+    bool questStage(const FormRef& quest, int32_t* stage) override {
+        uint32_t id = nvhooks::resolver().fromRef(quest);
+        void* f = id ? nvhooks::resolver().lookup(id) : nullptr;
+        return f && stage && questStageSEH(f, stage);
+    }
+
+    StageOutcome setStage(const FormRef& quest, uint32_t stage) override {
+        uint32_t id = nvhooks::resolver().fromRef(quest);
+        if (!id || stage == 0 || stage > 255) return StageOutcome::Failed;
+        // The console command reaches the engine's SetStage through our own detour: the stage gate of the rules engine is asked (it may defer), the
+        // stage is recorded on entry into the open acting scope, and its result scripts run captured. NOT under a StageGateBypass: the host keeps the say.
+        const uint64_t held = nvhooks::stageGateDeferred();
+        char line[64];
+        std::snprintf(line, sizeof line, "setstage %08X %u", id, stage);
+        const bool ran = nvhooks::execConsoleLine(line);
+        if (nvhooks::stageGateDeferred() != held) return StageOutcome::Deferred;
+        int32_t now = 0;
+        void* f = nvhooks::resolver().lookup(id);
+        return ran && f && questStageSEH(f, &now) && now >= static_cast<int32_t>(stage) ? StageOutcome::Applied : StageOutcome::Failed;
+    }
+
+    bool addNote(const FormRef& note) override {
+        uint32_t id = nvhooks::resolver().fromRef(note);
+        if (!id) return false;
+        char line[64];
+        std::snprintf(line, sizeof line, "AddNote %08X", id);   // the same line the remote applier uses; the engine's AddNote hook records the effect into the open scope
+        return nvhooks::execConsoleLine(line);
+    }
+
+    bool readItems(const FormRef& container, std::vector<StoredItem>* out) override {
+        uint32_t id = nvhooks::resolver().fromRef(container);
+        void* ref = id ? nvhooks::resolver().lookup(id) : nullptr;
+        if (!ref || !out) return false;
+        RawItem raw[kMaxStoredLines];
+        size_t n = 0;
+        if (!readContainerSEH(ref, raw, &n)) return false;
+        out->clear();
+        for (size_t i = 0; i < n; ++i) {
+            FormRef item;
+            if (raw[i].n <= 0) continue;
+            if (!nvhooks::resolver().toRef(raw[i].id, &item)) return false;   // a runtime-created item: cannot be named in the ledger, so do not touch the container
+            out->push_back({item, raw[i].n});
+        }
+        return true;
+    }
+
+    bool replaceItems(const FormRef& container, const std::vector<StoredItem>& items) override {
+        uint32_t id = nvhooks::resolver().fromRef(container);
+        if (!id || !nvhooks::resolver().lookup(id)) return false;
+        HubMute mute;
+        if (!nvhooks::execConsoleLineOn("RemoveAllItems", id)) return false;
+        char line[64];
+        bool ok = true;
+        for (const StoredItem& i : items) {
+            uint32_t item = nvhooks::resolver().fromRef(i.item);
+            if (!item || i.count <= 0) { ok = false; continue; }
+            std::snprintf(line, sizeof line, "AddItem %08X %d 1", item, i.count);
+            ok = nvhooks::execConsoleLineOn(line, id) && ok;
+        }
+        return ok;
     }
 
     void closeMenus() override { if (pinsOk()) voidCallSEH(addr::CloseAllMenusCore.addr); }

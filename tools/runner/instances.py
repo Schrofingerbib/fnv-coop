@@ -154,6 +154,8 @@ class PrefsUnavailable(RuntimeError):
 
 def display_adapter_name() -> Optional[str]:
     """The primary display adapter's name (EnumDisplayDevicesW), which is what the game's launcher writes as sD3DDevice."""
+    if os.environ.get("NVCOOP_ADAPTER"):   # a remote (ssh) session cannot enumerate displays: the name is given instead
+        return os.environ["NVCOOP_ADAPTER"]
     if os.name != "nt":
         return None
     import ctypes
@@ -226,7 +228,25 @@ def render_inis() -> Dict[str, str]:
     pr = _base_ini("FalloutPrefs.ini")
     for s, k, v in PREFS_EDITS:
         pr = ini_set(pr, s, k, v)
+    if os.environ.get("NVCOOP_LEAN") == "1":
+        fo, pr = _apply_lean(fo, pr)
     return {"Fallout.ini": fo, "FalloutPrefs.ini": pr}
+
+
+# NVCOOP_LEAN=1: the pool's low-cost profile (shadows, grass, water, effects off, no sound) for a machine short of RAM. Not applied: the window
+# size and the frame cap (a smaller window measured slower here, and a cap would distort fps scores) and keys whose effect is only a guess.
+LEAN_SKIP = {"iSize W", "iSize H", "iFPSClamp", "iPresentInterval", "iMultiSample", "bAllow30Shaders", "iTexMipMapMinimum", "bUseRefractionShader",
+             "bFXAA", "iMaxAnisotropy", "bTransparencyMultisampling"}
+
+
+def _apply_lean(fo: str, pr: str):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pool"))
+    import lowcost
+    texts = {lowcost.FO: fo, lowcost.PR: pr}
+    for r in lowcost.rows(audio_off=True):
+        if r.key not in LEAN_SKIP:
+            texts[r.file] = ini_set(texts[r.file], r.section, r.key, r.value)
+    return texts[lowcost.FO], texts[lowcost.PR]
 
 
 # ---------------------------------------------------------------- linking

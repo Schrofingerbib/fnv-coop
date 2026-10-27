@@ -6,8 +6,8 @@
 
 namespace nvcoop::intents {
 
-IntentService::IntentService(ServiceDeps deps, Config cfg, ContainerRedirect redirect)
-    : deps_(std::move(deps)), cfg_(std::move(cfg)), redirect_(std::move(redirect)) {}
+IntentService::IntentService(ServiceDeps deps, Config cfg, ContainerRedirect redirect, StorageBook stash)
+    : deps_(std::move(deps)), cfg_(std::move(cfg)), redirect_(std::move(redirect)), stash_(std::move(stash)) {}
 
 IntentService::~IntentService() {
     *live_ = 0;
@@ -52,6 +52,8 @@ void IntentService::begin(nvcoop::coop::Runtime* rt, fnvcoop::MuxTransport* mux,
         hd.dialogueStart = deps_.hostDialogue;
         hd.allowActivation = deps_.allowActivation;
         hd.interacted = deps_.interacted;
+        hd.allowStage = deps_.allowStage;
+        hd.stageRefused = deps_.stageRefused;
         hd.joined = [this](PlayerId slot) {   // asked live: a datagram can arrive in the same frame as the join
             if (!rt_ || !rt_->host()) return false;
             for (const auto& cv : rt_->host()->clients())
@@ -65,7 +67,7 @@ void IntentService::begin(nvcoop::coop::Runtime* rt, fnvcoop::MuxTransport* mux,
             return false;
         };
         hd.runAsGuest = [this](PlayerId slot, const std::function<void()>& body) { return rt_ && rt_->runAsGuest(slot, body); };
-        host_.reset(new IntentHost(std::move(hd), cfg_, redirect_));
+        host_.reset(new IntentHost(std::move(hd), cfg_, redirect_, &stash_));
         for (const auto& cv : rt->host()->clients())
             if (cv.joined) joined_.insert(cv.slot);
         // The older story-channel intents (ClientSession::submitAction -> HostSession::onAction -> this executor) get the same checks and the
@@ -142,7 +144,13 @@ uint64_t IntentService::runDialogueResult(const fnvcoop_dlg::ResultRequest& rq) 
         ++dlgStats_.asHost;
     }
     bool supported = true, ok = false;
-    auto body = [&] { ok = deps_.eng->runInfoResult(actor, slot, rq.info, rq.npc, rq.phase == fnvcoop_dlg::Phase::End, &supported); };
+    // the guest's conversation result scripts (the Fort's "give me my gear back" lines) see that guest's gear stash, like every other guest interaction
+    auto body = [&] {
+        IntentHost::StashHold hold;
+        if (host_ && !FNV_MUT(415)) hold = host_->stashEnter(slot);   // MUTANT 415: dialogue results run against the shared container (the line hands back everybody's gear)
+        ok = deps_.eng->runInfoResult(actor, slot, rq.info, rq.npc, rq.phase == fnvcoop_dlg::Phase::End, &supported);
+        if (host_) host_->stashExit(hold);
+    };
     const bool ran = FNV_MUT(326) ? (body(), true) : rt_->runAsGuest(slot, body);   // MUTANT 326: no guest window: the host is the origin, the initiator is neither paid nor charged
     ++dlgStats_.ran;
     if (!ran || !supported) ++dlgStats_.unsupported;
@@ -153,6 +161,7 @@ uint64_t IntentService::runDialogueResult(const fnvcoop_dlg::ResultRequest& rq) 
 }
 
 Obs IntentService::onActivate(const FormRef& target) { return client_ ? client_->onActivate(target) : Obs::Proceed; }
+bool IntentService::onStageBlocked(const FormRef& quest, uint32_t stage) { return client_ && client_->onStageBlocked(quest, stage); }
 Obs IntentService::onEvent(uint32_t mask, const FormRef& target) { return client_ ? client_->onEvent(mask, target) : Obs::Proceed; }
 uint32_t IntentService::submit(Kind kind, const FormRef& target, const FormRef* aux, int32_t value, std::vector<uint8_t> path) {
     return client_ ? client_->submit(kind, target, aux, value, std::move(path)) : 0u;

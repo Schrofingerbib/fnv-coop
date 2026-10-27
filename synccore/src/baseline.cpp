@@ -256,10 +256,16 @@ void walkEntries(const ShadowState& w, F&& put) {
 }
 }  // namespace
 
-std::vector<uint32_t> shardHashesOf(const ShadowState& w) {
-    if (mutations().slowHashing) return shardHashes(baselineEntries(w));   // TEST ONLY: the perf budget must catch this
+uint64_t shardTerm(uint64_t key, uint32_t value) { return mix(key + (static_cast<uint64_t>(value) << 1) * 0x9E3779B97F4A7C15ull); }
+
+bool sameScriptVarValue(const FormRef& owner, uint16_t index, double a, double b) { return kvVar(owner, index, a).val == kvVar(owner, index, b).val; }
+bool sameGlobalValue(const FormRef& global, double a, double b) { return kvGlobal(global, a).val == kvGlobal(global, b).val; }
+
+std::vector<uint32_t> shardHashesOf(const ShadowState& w, const std::vector<ShardAdjust>* adjust) {
+    if (mutations().slowHashing && !adjust) return shardHashes(baselineEntries(w));   // TEST ONLY: the perf budget must catch this
     std::vector<uint64_t> acc(kSyncShards, 0);
     walkEntries(w, [&](size_t cls, const KV& h) { acc[cls * 16 + static_cast<size_t>(h.key % 16)] += mix(h.key + (static_cast<uint64_t>(h.val) << 1) * 0x9E3779B97F4A7C15ull); });
+    if (adjust) for (auto& a : *adjust) if (a.shard < kSyncShards) acc[a.shard] += a.add - a.sub;   // acknowledged divergences, see HostSession::Client::acks
     std::vector<uint32_t> out(kSyncShards);
     for (size_t i = 0; i < kSyncShards; ++i) out[i] = static_cast<uint32_t>(acc[i] ^ (acc[i] >> 32));
     return out;
@@ -607,6 +613,15 @@ bool revertEffectFor(const ShadowState& clientWorld, uint64_t key, Effect& out) 
         return false;
     }
     return false;
+}
+
+bool mayHaveRevert(const Effect& e) {   // keep in step with the cases of revertEffectFor above
+    return std::holds_alternative<KillActor>(e) || std::holds_alternative<SetFastTravelLock>(e) || std::holds_alternative<CompanionOwner>(e) ||
+           std::holds_alternative<AddNote>(e) || std::holds_alternative<RefAngle>(e) || std::holds_alternative<SpawnRef>(e) ||
+           std::holds_alternative<DespawnRef>(e) || std::holds_alternative<RefAddItem>(e) || std::holds_alternative<RefRemoveItem>(e) ||
+           std::holds_alternative<RemoveAllItems>(e) || std::holds_alternative<SetLock>(e) || std::holds_alternative<RefScriptVar>(e) ||
+           std::holds_alternative<SetMapMarker>(e) || std::holds_alternative<SetWeather>(e) || std::holds_alternative<SetTimeScale>(e) ||
+           std::holds_alternative<ObjectState>(e);
 }
 
 uint64_t contentHashOf(const std::vector<std::string>& names) {

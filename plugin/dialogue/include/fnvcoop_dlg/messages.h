@@ -40,6 +40,7 @@ enum class CloseReason : uint8_t {
     HostShutdown = 7,
     ProtocolError = 8,
     Preempted = 9,      // the companion's owner took the NPC over from a non-owner conversation
+    ConsentDenied = 10, // the party refused an irreversible choice (ChoiceConsent): the INFO's scripts never ran
 };
 enum class Phase : uint8_t { Begin = 0, End = 1 };
 
@@ -243,7 +244,7 @@ inline DecodeStatus decode(const uint8_t* d, size_t n, Msg& out, bool verifyCrc 
             m = x; break;
         }
         case 4: { LineDone x; x.conv = r.v32(); x.step = r.v32(); m = x; break; }
-        case 5: { EndReq x; x.conv = r.v32(); x.reason = enumv<CloseReason>(r, 1, 9); m = x; break; }
+        case 5: { EndReq x; x.conv = r.v32(); x.reason = enumv<CloseReason>(r, 1, 10); m = x; break; }
         case 6: { Heartbeat x; x.conv = r.v32(); m = x; break; }
         case 7: { StartDenied x; x.reqId = r.v32(); x.reason = enumv<DenyReason>(r, 1, 6); x.owner = r.u8(); m = x; break; }
         case 8: { Opened x; x.conv = r.v32(); x.reqId = r.v32(); x.npc = r.form(); x.initiator = r.u8(); m = x; break; }
@@ -254,7 +255,7 @@ inline DecodeStatus decode(const uint8_t* d, size_t n, Msg& out, bool verifyCrc 
         }
         case 10: { Result x; x.conv = r.v32(); x.step = r.v32(); x.phase = enumv<Phase>(r, 0, 1); x.txnSeq = r.var(); m = x; break; }
         case 11: { Control x; x.conv = r.v32(); x.lockMask = r.u8(); x.locked = r.u8() != 0; m = x; break; }
-        case 12: { Closed x; x.conv = r.v32(); x.reason = enumv<CloseReason>(r, 1, 9); m = x; break; }
+        case 12: { Closed x; x.conv = r.v32(); x.reason = enumv<CloseReason>(r, 1, 10); m = x; break; }
         case 13: {
             MenuRequest x; x.menu = r.v32(); x.kind = enumv<MenuKind>(r, 1, 10); x.origin = r.u8(); x.text = r.str();
             x.defaultChoice = int32_t(r.vari()); x.subject = r.form();

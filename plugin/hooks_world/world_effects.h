@@ -38,10 +38,13 @@ struct SetRestrained {
 };
 // SetEnemy / SetAlly between two factions. kind 0 neutral, 1 enemy, 2 ally.
 enum class Relation : uint8_t { Neutral = 0, Enemy = 1, Ally = 2 };
+// flags1 / flags2: the two optional integers of the script command (`SetEnemy FactionA FactionB [flagA] [flagB]`), replayed as given (the capture used to
+// drop them, so `SetEnemy A B 1 1` reached the other machines as `SetEnemy A B`).
 struct SetRelation {
     fnvcoop::FormRef a, b;
     Relation kind = Relation::Neutral;
-    bool operator==(const SetRelation& o) const { return a == o.a && b == o.b && kind == o.kind; }
+    uint8_t flags1 = 0, flags2 = 0;
+    bool operator==(const SetRelation& o) const { return a == o.a && b == o.b && kind == o.kind && flags1 == o.flags1 && flags2 == o.flags2; }
 };
 struct SetScriptPackage {
     fnvcoop::FormRef actor, package;
@@ -83,9 +86,39 @@ struct SetCellPublic {
     bool operator==(const SetCellPublic& o) const { return cell == o.cell && on == o.on; }
 };
 
+// Lock / open / destroyed state of a door, container or activator that a SCRIPT changed (UnLock, Lock, SetOpenState, SetDestroyed). The same fact also travels as
+// the ObjectState effect of the capture hub; this copy goes through the world channel, which no state filter stands in front of (the shadow only forwards an
+// effect it counts as a change, and it does not know the engine's own lock state), and which a client that joins later gets replayed. mask = the
+// ObjectState mask bits (kObjOpen 1, kObjLock 2, kObjDestroyed 4).
+struct SetObjectState {
+    fnvcoop::FormRef ref;
+    uint8_t mask = 0;
+    bool open = false, locked = false;
+    int32_t level = 0;
+    bool destroyed = false;
+    bool operator==(const SetObjectState& o) const {
+        return ref == o.ref && mask == o.mask && open == o.open && locked == o.locked && level == o.level && destroyed == o.destroyed;
+    }
+};
+
+// Presentation of a host-run script (G39): what the script shows or plays on the screen and speakers of the machine that runs it. A guest never runs the
+// script, so without this it sees no fade and hears no sound. One-shot: never replayed to a late joiner (isEphemeral).
+enum class PresentKind : uint8_t { ApplyImageSpace = 0, RemoveImageSpace = 1, PlayMusic = 2, PlaySound = 3 };
+struct Present {
+    PresentKind kind = PresentKind::ApplyImageSpace;
+    fnvcoop::FormRef form;   // the ImageSpaceModifier / Music type / Sound
+    float value = 0;         // ApplyImageSpace / RemoveImageSpace: the optional strength; PlaySound: the optional integer argument
+    bool hasValue = false;
+    bool operator==(const Present& o) const { return kind == o.kind && form == o.form && value == o.value && hasValue == o.hasValue; }
+};
+
 using WorldEffect = std::variant<SetActorValueRef, SetEssential, SetRestrained, SetRelation, SetScriptPackage, SetIgnoreCrime,
-                                 SetFactionPlayerEnemy, SetOwner, SetCellOwner, SetCellPublic>;
+                                 SetFactionPlayerEnemy, SetOwner, SetCellOwner, SetCellPublic, SetObjectState, Present>;
 
 const char* worldEffectName(const WorldEffect& e);
+// True for one-shot effects: sent to the machines connected now, never kept for a late joiner.
+bool isEphemeral(const WorldEffect& e);
+// The key Runtime::pushWorldEffect coalesces on (a later state effect for the same subject replaces the earlier one); empty = a delta or an event.
+std::string worldEffectKey(const WorldEffect& e);
 
 }  // namespace nvworld

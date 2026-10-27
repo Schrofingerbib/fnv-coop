@@ -36,6 +36,11 @@ enum class Kind : uint8_t {
     ContainerOpen = 7,  // opened a container: one user at a time (the "in use" lock), per-slot storage is redirected
     ContainerClose = 8, // closed it: releases the lock
     TriggerLeave = 9,   // left the trigger volume (OnTriggerLeave player)
+    SetStage = 10,      // a quest stage advance the guest's own script / console tried to make (target = the quest, value = the stage). A REQUEST: the guest
+                        // applies nothing; the host runs the real SetStage (result scripts included) when the quest is behind that stage and its rules allow it
+    TriggerStay = 11,   // the guest's player is STILL inside a trigger volume (its per-frame OnTrigger events, throttled): keeps the host's presence alive, which
+                        // re-raises OnTrigger for the puppet every host frame until TriggerLeave / the lease runs out (G04)
+    StartCombat = 12,   // an actor (target) started combat with the guest's player: runs the actor's OnStartCombat blocks with the puppet as `player` (G04)
     Count_
 };
 const char* kindName(Kind k);
@@ -57,6 +62,8 @@ enum class Result : uint8_t {
     Unsupported,      // the engine path is not available (TODO-RE); nothing ran
     Failed,           // the engine refused or faulted
     Stale,            // older than the newest handled intent of this player (out of order)
+    NoAdvance,        // SetStage: the quest is already at or past that stage on the host (nothing ran: the stage merge is max, result scripts never re-run)
+    Deferred,         // SetStage: the host's rules hold the stage (barrier / party tether); the host releases it itself later and the txn reaches everybody
     Count_
 };
 const char* resultName(Result r);
@@ -90,6 +97,9 @@ struct Verdict {
 struct Config {
     bool enable = false;           // master switch (default OFF, like every live-layer part)
     bool activate = true, trigger = true, pickup = true, terminal = true, container = true;
+    bool stage = true;             // Kind::SetStage: a guest's blocked quest stage advance is forwarded (guest) and judged (host)
+    bool triggerStay = true;       // Kind::TriggerStay: per-frame OnTrigger blocks (needs trigger=1 as well)
+    bool combat = true;            // Kind::StartCombat: OnStartCombat blocks that filter on the player
     bool hit = false;              // see Kind::Hit: default off, the combat channel already raises OnHit for actors
     bool dialogue = false;         // DialogueStart forwarding needs L8's engine glue (not wired in this build)
     bool dialogueResults = true;   // host: run a guest conversation's INFO result scripts (replaces coop_module's stub runner)
@@ -109,9 +119,15 @@ struct Config {
     uint32_t lockLeaseMs = 120000; // a container lock the guest never released (crash, alt-F4) expires
     uint32_t triggerCooldownMs = 800;   // per (player, trigger): re-entry inside the volume is not a new event
     uint32_t pendingTimeoutMs = 6000;   // guest: no verdict by then = lost (counted, the UI is released)
+    float reachCombat = 6000.f;    // an NPC that opens fire from across the street still starts combat with the puppet
+    uint32_t stayKeepaliveMs = 1000;    // guest: one TriggerStay per trigger per this many ms while its OnTrigger events keep coming
+    uint32_t stayLeaseMs = 3500;        // host: a presence nobody refreshed (no TriggerStay, no TriggerLeave) ends after this long
+    uint32_t stayRaiseMs = 0;           // host: OnTrigger is raised for every present puppet at most every this many ms (0 = every host frame, like the engine)
+    uint32_t stayMax = 64;              // host: presences held at once (a flood cannot make the host raise thousands of events a frame)
+    bool storage = true;           // host: per-player stashes on shared gear containers (storage_book.h); needs the stashes in nvcoop_intents.json
     uint32_t coalesceMs = 250;     // guest: the same (kind, target) again inside this window is a double click, not a second intent
     uint32_t claimMemory = 4096;   // host: how many claimed items are remembered
-    std::string redirectFile;      // nvcoop_intents.json next to the dll: per-slot container redirects (container_redirect.h)
+    std::string redirectFile = "nvcoop_intents.json";   // next to the dll: per-slot container redirects (container_redirect.h) and gear stashes (storage_book.h)
 };
 
 }  // namespace nvcoop::intents

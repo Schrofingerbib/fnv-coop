@@ -20,7 +20,7 @@ function(nvi_flags tgt)
   target_compile_definitions(${tgt} PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN NOMINMAX)
 endfunction()
 
-set(NVI_SRC ${NVI_DIR}/intent_wire.cpp ${NVI_DIR}/intent_policy.cpp ${NVI_DIR}/container_redirect.cpp ${NVI_DIR}/intent_host.cpp
+set(NVI_SRC ${NVI_DIR}/intent_wire.cpp ${NVI_DIR}/intent_policy.cpp ${NVI_DIR}/container_redirect.cpp ${NVI_DIR}/storage_book.cpp ${NVI_DIR}/intent_host.cpp
     ${NVI_DIR}/intent_client.cpp ${NVI_DIR}/intent_service.cpp)
 foreach(sfx "" "_rt")
   add_library(nvcoop_intents_core${sfx} STATIC ${NVI_SRC})
@@ -49,5 +49,9 @@ if(TARGET nvcoop AND TARGET nvcoop_hooks_game AND MSVC AND CMAKE_SIZEOF_VOID_P E
   target_sources(nvcoop PRIVATE ${NVI_DIR}/engine/intents_module.cpp ${NVI_DIR}/engine/game_engine.cpp)
   target_link_libraries(nvcoop PRIVATE nvcoop_intents_core)
   target_compile_definitions(nvcoop PRIVATE NVCOOP_WITH_INTENTS=1)
+  # the shared gear containers and redirects (nvcoop_intents.json), deployed next to nvcoop.dll like nvcoop_guest_local_run.json
+  if(DEFINED NVCOOP_OUT_DIR AND EXISTS "${NVI_DIR}/data/nvcoop_intents.json")
+    configure_file(${NVI_DIR}/data/nvcoop_intents.json ${NVCOOP_OUT_DIR}/nvcoop_intents.json COPYONLY)
+  endif()
   target_include_directories(nvcoop PRIVATE ${NVI_DIR}/.. ${NVI_DIR}/../coop)
 endif()

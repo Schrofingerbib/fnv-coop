@@ -110,6 +110,10 @@ public:
 
     // A quest wants to advance to `stage` on the host. Deferred => do not perform it now; applyStage fires on release.
     StageDecision onStageRequested(const FormRef& quest, uint32_t stage, PlayerId initiator);
+    // ExclusiveStages, asked BEFORE anything runs: true when `stage` is an alternative outcome and a different one of the same set was committed first (or is the
+    // quest's present stage). filter() would drop that SetStage from the txn anyway, but only after its result scripts ran on the host; a guest's stage
+    // request (plugin/intents Kind::SetStage) is refused up front with this. Read-only.
+    bool stageExcluded(const FormRef& quest, uint32_t stage) const;
     // A player finished their per-player step of `quest` (chargen etc.). Slot 0 = the host player.
     void onPlayerPassed(PlayerId slot, const FormRef& quest);
     // A player is now in `cell` (clients report via IntentKind::ReportCell; the host reports itself).

@@ -66,6 +66,8 @@ void WorldTimeSession::frame(uint64_t nowMs) {
         broker_.tick(nowMs);
         if (env_.engine->readClock(&t)) {
             if (auto b = authority_.tick(nowMs, t, env_.engine->timeScale())) broadcastBeacon(*b);
+            GameTime back;
+            if (authority_.takeUndo(&back) && env_.engine->writeClock(back)) ++stats_.scriptedRepeatsUndone;
         }
         return;
     }

@@ -666,6 +666,27 @@ class Sched(unittest.TestCase):
             self.assertIsNone(X.pick(self.t(0), [claim], pairs))
         self.assertEqual(X.claim(self.t(2), [2, 3], 2), [2, 3], "an ordinary test claims only its own copies")
 
+    def test_max_pairs_defaults_to_two_and_the_env_raises_it(self):
+        self.assertEqual(X.max_pairs({}), 2)
+        self.assertEqual(X.max_pairs({"PROOF_MAX_PAIRS": "3"}), 3)
+        self.assertEqual(X.max_pairs({"PROOF_MAX_PAIRS": "1"}), 2, "never below the owner PC default")
+        self.assertEqual(X.max_pairs({"PROOF_MAX_PAIRS": "x"}), 2)
+        self.assertEqual(X.max_pairs({"PROOF_MAX_PAIRS": "99"}), 6, "ports and slots cap it")
+
+    def test_three_pairs_take_three_different_pairs_and_provision_pair_two(self):
+        t2 = self.t(2)
+        self.assertEqual(X.pick(t2, [[0, 1], [2, 3]], 3), [4, 5])
+        self.assertEqual(X.pick(t2, [[0, 1], [4, 5]], 3), [2, 3])
+        self.assertIsNone(X.pick(t2, [[0, 1], [2, 3], [4, 5]], 3), "three pairs busy: wait")
+        self.assertIsNone(X.pick(self.t(3), [[4, 5]], 3), "a three-copy test still runs alone")
+        self.assertEqual(X.provision_args(t2, [4, 5], True), ["--pairs=3", "--first-pair=2"])
+        self.assertEqual(sorted(X.claim(self.t(0, alone=True), [], 3)), [0, 1, 2, 3, 4, 5], "an alone test blocks all three pairs")
+
+    def test_nvse_dir_comes_from_the_env_into_the_provision_command(self):
+        self.assertEqual(X.nvse_args({}), [])
+        nvse = "D:/deps/nvse"
+        self.assertEqual(X.nvse_args({"PROOF_NVSE_DIR": nvse}), ["--nvse-dir=" + nvse])
+
     def test_pair_of(self):
         self.assertEqual([X.pair_of([0, 1]), X.pair_of([2, 3]), X.pair_of([0, 1, 2]), X.pair_of([])], [0, 1, 0, None])
 
@@ -1275,7 +1296,7 @@ class ManifestSetup(unittest.TestCase):
 
     def test_tests_that_need_the_player_in_a_cell_load_the_scenario_first(self):
         # sweep 2026-10-22 13:50: five tests ran from the main menu ("avatar runtime not created yet (no player in a cell)")
-        ids = ("puppet_loopback", "puppet_two_copy", "avatars_phases", "avatars_lifecycle", "social_proof", "loot_proof", "worldtime_proof")
+        ids = ("puppet_loopback", "puppet_two_copy", "avatars_phases", "avatars_lifecycle", "social_proof", "loot_proof", "worldtime_proof", "actor_port_two_copy")
         for tid in ids:
             t = self.t[tid]
             self.assertTrue(t["needs_world"], tid)
@@ -1295,6 +1316,17 @@ class ManifestSetup(unittest.TestCase):
         unmarked.pop("needs_world")
         self.assertTrue(prove.world_problem(unmarked))
         self.assertTrue(any("avatars_phases" in b for b in prove.check_manifest({"params": self.m["params"], "tests": [bare]})))
+
+    def test_the_two_copy_actor_port_test_jumps_to_the_scenario_before_coop_owner_is_asked(self):
+        # sweep 2026-10-22 .. 23: "NOT READY: coop.owner does not know the NPC on both copies" on every run, the copies sat in the main menu
+        t = self.t["actor_port_two_copy"]
+        self.assertEqual(t["commands"][0]["argv"][0], "tools/proof/drivers/load_scenario.py")
+        self.assertEqual([c["name"] for c in t["commands"]], ["load_scenario", "wiring", "two_copy"])
+        self.assertIsNone(prove.world_problem(t))
+        self.assertTrue(prove.world_problem(dict(t, commands=t["commands"][1:])), "without the jump")
+        unmarked = dict(t)
+        unmarked.pop("needs_world")
+        self.assertTrue(prove.world_problem(unmarked), "without the mark")
 
     def test_the_vats_weapons_are_form_ids_not_editor_ids(self):
         # sweep 2026-10-22: params.local.json held "WeapNV9mmPistol": `additem` on an editor id makes nothing

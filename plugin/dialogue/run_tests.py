@@ -40,33 +40,36 @@ def build(exe, srcs):
 
 
 def run(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=HERE)   # engine_tests read data/*.txt relative to plugin/dialogue
     print(r.stdout, r.stderr)
     return r.returncode
 
 
 def compile_xnvse():
-    """Compile-only check of engine/engine_xnvse.cpp against the xNVSE headers (x86, same flags as nvcoop)."""
+    """Compile-only check of engine/engine_xnvse.cpp and engine/guest_dialogue.cpp against the xNVSE headers (x86, same flags as nvcoop)."""
     n = os.path.join(REPO, 'third_party', 'NVSE')
-    bat = os.path.join(OUT, 'build_engine_xnvse.bat')
-    lines = ['@echo off', 'call "%s" >nul' % VC,
-             'cl /nologo /c /std:c++latest /EHsc /Zc:__cplusplus /permissive- /DRUNTIME=1 /DRUNTIME_VERSION=0x040020D0 '
-             '/DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS /FI"%s" /I"%s" /I"%s" /I"%s" /I"%s" /I"%s" /I"%s" /I"%s" /I"%s" "%s" /Fo"%s"' % (
-                 os.path.join(n, 'nvse', 'nvse', 'prefix.h'), n, os.path.join(n, 'nvse'), os.path.join(n, 'nvse', 'nvse'),
-                 os.path.join(HERE, 'include'), os.path.join(HERE, 'engine'), os.path.join(SYN, 'include'),
-                 os.path.join(REPO, 'plugin', 'hooks_ui'), os.path.join(REPO, 'plugin', 'hooks'),
-                 os.path.join(HERE, 'engine', 'engine_xnvse.cpp'), os.path.join(OUT, 'engine_xnvse.obj'))]
-    with open(bat, 'w', newline='') as f:
-        f.write(CRLF.join(lines) + CRLF)
-    r = subprocess.run(['cmd', '/c', bat], capture_output=True, text=True)
-    print('[%s] compile engine_xnvse.cpp (x86, xNVSE headers)' % ('PASS' if r.returncode == 0 else 'FAIL'))
-    if r.returncode:
-        print(r.stdout, r.stderr)
-    return r.returncode
+    rc = 0
+    for src in ('engine_xnvse', 'guest_dialogue'):
+        bat = os.path.join(OUT, 'build_%s.bat' % src)
+        lines = ['@echo off', 'call "%s" >nul' % VC,
+                 'cl /nologo /c /std:c++latest /EHsc /Zc:__cplusplus /permissive- /DRUNTIME=1 /DRUNTIME_VERSION=0x040020D0 '
+                 '/DWIN32 /D_WINDOWS /D_CRT_SECURE_NO_WARNINGS /FI"%s" /I"%s" /I"%s" /I"%s" /I"%s" /I"%s" /I"%s" /I"%s" /I"%s" "%s" /Fo"%s"' % (
+                     os.path.join(n, 'nvse', 'nvse', 'prefix.h'), n, os.path.join(n, 'nvse'), os.path.join(n, 'nvse', 'nvse'),
+                     os.path.join(HERE, 'include'), os.path.join(HERE, 'engine'), os.path.join(SYN, 'include'),
+                     os.path.join(REPO, 'plugin', 'hooks_ui'), os.path.join(REPO, 'plugin', 'hooks'),
+                     os.path.join(HERE, 'engine', src + '.cpp'), os.path.join(OUT, src + '.obj'))]
+        with open(bat, 'w', newline='') as f:
+            f.write(CRLF.join(lines) + CRLF)
+        r = subprocess.run(['cmd', '/c', bat], capture_output=True, text=True)
+        print('[%s] compile %s.cpp (x86, xNVSE headers)' % ('PASS' if r.returncode == 0 else 'FAIL', src))
+        if r.returncode:
+            print(r.stdout, r.stderr)
+        rc |= r.returncode
+    return rc
 
 
 rc = 0
-for tool in (['tools/info_stats.py', '--md', 'tools/info_stats.md'], ['tools/gen_m1_dialogue.py'], ['tools/gen_companion_topics.py'], ['tools/gen_consent_messages.py']):
+for tool in (['tools/info_stats.py', '--md', 'tools/info_stats.md'], ['tools/gen_m1_dialogue.py'], ['tools/gen_companion_topics.py'], ['tools/gen_consent_messages.py'], ['tools/gen_player_data.py'], ['tools/gen_follower_rules.py'], ['tools/gen_menumode_scripts.py']):
     s = subprocess.run([sys.executable, '-I', os.path.join(HERE, tool[0])] + [
         os.path.join(HERE, a) if a.endswith('.md') else a for a in tool[1:]], capture_output=True, text=True)
     print(s.stdout.strip() or '%s ok' % tool[0], s.stderr.strip())

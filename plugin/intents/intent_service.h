@@ -29,11 +29,13 @@ struct ServiceDeps {
     std::function<void(const FormRef& npc, PlayerId slot)> hostDialogue;   // host: optional notice for DialogueStart
     std::function<bool(PlayerId slot, const FormRef& target)> allowActivation;                  // host: plugin/companions, false = refuse (HostDeps::allowActivation)
     std::function<void(PlayerId slot, bool pickup, const FormRef& target)> interacted;          // host: plugin/companions, a guest interaction ran (HostDeps::interacted)
+    std::function<bool(PlayerId slot, const FormRef& quest, uint32_t stage)> allowStage;        // host: quest policy for a guest's SetStage (HostDeps::allowStage)
+    std::function<void(PlayerId slot, const FormRef& quest, uint32_t stage, Result why)> stageRefused;   // host: a guest stage was refused / held / skipped (the module logs it)
 };
 
 class IntentService {
 public:
-    IntentService(ServiceDeps deps, Config cfg, ContainerRedirect redirect = ContainerRedirect());
+    IntentService(ServiceDeps deps, Config cfg, ContainerRedirect redirect = ContainerRedirect(), StorageBook stash = StorageBook());
     ~IntentService();
 
     // Once per game frame, AFTER Runtime::frame() (which polls the mux and so delivers our datagrams). null / not running = no session.
@@ -42,6 +44,8 @@ public:
     // Guest observers (the module wires them into nvhooks::setActivateObserver / setEventObserver).
     Obs onActivate(const FormRef& target);
     Obs onEvent(uint32_t mask, const FormRef& target);
+    // Guest: the SetStage detour dropped a script / console stage advance (nvhooks::setStageRequestObserver). true = forwarded to the host.
+    bool onStageBlocked(const FormRef& quest, uint32_t stage);
     // Guest: send an intent by hand (terminal entry hook, RPC). 0 = not sent.
     uint32_t submit(Kind kind, const FormRef& target, const FormRef* aux = nullptr, int32_t value = 0, std::vector<uint8_t> path = {});
     // The host loaded a save: claims, locks and cooldowns of the old world are meaningless.
@@ -51,6 +55,8 @@ public:
     bool isHost() const { return up_ && isHost_; }
     IntentHost* host() { return host_.get(); }
     IntentClient* client() { return client_.get(); }
+    // The gear ledger (storage_book.h). It outlives sessions: the module saves stateJson() when dirty() and reloads it at start.
+    StorageBook& stash() { return stash_; }
     const Config& config() const { return cfg_; }
     uint64_t sessions() const { return sessions_; }
     std::string statusJson() const;
@@ -70,6 +76,7 @@ private:
     ServiceDeps deps_;
     Config cfg_;
     ContainerRedirect redirect_;
+    StorageBook stash_;
     nvcoop::coop::Runtime* rt_ = nullptr;
     fnvcoop::MuxTransport* mux_ = nullptr;
     bool up_ = false, isHost_ = false;

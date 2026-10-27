@@ -43,6 +43,7 @@ struct AvatarFaults {
     bool noPuppetDeathRespawn = false;   // a puppet that died stays in the world as a corpse
     bool appearanceUpdateRespawns = false;   // a look change that keeps race and sex still deletes and respawns the puppet
     bool adoptPhysicsPush = false;       // ActualPose reports the pushed place, so the buffer eases the puppet back from it (teleport out and back)
+    bool noBodyRoom = false;             // a puppet is put inside the local player's body (the engine shoves the real player)
 };
 
 inline AvatarFaults& avatarFaults() {

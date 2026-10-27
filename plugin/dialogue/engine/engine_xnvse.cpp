@@ -15,8 +15,10 @@
 #include "nvse/GameData.h"
 #include "nvse/GameForms.h"
 
+#include "engine_xnvse.h"
 #include "glue.h"
 #include "voice_token.h"
+#include "ui_addrs.h"   // pinned prologues of the engine functions called below
 #include "ui_hooks.h"   // L11 hooks_ui: nvui::ops (real message boxes, vanilla menus, CloseAllMenus core, StartConversation)
 
 namespace fndlg {
@@ -55,12 +57,146 @@ uint32_t RuntimeRefId(const FormRef& r) {
     return 0;
 }
 
+// ---- engine calls (each in its own function: SEH cannot share a frame with C++ objects). A fault answers false instead of crashing.
+const fnvcoop_dlg::FactTable* g_facts = nullptr;
+constexpr uint32_t kPlayerRef = 0x14;
+constexpr uint32_t kActorValueOwnerOffset = 0xA4;   // Actor+0xA4 = ActorValueOwner (docs/engine-addresses.md: vtbl[3] = GetActorValue 0x66EF50)
+
+uint32_t LookupForm(uint32_t refID) {
+    __try {
+        return reinterpret_cast<uint32_t>(reinterpret_cast<void*(__cdecl*)(uint32_t)>(nvui::addr::LookupFormByID.addr)(refID));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+bool CallLoadResponses(uint32_t info) {   // TESTopicInfo::GetResponses(info, 0): the chain lands in the engine cache cell
+    __try {
+        reinterpret_cast<void*(__thiscall*)(void*, void*)>(nvui::addr::DialogGetResponses.addr)(reinterpret_cast<void*>(uintptr_t(info)), nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool CallMarkSaid(uint32_t info) {
+    __try {
+        reinterpret_cast<void(__thiscall*)(void*)>(nvui::addr::InfoMarkSaid.addr)(reinterpret_cast<void*>(uintptr_t(info)));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool WriteByte(uint32_t addr, uint8_t v) {
+    __try {
+        *reinterpret_cast<volatile uint8_t*>(uintptr_t(addr)) = v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool CallCondition(uint32_t fn, uint32_t thisObj, uint32_t p1, double* out) {   // cdecl (thisObj, p1, p2, double*)
+    __try {
+        *out = 0;
+        return reinterpret_cast<bool(__cdecl*)(void*, void*, void*, double*)>(uintptr_t(fn))(
+            reinterpret_cast<void*>(uintptr_t(thisObj)), reinterpret_cast<void*>(uintptr_t(p1)), nullptr, out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool ReadActorValue(uint32_t player, uint32_t code, float* out) {   // the player is always loaded: the direct read is exact
+    __try {
+        *out = reinterpret_cast<float(__thiscall*)(void*, uint32_t)>(0x66EF50)(reinterpret_cast<void*>(uintptr_t(player + kActorValueOwnerOffset)), code);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+bool ReadItemCount(uint32_t player, uint32_t item, int* out) {
+    __try {
+        void* data = reinterpret_cast<void*(__cdecl*)(void*)>(nvui::addr::ContainerChangesOf.addr)(reinterpret_cast<void*>(uintptr_t(player)));
+        if (!data) return false;
+        *out = reinterpret_cast<int(__thiscall*)(void*, void*)>(nvui::addr::ContainerChangesCount.addr)(data, reinterpret_cast<void*>(uintptr_t(item)));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+uint32_t PeekU32(uint32_t a) {
+    __try {
+        return *reinterpret_cast<volatile uint32_t*>(uintptr_t(a));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+// One fact for the local player. Actor values and item counts use the engine primitives (the condition functions for these two are
+// party-reduced by plugin/hooks once a session runs, which would answer for the party instead of this player); perks and equipment use the
+// condition functions, which no hook touches.
+bool EvalFact(const fnvcoop_dlg::FactSpec& s, int32_t* value) {
+    const uint32_t player = LookupForm(kPlayerRef);
+    if (!player) return false;
+    using fnvcoop_dlg::FactKind;
+    if (s.kind == FactKind::ActorValue) {
+        float f = 0;
+        if (!ReadActorValue(player, s.what.localId, &f)) return false;
+        *value = int32_t(f);
+        return true;
+    }
+    const uint32_t form = LookupForm(RuntimeRefId(s.what));
+    if (!form) return false;
+    if (s.kind == FactKind::ItemCount) {
+        int n = 0;
+        if (!ReadItemCount(player, form, &n)) return false;
+        *value = n;
+        return true;
+    }
+    double d = 0;
+    const uint32_t fn = s.kind == FactKind::HasPerk ? nvui::addr::CondHasPerk.addr : nvui::addr::CondGetEquipped.addr;
+    if (!CallCondition(fn, player, form, &d)) return false;
+    *value = d != 0 ? 1 : 0;
+    return true;
+}
+
 }  // namespace
+
+void SetFactTable(const fnvcoop_dlg::FactTable* t) { g_facts = t; }
+
+// The response loader (see info_reader.h): makes `info` current in the engine's response cache. It must not run while the engine is
+// mid-line on ANOTHER INFO (state playing / queued): the cache would be evicted under nodes the engine still walks.
+bool LoadResponsesSafely(uint32_t info) {
+    const uint32_t menu = PeekU32(dialog_menu::kSingletonPtr);
+    if (menu) {
+        const uint32_t state = PeekU32(menu + dialog_menu::kState), spoken = PeekU32(dialog_menu::kSpokenInfoGlobal);
+        if ((state == dialog_menu::kStatePlaying || state == dialog_menu::kStateQueued) && spoken && spoken != info) return false;
+    }
+    return CallLoadResponses(info);
+}
+
+class XnvseEngine;
+XnvseEngine* g_engine = nullptr;
+void ReportUnsupported(const char* what);
+
+// Spectator output goes through the narration gate: scene lines carry the host's show stamp ("<token>#o<ord>.<after>") and must be
+// played in order with the slides; unstamped lines play at once. Subtitle = HUD message queue, voice = `<npc>.Say <topic>`.
+nvui::NarrationGate& Gate() {
+    static nvui::NarrationGate g(nvui::showSequencer(), nvui::NarrationGate::Sink{
+        [](const FormRef&, const std::string& text, float seconds) {
+            const std::string t = text.substr(0, 0x1FF);
+            QueueUIMessage(t.c_str(), 2, nullptr, nullptr, seconds, false);
+        },
+        [](const FormRef& npc, const std::string& token) {
+            nvui::VoiceToken v;
+            if (!nvui::parseVoiceToken(token, v)) {
+                ReportUnsupported("playVoice: not a voice token");
+                return;
+            }
+            if (!nvui::ops::sayTopic(RuntimeRefId(npc), v.topic)) ReportUnsupported("playVoice: npc or topic not loaded");
+        }});
+    return g;
+}
 
 class XnvseEngine : public IEngineApi {
 public:
     using Report = void (*)(const char*);
-    explicit XnvseEngine(Report r = nullptr) : report_(r) {}
+    explicit XnvseEngine(Report r = nullptr) : report_(r) { g_engine = this; }
 
     // [live] process memory, DialogMenu singleton (*(DialogMenu**)0x11D9510)
     const IMemory& memory() override { return mem_; }
@@ -100,9 +236,15 @@ public:
         return nvui::makeVoiceToken(topic, inf, responseNumber);
     }
 
-    // [stub] facts: Actor::GetActorValue (0x66EF50, L5 verified) for the AVs the INFO conditions reference,
-    // ContainerChanges item counts, perks. Needs the per-INFO form list (from L3 data / SCRO refs).
-    std::vector<fnvcoop_dlg::Fact> collectFacts(Addr32) override { unsupported("collectFacts"); return {}; }
+    // [live, in-game proof pending] the facts an INFO reads about the player (data/info_facts.txt, generated from the ESMs): actor values
+    // through the ActorValueOwner (0x66EF50), item counts through ExtraContainerChanges (0x4BF220 / 0x4C8F30), perks and equipment through
+    // the condition functions. Without the table (file missing) the pick carries no facts and the host answers as itself.
+    std::vector<fnvcoop_dlg::Fact> collectFacts(Addr32 info) override {
+        if (!g_facts || g_facts->size() == 0) return {};
+        FormRef ref;
+        if (!formRefOf(info, ref)) return {};
+        return g_facts->collect(ref, [](const fnvcoop_dlg::FactSpec& s, int32_t& v) { return EvalFact(s, &v); });
+    }
 
     // [live] speech/skill classification from the INFO's own fields
     CheckKind classifyCheck(Addr32, const InfoFlags& f) override {
@@ -125,8 +267,16 @@ public:
         QueueUIMessage(buf, 0, nullptr, nullptr, 2.0f, false);
     }
 
-    // [stub] re-run the engine's own topic-list build (DialogMenu refresh) after the end-script round trip
-    void rebuildTopicList() override { unsupported("rebuildTopicList"); }
+    // [needs in-game proof] the engine builds the next list itself at the end of the line, from the initiator's local state; the
+    // end-script gate only decides when the glue reports TopicsReady. Re-running the engine's list builder from here is not verified
+    // (0x7640A0 and the 0x762FF0 follow-up path are only mapped statically), so a late Result does not rebuild: reported once.
+    void rebuildTopicList() override {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            unsupported("rebuildTopicList: the engine list is built from local state; late end-script effects reach the NEXT list (needs in-game proof)");
+        }
+    }
     // [stub] close the DialogMenu without local end scripts. Candidates: the CloseAllMenus routine near 0x715177
     // (JIP GameUI.h comment) or Menu::HandleClick on the goodbye tile; both unverified.
     void forceCloseDialog() override { if (!nvui::ops::forceCloseDialog()) unsupported("forceCloseDialog: no DialogMenu open"); }   // [live via L11] CloseAllMenus core, END script never runs locally
@@ -140,19 +290,10 @@ public:
         QueueUIMessage(buf, 2, nullptr, nullptr, 2.0f, false);
     }
     void showTopics(const std::vector<fnvcoop_dlg::TopicEntry>&) override {}  // v1: no topic overlay
-    void showSubtitle(const FormRef&, const std::string& text, float seconds) override {
-        std::string t = text.substr(0, 0x1FF);
-        QueueUIMessage(t.c_str(), 2, nullptr, nullptr, seconds, false);
-    }
+    void showSubtitle(const FormRef& npc, const std::string& text, float seconds) override { Gate().onSubtitle(npc, text, seconds); }
     // [live via L11, in-game proof pending] token from voicePath() -> `<npc>.Say <topic>`; the engine picks the INFO by the local conditions
-    void playVoice(const FormRef& npc, const std::string& token) override {
-        nvui::VoiceToken v;
-        if (!nvui::parseVoiceToken(token, v)) {
-            unsupported("playVoice: not a voice token");
-            return;
-        }
-        if (!nvui::ops::sayTopic(RuntimeRefId(npc), v.topic)) unsupported("playVoice: npc or topic not loaded");
-    }
+    void playVoice(const FormRef& npc, const std::string& token) override { Gate().onVoice(npc, token, GetTickCount64()); }
+    void frame(uint32_t) override { Gate().tick(GetTickCount64()); }   // releases a stashed voice-less subtitle and gap-timed show items
     void hideOverlay() override {}
 
     // [live via L11, in-game proof pending] same cell (or both exterior) and within 2500 game units (about 36 m) of the local player
@@ -167,8 +308,26 @@ public:
         if (!ref || !nvui::ops::openDialogMenu(ref, topic)) unsupported("startForcedConversation: npc ref not loaded");
     }
 
-    // [stub] remove a choice from the live DialogMenu list (infos094[] entry + tile); needs the topic-list tile API
-    void hideTopic(Addr32) override { unsupported("hideTopic"); }
+    // [by design not done] unlinking a row from the ListBox would desynchronise the tile index (a click uses tile trait 0xFAC as the list
+    // index, docs/re/dialogmenu-menus-vats-inventory.md), so the row stays visible; the host rejects the pick and the glue explains why
+    // (EngineGlue::onInfoChosen -> notice). Reported once.
+    void hideTopic(Addr32) override {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            unsupported("hideTopic: owner-only command rows stay visible for non-owners; picking one is refused with a notice");
+        }
+    }
+    void notice(const std::string& t) override { QueueUIMessage(t.substr(0, 0x1FF).c_str(), 2, nullptr, nullptr, 3.0f, false); }
+    // [live, in-game proof pending] the engine's own MarkSaid (sets [info+0x22] and the save-modified flag unless flags1 & 0x10)
+    void markSaid(const FormRef& info) override {
+        const uint32_t f = LookupForm(RuntimeRefId(info));
+        if (!f || !CallMarkSaid(f)) unsupported("markSaid: INFO not loaded");
+    }
+    void clearSaid(const FormRef& info) override {
+        const uint32_t f = LookupForm(RuntimeRefId(info));
+        if (!f || !WriteByte(f + topic_info::kSaidOnce, 0)) unsupported("clearSaid: INFO not loaded");
+    }
     // [stub] the host's ShowMessageBox/ShowBarterMenu/... interception (L5) forwards the request here; opening it
     // locally means calling the same engine function the script command would have called, on THIS machine
     void openMenu(const fnvcoop_dlg::MenuRequest& rq) override { if (!nvui::ops::openMenu(rq)) unsupported("openMenu: kind not supported by hooks_ui"); }   // [live via L11]
@@ -193,6 +352,13 @@ private:
 };
 
 // Factory for the nvcoop module code (L1's NVCOOP_MODULE) to instantiate.
-IEngineApi* CreateXnvseEngine(void (*report)(const char*)) { return new XnvseEngine(report); }
+void ReportUnsupported(const char* what) {
+    if (g_engine) g_engine->unsupported(what);
+}
+
+IEngineApi* CreateXnvseEngine(void (*report)(const char*)) {
+    setResponseLoader([](Addr32 info) { return LoadResponsesSafely(info); });   // makes a default-constructed ResponseLayout work in the live game
+    return new XnvseEngine(report);
+}
 
 }  // namespace fndlg

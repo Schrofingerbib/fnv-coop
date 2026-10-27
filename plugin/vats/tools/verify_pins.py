@@ -37,6 +37,7 @@ FUNCTIONS: List[Tuple[str, str]] = [
     ("kLimbOfPart", "kLimbOfPartPrologue"),
     ("kMenuHandleClickFn", "kMenuHandleClickPrologue"),
     ("kGetMode", "kGetModePrologue"),
+    ("kThreadsActive", "kThreadsActivePrologue"),
 ]
 # site table -> the function its sites call
 SITE_TABLES: List[Tuple[str, str]] = [
@@ -45,6 +46,7 @@ SITE_TABLES: List[Tuple[str, str]] = [
     ("kTargetMultSites", "kGetTargetTimeMult"),
     ("kPauseSitesMain", "kMenuMode"),
     ("kPauseSitesExtended", "kMenuMode"),
+    ("kThreadWaitSites", "kThreadsActive"),
 ]
 Reader = Callable[[int, int], Optional[bytes]]
 
@@ -201,8 +203,8 @@ def selftest() -> int:
             print(f"  FAIL {name}")
 
     consts = h["consts"]  # type: ignore[assignment]
-    expect("the header parses: 10 functions, 5 site tables, the vtable", all(f in consts for f, _ in FUNCTIONS) and len(h["tables"]) == 5 and "kMenuVtable" in consts)  # type: ignore[arg-type]
-    expect("the table sizes are the documented ones (11, 5, 9, 2, 9)", [len(h["tables"][t]) for t, _ in SITE_TABLES] == [11, 5, 9, 2, 9])  # type: ignore[index]
+    expect("the header parses: 11 functions, 6 site tables, the vtable", all(f in consts for f, _ in FUNCTIONS) and len(h["tables"]) == 6 and "kMenuVtable" in consts)  # type: ignore[arg-type]
+    expect("the table sizes are the documented ones (11, 5, 9, 2, 9, 1)", [len(h["tables"][t]) for t, _ in SITE_TABLES] == [11, 5, 9, 2, 9, 1])  # type: ignore[index]
     expect("five game settings are pinned at least", len(h["settings"]) >= 5)  # type: ignore[arg-type]
 
     def reader_of(mem: Dict[int, int]) -> Reader:

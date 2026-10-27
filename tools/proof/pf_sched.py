@@ -18,7 +18,31 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 MUTANT = os.environ.get("PROOF_MUTANT", "")   # test-only: one deliberate bug per name (tools/proof/tests/run_tests.py)
-MAX_PAIRS = 2          # the owner's PC fits two pairs (docs/PROOF-PLAN.md section 6)
+
+
+def max_pairs(environ=None) -> int:
+    """How many pairs --pairs may ask for: 2 on the owner's PC (docs/PROOF-PLAN.md section 6). PROOF_MAX_PAIRS raises it for a PC that has the RAM
+    and the cores (the second PC: 3 pairs, FALLOUT.md); a bad value or one below 2 keeps 2, and 6 is the ceiling (ports and slots)."""
+    if MUTANT == "max_pairs_env_ignored":
+        return 2
+    raw = (os.environ if environ is None else environ).get("PROOF_MAX_PAIRS", "")
+    try:
+        n = int(str(raw).strip())
+    except ValueError:
+        return 2
+    return max(2, min(n, 6))
+
+
+def nvse_args(environ=None) -> List[str]:
+    """`--nvse-dir <dir>` for run.py provision when PROOF_NVSE_DIR names the xNVSE folder (a PC whose copies were set up from a cache folder),
+    else nothing: provisioning then leaves the loader files already in the copy alone."""
+    if MUTANT == "nvse_dir_ignored":
+        return []
+    d = (os.environ if environ is None else environ).get("PROOF_NVSE_DIR", "").strip()
+    return [f"--nvse-dir={d}"] if d else []
+
+
+MAX_PAIRS = max_pairs()
 
 
 def copies_of(test: Dict[str, Any]) -> int:

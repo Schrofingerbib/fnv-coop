@@ -101,13 +101,16 @@ const char* kindName(Kind k) {
         case Kind::ContainerOpen: return "ContainerOpen";
         case Kind::ContainerClose: return "ContainerClose";
         case Kind::TriggerLeave: return "TriggerLeave";
+        case Kind::SetStage: return "SetStage";
+        case Kind::TriggerStay: return "TriggerStay";
+        case Kind::StartCombat: return "StartCombat";
         default: return "?";
     }
 }
 
 const char* resultName(Result r) {
     static const char* n[] = {"Executed", "Duplicate", "Disabled", "NotJoined", "RateLimited", "BadTarget", "NotLoaded", "OutOfRange",
-                              "Busy", "Taken", "Denied", "NoPuppet", "Unsupported", "Failed", "Stale"};
+                              "Busy", "Taken", "Denied", "NoPuppet", "Unsupported", "Failed", "Stale", "NoAdvance", "Deferred"};
     static_assert(sizeof n / sizeof *n == static_cast<size_t>(Result::Count_), "resultName: a Result was added");
     return static_cast<size_t>(r) < sizeof n / sizeof *n ? n[static_cast<size_t>(r)] : "?";
 }

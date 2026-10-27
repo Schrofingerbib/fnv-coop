@@ -80,6 +80,7 @@ bool g_callsOk = false;
 // bot.vats accept: the detour on the VATS attack-button test 0x7EEB50 answers from this gate (main thread only: the job arms it in
 // OnFrame, VATSMenu::Update calls the detour).
 nvbots::VatsAcceptGate g_accept;
+ULONGLONG g_acceptArmedAt = 0;   // when the gate was armed (GetTickCount64)
 bool g_acceptHooked = false;
 // The game main thread: written at DeferredInit and on every frame (both run on it). 0 until then, so the native press refuses.
 volatile DWORD g_mainThread = 0;
@@ -207,6 +208,7 @@ struct LiveGame : nvbots::IEngine {
     }
     bool closeTutorial() override {
         if (!g_callsOk || !onMainThread()) return false;
+        nvcoop::Log("bots: vats trace: TutorialClose 0x7E8D60 called");
         __try {
             reinterpret_cast<void(__cdecl*)()>(nvbots::addr::TutorialClose.addr)();
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -222,6 +224,7 @@ struct LiveGame : nvbots::IEngine {
         if (!rd32(menu, &vt) || vt != nvbots::addr::VatsMenuVtbl) return false;
         if (!rd32(vt + nvbots::addr::kMenuSlotHandleClick, &fn) || fn != nvbots::addr::VatsMenuHandleClick.addr) return false;
         unsigned r = 0;
+        nvcoop::Log("bots: vats trace: VATSMenu::HandleClick(%d) called", id);
         return GuardedThis<unsigned>(&r, fn, reinterpret_cast<void*>(menu), id, 0u);
     }
     int vatsQueueCount() override {
@@ -230,6 +233,7 @@ struct LiveGame : nvbots::IEngine {
     }
     bool vatsExecute() override {
         if (!g_callsOk || !onMainThread()) return false;
+        nvcoop::Log("bots: vats trace: VatsExecute 0x705780 called");
         __try {
             reinterpret_cast<void(__stdcall*)()>(nvbots::addr::VatsExecute.addr)();
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -243,6 +247,8 @@ struct LiveGame : nvbots::IEngine {
         const int n = vatsQueueCount();
         if (n < 0) return false;
         g_accept.arm(n);
+        g_acceptArmedAt = GetTickCount64();
+        nvcoop::Log("bots: vats trace: accept gate armed (queue %d)", n);
         return true;
     }
     nvbots::Addr32 containerData(nvbots::Addr32 ref) override {
@@ -295,7 +301,16 @@ using Fn_VatsAttackButton = bool(__cdecl*)(int, char, int);
 Fn_VatsAttackButton o_VatsAttackButton = nullptr;
 
 bool __cdecl h_VatsAttackButton(int slot, char held, int binding) {
-    if (g_accept.armed() && g_accept.force(slot, (int)(unsigned char)held, g_game.vatsQueueCount())) return true;
+    if (g_accept.armed()) {
+        // a gate that stays armed more than 3 s is dropped whatever the job does (the job's own limit counts frames, which a stuck frame never ends)
+        if (GetTickCount64() - g_acceptArmedAt > 3000) {
+            g_accept.disarm();
+            nvcoop::Log("bots: vats trace: accept gate dropped after 3 s armed (forced %d)", g_accept.forced());
+        } else if (g_accept.force(slot, (int)(unsigned char)held, g_game.vatsQueueCount())) {
+            if (g_accept.forced() <= 3) nvcoop::Log("bots: vats trace: accept gate forced slot %d held %d (#%d)", slot, (int)(unsigned char)held, g_accept.forced());
+            return true;
+        }
+    }
     return o_VatsAttackButton(slot, held, binding);
 }
 
@@ -476,7 +491,17 @@ void OnMessage(uint32_t type, void*, uint32_t) {
 }
 void OnFrame() {
     g_mainThread = GetCurrentThreadId();   // the main game loop
-    if (g_rpc) g_rpc->tick();
+    if (!g_rpc) return;
+    const nvbots::VatsJob::Phase before = g_rpc->vats().phase();
+    g_rpc->tick();
+    const nvbots::VatsJob::Phase after = g_rpc->vats().phase();
+    // a job that ends in a frozen game leaves its last phase in the log: every change is written (the log is flushed per line)
+    if (after != before) {
+        uint32_t mode = 0;
+        g_game.rd32(nvbots::eng::kVatsCamera + nvbots::eng::kVatsMode, &mode);
+        nvcoop::Log("bots: vats trace: phase %s -> %s (camera mode %u)%s%s", nvbots::VatsJob::name(before), nvbots::VatsJob::name(after), mode,
+                    after == nvbots::VatsJob::kFailed ? " reason: " : "", after == nvbots::VatsJob::kFailed ? g_rpc->vats().reason().c_str() : "");
+    }
 }
 
 void OnLoad(void* nvse) { g_nvse = static_cast<NVSEInterface*>(nvse); }

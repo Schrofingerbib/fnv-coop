@@ -274,8 +274,45 @@ it from the same save, but a host without a world baseline never recorded it, an
 The host adopts such a key only after its OWN engine confirms it (`HostSession::hostQuestState`: engine stage >= the client's stage, or
 equal completed / failed flag), by committing the client's value as a normal host txn (`questStateAdopted`). When the engine disagrees the key
 is a real divergence: it is not adopted, not resent as a revert, and stays in the desync report (`questStateDisagreed`, counted per round).
-Without the hook (or when it fails) nothing is adopted and the old revert keys are sent. `SetObjective` / `CompleteAllObjectives` are not
-covered (no engine reader yet).
+Without the hook (or when it fails) nothing is adopted and the old revert keys are sent.
+
+Client-only objectives follow the same rules. `SetObjective` with flags 0 (not displayed, not completed: the objective analogue of stage 0)
+is adopted outright, the host commits the same flags 0 (`objectiveZeroAdopted`). `SetObjective` with non-zero flags and
+`CompleteAllObjectives` are adopted only after the host engine confirms them (`HostSession::hostObjectives` returns the status bits of every
+objective of the quest: the objective's flags must equal the client's, or every objective of the quest must be completed;
+`objectiveStateAdopted`). A disagreement is a real divergence: not adopted, still reported (`objectiveStateDisagreed`).
+
+Client-only script vars (`SetScriptVar`, quest vars and the vars of watched refs) are the same shape. A baseline-less host primes its engine poll
+with the values already there and drops them, so its shared world only holds vars that changed since the session started, while the client's
+digest lists every var of every quest (the completeness rule). `SetScriptVar` has no inverse. A client-only var with value 0 is the untouched
+default, the meaning of an absent key: the host commits the same 0 as a normal host txn (`scriptVarAdopted`), unless its engine
+(`HostSession::hostScriptVars`) holds another value for it (`scriptVarDisagreed`: a real divergence, not adopted, not resent, still reported).
+A non-zero value is adopted only when the host's own engine reads the same value; with no reader, a failing one, or an owner it cannot read,
+nothing is adopted. In the 2026-10-26 two-PC benchmark these keys went out as 256 revert keys per digest round that the client skipped
+(5.8 digest mismatches and 1180 repair effects per minute, idle included, the digest never ok).
+
+The repair loop never sends a revert key for a client-only entry of a kind the client can never revert (`mayHaveRevert` in baseline.cpp lists
+the kinds `revertEffectFor` handles): it is counted per round (`revertsSkippedNoInverse`, `desyncs.digests`) and stays in the report.
+Twins: `scriptVarReverted`, `noInverseResent`.
+
+Second two-PC benchmark (2026-10-27, after the script var fix: 5.9 mismatches and 744 repair effects per minute, digest never ok). What was left:
+
+- **The host never loaded the volatile list.** Only a world dump loads `nvcoop_volatile_keys.txt` and resolves its variable names, and a baseline-less host never dumps. Its poll
+  therefore committed per-machine vars (VNPCFollowers bFixedEDE / bWeaponCheck, the random-encounter quests' iSpawnMonsters, ...) that the client's dump leaves out: "differs: host has
+  it, client (missing)", every round. The host now calls `snapshot::PrepareVolatileKeys` when its state poll starts (retried until every name resolves).
+- **A baseline-less host committed "not running" for quests the client was running.** `hostQuestRunning` was only wired with a world baseline, so the completeness default won and the
+  client applied `StopQuest` to ~190 running quests (their scripts stopped). The plugin now reads the running flag (`TESQuest::flags & 1`) per reported quest
+  (`Runtime::setQuestRunningReader`). A quest the engine cannot read is left alone; only a host with no hook at all (game-free sessions) still commits the default.
+- **Client-only SetGlobal** is settled like script vars: adopted where `hostGlobals` (`TESGlobal::data`) shows the same value, never sent as a revert key.
+- **Settling is not repair.** The client's dump lists every quest, objective and var; the host's world only what changed. ~5000 default-valued keys (not running, stage 0, flags 0, var 0) and
+  ~400 engine-confirmed ones were committed once. They are counted as `effectsSettled` / `settleRounds`, no longer in `effectsRepaired` (which is what the benchmark's `deff` reads).
+- **Settling is fast.** The bad shards are asked round-robin (`askCursor`), up to `maxShardsPerRound` (32) and the reply cap, and a round that settled keys with bad shards left asks for the
+  next digest at once (`settleFollowUps`) instead of in 10 s. The benchmark needed 25 rounds because the same stuck quest shards were asked first every time.
+- **Known divergences are acknowledged once.** A client-only key the host engine contradicts (the 8 + 1 completed quests: `questStateDisagreed`), cannot read for `kUnreadRounds` rounds, or that has
+  no inverse is listed in the report with `acked: true` and remembered per client. From then on the host sums the client's term for that key into its shard hash (`ShardAdjust`), so the digest
+  agrees instead of mismatching every round, and nothing is sent. The same goes for a key repaired `kMaxRepairAttempts` (3) times with the same two values and still different (`repairGaveUp`):
+  no key is resent for ever. A change of either side's value withdraws the acknowledgement (`ackDropped`) and the key is looked at afresh; `divergenceAcked` counts them.
+  Twins: `ackIgnored`, `askLowestFirst`, `noSettleFollowUp`, `settleCountsAsRepair`, `repairForever`, `runningBlindStop`, `globalReverted`.
 
 ### 7.6 AppData
 
@@ -725,19 +762,27 @@ byte 3.. Archive (string table + body)
 
 | type | message | direction | body |
 |---|---|---|---|
-| 1 | `Intent` | guest -> host | `varu32 session`, `varu32 id`, `u8 kind` (1..9), FormRef `target`, `boolean hasAux` [FormRef `aux`], `vari32 value`, `bytes path` (<= 8) |
-| 2 | `Verdict` | host -> guest | `varu32 session`, `varu32 id`, `u8 result` (0..14), `u8 holder` (slot, 0xFF none), `boolean hasRedirect` [FormRef `redirect`] |
+| 1 | `Intent` | guest -> host | `varu32 session`, `varu32 id`, `u8 kind` (1..10), FormRef `target`, `boolean hasAux` [FormRef `aux`], `vari32 value`, `bytes path` (<= 8) |
+| 2 | `Verdict` | host -> guest | `varu32 session`, `varu32 id`, `u8 result` (0..16), `u8 holder` (slot, 0xFF none), `boolean hasRedirect` [FormRef `redirect`] |
 
-Kinds: 1 Activate, 2 TriggerEnter, 3 PickUp, 4 Hit, 5 DialogueStart, 6 TerminalUse (`path` = entry indices from the top menu down), 7 ContainerOpen, 8 ContainerClose, 9 TriggerLeave.
-Results: 0 Executed, 1 Duplicate, 2 Disabled, 3 NotJoined, 4 RateLimited, 5 BadTarget, 6 NotLoaded, 7 OutOfRange, 8 Busy (`holder`), 9 Taken, 10 Denied, 11 NoPuppet, 12 Unsupported, 13 Failed, 14 Stale.
+Kinds: 1 Activate, 2 TriggerEnter, 3 PickUp, 4 Hit, 5 DialogueStart, 6 TerminalUse (`path` = entry indices from the top menu down), 7 ContainerOpen, 8 ContainerClose, 9 TriggerLeave, 10 SetStage (`target` = the quest, `value` = the stage 1..255; a request: the guest applied nothing, the host runs the real `SetStage` only when the quest is behind that stage and the host's rules allow it), 11 TriggerStay (`target` = the trigger volume; a keep-alive of the guest's presence inside it, sent at most once per `stay_keepalive_ms`; the host raises `OnTrigger` for the puppet by itself every host frame until TriggerLeave or the lease `stay_lease_ms` runs out), 12 StartCombat (`target` = the actor that started combat with the guest's player; the host runs its `OnStartCombat` blocks once with the puppet as `player`).
+Results: 0 Executed, 1 Duplicate, 2 Disabled, 3 NotJoined, 4 RateLimited, 5 BadTarget, 6 NotLoaded, 7 OutOfRange, 8 Busy (`holder`), 9 Taken, 10 Denied, 11 NoPuppet, 12 Unsupported, 13 Failed, 14 Stale, 15 NoAdvance (SetStage: the quest is already at or past the stage), 16 Deferred (SetStage: the host's barrier / tether holds it and releases it later).
 
-Rules (each has a mutation twin in `plugin/intents/tests`, numbers 301..326):
+Rules (each has a mutation twin in `plugin/intents/tests`, numbers 301..336 and 401..415):
 - `session` is the guest's story session id; ids start at 1 in every session and only grow. The host runs each (slot, session, id) once; a repeat gets the SAME verdict again, an older id
   is `Duplicate`, id 0 is `Stale`. The slot is the transport peer's, never a field of the message. A datagram from a peer that is not a joined player is dropped.
 - A guest never applies anything from an intent. The host runs the interaction under `Runtime::runAsGuest(slot)` with the guest's puppet as the acting player; every effect
   comes back as an ordinary txn with `origin = slot`. A pickup is a CLAIM: the first wins (`Taken` for the rest), the item ref is disabled and an `AddItem{base, count, Recipient::origin()}`
   is committed, so the item reaches the claimer only. A container has one user at a time (`Busy` + `holder`), leased (`lock_lease_ms`), released by ContainerClose, by the holder
   leaving, or by the lease. A shared storage container in `nvcoop_intents.json` is answered with `redirect` = the container of that player.
+- SetStage: the guest's detour of the engine's `SetStage` drops a script / console call on a guest (the host owns quest progress) and hands it to the intents client instead of losing it
+  (`nvhooks::setStageRequestObserver`, counters `stagesBlocked` / `stagesForwarded` in `hooks.scripts`). One intent per (quest, stage) per `coalesce_ms`. The host answers `NoAdvance` when the
+  quest is already at or past the stage (the host's own copy of the script got there first; result scripts never run twice), `Denied` when the rules engine's ExclusiveStages already decided the
+  fork the other way, `Deferred` when a barrier / tether holds it; otherwise it runs the real `setstage` as the guest and the txn (origin = guest) reaches every copy, the requester's too. Each refusal is
+  a counter (`intents.status` service.detail.stage) and a host log line. Quest VARIABLES a guest writes are not part of this: an inline `set Quest.var` has no call to detour (guest_objvars.h puts the
+  host's value back for known object scripts; the host's digest repair does it for everything else).
+- PickUp of a NOTE (the item's base form is a note / holotape) grants the journal entry, not an inventory item: the host's journal gains the note (`AddNote`) and the shared `AddNote` effect travels in the txn with `origin` = the guest. The ref is disabled after the note was added.
+- Gear stashes (docs/tools/guest-intents.md): around every guest interaction the host swaps the contents of the shared gear containers of `nvcoop_intents.json` (`stashes`) for that guest's stash and back; nothing of the swap is on the wire.
 - Guards (host): rate limit per player (token bucket), reach from the puppet to the target, `Hit` refused on actors (the combat channel raises OnHit for them), a per-player trigger
   cooldown, a bounded claim table. Everything is switchable per kind in `nvcoop.ini [intents]`.
 - Versioning: the module has its own version byte; `kProtocolVersion` / `kWireVersion` are NOT bumped (the channel is not part of the Hello handshake, like 0xAC, 0xCB, 0xA5, 0xAD,
@@ -812,7 +857,7 @@ un_tests.cmd`); never run in a game. The channel is self-versioned and does NOT 
 
 ```
 byte 0   0xB1                kChannelLoot
-byte 1.. Archive (string table + body):  u8 version (=1), u8 src, u8 body index, body
+byte 1.. Archive (string table + body):  u8 version (=2), u8 src, u8 body index, body
 ```
 
 `src` is informational: the host uses the transport peer's slot and counts a mismatch (`Stats::spoofed`); a guest accepts datagrams from the host only.
@@ -825,7 +870,7 @@ byte 1.. Archive (string table + body):  u8 version (=1), u8 src, u8 body index,
 | 3 | `ReqClose` | guest -> host | `varu32 txn`, `varu32 cont`, `u64 digest` of the closer's contents |
 | 4 | `ReqHold` | guest -> host | `varu32 cont` (lock keep-alive) |
 | 5 | `ReqDrop` | guest -> host | `varu32 txn`, FormRef base, `vari32 count`, `varu32 meta`, `varu32 cell`, pos, rot |
-| 6 | `ReqClaim` | guest -> host | `varu32 txn`, `varu32 item`, `boolean hasAdopt` [WorldItem: a placed item the host has not heard of] |
+| 6 | `ReqClaim` | guest -> host | `varu32 txn`, `varu32 item`, `boolean hasAdopt` [WorldItem: a placed item the host has not heard of, then FormRef ref: the placed world ref itself, plugin:localId] |
 | 7 | `ReqResync` | guest -> host | `varu32 cont`, `boolean all` |
 | 8 | `ReqDigest` | guest -> host | `u64 digest`, `varu32 containers`, `varu32 items` |
 | 9 | `ReqTouch` | guest -> host | `varu32 net`, pos, rot (asks for clutter ownership) |
@@ -834,7 +879,7 @@ byte 1.. Archive (string table + body):  u8 version (=1), u8 src, u8 body index,
 | 12 | `MDelta` | host -> guest | `varu32 cont`, `varu32 rev`, FormRef base, `vari32 newCount` (absolute count of one base after the change) |
 | 13 | `MLock` | host -> guest | `varu32 cont`, `varu32 lockSeq`, `u8 holder` (0xFF none) |
 | 14 | `MItemNew` | host -> guest | WorldItem (a dropped item, or the table) |
-| 15 | `MItemGone` | host -> guest | `varu32 item`, `u8 by`, `varu32 txn` |
+| 15 | `MItemGone` | host -> guest | `varu32 item`, `u8 by`, `varu32 txn`, FormRef ref (a PLACED item's world ref; empty plugin for a dropped one) |
 | 16 | `MContainerGone` | host -> guest | `varu32 cont` (the host forgot it: cell reset) |
 | 17 / 18 | `MTableBegin` / `MTableEnd` | host -> guest | `varu32 seq` / `varu32 seq`, `varu32 containers`, `varu32 items` (ids not mentioned between the two are removed, only when the counts match) |
 | 19 | `MClutter` | either, unreliable | `varu32 net`, `varu32 epoch`, `varu32 seq`, pos, rot, `boolean moving` (a guest sends it to the host, the host relays it) |
@@ -844,14 +889,17 @@ ContainerRec = `varu32 id`, `u8 kind` (0 container, 1 corpse), `varu32 cell`, po
 WorldItem = `varu32 id`, FormRef base, `vari32 count`, `varu32 meta`, `varu32 cell`, pos, rot, `u8 dropper`, `varu32 dropTxn`. Dropped items get host-issued ids in
 `[0xFFB00000, 0xFFBFFFFF]`; placed items keep the id every machine derives (`plugin/actors deriveNetId`).
 
-Rules (each has a mutation twin: synccore/loot 101..137, plugin/loot 141..157):
+Rules (each has a mutation twin: synccore/loot 101..137, plugin/loot 141..167):
 - **Every request with a txn is idempotent.** The host keeps the last 256 answers per sender; a replay gets the cached answer (with a container record refreshed to the state NOW), a txn
   older than the window gets `Stale`. The ledger is cleared when the sender joins; the guest restarts its counter on `hostLinkUp`.
 - **One lock per container**, leased (default 10 minutes without a request or `ReqHold`), released by `ReqClose`, by the holder leaving, or by the lease. Take / put from a non-holder: `NotHolder`.
 - **Contents are resolved once.** `ReqRegister` and the adopt record of `ReqOpen` make the FIRST sender's items the shared ones; a later different registration gets `AlreadyResolved` with the
   shared record, which the sender puts into its engine.
 - **A close compares digests.** `ReqClose.digest` against the host's contents: a mismatch is `DigestMismatch` plus the authoritative record; the lock is released either way.
-- **Pickups are claims.** The first claim of an item wins, later ones get `AlreadyTaken` (+ the winner) or `Unknown`; a placed item stays taken (tombstone, saved with the host table).
+- **Pickups are claims.** The first claim of an item wins, later ones get `AlreadyTaken` (+ the winner) or `Unknown`; a placed item stays taken (tombstone, saved with the host table). The winner's own repeat of a claim
+  is `Ok` (never a loss: its item would be taken back), and a client sends one claim per item at a time. A placed item's net id is a hash of its ref that nothing maps back, so the claim and `MItemGone` carry
+  the ref (plugin:localId): that is how the other copies find and remove it (wire version 2; twins 170..175). The join table also carries one `MItemGone` with the ref per placed tombstone (max 4096, between
+  `MTableBegin` and `MTableEnd`, not counted in `MTableEnd`), so a client that joins after the pickup removes the item as well (twins 180..183, 176, 177).
 - **Containers are mirrored by revision.** `MDelta` applies only as `rev + 1`; a gap asks `ReqResync`; the client digest (`ReqDigest`, every 2 s while quiet) triggers a table push on mismatch (at most once per 2 s per guest).
 - **Clutter** has one owner per epoch. Only the owner's snapshots at the current epoch and a higher seq are relayed; a second mover takes over only from an owner that is not moving.
 - **Coordination with section 19.** Both modules can handle a pickup or a container open. With `[loot] enabled=1` set `[intents] pickup=0` and `container=0`; the loot module logs a warning when they are not.

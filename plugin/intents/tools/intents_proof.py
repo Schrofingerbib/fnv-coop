@@ -6,7 +6,8 @@ nvcoop.ini [intents] enable=1 on all three (and [live] avatars=1 on the host and
 host acts as a stand-in and step 2 reports it).
 
     python -I plugin/intents/tools/intents_proof.py --instances 0 1 2 --door 0xDOOR --item 0xITEM --item-base 0xBASE --container 0xCONT
-                                                    [--terminal 0xREF --entry 0] [--trigger 0xREF] [--close-menu CloseAllMenus]
+                                                    [--terminal 0xREF --entry 0] [--trigger 0xREF] [--note 0xREF --note-base 0xNOTE]
+                                                    [--npc 0xREF] [--stash] [--close-menu CloseAllMenus]
     python -I plugin/intents/tools/intents_proof.py --selftest      # game-free: the script's own pass / fail logic against a fake world
 
 Step 0 puts all three players within 400 units of the door, the item and the container by itself (bridge ref.info reads where the three
@@ -24,6 +25,10 @@ Steps (each prints PASS / FAIL with the numbers it saw):
   4 container  guest 1 opens the container (lock held), guest 2 is told it is in use, guest 1 closes the menu: the lock is released
   5 terminal   (--terminal) a terminal entry intent reaches the host and the host answers (Executed or a plain Unsupported)
   6 trigger    (--trigger) an OnTriggerEnter intent runs once on the host and its repeat inside the cooldown does not
+  6b stay      (--trigger) the guest's presence in the volume makes the host raise OnTrigger every frame by itself; a TriggerLeave ends it (G04)
+  8 note       (--note, --note-base) guest 1 picks up a note: the host's journal has it (GetHasNote true on the host and everywhere), no inventory item (G10)
+  9 combat     (--npc) an actor starts combat with guest 1: the host ran its OnStartCombat block once (G04)
+  10 stash     (--stash) the shared gear containers of nvcoop_intents.json are loaded on the host and no swap failed (G35)
   7 save gate  the host's story turns SaveSuppress on: CanSaveNow is refused on every instance (and the game's own answer is restored when it is off)
 Exit code 0 only if every step passed.
 """
@@ -277,6 +282,55 @@ class Proof:
         self.sleep(SETTLE_S)
         self.check(self.host_stat("byKind.TriggerEnter") == before + 1, "OnTriggerEnter ran once; the repeat inside the cooldown did not", self.host_stat("byKind.TriggerEnter") - before)
 
+    def step_stay(self) -> None:
+        self.log("6b stay")
+        if not self.a.trigger:
+            self.log("  (skipped: pass --trigger REF)")
+            return
+        self.nvs[1].call("intents.submit", {"kind": "stay", "ref": self.a.trigger})
+        self.sleep(SETTLE_S)
+        self.check(self.host_stat("stay.present") >= 1, "the host holds guest 1's presence in the volume", self.host_stat("stay.present"))
+        r0 = self.host_stat("stay.raises")
+        self.sleep(1.0)
+        self.check(self.host_stat("stay.raises") - r0 >= 10, "the host raised OnTrigger by itself, many times a second", self.host_stat("stay.raises") - r0)
+        self.nvs[1].call("intents.submit", {"kind": "triggerleave", "ref": self.a.trigger})
+        self.sleep(SETTLE_S)
+        self.check(self.host_stat("stay.present") == 0, "TriggerLeave ended the presence", self.host_stat("stay.present"))
+        r1 = self.host_stat("stay.raises")
+        self.sleep(1.0)
+        self.check(self.host_stat("stay.raises") == r1, "no OnTrigger after the leave", self.host_stat("stay.raises") - r1)
+
+    def step_note(self) -> None:
+        self.log("8 note")
+        if not self.a.note:
+            self.log("  (skipped: pass --note REF --note-base NOTEFORM)")
+            return
+        n0 = self.host_stat("notes")
+        self.activate(self.nvs[1], self.a.note)
+        self.sleep(SETTLE_S + 1.0)
+        self.check(self.host_stat("notes") == n0 + 1, "the host granted the note to the journal once", self.host_stat("notes") - n0)
+        has = [nv.eval(f"player.GetHasNote {self.a.note_base}") for nv in self.nvs]
+        self.check(has[0] == 1, "GetHasNote is true on the host (VMQ01 polls it there)", has)
+        self.check(all(h == 1 for h in has), "the note is in every journal (shared)", has)
+
+    def step_combat(self) -> None:
+        self.log("9 combat")
+        if not self.a.npc:
+            self.log("  (skipped: pass --npc REF)")
+            return
+        c0 = self.host_stat("byKind.StartCombat")
+        self.nvs[1].call("intents.submit", {"kind": "combat", "ref": self.a.npc})
+        self.sleep(SETTLE_S)
+        self.check(self.host_stat("byKind.StartCombat") == c0 + 1, "the host ran the actor's OnStartCombat block once", self.host_stat("byKind.StartCombat") - c0)
+
+    def step_stash(self) -> None:
+        self.log("10 stash")
+        if not self.a.stash:
+            self.log("  (skipped: pass --stash)")
+            return
+        self.check(self.host_stat("stash.containers") >= 5, "the shared gear containers of nvcoop_intents.json are loaded", self.host_stat("stash.containers"))
+        self.check(self.host_stat("stash.failed") == 0, "no stash swap failed", self.host_stat("stash.failed"))
+
     def step_save_gate(self) -> None:
         self.log("7 save gate")
         host = self.nvs[0]
@@ -305,6 +359,10 @@ class Proof:
         self.step_container()
         self.step_terminal()
         self.step_trigger()
+        self.step_stay()
+        self.step_note()
+        self.step_combat()
+        self.step_stash()
         self.step_save_gate()
         self.log(f"{self.passes} checks passed, {len(self.failures)} failed")
         for f in self.failures:
@@ -319,6 +377,7 @@ class FakeWorld:
     An activation from a player farther than 400 units from the reference does nothing, like the host's range check."""
 
     DOOR, ITEM, CONT = "FalloutNV.esm:103E61", "FalloutNV.esm:0F8B6C", "FalloutNV.esm:103E37"
+    NOTE = "FalloutNV.esm:1048AA"
 
     def __init__(self, defect: str = ""):
         self.defect = defect
@@ -333,6 +392,9 @@ class FakeWorld:
                      "byKind": {}, "rejected": {}}
         self.guest = {1: {"verdicts": 0, "rejected": {}, "closesSent": 0}, 2: {"verdicts": 0, "rejected": {}, "closesSent": 0}}
         self.gate = [0, 0, 0]
+        self.stay_present = 0
+        self.note_held = [0, 0, 0]
+        self.host.update({"stay": {"present": 0, "raises": 0}, "notes": 0, "stash": {"containers": 5, "failed": 0}})
         self.trigger_at = -99.0
         self.refpos = {self.DOOR: [3000.0 if defect == "far" else 1000.0, 1000.0, 50.0], self.ITEM: [1100.0, 1000.0, 20.0], self.CONT: [1000.0, 1150.0, 30.0]}
         self.ppos = [[-5000.0 + i * 10, -5000.0, 0.0] for i in range(3)]      # every player starts far away from the references
@@ -343,9 +405,16 @@ class FakeWorld:
 
     def sleep(self, s: float) -> None:
         self.t += s
+        if self.stay_present and self.defect != "stay":
+            self.host["stay"]["raises"] += int(s * 60)
 
     def activate(self, idx: int, ref: str) -> None:
         h = self.host
+        if ref == self.NOTE:
+            h["notes"] += 1
+            if self.defect != "note":
+                self.note_held = [1, 1, 1]
+            return
         if not self.near(idx, {"door": self.DOOR, "item": self.ITEM, "container": self.CONT}[ref]):
             return
         if ref == "door":
@@ -397,7 +466,7 @@ class FakeNv:
             return {"enabled": True, "pinsOk": True, "canSaveHook": True, "service": {"up": True, "detail": detail},
                     "saveGate": {"blocked": 1 if w.suppress and w.defect != "gate" else 0}}
         if method == "activate.ref":
-            w.activate(self.i, "door" if p["ref"] == w.DOOR else "item" if p["ref"] == w.ITEM else "container")
+            w.activate(self.i, w.NOTE if p["ref"] == w.NOTE else "door" if p["ref"] == w.DOOR else "item" if p["ref"] == w.ITEM else "container")
             return {}
         if method == "ref.info":
             if p["ref"] == PLAYER_INFO_REF:
@@ -408,7 +477,17 @@ class FakeNv:
                 raise KeyError("reference not loaded")
             return {"x": pos[0], "y": pos[1], "z": pos[2], "cell": 7}
         if method == "intents.submit":
-            if p["kind"] == "trigger":
+            if p["kind"] == "stay":
+                w.stay_present = 1
+                w.host["stay"]["present"] = 1
+            elif p["kind"] == "triggerleave":
+                if w.defect != "leave":
+                    w.stay_present = 0
+                    w.host["stay"]["present"] = 0
+            elif p["kind"] == "combat":
+                if w.defect != "combat":
+                    w.host["byKind"]["StartCombat"] = w.host["byKind"].get("StartCombat", 0) + 1
+            elif p["kind"] == "trigger":
                 if w.t - w.trigger_at > 5:
                     w.host["byKind"]["TriggerEnter"] = w.host["byKind"].get("TriggerEnter", 0) + 1
                     w.host["executed"] += 1
@@ -445,6 +524,8 @@ class FakeNv:
             return float(w.door_open)
         if expr.startswith("GetDisabled"):
             return 1.0 if w.item_gone else 0.0
+        if expr.startswith("player.GetHasNote"):
+            return float(w.note_held[self.i])
         if expr.startswith("player.GetItemCount"):
             return w.items[self.i]
         raise KeyError(expr)
@@ -455,11 +536,15 @@ def selftest() -> int:
     # (defect, position step on, substring the log must show for a failing run)
     cases = [("", True, ""), ("claim", True, ""), ("lock", True, ""), ("gate", True, ""), ("puppet", True, ""), ("release", True, ""), ("once", True, ""),
              ("stuck", True, "instance 2 is"),          # twin: a player left out of range is detected, and named
+             ("stay", True, "raised OnTrigger"),        # twin: the host never re-raises OnTrigger
+             ("leave", True, "ended the presence"),     # twin: a Leave that does not end the presence
+             ("note", True, "GetHasNote"),              # twin: the note never reaches the host's journal
+             ("combat", True, "OnStartCombat"),         # twin: the actor's block does not run
              ("far", True, "close enough together"),    # twin: references too far apart are reported, not walked into
              ("", False, "")]                           # twin: nobody positions the players (--no-position) and they start far away: every intent is ignored
     for defect, position, needle in cases:
         w = FakeWorld(defect)
-        args = argparse.Namespace(door=w.DOOR, item=w.ITEM, item_base="0xF", container=w.CONT, terminal="T", entry=0, trigger="G", close_menu="CloseAllMenus",
+        args = argparse.Namespace(door=w.DOOR, item=w.ITEM, item_base="0xF", container=w.CONT, terminal="T", entry=0, trigger="G", note=w.NOTE, note_base="0xB", npc="NPC", stash=True, close_menu="CloseAllMenus",
                                   position=position, radius=NEAR_UNITS)
         lines: List[str] = []
         p = Proof([FakeNv(w, i) for i in range(3)], w.sleep, args, log=lines.append)
@@ -496,6 +581,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--terminal", help="a terminal (optional)")
     ap.add_argument("--entry", type=int, default=0, help="terminal entry index at the top menu")
     ap.add_argument("--trigger", help="a trigger volume reference (optional)")
+    ap.add_argument("--note", help="a note lying in the world near the players (optional)")
+    ap.add_argument("--note-base", help="the NOTE form of --note, as a hex form id: GetHasNote is asked for it")
+    ap.add_argument("--npc", help="an NPC that can start combat (optional)")
+    ap.add_argument("--stash", action="store_true", help="check that the shared gear containers are loaded (optional)")
     ap.add_argument("--position", dest="position", action="store_true", default=True, help="(default) step 0: put every player within --radius of the door, the item and the container")
     ap.add_argument("--no-position", dest="position", action="store_false", help="skip step 0: the players already stand near the references")
     ap.add_argument("--radius", type=float, default=NEAR_UNITS, help="how close every player must be to each reference (units)")

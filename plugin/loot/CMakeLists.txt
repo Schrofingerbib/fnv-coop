@@ -58,12 +58,12 @@ foreach(sfx "" "_rt")
   endif()
 endforeach()
 
-# ---- tests. One exe; twins 101..137 (synccore/loot, also compiled in) and 141..157 (this module) are chosen at run time with FNVCOOP_MUT=<n> ----
+# ---- tests. One exe; twins 101..137 (synccore/loot, also compiled in) and 141..167 (this module) are chosen at run time with FNVCOOP_MUT=<n> ----
 set(NVL_TEST_EXCL "")
 if(TARGET nvcoop)
   set(NVL_TEST_EXCL EXCLUDE_FROM_ALL)   # plugin build: skip tests unless asked for
 endif()
-add_executable(nvcoop_loot_tests ${NVL_TEST_EXCL} ${NVL_DIR}/tests/test_sync.cpp ${NVL_DIR}/tests/test_session.cpp ${NVL_REPO}/synccore/tests/main.cpp)
+add_executable(nvcoop_loot_tests ${NVL_TEST_EXCL} ${NVL_DIR}/tests/test_sync.cpp ${NVL_DIR}/tests/test_session.cpp ${NVL_DIR}/tests/test_menuless.cpp ${NVL_REPO}/synccore/tests/main.cpp)
 target_include_directories(nvcoop_loot_tests PRIVATE ${NVL_REPO}/synccore/tests ${NVL_DIR}/tests)
 target_link_libraries(nvcoop_loot_tests PRIVATE nvcoop_loot_core_rt)
 nvl_flags(nvcoop_loot_tests)
@@ -76,7 +76,11 @@ endforeach()
 
 enable_testing()
 add_test(NAME loot_plugin_unit COMMAND nvcoop_loot_tests)
-foreach(v RANGE 141 157)
+foreach(v RANGE 141 167)
+  add_test(NAME loot_plugin_mut${v} COMMAND nvcoop_loot_tests)
+  set_tests_properties(loot_plugin_mut${v} PROPERTIES WILL_FAIL TRUE ENVIRONMENT "FNVCOOP_MUT=${v}")
+endforeach()
+foreach(v 170 172 173 174 175)   # the placed-item pickup twins (170..173 live in synccore/loot, 174 / 175 here)
   add_test(NAME loot_plugin_mut${v} COMMAND nvcoop_loot_tests)
   set_tests_properties(loot_plugin_mut${v} PROPERTIES WILL_FAIL TRUE ENVIRONMENT "FNVCOOP_MUT=${v}")
 endforeach()

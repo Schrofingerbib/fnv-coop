@@ -125,6 +125,7 @@ private:
     void Purge();
     FormId ChooseTemplate(const Appearance& a) const;
     bool Budget(unsigned n = 1);
+    Vec3 MakeRoom(CellId cell, const Vec3& want, const Vec3& from, bool haveFrom);
     void Log(const std::string& s) const { if (log_) log_(s); }
 
     IPuppetEngine& e_;
@@ -140,6 +141,9 @@ private:
     bool prevMenu_ = false;
     unsigned callsLeft_ = 0;
     uint32_t tickNo_ = 0;
+    bool localRead_ = false, haveLocal_ = false;   // the local player's place, read at most once per Tick
+    CellId localCell_ = 0;
+    Vec3 localPos_;
     std::map<Slot, RefId> staleMap_;   // only used by the staleMapEntries fault
 };
 

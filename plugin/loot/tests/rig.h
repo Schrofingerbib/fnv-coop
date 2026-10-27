@@ -30,7 +30,7 @@ inline int32_t count(const Items& i, uint32_t base) { auto f = i.find(F(base)); 
 class FakeEngine : public ILootEngine {
 public:
     struct Cont { RefId ref = 0; lc::ContainerKind kind = lc::ContainerKind::Container; lc::CellId cell = 7; lc::Vec3 pos; Items items; bool exact = true; bool loaded = true; };
-    struct WItem { RefId ref = 0; lc::WorldItem it; NetId net = 0; bool alive = true; };
+    struct WItem { RefId ref = 0; lc::WorldItem it; NetId net = 0; bool alive = true; FormRef placed; };   // placed: a plugin's own ref (the real engine finds it from this alone)
 
     bool ready = true;
     std::map<NetId, Cont> conts;
@@ -42,6 +42,8 @@ public:
     std::map<RefId, WItem> world;
     RefId nextRef = 0x1000;
     bool cellLoaded = true;
+    bool listOnlyDescribed = false;                            // like the real engine: loadedContainers() knows only containers that were described before
+    std::set<NetId> described;
     int createCalls = 0;
     std::map<NetId, std::pair<lc::Vec3, lc::Vec3>> poses;      // what readPose answers (the owner's engine)
     std::map<NetId, std::pair<lc::Vec3, bool>> shown;          // what setPose put on screen
@@ -66,6 +68,23 @@ public:
         player[F(base)] += n;
         return true;
     }
+    // a transfer WITHOUT the container menu: console RemoveItem on the container + AddItem on the player (what the benchmark and quick-loot mods do)
+    bool silentTake(NetId net, uint32_t base, int32_t n, bool giveToPlayer = true) {
+        Cont& c = conts.at(net);
+        if (count(c.items, base) < n) return false;
+        c.items[F(base)] -= n;
+        if (c.items[F(base)] == 0) c.items.erase(F(base));
+        if (giveToPlayer) player[F(base)] += n;
+        return true;
+    }
+    bool silentPut(NetId net, uint32_t base, int32_t n) {
+        Cont& c = conts.at(net);
+        if (count(player, base) < n) return false;
+        player[F(base)] -= n;
+        if (player[F(base)] == 0) player.erase(F(base));
+        c.items[F(base)] += n;
+        return true;
+    }
     bool put(NetId net, uint32_t base, int32_t n) {
         Cont& c = conts.at(net);
         if (menu != c.ref || count(player, base) < n) return false;
@@ -81,6 +100,13 @@ public:
         world[w.ref] = w;
         return w.ref;
     }
+    // a PLACED world item: a persistent ref of a plugin (net id = what every machine derives from it)
+    RefId addPlaced(const FormRef& base, int32_t n, const FormRef& ref, lc::CellId cell = 7, lc::Vec3 pos = V(1, 2, 3)) {
+        const RefId r = addWorld(base, n, placedNet(ref), cell, pos);
+        world[r].placed = ref;
+        return r;
+    }
+    static NetId placedNet(const FormRef& ref) { return 0x20000000u + ref.localId; }   // stands for deriveNetId: a hash nothing maps back
     int aliveWorld() const { int n = 0; for (auto& kv : world) if (kv.second.alive) ++n; return n; }
     WItem* worldByNet(NetId net) { for (auto& kv : world) if (kv.second.alive && kv.second.net == net) return &kv.second; return nullptr; }
 
@@ -91,6 +117,7 @@ public:
         Cont* c = byRef(ref);
         if (!c || !c->loaded) return false;
         out.net = netOfRef(ref); out.kind = c->kind; out.cell = c->cell; out.pos = c->pos;
+        described.insert(out.net);
         return true;
     }
     RefId refOfContainer(NetId net) override { auto it = conts.find(net); return it != conts.end() && it->second.loaded ? it->second.ref : 0; }
@@ -124,10 +151,11 @@ public:
         if (c <= 0) player.erase(base);
         return ok;
     }
+    bool playerCount(const FormRef& base, int32_t& out) override { auto f = player.find(base); out = f == player.end() ? 0 : f->second; return true; }
     void notify(lc::Notice n, NetId id) override { notices.emplace_back(n, id); }
     void loadedContainers(std::vector<NetId>& out, size_t max) override {
         out.clear();
-        for (auto& kv : conts) if (kv.second.loaded && out.size() < max) out.push_back(kv.first);
+        for (auto& kv : conts) if (kv.second.loaded && out.size() < max && (!listOnlyDescribed || described.count(kv.first))) out.push_back(kv.first);
     }
     bool describeItem(RefId ref, ItemDesc& out) override {
         auto it = world.find(ref);
@@ -136,6 +164,7 @@ public:
         out.net = it->second.net;
         out.boundDrop = isIssuedNet(it->second.net);
         out.item.id = out.net;
+        out.placedRef = it->second.placed;
         return true;
     }
     static bool isIssuedNet(NetId n) { return lc::isIssuedItemId(n); }
@@ -149,11 +178,23 @@ public:
         return w.ref;
     }
     void bindItem(RefId ref, NetId net) override { auto it = world.find(ref); if (it != world.end()) it->second.net = net; }
-    bool removeItem(NetId net) override {
+    // Like the real engine: a dropped item is found by its issued id; a placed one ONLY from its ref (its hashed net id maps to nothing).
+    bool removeItem(NetId net, const FormRef& placed) override {
+        ++removeCalls;
         bool any = false;
-        for (auto& kv : world) if (kv.second.alive && kv.second.net == net) { kv.second.alive = false; any = true; }
+        for (auto& kv : world) {
+            if (!kv.second.alive) continue;
+            const bool hit = isIssuedNet(net) ? kv.second.net == net : (!placed.plugin.empty() && kv.second.placed == placed);
+            if (hit) { kv.second.alive = false; any = true; }
+        }
         return any;
     }
+    int removeCalls = 0;
+    // notes: bases that are BGSNotes; every journal entry the host's glue added (the console's AddNote)
+    std::set<FormRef> notes;
+    std::vector<FormRef> notesAdded;
+    bool isNoteBase(const FormRef& base) override { return notes.count(base) != 0; }
+    bool addNote(const FormRef& note) override { notesAdded.push_back(note); return true; }
     bool readPose(NetId net, lc::Vec3& pos, lc::Vec3& rot) override {
         auto it = poses.find(net);
         if (it == poses.end()) return false;

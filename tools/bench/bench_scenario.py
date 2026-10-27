@@ -30,10 +30,12 @@ def register(name):
 
 class Ctx:
     """Everything a phase needs. `k` scales every duration (0.5 = quick run; tests use a tiny value)."""
-    def __init__(self, samp, bots, arena, k=1.0, relay=None, outdir=None, log=print, walk_mode="step", phases_mod=None):
+    def __init__(self, samp, bots, arena, k=1.0, relay=None, outdir=None, log=print, walk_mode="step", phases_mod=None, arena_content=None, real_stage=None):
         self.samp, self.bots, self.arena, self.k = samp, bots, arena, k
         self.relay, self.outdir, self.log, self.walk_mode = relay, outdir, log, walk_mode
         self.phases = phases_mod        # tools/bench/phases.py (the game-facing helpers); None in unit tests
+        self.real_stage = real_stage
+        self.arena_content = arena_content   # tests pass a fake; None means the real tools/bench/arena_content.py
         self.walk = {"legs": 0, "legs_ok": 0, "why": {}}
         self.extras = {}
 
@@ -86,18 +88,33 @@ def run(ctx, scenario):
 
 
 # ------------------------------------------------------------------ phase types
+def _count_fail(ctx, why):
+    ctx.walk["legs"] += 1
+    why = str(why)[:70]
+    ctx.walk["why"][why] = ctx.walk["why"].get(why, 0) + 1
+
+
 def _walk_one(ctx, bot, course, deadline):
-    pts = ctx.arena.course(course, around=[float(v) for v in bot.pos()])
-    k = 0
+    """Walk the course until the deadline. Any error (the game still loading, a bridge hiccup) counts as a failed leg and the loop goes on:
+    a walker thread must never die silently and leave the rest of the phase unmeasured."""
+    pts, k = None, 0
     while time.time() < deadline:
-        px, py, pz = pts[k % len(pts)]
-        r = bot.goto_pos(px, py, pz, timeout_s=max(2.0, min(25.0, deadline - time.time())), mode=ctx.walk_mode)
-        ctx.walk["legs"] += 1
-        ctx.walk["legs_ok"] += 1 if r.ok else 0
-        if not r.ok:
-            why = str(getattr(r, "reason", "") or "")[:70]
-            ctx.walk["why"][why] = ctx.walk["why"].get(why, 0) + 1
-        k += 1
+        try:
+            if pts is None:
+                pts = ctx.arena.course(course, around=[float(v) for v in bot.pos()])
+            px, py, pz = pts[k % len(pts)]
+            r = bot.goto_pos(px, py, pz, timeout_s=max(2.0, min(25.0, deadline - time.time())), mode=ctx.walk_mode)
+            ctx.walk["legs"] += 1
+            ctx.walk["legs_ok"] += 1 if r.ok else 0
+            if not r.ok:
+                why = str(getattr(r, "reason", "") or "")[:70]
+                ctx.walk["why"][why] = ctx.walk["why"].get(why, 0) + 1
+            k += 1
+        except Exception as e:   # noqa: BLE001
+            if MUTANT == "walker_dies":   # twin: the old behaviour, the walker thread dies on the first error
+                raise
+            _count_fail(ctx, "error: " + str(e))
+            time.sleep(0.5)
 
 
 @register("warmup")
@@ -139,6 +156,34 @@ def _playbook(ctx, step):
     name = step["name"]
     label = step.get("label") or {"loot_race": "loot"}.get(name, name)
     ctx.extras[f"playbook_{label}"] = ctx.phases.run_playbook(name, Path(ctx.outdir) / f"pb_{label}", ctx.log)
+
+
+@register("arena_fight")
+def _arena_fight(ctx, step):
+    """An enemy ring built at runtime in the arena; PASS/FAIL checks stored where the fight playbook's result goes (play.fight_pass_pct)."""
+    ac = ctx.arena_content or __import__("arena_content")
+    ctx.extras["playbook_fight"] = ac.arena_fight(ctx.bots, ctx.arena, ctx.log, n=int(step.get("enemies", ac.N_ENEMIES)))
+
+
+@register("arena_loot")
+def _arena_loot(ctx, step):
+    ac = ctx.arena_content or __import__("arena_content")
+    ctx.extras["playbook_loot"] = ac.arena_loot(ctx.bots, ctx.arena, ctx.log, n=int(step.get("items", ac.N_LOOT)))
+
+
+@register("real_fight")
+def _real_fight(ctx, step):
+    """Fight on the four REAL placed actors at the Goodsprings gang spot (same ref id on every machine): numbers for kill latency and NPC position error."""
+    rs = ctx.real_stage or __import__("real_stage")
+    rs.stage(ctx.bots, ctx.log)
+    ctx.extras["playbook_fight"] = rs.real_fight(ctx.bots, ctx.log)
+
+
+@register("real_loot")
+def _real_loot(ctx, step):
+    """Both players take the corpse loot of the ganger killed in real_fight at the same moment."""
+    rs = ctx.real_stage or __import__("real_stage")
+    ctx.extras["playbook_loot"] = rs.real_loot(ctx.bots, ctx.log)
 
 
 @register("net")

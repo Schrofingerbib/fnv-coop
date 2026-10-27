@@ -363,6 +363,13 @@
         "reason": "VDLCPackQuest: DLC setup quest (GuestLocalRun): each machine runs its own copy after a load (intro signal, level cap note, pack items); shared, it was reset on one machine and replayed all its message boxes on every load (two-copy fight test 2026-10-21: host stage 10, guest 0)"
       }
     ],
-    "globals": []
+    "globals": [
+      "FalloutNV.esm:000035",
+      "FalloutNV.esm:000036",
+      "FalloutNV.esm:000037",
+      "FalloutNV.esm:000038",
+      "FalloutNV.esm:000039",
+      "FalloutNV.esm:00003A"
+    ]
   }
 }

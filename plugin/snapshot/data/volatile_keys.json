@@ -1,7 +1,7 @@
 {
  "counts": {
   "fields": 0,
-  "globals": 0,
+  "globals": 6,
   "groups": 2,
   "protected": 0,
   "snapshots": 6,
@@ -11,7 +11,50 @@
  "dumpsPerLaunch": 3,
  "entries": {
   "fields": [],
-  "globals": [],
+  "globals": [
+   {
+    "edid": "GameYear",
+    "global": "FalloutNV.esm:000035",
+    "reasons": [
+     "manual:clock"
+    ]
+   },
+   {
+    "edid": "GameMonth",
+    "global": "FalloutNV.esm:000036",
+    "reasons": [
+     "manual:clock"
+    ]
+   },
+   {
+    "edid": "GameDay",
+    "global": "FalloutNV.esm:000037",
+    "reasons": [
+     "manual:clock"
+    ]
+   },
+   {
+    "edid": "GameHour",
+    "global": "FalloutNV.esm:000038",
+    "reasons": [
+     "manual:clock"
+    ]
+   },
+   {
+    "edid": "GameDaysPassed",
+    "global": "FalloutNV.esm:000039",
+    "reasons": [
+     "manual:clock"
+    ]
+   },
+   {
+    "edid": "TimeScale",
+    "global": "FalloutNV.esm:00003A",
+    "reasons": [
+     "manual:clock"
+    ]
+   }
+  ],
   "vars": [
    {
     "edid": "NVDLC01MQ00",

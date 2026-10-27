@@ -25,9 +25,10 @@ void LootSync::sessionBegin(const nvcoop::livewire::SessionInfo& info, nvcoop::l
     ++stats_.sessions;
     inbox_.clear();
     menuRef_ = 0; menuNet_ = 0;
-    suppressClose_.clear();
+    suppressClose_.clear(); blockedMenu_.clear();
     ownedClutter_.clear();
-    if (!FNV_MUT(153)) { resolves_.clear(); creates_.clear(); createsDue_.clear(); }
+    playerSeen_.clear(); suspect_.clear(); implicit_.clear(); engineBase_.clear();
+    if (!FNV_MUT(153)) { resolves_.clear(); creates_.clear(); createsDue_.clear(); removes_.clear(); notesDone_.clear(); }
     host_.reset();
     if (info.isHost) {
         host_ = std::make_unique<lc::LootHost>(cfg_.host);
@@ -52,9 +53,10 @@ void LootSync::sessionEnd() {
     link_ = nullptr;
     linkUp_ = false;
     inbox_.clear();
-    menuRef_ = 0; menuNet_ = 0;
+    menuRef_ = 0; menuNet_ = 0; blockedMenu_.clear();
     ownedClutter_.clear();
-    if (!FNV_MUT(153)) { resolves_.clear(); creates_.clear(); createsDue_.clear(); }   // twin 153: scheduled work of a dead session survives into the next one
+    playerSeen_.clear(); suspect_.clear(); implicit_.clear(); engineBase_.clear();
+    if (!FNV_MUT(153)) { resolves_.clear(); creates_.clear(); createsDue_.clear(); removes_.clear(); notesDone_.clear(); }   // twin 153: scheduled work of a dead session survives into the next one
 }
 
 void LootSync::playerJoined(PlayerId p) {
@@ -89,10 +91,11 @@ void LootSync::hostLinkDown() {
 void LootSync::loadBegin() {
     ++stats_.loads;
     menuRef_ = 0; menuNet_ = 0;
-    suppressClose_.clear();
+    suppressClose_.clear(); blockedMenu_.clear();
     ownedClutter_.clear();
-    resolves_.clear(); creates_.clear(); createsDue_.clear();
+    resolves_.clear(); creates_.clear(); createsDue_.clear(); removes_.clear(); notesDone_.clear();
     inbox_.clear();
+    playerSeen_.clear(); suspect_.clear(); implicit_.clear(); engineBase_.clear();   // engine counts of the old world mean nothing in the loaded one
     if (client_ && !FNV_MUT(152)) client_->worldReset();   // twin 152: the view (and its "already has a ref" memory) survives a load
 }
 
@@ -112,6 +115,7 @@ void LootSync::sendUp(const lc::Body& b) {
     if (host_) {
         lc::LootHost::Out out;
         host_->onRequest(kHostPlayer, b, now_, out);
+        grantNotes(out);
         deliver(out);
         return;
     }
@@ -123,6 +127,20 @@ void LootSync::sendUp(const lc::Body& b) {
     if (bytes.empty()) return;
     ++stats_.datagramsOut;
     link_->send(kHostPlayer, !lc::isUnreliable(b), std::move(bytes));
+}
+
+// A pickup claim the host just WON for a note: the picker's own engine added the note to ITS journal; the host's journal (GetHasNote on the host, the quest
+// scripts that poll it) and every other copy get it through AddNote. Claims that lost, and anything that is not a note, grant nothing.
+void LootSync::grantNotes(const lc::LootHost::Out& out) {
+    if (FNV_MUT(178)) return;   // twin 178: a picked-up note never reaches the host's journal
+    for (const auto& o : out) {
+        const auto* r = std::get_if<lc::Result>(&o.body);
+        if (!r || r->op != lc::OpKind::Claim || r->base.plugin.empty()) continue;
+        if (r->status != lc::Status::Ok) continue;                      // a lost claim grants nothing
+        if (!notesDone_.insert(r->id).second && !FNV_MUT(179)) continue;   // twin 179: the winner's repeated claim of the same note is granted again
+        if (!FNV_MUT(180) && !eng_.isNoteBase(r->base)) continue;      // twin 180: every won claim is granted as a note (a Stimpak becomes a journal entry)
+        if (eng_.addNote(r->base)) ++stats_.notesGranted; else ++stats_.notesRefused;
+    }
 }
 
 void LootSync::deliver(lc::LootHost::Out& out) {
@@ -156,6 +174,7 @@ void LootSync::receive(PlayerId from, const uint8_t* data, size_t size) {
         poll();
         lc::LootHost::Out out;
         host_->onRequest(who, e.body, now_, out);
+        grantNotes(out);
         deliver(out);
         pump();
         return;
@@ -189,8 +208,28 @@ bool LootSync::readExact(NetId net, Items& out) {
     return true;
 }
 
+// A menu the host refused and the engine could not close: whatever the player moves in it is undone (items back into the container, taken out of the player).
+void LootSync::revertBlockedMenu() {
+    const lc::ContainerRec* rec = client_->container(menuNet_);
+    if (!rec) return;
+    Items have;
+    bool exact = true;
+    if (!eng_.readContents(menuNet_, have, exact)) { ++stats_.readFailures; return; }
+    lc::normalize(have);
+    const Items shared = rec->items;
+    if (lc::digestOf(have) == lc::digestOf(shared)) return;
+    for (const lc::ItemDiff& x : lc::diffItems(shared, have)) {
+        const int32_t delta = x.b < x.a ? -(x.a - x.b) : (x.b - x.a);   // the container lost -> the player gained it: take it back
+        if (!eng_.adjustPlayer(x.base, delta)) ++stats_.actionsFailed;
+        ++stats_.rollbacksApplied;
+        stats_.revertedItems += static_cast<uint64_t>(delta < 0 ? -delta : delta);
+    }
+    applyContents(menuNet_, shared);
+}
+
 void LootSync::poll() {
     if (!client_ || !menuNet_) return;
+    if (blockedMenu_.count(menuNet_)) { revertBlockedMenu(); return; }
     Items now;
     bool exact = true;
     if (!eng_.readContents(menuNet_, now, exact)) { ++stats_.readFailures; return; }   // an inexact read of an OPEN container still shows what the player moved
@@ -207,6 +246,7 @@ void LootSync::openMenu(RefId ref) {
     bool exact = true;
     if (!eng_.readContents(d.net, items, exact)) { ++stats_.readFailures; return; }
     menuNet_ = d.net;
+    engineBase_.erase(d.net);   // the menu owns the engine copy now; the reference is taken again when the container matches after it closes
     ++stats_.menusOpened;
     lastPollMs_ = now_;
     client_->opened(d.net, d.kind, d.cell, d.pos, items, now_);
@@ -217,6 +257,8 @@ void LootSync::closeMenu() {
     menuRef_ = 0;
     menuNet_ = 0;
     if (!net) return;
+    engineBase_.erase(net);
+    blockedMenu_.erase(net);
     ++stats_.menusClosed;
     if (suppressClose_.erase(net) && !FNV_MUT(144)) return;   // twin 144: a menu WE closed (busy / lock lost) is reported as the player closing it
     Items items;
@@ -241,13 +283,34 @@ void LootSync::pollMenu(uint64_t now) {
 // ================================================================================================================ actions
 
 void LootSync::applyContents(NetId net, const Items& want) {
+    // A closed container whose engine copy moved on its own since it last matched (a menu-less take whose AddItem is still to come, a script) is not
+    // overwritten by a change the others made: the write would turn the player's move into "the engine already shows the shared contents" and nobody
+    // would ever ask the host for it (both grabbers of the same stack kept everything, bench dino-20261027-144058). screenTransfer attributes the move; its
+    // Open / Take answer writes the right contents, a script's change is handed back after the grace.
+    if (cfg_.menuless && net != menuNet_ && !implicit_.count(net) && client_ && !FNV_MUT(165)) {
+        auto b = engineBase_.find(net);
+        if (b != engineBase_.end() && client_->transferIdle(net)) {
+            Items cur;
+            bool exact = true;
+            if (eng_.readContents(net, cur, exact)) {
+                lc::normalize(cur);
+                if (lc::digestOf(cur) != lc::digestOf(b->second)) { ++stats_.setsDeferred; return; }
+            }
+        }
+    }
     const bool ok = eng_.setContents(net, want);
     if (!ok) ++stats_.actionsFailed;
     // what the engine really holds now is the new baseline: if it could not be set, the watcher must not mistake the difference for a player move
     Items now;
     bool exact = true;
-    if (!FNV_MUT(143) && eng_.readContents(net, now, exact)) client_->rebaseline(net, now);
+    const bool read = eng_.readContents(net, now, exact);
+    if (!FNV_MUT(143) && read) client_->rebaseline(net, now);
     else if (!FNV_MUT(143)) client_->rebaseline(net, want);
+    if (cfg_.menuless && net != menuNet_) {
+        Items b = read && exact ? now : want;
+        lc::normalize(b);
+        engineBase_[net] = std::move(b);
+    }
 }
 
 void LootSync::run(const std::vector<lc::Action>& acts) {
@@ -258,12 +321,19 @@ void LootSync::run(const std::vector<lc::Action>& acts) {
             if (!FNV_MUT(142)) {   // twin 142: a refused transfer is never taken back
                 if (!eng_.adjustPlayer(a.base, a.delta)) ++stats_.actionsFailed;
                 ++stats_.rollbacksApplied;
+                if (!FNV_MUT(166)) stats_.revertedItems += static_cast<uint64_t>(a.delta < 0 ? -a.delta : a.delta);   // twin 166: the status does not count what was taken back
             }
             break;
         case lc::Action::ContainerSet: applyContents(a.id, a.items); break;
         case lc::Action::CloseMenu:
+            if (menuNet_ != a.id && implicit_.count(a.id) && !FNV_MUT(162)) break;   // twin 162: a refused menu-less transfer closes whatever menu is up (there is none of ours to close)
             if (menuNet_ == a.id) suppressClose_.insert(a.id);
-            eng_.closeMenu();
+            // The real engine cannot close the menu from code yet (TODO-RE): the player then sits in a menu the host refused (busy, lock lost) and goes on taking.
+            // Those moves are never reported (the lock is not ours), so they are taken back here, every poll, until the player closes the menu (twin 167).
+            if (!eng_.closeMenu() && menuNet_ == a.id && !FNV_MUT(167)) {
+                blockedMenu_.insert(a.id);
+                if (const lc::ContainerRec* rec = client_->container(a.id)) applyContents(a.id, rec->items);   // from here on every difference is the player's move
+            }
             break;
         case lc::Action::Notify: eng_.notify(a.notice, a.id); break;
         case lc::Action::BindDrop: eng_.bindItem(a.ref, a.id); break;
@@ -278,13 +348,31 @@ void LootSync::run(const std::vector<lc::Action>& acts) {
                 }
             }
             break;
-        case lc::Action::RemoveItem:
-            eng_.removeItem(a.id);
+        case lc::Action::RemoveItem: {
+            ++stats_.removesRun;
+            if (!a.placed.plugin.empty()) ++stats_.removesPlaced;
+            // twin 174: the engine gets the id only. false: no such ref here (already gone, or its cell is not loaded)
+            if (eng_.removeItem(a.id, FNV_MUT(174) ? FormRef() : a.placed)) ++stats_.removesDone;
+            else {
+                ++stats_.removesGone;
+                // A placed item whose cell is not loaded here has no ref to remove yet: it would be back on the floor when the cell loads. Ask again later.
+                if (!a.placed.plugin.empty() && !FNV_MUT(176)) {   // twin 176: a placed item that was not here at that moment stays in the world for good
+                    if (removes_.size() < cfg_.maxPendingRemoves) {
+                        PendingRemove p;
+                        p.id = a.id; p.placed = a.placed; p.due = now_ + cfg_.removeRetryMs;
+                        removes_.push_back(std::move(p));
+                        ++stats_.removesDeferred;
+                    } else {
+                        ++stats_.removesDropped;
+                    }
+                }
+            }
             for (size_t i = 0; i < creates_.size();) {
                 if (creates_[i].id == a.id) { creates_.erase(creates_.begin() + static_cast<long>(i)); createsDue_.erase(createsDue_.begin() + static_cast<long>(i)); }
                 else ++i;
             }
             break;
+        }
         case lc::Action::SetPose: eng_.setPose(a.id, a.pos, a.rot, a.flag); break;
         case lc::Action::ReadyToClose: {
             Items items;
@@ -332,6 +420,8 @@ void LootSync::tick(uint64_t nowMs) {
     }
     tickResolve(nowMs);
     tickCreates(nowMs);
+    tickRemoves(nowMs);
+    tickTransfers(nowMs);
     tickSweep(nowMs);
     tickAudit(nowMs);
     tickClutter(nowMs);
@@ -375,6 +465,8 @@ void LootSync::tickResolve(uint64_t now) {
             continue;
         }
         client_->resolved(d.net, d.kind, d.cell, d.pos, items, now);
+        if (cfg_.menuless) { Items b = items; lc::normalize(b); engineBase_[d.net] = b; }
+        seedPlayer(d.net, items);
         if (r.corpse) ++stats_.corpsesResolved; else ++stats_.containersResolved;
     }
 }
@@ -393,19 +485,37 @@ void LootSync::tickCreates(uint64_t now) {
     }
 }
 
+void LootSync::tickRemoves(uint64_t now) {
+    for (size_t i = 0; i < removes_.size();) {
+        PendingRemove& p = removes_[i];
+        if (p.due > now) { ++i; continue; }
+        ++stats_.removesRetried;
+        if (eng_.removeItem(p.id, p.placed)) {
+            ++stats_.removesDone;
+            removes_.erase(removes_.begin() + static_cast<long>(i));
+        } else if (++p.tries >= cfg_.maxRemoveTries && !FNV_MUT(177)) {   // twin 177: a ref that never shows up is asked about for ever
+            ++stats_.removesDropped;
+            removes_.erase(removes_.begin() + static_cast<long>(i));
+        } else {
+            p.due = now + cfg_.removeRetryMs;
+            ++i;
+        }
+    }
+}
+
 void LootSync::tickSweep(uint64_t now) {
     if (!host_ || !cfg_.hostSweep || FNV_MUT(147) || now < nextSweep_) return;   // twin 147: scripts' changes to a container never reach the table
     nextSweep_ = now + cfg_.sweepEveryMs;
     std::vector<NetId> ids;
-    eng_.loadedContainers(ids, 512);
+    scanIds(ids);
     if (ids.empty()) return;
-    std::sort(ids.begin(), ids.end());
     for (uint32_t n = 0; n < cfg_.sweepPerTick && n < ids.size(); ++n) {
         const NetId id = ids[(sweepCursor_ + n) % ids.size()];
         const lc::ContainerRec* c = host_->container(id);
         if (!c || c->holder != lc::kNoPlayer || id == menuNet_) continue;
         Items items;
         if (!readExact(id, items)) continue;
+        if (screenTransfer(id, items)) continue;   // the local player's own menu-less take / put is not a script's change
         ++stats_.sweepsCompared;
         if (lc::digestOf(items) == lc::digestOf(c->items)) continue;
         lc::LootHost::Out out;
@@ -420,14 +530,14 @@ void LootSync::tickAudit(uint64_t now) {
     if (FNV_MUT(148) || now < nextAudit_) return;   // twin 148: engine copies are never compared with the shared contents
     nextAudit_ = now + cfg_.auditEveryMs;
     std::vector<NetId> ids;
-    eng_.loadedContainers(ids, 512);
+    scanIds(ids);
     if (ids.empty()) return;
-    std::sort(ids.begin(), ids.end());
     for (uint32_t n = 0; n < cfg_.auditPerTick && n < ids.size(); ++n) {
         const NetId id = ids[(auditCursor_ + n) % ids.size()];
         if (id == menuNet_ || !client_->container(id)) continue;
         Items items;
         if (!readExact(id, items)) continue;
+        if (screenTransfer(id, items)) continue;   // the local player's own menu-less take / put is not a stray difference to correct
         ++stats_.auditsCompared;
         client_->audit(id, items, now);
     }
@@ -445,6 +555,142 @@ void LootSync::tickClutter(uint64_t now) {
         if (eng_.readPose(id, s.pos, s.rot)) samples.push_back(s);
     }
     if (!samples.empty()) client_->clutterSamples(samples, now);
+}
+
+// ================================================================================================================ menu-less transfers
+
+// A take or put the engine did on a CLOSED container without the container menu (console RemoveItem + AddItem, a quick-loot mod, a script of the
+// player's). The menu watcher never sees it, so it used to bypass the lock: on the host the sweep adopted it as a script's change, on a guest the
+// audit threw the container back while the player kept the items; two players doing it at once both kept everything.
+// Now the difference between the engine copy and the shared contents is attributed to the local player when the player's own inventory moved the
+// other way by that much, and then goes through exactly the menu path: open (lock), take / put, close. The host's answer decides; a refusal
+// takes the items back from the player (Action::PlayerAdjust) and puts the shared contents back (Action::ContainerSet).
+
+void LootSync::seedPlayer(NetId net, const Items& shared) {
+    if (!cfg_.menuless) return;
+    if (playerSeen_.size() > 4096) playerSeen_.clear();
+    std::map<FormRef, int32_t>& m = playerSeen_[net];
+    m.clear();
+    for (const auto& kv : shared) {
+        int32_t n = 0;
+        if (eng_.playerCount(kv.first, n)) m[kv.first] = n;
+    }
+}
+
+void LootSync::shiftPlayerSeen(const FormRef& base, int32_t delta, NetId except) {
+    for (auto& c : playerSeen_) {
+        if (c.first == except) continue;
+        auto f = c.second.find(base);
+        if (f != c.second.end()) f->second += delta;
+    }
+}
+
+// The containers worth comparing, sorted: the ones the engine lists as loaded and every container of the shared table that has a ref on this machine.
+// (The real engine lists only containers it described before: a corpse somebody else's death registered would never be looked at on this machine, and its
+// menu-less takes would pass unseen.)
+void LootSync::scanIds(std::vector<NetId>& ids) {
+    eng_.loadedContainers(ids, 512);
+    if (client_ && !FNV_MUT(163)) {   // twin 163: only containers the engine already described are looked at
+        std::vector<NetId> known;
+        client_->containerIds(known, 512);
+        std::sort(ids.begin(), ids.end());
+        for (NetId id : known)
+            if (!std::binary_search(ids.begin(), ids.end(), id) && eng_.refOfContainer(id) != 0) ids.push_back(id);
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+}
+
+bool LootSync::screenTransfer(NetId id, const Items& engineItems) {
+    if (!cfg_.menuless || !client_ || FNV_MUT(158)) return false;   // twin 158: menu-less transfers are never looked for (the old behaviour: they bypass the lock)
+    const lc::ContainerRec* rec = client_->container(id);
+    if (!rec || id == menuNet_) return false;
+    const Items shared = rec->items;
+    Items have = engineItems;
+    lc::normalize(have);
+    // What the engine copy is compared with: what it held when it last matched a shared state. NOT the shared contents as they are now: a change the others
+    // made (their take, applied here before this machine's scan ran) would otherwise make the local player's own, still unattributed take look like "the
+    // engine already shows the shared contents" and the player would keep the items (twin 164).
+    auto bi = engineBase_.find(id);
+    const bool hasBase = bi != engineBase_.end() && !FNV_MUT(164);
+    const Items ref = hasBase ? bi->second : shared;
+    if (lc::digestOf(have) == lc::digestOf(ref)) {
+        suspect_.erase(id);
+        if (lc::digestOf(have) == lc::digestOf(shared) && client_->transferIdle(id)) {
+            implicit_.erase(id);
+            seedPlayer(id, shared);
+            if (cfg_.menuless) engineBase_[id] = shared;
+        }
+        return false;
+    }
+    ++stats_.transferDiffs;
+    if (!client_->transferIdle(id)) return true;   // a menu or a transfer of this container is under way: it owns the engine copy
+    const lc::ContainerKind kind = rec->kind;
+    const lc::CellId cell = rec->cell;
+    const lc::Vec3 pos = rec->pos;
+    Items settled = ref;                            // the reference with the explained differences applied
+    bool any = false;
+    auto seenIt = playerSeen_.find(id);
+    for (const lc::ItemDiff& x : lc::diffItems(ref, have)) {
+        if (seenIt == playerSeen_.end()) break;
+        auto seen = seenIt->second.find(x.base);
+        int32_t now = 0;
+        if (seen == seenIt->second.end()) continue;
+        if (!eng_.playerCount(x.base, now)) { ++stats_.playerCountFails; continue; }
+        const bool take = x.b < x.a;
+        const int32_t want = take ? x.a - x.b : x.b - x.a;                       // what the container lost / gained
+        int32_t moved = take ? now - seen->second : seen->second - now;          // what the player gained / gave up since the container last matched
+        if (FNV_MUT(159)) moved = want;                                          // twin 159: any difference is believed to be the player's (a script's change becomes a take)
+        const int32_t n = std::min(want, moved);
+        if (n <= 0) continue;
+        any = true;
+        settled[x.base] = take ? x.a - n : x.a + n;
+        if (settled[x.base] <= 0) settled.erase(x.base);
+        // the player's move is used up: no other container may claim it, and this one now stands at the player's count
+        if (!FNV_MUT(161)) shiftPlayerSeen(x.base, take ? n : -n, id);   // twin 161: an explained move explains every other container's difference too
+        seen->second = now;
+    }
+    if (!any) {
+        auto s = suspect_.find(id);
+        if (s == suspect_.end()) { suspect_[id] = now_; ++stats_.transferSuspects; s = suspect_.find(id); }
+        // twin 160: no grace: the AddItem that follows a RemoveItem comes too late and the sweep adopts the RemoveItem as a script's change
+        if (!FNV_MUT(160) && now_ - s->second < cfg_.transferGraceMs) return true;
+        // the grace is over and nothing of the player's explains it: a script's change. The old handling takes over (host sweep adopts it, guest audit
+        // corrects it) and the reference is dropped so that nothing is held back any more.
+        if (hasBase) { engineBase_.erase(id); ++stats_.transferGraceExpired; }
+        return false;
+    }
+    suspect_.erase(id);
+    implicit_.insert(id);
+    ++stats_.transfersMenuless;
+    if (cfg_.menuless) engineBase_[id] = settled;
+    client_->opened(id, kind, cell, pos, ref, now_);
+    client_->observed(id, settled, now_);
+    client_->closed(id, settled, now_);
+    drain();
+    return true;
+}
+
+void LootSync::tickTransfers(uint64_t now) {
+    if (!client_ || !cfg_.menuless || FNV_MUT(158) || now < nextTransfer_) return;
+    nextTransfer_ = now + cfg_.transferEveryMs;
+    std::vector<NetId> ids;
+    scanIds(ids);
+    stats_.scanKnown = ids.size();
+    if (ids.empty()) return;
+    auto look = [&](NetId id) {
+        if (!client_ || !client_->container(id) || id == menuNet_) return;
+        Items items;
+        if (!readExact(id, items)) return;
+        ++stats_.transferScans;
+        screenTransfer(id, items);
+    };
+    std::vector<NetId> sus;
+    for (const auto& kv : suspect_) sus.push_back(kv.first);
+    for (NetId id : sus) look(id);                  // differences seen before are looked at again every pass
+    for (uint32_t n = 0; n < cfg_.transferPerTick && n < ids.size(); ++n) look(ids[(transferCursor_ + n) % ids.size()]);
+    transferCursor_ = (transferCursor_ + cfg_.transferPerTick) % ids.size();
+    pump();
 }
 
 // ================================================================================================================ items
@@ -465,7 +711,8 @@ void LootSync::onPickup(RefId picker, RefId item) {
     if (picker != kPlayerRef && !FNV_MUT(151)) { ++stats_.pickupsIgnored; return; }   // twin 151: an NPC's pickup is claimed for the local player
     ItemDesc d;
     if (!eng_.describeItem(item, d) || d.item.base.plugin.empty()) { ++stats_.pickupsIgnored; return; }
-    client_->pickedUp(item, d.net, d.item.base, d.item.count, d.item.meta, d.item.cell, d.item.pos, now_);
+    ++stats_.pickupsClaimed;
+    client_->pickedUp(item, d.net, d.item.base, d.item.count, d.item.meta, d.item.cell, d.item.pos, now_, FNV_MUT(175) ? FormRef() : d.placedRef);   // twin 175: the claim does not name the ref
     pump();
 }
 
@@ -498,7 +745,7 @@ bool LootSync::loadState(const std::vector<uint8_t>& bytes) {
 }
 
 std::string LootSync::statusJson() const {
-    char b[1400];
+    char b[3200];
     const lc::ClientStats* cs = client_ ? &client_->stats() : nullptr;
     const lc::HostStats* hs = host_ ? &host_->stats() : nullptr;
     std::snprintf(b, sizeof b,
@@ -506,7 +753,11 @@ std::string LootSync::statusJson() const {
                   "\"digest\":\"%016llx\",\"hostDigest\":\"%016llx\",\"tick\":{\"in\":%llu,\"out\":%llu,\"undecodable\":%llu,\"spoofed\":%llu,\"polls\":%llu,"
                   "\"actions\":%llu,\"actionsFailed\":%llu,\"rollbacks\":%llu,\"resolved\":%llu,\"corpses\":%llu,\"createsDeferred\":%llu,\"sweepsChanged\":%llu},"
                   "\"client\":{\"rollbacks\":%llu,\"busy\":%llu,\"claimsLost\":%llu,\"resent\":%llu,\"gaps\":%llu,\"tables\":%llu,\"closeMismatch\":%llu,\"audit\":%llu},"
-                  "\"hostStats\":{\"requests\":%llu,\"replays\":%llu,\"busy\":%llu,\"closeMismatch\":%llu,\"claimsWon\":%llu,\"claimsLost\":%llu,\"heals\":%llu}}",
+                  "\"hostStats\":{\"requests\":%llu,\"replays\":%llu,\"busy\":%llu,\"closeMismatch\":%llu,\"claimsWon\":%llu,\"claimsLost\":%llu,\"heals\":%llu},"
+                  "\"pickups\":{\"activates\":%llu,\"byPlayer\":%llu,\"seen\":%llu,\"ignored\":%llu,\"claimed\":%llu,\"claims\":%llu,\"duplicate\":%llu,\"won\":%llu,\"lost\":%llu,"
+                  "\"removesRun\":%llu,\"removesDone\":%llu,\"removesGone\":%llu,\"removesPlaced\":%llu,\"hostWon\":%llu,\"hostLost\":%llu,\"hostRepeated\":%llu},"
+                  "\"menuless\":{\"enabled\":%s,\"known\":%llu,\"scans\":%llu,\"seen\":%llu,\"suspects\":%llu,\"arbitrated\":%llu,\"graceExpired\":%llu,"
+                  "\"setsDeferred\":%llu,\"countFails\":%llu,\"reverted\":%llu,\"revertedItems\":%llu,\"refused\":%llu,\"busy\":%llu,\"rollbackItems\":%llu}}",
                   cfg_.enabled ? "true" : "false", link_ ? "true" : "false", host_ ? "true" : "false", linkUp_ ? "true" : "false", menuNet_,
                   client_ ? client_->containerCount() : 0, client_ ? client_->itemCount() : 0, client_ ? client_->pendingCount() : 0,
                   (unsigned long long)(client_ ? client_->digest() : 0), (unsigned long long)(host_ ? host_->digest() : 0),
@@ -519,7 +770,18 @@ std::string LootSync::statusJson() const {
                   (unsigned long long)(cs ? cs->closeMismatch : 0), (unsigned long long)(cs ? cs->auditCorrections : 0),
                   (unsigned long long)(hs ? hs->requests : 0), (unsigned long long)(hs ? hs->replays : 0), (unsigned long long)(hs ? hs->busy : 0),
                   (unsigned long long)(hs ? hs->closeMismatch : 0), (unsigned long long)(hs ? hs->claimsWon : 0), (unsigned long long)(hs ? hs->claimsLost : 0),
-                  (unsigned long long)(hs ? hs->healsSent : 0));
+                  (unsigned long long)(hs ? hs->healsSent : 0),
+                  (unsigned long long)stats_.activateEvents, (unsigned long long)stats_.activateByPlayer, (unsigned long long)stats_.pickupsSeen,
+                  (unsigned long long)stats_.pickupsIgnored, (unsigned long long)stats_.pickupsClaimed, (unsigned long long)(cs ? cs->claims : 0),
+                  (unsigned long long)(cs ? cs->claimsDuplicate : 0), (unsigned long long)(cs ? cs->claimsWon : 0), (unsigned long long)(cs ? cs->claimsLost : 0),
+                  (unsigned long long)stats_.removesRun, (unsigned long long)stats_.removesDone, (unsigned long long)stats_.removesGone,
+                  (unsigned long long)stats_.removesPlaced, (unsigned long long)(hs ? hs->claimsWon : 0), (unsigned long long)(hs ? hs->claimsLost : 0),
+                  (unsigned long long)(hs ? hs->claimsRepeated : 0),
+                  cfg_.menuless ? "true" : "false", (unsigned long long)stats_.scanKnown, (unsigned long long)stats_.transferScans, (unsigned long long)stats_.transferDiffs,
+                  (unsigned long long)stats_.transferSuspects, (unsigned long long)stats_.transfersMenuless, (unsigned long long)stats_.transferGraceExpired,
+                  (unsigned long long)stats_.setsDeferred, (unsigned long long)stats_.playerCountFails, (unsigned long long)stats_.rollbacksApplied,
+                  (unsigned long long)stats_.revertedItems, (unsigned long long)(cs ? cs->rollbacks : 0), (unsigned long long)(cs ? cs->busy : 0),
+                  (unsigned long long)(cs ? cs->rollbackItems : 0));
     return b;
 }
 

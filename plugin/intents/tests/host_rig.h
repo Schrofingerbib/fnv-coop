@@ -38,6 +38,8 @@ struct HostRig {
     std::vector<std::pair<FormRef, PlayerId>> dialogues;
     std::function<bool(PlayerId, const FormRef&)> allowActivation;                         // plugin/companions question (empty = allow)
     std::vector<std::tuple<PlayerId, bool, FormRef>> interactions;                           // plugin/companions report: (slot, pickup, target)
+    std::function<bool(PlayerId, const FormRef&, uint32_t)> allowStage;                      // quest policy for a guest's SetStage (empty = allow)
+    std::vector<std::tuple<PlayerId, FormRef, uint32_t, Result>> stageRefusals;              // HostDeps::stageRefused reports
     uint64_t now = 100000;
     Config cfg;
     std::unique_ptr<IntentHost> host;
@@ -49,7 +51,7 @@ struct HostRig {
         build();
     }
 
-    void build(ContainerRedirect redirect = ContainerRedirect()) {
+    void build(ContainerRedirect redirect = ContainerRedirect(), StorageBook* stash = nullptr) {
         HostDeps d;
         d.eng = &eng;
         d.nowMs = [this] { return now; };
@@ -69,7 +71,9 @@ struct HostRig {
         d.dialogueStart = [this](const FormRef& n, PlayerId s) { dialogues.emplace_back(n, s); };
         d.allowActivation = [this](PlayerId s, const FormRef& t) { return !allowActivation || allowActivation(s, t); };
         d.interacted = [this](PlayerId s, bool pickup, const FormRef& t) { interactions.emplace_back(s, pickup, t); };
-        host.reset(new IntentHost(std::move(d), cfg, std::move(redirect)));
+        d.allowStage = [this](PlayerId s, const FormRef& q, uint32_t st) { return !allowStage || allowStage(s, q, st); };
+        d.stageRefused = [this](PlayerId s, const FormRef& q, uint32_t st, Result why) { stageRefusals.emplace_back(s, q, st, why); };
+        host.reset(new IntentHost(std::move(d), cfg, std::move(redirect), stash));
     }
 
     void add(uint32_t id, TargetClass cls, float x = 0, float y = 0, float z = 0) { eng.world[R(id)] = mkTarget(cls, id, x, y, z); }

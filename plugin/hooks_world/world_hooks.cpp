@@ -14,12 +14,16 @@
 #include "GameExtraData.h"
 #include "GameForms.h"
 #include "GameObjects.h"
+#include "GameProcess.h"
 #include "common/nvcoop_api.h"
 #include "effect_json.h"
 #include "engine_addrs.h"
 #include "world_addrs.h"
 #include "world_owner_addrs.h"
+#include "world_present_addrs.h"
 #include "world_query.h"
+#include "world_refvar_watch.h"
+#include "world_refvars.h"
 
 using namespace fnvcoop;
 
@@ -52,7 +56,9 @@ SpawnLedger g_ledger;
 WorldLog g_log;
 WorldBaseline g_base;
 WeatherTimeSync g_weather;
-RefVarTracker g_vars;
+RefVarPoller g_poller;
+std::vector<uint32_t> g_staticWatch;   // world_refvar_watch.h resolved to engine ids (once per loaded world)
+bool g_staticWatchBuilt = false;
 std::function<void(const WorldEffect&)> g_sink;
 std::function<void(const EffectTxn&)> g_txnObserver;   // setTxnObserver
 std::vector<FormRef> g_watched;
@@ -166,7 +172,12 @@ bool relationCmd(Fn_Cmd o, Relation kind, CMD_ARGS) {
     int flags1 = 0, flags2 = 0;  // two optional ints follow the factions
     bool parsed = capturing() && parseArgs(pi, sd, thisObj, contObj, script, ev, res, opc, &a, &b, &flags1, &flags2);
     bool ok = CMD_FWD(o);
-    if (ok && parsed && a && b && formRef(a, &fa) && formRef(b, &fb)) emitLocal(SetRelation{fa, fb, kind});
+    if (ok && parsed && a && b && formRef(a, &fa) && formRef(b, &fb)) {
+        SetRelation r{fa, fb, kind};
+        r.flags1 = static_cast<uint8_t>(flags1 < 0 ? 0 : flags1 > 255 ? 255 : flags1);   // the two optional integers travel as given
+        r.flags2 = static_cast<uint8_t>(flags2 < 0 ? 0 : flags2 > 255 ? 255 : flags2);
+        emitLocal(r);
+    }
     return ok;
 }
 bool __cdecl h_SetEnemy(CMD_ARGS) { return relationCmd(o_SetEnemy, Relation::Enemy, pi, sd, thisObj, contObj, script, ev, res, opc); }
@@ -274,6 +285,39 @@ bool __cdecl h_SetCellPublicFlag(CMD_ARGS) {
     return ok;
 }
 
+// Presentation (G39): ApplyImageSpaceModifier / RemoveImageSpaceModifier <imod> [strength], PlayMusic <music>, PlaySound <sound> [int]. Never blocked (they change
+// no shared state, a guest's own scripts must still show their own fades); captured on the HOST only, inside a capture scope.
+Fn_Cmd o_ApplyImod, o_RemoveImod, o_PlayMusic, o_PlaySound;
+bool presentCmd(Fn_Cmd o, PresentKind kind, CMD_ARGS) {
+    FormRef fr;
+    TESForm* f = nullptr;
+    float strength = 0;
+    int opt = 0;
+    const bool takesFloat = kind == PresentKind::ApplyImageSpace || kind == PresentKind::RemoveImageSpace;
+    const bool takesInt = kind == PresentKind::PlaySound;
+    const bool track = g_role == nvhooks::Role::Host && capturing();
+    bool parsed = false;
+    if (track) {
+        if (takesFloat) parsed = parseArgs(pi, sd, thisObj, contObj, script, ev, res, opc, &f, &strength);
+        else if (takesInt) parsed = parseArgs(pi, sd, thisObj, contObj, script, ev, res, opc, &f, &opt);
+        else parsed = parseArgs(pi, sd, thisObj, contObj, script, ev, res, opc, &f);
+    }
+    bool ok = CMD_FWD(o);
+    if (ok && parsed && f && formRef(f, &fr)) {
+        Present p;
+        p.kind = kind;
+        p.form = fr;
+        if (takesFloat && strength != 0) { p.hasValue = true; p.value = strength; }
+        if (takesInt && opt != 0) { p.hasValue = true; p.value = static_cast<float>(opt); }
+        emitLocal(p);
+    }
+    return ok;
+}
+bool __cdecl h_ApplyImod(CMD_ARGS) { return presentCmd(o_ApplyImod, PresentKind::ApplyImageSpace, pi, sd, thisObj, contObj, script, ev, res, opc); }
+bool __cdecl h_RemoveImod(CMD_ARGS) { return presentCmd(o_RemoveImod, PresentKind::RemoveImageSpace, pi, sd, thisObj, contObj, script, ev, res, opc); }
+bool __cdecl h_PlayMusic(CMD_ARGS) { return presentCmd(o_PlayMusic, PresentKind::PlayMusic, pi, sd, thisObj, contObj, script, ev, res, opc); }
+bool __cdecl h_PlaySound(CMD_ARGS) { return presentCmd(o_PlaySound, PresentKind::PlaySound, pi, sd, thisObj, contObj, script, ev, res, opc); }
+
 struct Entry {
     const nvhooks::HookSpec* spec;
     void* detour;
@@ -298,6 +342,13 @@ const Entry kOwnerEntries[] = {
     HKO(Cmd_ClearOwnership, h_ClearOwnership, o_ClearOwnership),
     HKO(Cmd_SetCellOwnership, h_SetCellOwnership, o_SetCellOwnership),
     HKO(Cmd_SetCellPublicFlag, h_SetCellPublicFlag, o_SetCellPublicFlag),
+};
+#define HKP(spec, det, orig) {&world_present_addrs::spec, reinterpret_cast<void*>(&det), reinterpret_cast<void*>(&orig)}
+const Entry kPresentEntries[] = {
+    HKP(Cmd_ApplyImageSpaceModifier, h_ApplyImod, o_ApplyImod),
+    HKP(Cmd_RemoveImageSpaceModifier, h_RemoveImod, o_RemoveImod),
+    HKP(Cmd_PlayMusic, h_PlayMusic, o_PlayMusic),
+    HKP(Cmd_PlaySound, h_PlaySound, o_PlaySound),
 };
 
 // ------------------------------------------------------------------ polls
@@ -345,41 +396,74 @@ TESObjectCELL* playerCell() {
     return p ? p->parentCell : nullptr;
 }
 
-size_t scanRefVars(std::vector<RefScriptVar>* out, size_t budget) {
-    g_vars.beginPoll(budget);
-    static TESObjectCELL* lastCell = nullptr;
-    TESObjectCELL* cell = playerCell();
-    if (cell != lastCell) {  // new cell: everything is re-baselined on first sight
-        g_vars.clear();
-        lastCell = cell;
+// Loaded actors, every cell the engine keeps in a process list (the player's cell is walked separately). Plain arrays: SEH cannot live next to C++ objects.
+void walkActorList(const tList<Actor>* list, uint32_t* buf, size_t cap, size_t* n) {
+    __try {
+        int guard = 0;
+        for (auto* node = list->Head(); node && guard < 6000; node = node->next, ++guard) {
+            Actor* a = node->data;
+            if (!a || (a->typeID != kFormType_Character && a->typeID != kFormType_Creature)) continue;
+            if (*n < cap) buf[(*n)++] = a->refID;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
-    size_t n = 0;
-    auto visit = [&](TESObjectREFR* r) {
-        if (!r || !r->refID) return;
+}
+
+class EngineRefVarSource : public IRefVarSource {
+public:
+    uint32_t playerCell() override { return refIdOf(nvworld::playerCell()); }
+    void cellRefs(std::vector<uint32_t>& out) override {
+        TESObjectCELL* cell = nvworld::playerCell();
+        if (!cell) return;
+        for (auto it = cell->objectList.Begin(); !it.End(); ++it) {
+            TESObjectREFR* r = it.Get();
+            if (r && r->refID && r->extraDataList.GetByType(kExtraData_Script)) out.push_back(r->refID);
+        }
+    }
+    void actorRefs(std::vector<uint32_t>& out) override {
+        if (!g_actorProcessManager) return;
+        static uint32_t buf[8192];
+        size_t n = 0;
+        walkActorList(&g_actorProcessManager->highActors, buf, 8192, &n);
+        walkActorList(&g_actorProcessManager->middleHighActors.head, buf, 8192, &n);
+        out.insert(out.end(), buf, buf + n);
+    }
+    void watchedRefs(std::vector<uint32_t>& out) override {
+        if (!g_staticWatchBuilt) {
+            g_staticWatchBuilt = true;
+            g_staticWatch.clear();
+            for (size_t i = 0; i < world_refvar_watch::kCount; ++i) {
+                uint32_t id = nvhooks::resolver().fromRef(FormRef(world_refvar_watch::kRefs[i].plugin, world_refvar_watch::kRefs[i].localId));
+                if (id) g_staticWatch.push_back(id);
+            }
+        }
+        out.insert(out.end(), g_staticWatch.begin(), g_staticWatch.end());
+        auto add = [&](const FormRef& w) {
+            uint32_t id = nvhooks::resolver().fromRef(w);
+            if (id) out.push_back(id);
+        };
+        for (const FormRef& w : g_watched) add(w);
+        for (const FormRef& w : g_base.liveSpawnRefs()) add(w);   // spawned refs keep being polled when the player is elsewhere
+    }
+    bool readVars(uint32_t refID, std::vector<std::pair<uint16_t, double>>& out) override {
+        TESObjectREFR* r = static_cast<TESObjectREFR*>(nvhooks::resolver().lookup(refID));
+        if (!r) return false;
+        BSExtraData* xd = r->extraDataList.GetByType(kExtraData_Script);
+        ScriptEventList* el = xd ? static_cast<ExtraScript*>(xd)->eventList : nullptr;
+        if (!el || !el->m_vars) return false;
+        forRefVars(r, [&](uint16_t idx, double val) { out.emplace_back(idx, val); });
+        return true;
+    }
+};
+EngineRefVarSource g_src;
+
+// RefVarChange -> RefScriptVar effect (a ref the wire cannot name is dropped).
+void toEffects(const std::vector<RefVarChange>& in, std::vector<RefScriptVar>* out) {
+    for (const RefVarChange& c : in) {
+        TESObjectREFR* r = static_cast<TESObjectREFR*>(nvhooks::resolver().lookup(c.refID));
         FormRef rr;
-        bool haveRef = false, got = false;
-        forRefVars(r, [&](uint16_t idx, double val) {
-            if (!g_vars.observe(r->refID, idx, val)) return;
-            if (!haveRef) {
-                got = formRef(r, &rr);
-                haveRef = true;
-            }
-            if (got) {
-                out->push_back(RefScriptVar{rr, idx, val});
-                ++n;
-            }
-        });
-    };
-    if (cell)
-        for (auto it = cell->objectList.Begin(); !it.End(); ++it) visit(it.Get());
-    auto visitOutside = [&](const FormRef& w) {
-        uint32_t id = nvhooks::resolver().fromRef(w);
-        TESObjectREFR* r = static_cast<TESObjectREFR*>(id ? nvhooks::resolver().lookup(id) : nullptr);
-        if (r && r->parentCell != cell) visit(r);  // refs of the player's cell were already visited
-    };
-    for (const FormRef& w : g_watched) visitOutside(w);
-    for (const FormRef& w : g_base.liveSpawnRefs()) visitOutside(w);  // spawned refs keep being polled when the player is elsewhere
-    return n;
+        if (r && formRef(r, &rr)) out->push_back(RefScriptVar{rr, c.index, c.value});
+    }
 }
 
 }  // namespace
@@ -420,6 +504,19 @@ InitReport Init(nvhooks::CaptureHub& hub, nvhooks::Role role) {
         }
         rep.hooks.push_back({e.spec->name, st});
     }
+        if (role == nvhooks::Role::Host) {   // presentation of host-run scripts (G39)
+        for (const Entry& e : kPresentEntries) {
+            nvhooks::Addr tramp = 0;
+            nvhooks::PatchStatus st = g_reg->acquire(*e.spec, reinterpret_cast<nvhooks::Addr>(e.detour), &tramp, reinterpret_cast<nvhooks::Addr*>(e.origOut));
+            if (nvhooks::installed(st)) {
+                *reinterpret_cast<void**>(e.origOut) = reinterpret_cast<void*>(tramp);
+                ++rep.ok;
+            } else {
+                ++rep.failed;
+            }
+            rep.hooks.push_back({e.spec->name, st});
+        }
+    }
     // L5 detours these commands; it reports non-player AV changes and script packages through observers.
     nvhooks::setNonPlayerAvObserver([](const FormRef& actor, uint32_t av, uint8_t kind, float before, float after) {
         if (kind <= static_cast<uint8_t>(AvCmdKind::Damage)) recordNonPlayerAv(actor, av, static_cast<AvCmdKind>(kind), before, after);
@@ -433,8 +530,14 @@ InitReport Init(nvhooks::CaptureHub& hub, nvhooks::Role role) {
         for (const Effect& e : t.effects) {
             g_weather.noteSent(e);
             g_base.onEffect(e);  // net spawn / ref var state for joiners and rejoiners
-            if (auto* os = std::get_if<fnvcoop::ObjectState>(&e))
+            if (auto* os = std::get_if<fnvcoop::ObjectState>(&e)) {
                 if (g_objObserver) g_objObserver(*os);   // the world-time poll must not send what a script command already sent
+                // A script's (or a guest intent's) Lock / UnLock / SetOpenState / SetDestroyed also goes out as a world effect: the txn copy reaches a client only
+                // through the shadow's change filter, which does not know the engine's own lock state, and a client that joins later has to be told too.
+                // The world-time poll's own effects are marked (cause.aux) and not repeated.
+                if (g_role == nvhooks::Role::Host)
+                    if (auto w = worldCopyOfObjectState(*os, t.cause.aux)) emitLocal(*w);
+            }
         }
     });
     return rep;
@@ -452,7 +555,8 @@ void Shutdown() {
 void resetSession() {
     g_ledger.clear();
     g_base.clear();
-    g_vars.clear();
+    g_poller.reset();
+    g_staticWatchBuilt = false;
     g_weather.reset();
     g_log.drain();
 }
@@ -476,21 +580,45 @@ void clearWatched() { g_watched.clear(); }
 size_t pollRefVarsNow(std::vector<RefScriptVar>* out) {
     std::vector<RefScriptVar> tmp;
     if (!out) out = &tmp;
-    return scanRefVars(out, 1u << 20);
+    std::vector<RefVarChange> ch;
+    g_poller.pollAll(g_src, ch);
+    const size_t before = out->size();
+    toEffects(ch, out);
+    return out->size() - before;
+}
+
+void setRefVarPollConfig(const RefVarPollCfg& cfg) { g_poller.setConfig(cfg); }
+RefVarPollStats refVarPollStats() {
+    RefVarPollStats st;
+    st.sweeps = g_poller.sweeps();
+    st.fastReads = g_poller.fastReads();
+    st.tracked = g_poller.tracker().size();
+    st.pending = g_poller.pending();
+    st.watched = g_staticWatch.size() + g_watched.size();
+    return st;
+}
+void noteRefScriptRan(uint32_t refID) {
+    if (!g_hub || !g_hub->enabled() || g_role != nvhooks::Role::Host) return;
+    g_poller.afterScript(refID, g_src);
 }
 
 void hostTick() {
     static uint32_t frame = 0;
     if (!g_hub || !g_hub->enabled() || g_role != nvhooks::Role::Host) return;
-    if (++frame % 15 != 0) return;
+    ++frame;
     if (g_hub->depth() != 0) return;  // never inside a script scope
 
+    std::vector<RefVarChange> ch;
+    g_poller.tick(frame, g_src, ch);
+    std::vector<Effect> fx;
+    if (frame % 15 == 0) {
+        FormRef wr;
+        void* w = skyWeather();
+        bool haveW = w && formRef(w, &wr);
+        fx = g_weather.poll(wr, haveW, timeScale());
+    }
     std::vector<RefScriptVar> vars;
-    scanRefVars(&vars, 64);
-    FormRef wr;
-    void* w = skyWeather();
-    bool haveW = w && formRef(w, &wr);
-    std::vector<Effect> fx = g_weather.poll(wr, haveW, timeScale());
+    toEffects(ch, &vars);
     for (auto& v : vars) fx.push_back(v);
     if (fx.empty()) return;
     Cause c;
@@ -794,6 +922,12 @@ ApplyStatus WorldApplier::applyAny(const Effect& e) {
 }
 
 ApplyStatus WorldApplier::applyWorld(const WorldEffect& e) {
+    if (auto* os = std::get_if<SetObjectState>(&e))
+        if (g_objObserver) {   // the host's word, noted before the apply (the object may not be loaded here yet); the poll heals toward it
+            fnvcoop::ObjectState o;
+            o.ref = os->ref; o.mask = os->mask; o.open = os->open; o.locked = os->locked; o.level = os->level; o.destroyed = os->destroyed;
+            g_objObserver(o);
+        }
     fnvcoop::EchoGuard echo(&hub_.echo());
     nvhooks::ApplyScope applyScope;
     PlanEnv env{res_, g_ledger, cellIsReady};

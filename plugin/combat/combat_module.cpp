@@ -137,7 +137,7 @@ bool g_inited = false;
 volatile PlayerId g_self = kNoPlayer;
 volatile LONG g_nativeFaults = 0;
 bool g_nativeOk = false;           // the pins of the hit-data constructor and the funnel matched
-uint64_t g_gateCalls = 0, g_gateErrors = 0, g_gateOffThread = 0, g_nativeReplays = 0, g_consoleDamage = 0, g_consoleLines = 0, g_consoleFailed = 0;
+uint64_t g_gateLogged = 0, g_gateCalls = 0, g_gateErrors = 0, g_gateOffThread = 0, g_nativeReplays = 0, g_consoleDamage = 0, g_consoleLines = 0, g_consoleFailed = 0;
 volatile DWORD g_mainThread = 0;   // the game main thread: set at DeferredInit and every session frame; the gate only acts there
 
 std::function<bool(uint32_t, uint8_t&)> g_slotOfRef;
@@ -342,6 +342,19 @@ public:
         (void)victim;
         return ExecOn(line, victimRef);
     }
+    // The owner's own kill, for a victim an accepted lethal hit left standing: the same console command the actor port uses for a death
+    // (script_engine.cpp lines::kill); the port's death poll then sees the corpse and declares the death.
+    bool killActor(uint32_t ref) override {
+        static int logged = 0;
+        if (ref && logged < 20) {
+            ++logged;
+            void* obj = LookupRef(ref);
+            ActorRead r;
+            const bool ok = obj && ReadActorRaw(obj, &r);
+            nvcoop::Log("combat: owner kills %08X (life state %u, health %.1f): the engine left a victim of a lethal hit standing", ref, ok ? r.life : 99u, ok ? static_cast<double>(r.health) : 0.0);
+        }
+        return ref && ExecOn("KillActor", ref);
+    }
     bool setLimbCrippled(const cc::Entity&, uint32_t ref, cc::Limb limb) override {
         const char* av = LimbAvName(limb);
         if (!av || !ref) return false;
@@ -367,6 +380,12 @@ public:
         void* obj = LookupRef(ref);
         ActorRead r;
         return obj && ReadActorRaw(obj, &r) && (r.life == 1 || r.life == 2 || r.health <= 0);
+    }
+    // the life state alone (Actor+0x108 = 1 dying / 2 dead): what the actor port's death poll looks at. A VATS kill can leave health <= 0 with life state 0.
+    bool lifeDead(uint32_t ref) override {
+        void* obj = LookupRef(ref);
+        ActorRead r;
+        return obj && ReadActorRaw(obj, &r) && (r.life == 1 || r.life == 2);
     }
     // The engine's own kill-XP award (inside ApplyHitData, 0x89E5xx..0x89E6FE) takes a float from a virtual of the VICTIM at vtable offset 0x730 (called with
     // no arguments), scales it by the GMST difficulty tiers and the player's XP multiplier, and hands the integer to Player vtable +0x488 (RewardXP). We use
@@ -480,6 +499,11 @@ int __fastcall HitGateThunk(void* victim, void*, void* hd, int flag) {
                 decided = true;
             } catch (...) {
                 ++g_gateErrors;
+            }
+            if (decided && g_gateLogged < 60 && eh.victimRef && (eng::netIdOf(eh.victimRef) || eh.attackerRef == eng::kLocalPlayerRef) && d.action != GateAction::Neutralize) {
+                ++g_gateLogged;
+                nvcoop::Log("combat: gate %s on victim %08X by %08X, damage %.1f, cap %d: %s", d.action == GateAction::Proceed ? "PROCEED" : "CLAMP", eh.victimRef,
+                            eh.attackerRef, static_cast<double>(eh.healthDmg), d.maxHealthDamage, d.why);   // (a victim that is no synced actor reads "not a synced combatant")
             }
             if (decided && nvcoop::combat::applyDecisionToHit(buf, raw, d.action, d.maxHealthDamage) && !PokeHit(hd, buf)) ++g_gateErrors;
         } else {
@@ -670,8 +694,20 @@ void glueFrame(nvcoop::coop::Runtime* rt) {
     }
 }
 
+namespace {
+std::string JsonEscape(const std::string& in) {
+    std::string out;
+    for (char c : in) {
+        if (c == '"' || c == '\\') { out += '\\'; out += c; }
+        else if (c == '\n') out += "\\n";
+        else if (static_cast<unsigned char>(c) >= 0x20) out += c;
+    }
+    return out;
+}
+}  // namespace
+
 std::string glueStatusJson() {
-    char b[1536];
+    char b[3072];
     const CombatSync* cs = g_rt ? g_rt->sync() : nullptr;
     const Stats* s = cs ? &cs->stats() : nullptr;
     auto u = [&](uint64_t Stats::*m) { return static_cast<unsigned long long>(s ? s->*m : 0); };
@@ -684,6 +720,8 @@ std::string glueStatusJson() {
                   "\"nacksSent\":%llu,\"hitRetries\":%llu,\"hitsAbandoned\":%llu,\"damageApplied\":%llu,"
                   "\"deathsDeclared\":%llu,\"deathsAccepted\":%llu,\"xpAwards\":%llu,"
                   "\"deathsRejected\":%llu,\"deathsDeferred\":%llu,\"deathsRefusedLocal\":%llu,\"undecodable\":%llu,\"spoofed\":%llu,\"unroutable\":%llu,"
+                  "\"naturalHits\":%llu,\"envHitsNeutralized\":%llu,\"hitsResolvedLate\":%llu,\"killsForced\":%llu,\"damageRefused\":%llu,\"engineRefused\":%llu,"
+                  "\"naturalLethal\":%llu,\"naturalLethalStuck\":%llu,\"lastGate\":\"%s\",\"rejections\":\"%s\","
                   "\"rebuilds\":%llu,\"droppedUnknownPeer\":%llu}}",
                   g_set.enabled ? "true" : "false", cs ? "true" : "false",
                   g_patches ? g_patches->installed() : 0, (unsigned long long)g_gateCalls, (unsigned long long)g_gateErrors, (unsigned long long)g_gateOffThread,
@@ -695,6 +733,8 @@ std::string glueStatusJson() {
                   u(&Stats::deathsDeclared), u(&Stats::deathsAccepted), u(&Stats::xpAwards),
                   u(&Stats::deathsRejected), u(&Stats::deathsDeferred), u(&Stats::deathsRefusedLocal), u(&Stats::undecodable), u(&Stats::spoofed),
                   u(&Stats::unroutable),   // a death or hit the host had nobody to send to: the client was never seen as joined
+                  u(&Stats::naturalHits), u(&Stats::envHitsNeutralized), u(&Stats::hitsResolvedLate), u(&Stats::killsForced), u(&Stats::damageRefused),
+                  u(&Stats::engineRefused), u(&Stats::naturalLethal), u(&Stats::naturalLethalStuck), JsonEscape(cs ? cs->lastGate() : std::string()).c_str(), JsonEscape(cs ? cs->lastRejections() : std::string()).c_str(),
                   (unsigned long long)(g_rt ? g_rt->rebuilds() : 0), (unsigned long long)(g_rt ? g_rt->droppedUnknownPeer() : 0));
     return b;
 }

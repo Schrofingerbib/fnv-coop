@@ -246,9 +246,15 @@ void ActorFeed::pollDeaths(uint64_t nowMs) {
     for (auto& kv : fed_) {
         Fed& f = kv.second;
         const NetId id = kv.first;
-        if (f.dead) continue;
         const RefId r = port_.activeRef(id);
         ActorRaw raw;
+        if (f.dead) {
+            // A death on record is over when ActorSync forgot it (a scripted ResurrectActor, a world load) AND the engine shows the actor on its feet
+            // again: the next death must be polled and declared like the first (bench 2026-10-27: the harness resurrects its gangers before every
+            // fight, and the second death of the same ref was never published).
+            if (!FNV_MUT(74) && r && !s->isDead(id) && eng_.read(r, raw) && !raw.dead()) { f.dead = false; f.deadSinceMs = 0; ++st_.deathsRearmed; }
+            continue;
+        }
         if (!r || !eng_.read(r, raw)) continue;
         if (!raw.dead()) { f.deadSinceMs = 0; continue; }
         if (s->isDead(id)) { f.dead = true; continue; }   // the network already declared it (port.kill ran)

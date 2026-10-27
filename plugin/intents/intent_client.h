@@ -32,6 +32,7 @@ enum class Obs { Proceed, Suppress };
 struct ClientStats {
     uint64_t observedActivate = 0, observedEvent = 0, forwarded = 0, suppressed = 0, proceeded = 0, coalesced = 0, notReady = 0, pendingCapped = 0;
     uint64_t sendFailed = 0, verdicts = 0, unknownVerdicts = 0, timeouts = 0, badDatagrams = 0, dialogueStarts = 0, redirectsOpened = 0, closesSent = 0;
+    uint64_t observedStage = 0, stageOff = 0, stageBad = 0;   // SetStage: blocked advances seen by the hook / not forwarded (switched off, or no stage to ask for)
     uint64_t byKind[static_cast<size_t>(Kind::Count_)] = {};
     uint64_t rejected[static_cast<size_t>(Result::Count_)] = {};
 };
@@ -42,6 +43,9 @@ public:
 
     Obs onActivate(const FormRef& target);                   // nvhooks::setActivateObserver
     Obs onEvent(uint32_t mask, const FormRef& target);       // nvhooks::setEventObserver
+    // nvhooks::setStageRequestObserver: the guest's SetStage detour dropped a script / console stage advance. true = it was sent to the host as
+    // Kind::SetStage (the host decides); false = it was not (intents off, not joined yet, too many in flight, or a double of one just sent).
+    bool onStageBlocked(const FormRef& quest, uint32_t stage);
     // Send an intent (terminal entry, RPC, tests). 0 = not sent (not ready, send failed, too many in flight); else the intent id.
     uint32_t submit(Kind kind, const FormRef& target, const FormRef* aux = nullptr, int32_t value = 0, std::vector<uint8_t> path = {});
 
@@ -64,6 +68,7 @@ private:
     Config cfg_;
     uint32_t session_ = 0, nextId_ = 1;
     std::map<uint32_t, Pending> pending_;
+    std::map<std::pair<FormRef, uint32_t>, uint64_t> recentStage_;   // (quest, stage) -> last forwarded: a GameMode script that retries every frame
     std::map<std::pair<Kind, FormRef>, uint64_t> recent_;   // (kind, target) -> last forwarded, for double-click coalescing
     bool inObserver_ = false;       // our own openContainer call must not be forwarded again
     // container-menu watcher: after an accepted ContainerOpen, send ContainerClose when the menu goes away

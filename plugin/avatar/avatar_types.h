@@ -93,6 +93,11 @@ struct Config {
     float yawEpsilonRad = 0.0087f;           // 0.5 degree
     uint32_t posHeartbeatMs = 1000;          // re-send an unchanged position (physics / AI may have moved it)
     float driftUnits = 140.0f;               // actual vs applied farther than this (2 m) forces a re-send and is counted
+    // A puppet is never put inside the body of this machine's own player: two overlapping bodies make the engine push them apart, and the
+    // driver's SetPos back into the same spot every frame turns that into a continuous shove of the REAL player. The place sent to the
+    // engine is moved out to this horizontal distance (1 m, a little more than two body radii) when the remote stands closer than that.
+    float bodyRoomUnits = 70.0f;
+    float bodyRoomHeightUnits = 110.0f;      // only when the two are within this height of each other (not on different floors)
     uint32_t restrainCheckMs = 250;          // how often IsRestrained is polled
 
     // animation
@@ -135,6 +140,7 @@ struct Stats {
     uint64_t appearanceUpdates = 0;                                  // a look change applied to an existing puppet (no respawn)
     uint64_t modOps = 0, modFailures = 0, modGaveUp = 0;             // weapon modification writes (EnableWeaponMod) and their outcome
     uint64_t pushesIgnored = 0;                                      // engine pushes (body in the way) not handed to the interpolation buffer
+    uint64_t bodyYields = 0;                                         // driven places moved out of the local player's body (frames, not episodes)
 };
 
 }  // namespace nvcoop::avatar
